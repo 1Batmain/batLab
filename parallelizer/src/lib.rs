@@ -35,6 +35,7 @@ impl LayerSpec {
     }
 }
 
+#[derive(Debug)]
 pub struct Layer {
     name: String,
     shader: ShaderModule,
@@ -128,7 +129,7 @@ pub struct Wrapper {
     adapter: Adapter,
     device: Device,
     queue: Queue,
-    layer: Option<Layer>,
+    layer: Vec<Layer>,
 }
 
 impl Wrapper {
@@ -144,54 +145,54 @@ impl Wrapper {
             adapter,
             device,
             queue,
-            layer: None,
+            layer: Vec::new(),
         }
     }
     pub async fn run (&mut self) -> Vec<f32>
     {
-        let mut result = Vec::new();
-        if let Some(layer) = &self.layer {
-            let mut encoder = self.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = encoder.begin_compute_pass(&Default::default());
-                pass.set_pipeline(&layer.pipeline);
-                pass.set_bind_group(0, &layer.bind_group, &[]);
-                pass.dispatch_workgroups(layer.num_workgroups, 1, 1);
-            }
-            let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("staging"),
-                size: layer.output.size(),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            encoder.copy_buffer_to_buffer(&layer.output, 0, &staging_buffer, 0, layer.output.size());
-            self.queue.submit([encoder.finish()]);
-
-            let buffer_slice = staging_buffer.slice(..);
-
-            let (gpu, cpu) = futures::channel::oneshot::channel();
-            buffer_slice.map_async(wgpu::MapMode::Read, move |result| gpu.send(result).unwrap());
-
-            match self.device.poll(wgpu::PollType::wait_indefinitely()) {
-                Ok(_) => {},
-                Err(e) => println!("error on poll : {}", e),
-            };
-
-            pollster::block_on(async { 
-                let _ = cpu.await.unwrap(); 
-            });
-
-            {
-                let data = buffer_slice.get_mapped_range();
-                result = bytemuck::cast_slice(&data).to_vec();
-            }
-            staging_buffer.unmap();
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        for layer in self.layer.iter() {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&layer.pipeline);
+            pass.set_bind_group(0, &layer.bind_group, &[]);
+            pass.dispatch_workgroups(layer.num_workgroups, 1, 1);
         }
-            result
+
+        let layer = self.layer.last().unwrap();
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: layer.output.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(&layer.output, 0, &staging_buffer, 0, layer.output.size());
+        self.queue.submit([encoder.finish()]);
+
+        let buffer_slice = staging_buffer.slice(..);
+
+        let (gpu, cpu) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| gpu.send(result).unwrap());
+
+        match self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            Ok(_) => {},
+            Err(e) => println!("error on poll : {}", e),
+        };
+
+        pollster::block_on(async { 
+            let _ = cpu.await.unwrap(); 
+        });
+
+        let mut result = Vec::new();
+        {
+            let data = buffer_slice.get_mapped_range();
+            result = bytemuck::cast_slice(&data).to_vec();
+        }
+        staging_buffer.unmap();
+        result
     }
     pub fn add_layer(&mut self, spec: LayerSpec)
     {
-        self.layer = Some(Layer::new(&self.device, &spec));
+        self.layer.push(Layer::new(&self.device, &spec));
     }
 }

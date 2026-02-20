@@ -10,7 +10,7 @@ async fn main() {
         "../shader/test.wgsl".to_string()
     )
     .workgroup_size(64)
-    .input(vec![0., 1., 2., 3., 4., 5.])
+    .input(vec![0.; 1024])
     .output(Vec::new());
 
     let mut wrapper = Wrapper::new().await;
