@@ -13,5 +13,5 @@ fn main(
         return;
     }
     
-    output[index] = input[index] + f32(index);
+    output[index] = 1.;
 }
