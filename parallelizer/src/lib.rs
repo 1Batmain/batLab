@@ -20,7 +20,7 @@ impl Dim3 {
             y:0,z:0
         }
     }
-    pub fn length(&self) -> u32{
+    pub fn length(&self) -> u64{
         self.x * self.y * self.z
     }
 }
@@ -52,7 +52,7 @@ pub trait LayerTrait : std::fmt::Debug {
     fn get_dim_input(&self) -> &Dim3;
     fn get_dim_output(&self) -> &Dim3;
     fn set_dim_output(&self) -> Dim3;
-    // TODO get_shader_data -> ShaderData
+    // TODO get_shader_buffers -> Shaderbuffers
 }
 impl LayerTrait for ConvolutionLayer {
     fn get_nb_workgroups(&self) -> u32 {
@@ -92,16 +92,16 @@ impl ConvolutionLayer {
 }
 
 #[derive(Debug)]
-struct LayerData {
-    input: Option<Vec<f32>>,
-    output: Option<Vec<f32>>,
-    weights: Option<Vec<f32>>,
-    bias: Option<Vec<f32>>,
-    grad_weights: Option<Vec<f32>>,
-    grad_bias: Option<Vec<f32>>,
-    grad_input:Option<Vec<f32>>,
+struct LayerBuffers {
+    input: Buffer,
+    output: Buffer,
+    weights: Buffer,
+    bias: Buffer,
+    grad_weights: Buffer,
+    grad_bias: Buffer,
+    grad_input:Buffer,
 }
-impl LayerData {
+impl LayerBuffers {
     fn new() -> Self 
     {
         Self {
@@ -119,7 +119,7 @@ impl LayerData {
 #[derive(Debug)]
 pub struct Layer {
     ty: Box<dyn LayerTrait>,
-    data: LayerData, 
+    buffers: LayerBuffers, 
     shader: ShaderModule,
     pipeline: Option<ComputePipeline>,
     num_workgroups: u32,
@@ -129,12 +129,12 @@ impl Layer {
     pub fn new(device: &Device, idx: usize, spec: LayerSpec) -> Self
     {
     let ty = Self::create_layer_type(&spec);
-    let data = LayerData::new();
+    let buffers = LayerBuffers::new();
     let shader = Self::create_shader(device, &spec);
     let num_workgroups = ty.get_nb_workgroups();
         Self {
             ty,
-            data,
+            buffers,
             shader,
             pipeline: None,
             num_workgroups,
@@ -261,29 +261,35 @@ impl Model {
         }
     }
 
-    fn create_init_buffer(&self) {
-        let input = device.create_buffer(&BufferDescriptor {
-            label: Some("input"),
-            size: self.ty.get_dim_input().length() as u64,
+    fn create_buffer(&mut self, size: u64) -> Buffer {
+        let buffer = self.device.create_buffer(&BufferDescriptor {
+            label: Some("buffer"),
+            size: size,
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
-
+        buffer
     }
 
-    pub fn build_model(&self, input: Vec<f32> ) 
+    pub fn build_model(&mut self) 
     {
-        for (idx, layer) in self.layer.iter().enumerate() {
+        let input_buffers: Vec<(Option<Buffer>, <Buffer>)> = self.layer.iter().enumerate()
+        .map(|(idx, layer)| {
             if idx == 0 {
-                self.create_init_buffer(input);
+                (
+                    Some(self.create_buffer(layer.ty.get_dim_input().length())), 
+                    self.create_buffer(layer.ty.get_dim_output().length())
+                )
+            } else {
+                (None, self.create_buffer(layer.ty.set_dim_output().length()))
             }
-        }
+        }).collect();
     }
 
 
     pub async fn run (&mut self) -> Vec<f32> {
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for layer in self.layer.iter().as_ref() {
+        for layer in self.layer.iter() {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&layer.pipeline.unwrap());
             pass.set_bind_group(0, &layer.bind_group, &[]);
@@ -317,8 +323,8 @@ impl Model {
 
         let mut result = Vec::new();
         {
-            let data = buffer_slice.get_mapped_range();
-            result = bytemuck::cast_slice(&data).to_vec();
+            let buffers = buffer_slice.get_mapped_range();
+            result = bytemuck::cast_slice(&buffers).to_vec();
         }
         staging_buffer.unmap();
         result
