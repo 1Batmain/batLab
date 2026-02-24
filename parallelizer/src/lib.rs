@@ -1,18 +1,18 @@
-use wgpu::{Adapter, BindGroup, Buffer, BufferDescriptor, BufferUsages, ComputePipeline, Device, Instance, Queue, ShaderModule, util::{BufferInitDescriptor, DeviceExt}};
-use encase::{ShaderType, rts_array::Length};
+use wgpu::{Adapter, BindGroup, Buffer, BufferDescriptor, BufferUsages, ComputePipeline, Device, Instance, Queue, ShaderModule};
+use encase::ShaderType;
 use std::sync::Arc;
 
 // Définitions de types utils
 #[derive(Debug, Clone, Copy)]
-enum PaddingMode {
+pub enum PaddingMode {
     Valid,
     Same,
 }
 #[derive(ShaderType, Debug, Clone, Copy)]
-struct Dim3{
-    x: u32,
-    y: u32,
-    z: u32,
+pub struct Dim3{
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
 }
 impl Dim3 {
     pub fn new() -> Self {
@@ -22,12 +22,12 @@ impl Dim3 {
         }
     }
     pub fn length(&self) -> u32{
-        (self.x * self.y * self.z)
+        self.x * self.y * self.z 
     }
 }
 
 // Définition des types Specs (définition d'un layer)
-enum LayerSpec {
+pub enum LayerSpec {
     Convolution(ConvolutionLayerSpec),
 }
 pub struct ConvolutionLayerSpec {
@@ -35,7 +35,7 @@ pub struct ConvolutionLayerSpec {
     pub dim_kernel: Dim3,
     pub stripe: u32,        // step size to move the filter
     pub mode: PaddingMode,  // Active the layer 
-    pub dim_input: Dim3
+    pub dim_input: Option<Dim3>
 }
 
 // Définition des types de layers (Execution layer) 
@@ -54,8 +54,8 @@ pub trait LayerType : std::fmt::Debug {
     fn get_output_size(&self) -> u32;
     fn get_weight_size(&self) -> u32;
     fn get_bias_size(&self) -> u32;
-    fn set_dim_output(&self) -> Dim3;
-    // TODO get_shader_buffers -> Shaderbuffers
+    fn set_dim_output(& mut self) -> Dim3;
+    fn get_dim_output(&self) -> Dim3;
 }
 impl LayerType for ConvolutionLayer {
     fn get_nb_workgroups(&self) -> u32 {
@@ -73,26 +73,31 @@ impl LayerType for ConvolutionLayer {
     fn get_bias_size(&self) -> u32 {
         self.nb_kernel
     }
-    fn set_dim_output(&self) -> Dim3 {
+    fn set_dim_output(&mut self) -> Dim3 {
         let padding = match self.mode {
             PaddingMode::Valid  => (0, 0),
             PaddingMode::Same   => (self.dim_kernel.x - 1, self.dim_kernel.y - 1),
         };
-        let x = (self.dim_input.x + 2 * padding.0 - self.dim_kernel.x / self.stripe) + 1;
-        let y = (self.dim_input.y + 2 * padding.1 - self.dim_kernel.y / self.stripe) + 1;
+        let x = ((self.dim_input.x + 2 * padding.0 - self.dim_kernel.x) / self.stripe) + 1;
+        let y = ((self.dim_input.y + 2 * padding.1 - self.dim_kernel.y) / self.stripe) + 1;
         let z = self.nb_kernel;
-        Dim3 {x, y, z}
+        let res = Dim3 {x, y, z};
+        self.dim_output = res;
+        self.dim_output
+    }
+    fn get_dim_output(&self) -> Dim3 {
+        self.dim_output
     }
 }
 impl ConvolutionLayer {
     pub fn new(spec: &ConvolutionLayerSpec) -> Self
     {
-        let instance = Self {
+        let mut instance = Self {
                 nb_kernel: spec.nb_kernel,
                 dim_kernel: spec.dim_kernel,
                 stripe: spec.stripe,
                 mode: spec.mode,
-                dim_input: spec.dim_input,
+                dim_input: spec.dim_input.unwrap(),
                 dim_output: Dim3::new(),
             };
         instance.set_dim_output();
@@ -157,25 +162,76 @@ impl Layer {
     }
 
     fn create_shader(device: &Device, spec: &LayerSpec) -> ShaderModule {
-        let (path, name): (&str, &str) = match spec {
-            LayerSpec::Convolution(_) => ("shader/convolution.wgsl", "convolution"),
-//            LayerSpec::Activation(_) => ("shader/activation.wgsl", "activation"),
-//            LayerSpec::Upscale(_) => ("shader/upscale.wgsl", "upscale"),
-//            LayerSpec::Loss(_) => ("shader/loss.wgsl", "loss"),
+        let (code, name): (&str, &str) = match spec {
+            LayerSpec::Convolution(_) => (include_str!("shader/convolution.wgsl"), "convolution"),
+//            LayerSpec::Activation(_) => (include_str!("shader/activation.wgsl"), "activation"),
+//            LayerSpec::Upscale(_) => (include_str!("shader/upscale.wgsl"), "upscale"),
+//            LayerSpec::Loss(_) => (include_str!("shader/loss.wgsl"), "loss"),
         };
-
-        let shader_code = std::fs::read_to_string(path)
-            .expect(&format!("Failed to read shader file: {}", path));
+        
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(shader_code)),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(code)),
         });
         shader
     }
     fn set_pipeline(&mut self, device: &Device) {
+        // Create bind group layout explicitly
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
         self.pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("piepeline"),
-            layout: None,
+            layout: Some(&pipeline_layout),
             module: &self.shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
@@ -207,11 +263,12 @@ impl Layer {
         }));
     }
 }
+#[derive(Debug)]
 pub struct TrainingSpec {
     lr: f32,
     batch_size: u32,
-
 }
+#[derive(Debug)]
 pub struct Model {
     instance: Instance,
     adapter: Adapter,
@@ -235,10 +292,10 @@ impl Model {
         }
     }
 
-    fn create_buffer(device: &Device, size: u32) -> Arc<Buffer> {
+    fn create_buffer(device: &Device, size: u64) -> Arc<Buffer> {
         let buffer = device.create_buffer(&BufferDescriptor {
             label: Some("buffer"),
-            size: size as u64,
+            size: size,
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -248,13 +305,21 @@ impl Model {
     pub fn build_model(&mut self) 
     {
         let device = &self.device;
-        let mut last_output = Self::create_buffer(device, self.layer.first().unwrap().ty.get_input_size());
+        let input_size = self.layer.first().unwrap().ty.get_input_size();
+        let output_size = self.layer.first().unwrap().ty.get_output_size();
+        
+        let input_bytes = input_size as u64 * 4;  // f32 is 4 bytes
+        
+        let mut last_output = Self::create_buffer(device, input_bytes);
         for  layer in self.layer.iter_mut() {
+            let output_size = layer.ty.get_output_size();
+            let output_bytes = output_size as u64 * 4;
+            
             layer.buffers = LayerBuffers {
                 input: Some(last_output),
-                weights: Some(Self::create_buffer(device, layer.ty.get_weight_size())),
-                bias: Some(Self::create_buffer(device, layer.ty.get_bias_size())),
-                output: Some(Self::create_buffer(device, layer.ty.get_output_size())),
+                weights: Some(Self::create_buffer(device, layer.ty.get_weight_size() as u64 * 4)),
+                bias: Some(Self::create_buffer(device, layer.ty.get_bias_size() as u64 * 4)),
+                output: Some(Self::create_buffer(device, output_bytes)),
             };
             last_output = layer.buffers.output.clone().unwrap();
             layer.set_pipeline(device);
@@ -268,19 +333,19 @@ impl Model {
         for layer in self.layer.iter() {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&layer.pipeline.as_ref().unwrap());
-            pass.set_bind_group(0, &layer.bind_group, &[]);
+            pass.set_bind_group(0, layer.bind_group.as_ref().unwrap(), &[]);
             pass.dispatch_workgroups(layer.num_workgroups, 1, 1);
         }
 
         let layer = self.layer.last().unwrap();
+        let output_size_bytes = layer.ty.get_output_size() as u64 * 4;  // f32 is 4 bytes
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),
-            size: layer.ty.get_output_size() as u64,
+            size: output_size_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-
-        encoder.copy_buffer_to_buffer(&layer.buffers.output.as_ref().unwrap(), 0, &staging_buffer, 0, layer.ty.get_output_size() as u64);
+        encoder.copy_buffer_to_buffer(&layer.buffers.output.as_ref().unwrap(), 0, &staging_buffer, 0, output_size_bytes);
         self.queue.submit([encoder.finish()]);
 
         let buffer_slice = staging_buffer.slice(..);
@@ -297,7 +362,7 @@ impl Model {
             let _ = cpu.await.unwrap(); 
         });
 
-        let mut result = Vec::new();
+        let result;
         {
             let buffers = buffer_slice.get_mapped_range();
             result = bytemuck::cast_slice(&buffers).to_vec();
@@ -305,78 +370,15 @@ impl Model {
         staging_buffer.unmap();
         result
     }
-    pub fn add_layer(&mut self, spec: LayerSpec) {
+    pub fn add_layer(&mut self, mut spec: LayerSpec) {
+        if !self.layer.is_empty() {
+            let prev_output = self.layer.last().unwrap().ty.get_dim_output();
+            match &mut spec {
+                LayerSpec::Convolution(conv_spec) => {
+                    conv_spec.dim_input = Some(prev_output);
+                }
+            }
+        }
         self.layer.push(Layer::new(&self.device, spec));
     }
 }
-/*
-impl Layer {
-    pub fn new(device: &Device, spec: &LayerSpec) -> Self
-    {
-        let ty = Self::create_layer_type(&spec);
-        let shader = Self::create_shader(device, &spec);
-        let pipeline = Self::create_pipeline(device, &shader);
-        let num_workgroups = ty.get_nb_workgroups();
-        let (input, output) = Self::create_buffers(device);
-        let bind_group = Self::create_bind_group(device, &pipeline, &input, &output);
-        Self {
-            ty,
-            shader,
-            pipeline,
-            num_workgroups,
-            input,
-            output,
-            bind_group
-       } 
-    }
-
-    fn create_pipeline(device: &Device, shader: &ShaderModule) -> ComputePipeline
-    {
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("piepeline"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: Default::default(),
-        });
-        pipeline
-    }
-
-    fn create_buffers(&self, device: &Device) -> (Buffer, Buffer)
-    {
-        let input = device.create_buffer(&BufferDescriptor {
-            label: Some("input"),
-            size: self.ty.get_dim_input().length() as u64,
-            usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let output = device.create_buffer(&BufferDescriptor {
-            label: Some("output"),
-            size: self.ty.get_dim_output().length() as u64,
-            usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        (input, output)
-    }
-
-    fn create_bind_group(device: &Device, pipeline: &ComputePipeline, input: &Buffer, output: &Buffer) -> BindGroup
-    {
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:1,
-                    resource: output.as_entire_binding(),
-                },
-            ],
-        });
-        bind_group
-    }
-}
-*/
