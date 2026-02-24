@@ -54,6 +54,10 @@ pub trait LayerType : std::fmt::Debug {
     fn get_output_size(&self) -> u32;
     fn get_weight_size(&self) -> u32;
     fn get_bias_size(&self) -> u32;
+    fn get_input_size_bytes(&self) -> u64 { (self.get_input_size() * 4) as u64 }
+    fn get_output_size_bytes(&self) -> u64 { (self.get_output_size() * 4) as u64 }
+    fn get_weight_size_bytes(&self) -> u64 { (self.get_weight_size() * 4) as u64 }
+    fn get_bias_size_bytes(&self) -> u64 { (self.get_bias_size() * 4) as u64 }
     fn set_dim_output(& mut self) -> Dim3;
     fn get_dim_output(&self) -> Dim3;
 }
@@ -106,14 +110,38 @@ impl ConvolutionLayer {
 }
 
 #[derive(Debug)]
-struct LayerBuffers {
+struct  LayerBuffers {
+    gpu: GpuBuffers,
+    cpu: CpuBuffers,
+}
+#[derive(Debug)]
+struct CpuBuffers {
+    input: Option<Arc<Vec<f32>>>,
+    output: Option<Arc<Vec<f32>>>,
+    weights: Option<Arc<Vec<f32>>>,
+    bias: Option<Arc<Vec<f32>>>,
+}
+#[derive(Debug)]
+struct GpuBuffers {
     input: Option<Arc<Buffer>>,
     output: Option<Arc<Buffer>>,
     weights: Option<Arc<Buffer>>,
     bias: Option<Arc<Buffer>>,
 }
 
-impl LayerBuffers {
+
+impl GpuBuffers {
+    fn new() -> Self 
+    {
+        Self {
+            input: None, 
+            output: None,
+            weights: None,
+            bias: None,
+        }
+    }
+}
+impl CpuBuffers {
     fn new() -> Self 
     {
         Self {
@@ -305,20 +333,17 @@ impl Model {
     pub fn build_model(&mut self) 
     {
         let device = &self.device;
-        let input_size = self.layer.first().unwrap().ty.get_input_size();
-        let output_size = self.layer.first().unwrap().ty.get_output_size();
         
-        let input_bytes = input_size as u64 * 4;  // f32 is 4 bytes
+        let input_bytes = self.layer.first().unwrap().ty.get_input_size_bytes();
         
         let mut last_output = Self::create_buffer(device, input_bytes);
         for  layer in self.layer.iter_mut() {
-            let output_size = layer.ty.get_output_size();
-            let output_bytes = output_size as u64 * 4;
+            let output_bytes = layer.ty.get_output_size_bytes();
             
             layer.buffers = LayerBuffers {
                 input: Some(last_output),
-                weights: Some(Self::create_buffer(device, layer.ty.get_weight_size() as u64 * 4)),
-                bias: Some(Self::create_buffer(device, layer.ty.get_bias_size() as u64 * 4)),
+                weights: Some(Self::create_buffer(device, layer.ty.get_weight_size_bytes())),
+                bias: Some(Self::create_buffer(device, layer.ty.get_bias_size_bytes())),
                 output: Some(Self::create_buffer(device, output_bytes)),
             };
             last_output = layer.buffers.output.clone().unwrap();
@@ -338,14 +363,14 @@ impl Model {
         }
 
         let layer = self.layer.last().unwrap();
-        let output_size_bytes = layer.ty.get_output_size() as u64 * 4;  // f32 is 4 bytes
+        let output_size_bytes = layer.ty.get_output_size_bytes();  // f32 is 4 bytes
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging"),
             size: output_size_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        encoder.copy_buffer_to_buffer(&layer.buffers.output.as_ref().unwrap(), 0, &staging_buffer, 0, output_size_bytes);
+        encoder.copy_buffer_to_buffer(&layer.buffers.gpu.output.as_ref().unwrap(), 0, &staging_buffer, 0, output_size_bytes);
         self.queue.submit([encoder.finish()]);
 
         let buffer_slice = staging_buffer.slice(..);
