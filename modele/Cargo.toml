@@ -3,7 +3,11 @@ name = "modele"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["visualisation"]
+visualisation = ["parallelizer/visualisation"]
+
 [dependencies]
 
-parallelizer = {path = "../parallelizer"}
+parallelizer = { path = "../parallelizer", default-features = false }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }

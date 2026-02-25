@@ -5,91 +5,6 @@
     {
       "architecture": {
         "type": "Convolution",
-        "nb_kernel": 10,
-        "dim_kernel": {
-          "x": 1,
-          "y": 1,
-          "z": 1
-        },
-        "stripe": 1,
-        "mode": "Valid",
-        "dim_input": {
-          "x": 200,
-          "y": 20,
-          "z": 1
-        },
-        "dim_output": {
-          "x": 200,
-          "y": 20,
-          "z": 10
-        }
-      },
-      "weights": [
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0
-      ],
-      "bias": [
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0
-      ]
-    },
-    {
-      "architecture": {
-        "type": "Convolution",
-        "nb_kernel": 1,
-        "dim_kernel": {
-          "x": 1,
-          "y": 1,
-          "z": 10
-        },
-        "stripe": 1,
-        "mode": "Valid",
-        "dim_input": {
-          "x": 200,
-          "y": 20,
-          "z": 10
-        },
-        "dim_output": {
-          "x": 200,
-          "y": 20,
-          "z": 1
-        }
-      },
-      "weights": [
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0
-      ],
-      "bias": [
-        0.0
-      ]
-    },
-    {
-      "architecture": {
-        "type": "Convolution",
         "nb_kernel": 1,
         "dim_kernel": {
           "x": 1,
@@ -99,13 +14,13 @@
         "stripe": 1,
         "mode": "Valid",
         "dim_input": {
-          "x": 200,
-          "y": 20,
-          "z": 1
+          "x": 512,
+          "y": 512,
+          "z": 3
         },
         "dim_output": {
-          "x": 200,
-          "y": 20,
+          "x": 512,
+          "y": 512,
           "z": 1
         }
       },
@@ -115,6 +30,24 @@
       "bias": [
         0.0
       ]
+    },
+    {
+      "architecture": {
+        "type": "Activation",
+        "method": "Linear",
+        "dim_input": {
+          "x": 512,
+          "y": 512,
+          "z": 1
+        },
+        "dim_output": {
+          "x": 512,
+          "y": 512,
+          "z": 1
+        }
+      },
+      "weights": [],
+      "bias": []
     }
   ]
 }

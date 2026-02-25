@@ -3,9 +3,16 @@ name = "parallelizer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["visualisation"]
+visualisation = ["dep:winit"]
+
 [dependencies]
 bytemuck = "1.25.0"
 encase = "0.12.0"
 futures = "0.3.32"
 pollster = "0.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 wgpu = "28.0.0"
+winit = { version = "0.30.12", optional = true }
