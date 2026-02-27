@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["visualisation"]
+# previously contained visualisation support; visualiser has been split into its own crate
+default = []
 visualisation = ["dep:winit"]
 
 [dependencies]

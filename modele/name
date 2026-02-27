@@ -9,19 +9,22 @@
         "dim_kernel": {
           "x": 1,
           "y": 1,
-          "z": 1
+          "z": 1,
+          "_padding": 0
         },
         "stripe": 1,
         "mode": "Valid",
         "dim_input": {
           "x": 512,
           "y": 512,
-          "z": 3
+          "z": 1,
+          "_padding": 0
         },
         "dim_output": {
           "x": 512,
           "y": 512,
-          "z": 1
+          "z": 1,
+          "_padding": 0
         }
       },
       "weights": [
@@ -38,12 +41,14 @@
         "dim_input": {
           "x": 512,
           "y": 512,
-          "z": 1
+          "z": 1,
+          "_padding": 0
         },
         "dim_output": {
           "x": 512,
           "y": 512,
-          "z": 1
+          "z": 1,
+          "_padding": 0
         }
       },
       "weights": [],

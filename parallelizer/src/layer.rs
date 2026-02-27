@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use wgpu::{BindGroup, Buffer, ComputePipeline, Device, ShaderModule};
+use wgpu::{BindGroup, Buffer, ComputePipeline, Device, Queue, ShaderModule};
 
 use crate::persistence::SavedLayerArchitecture;
 use crate::spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
-use crate::types::{ActivationMethod, Dim3, PaddingMode};
+use crate::types::{ActivationMethod, ConvolutionSpecUniform, Dim3, PaddingMode};
 
 #[derive(Debug)]
 struct ConvolutionLayer {
     nb_kernel: u32,
     dim_kernel: Dim3,
-    stripe: u32,
+    stride: u32,
     mode: PaddingMode,
     dim_input: Dim3,
     dim_output: Dim3,
@@ -23,11 +23,10 @@ struct ActivationLayer {
     dim_output: Dim3,
 }
 
-pub(crate) trait LayerType: std::fmt::Debug {
+pub trait LayerType: std::fmt::Debug {
     fn get_nb_workgroups(&self) -> u32;
     fn get_input_size(&self) -> u32;
     fn get_output_size(&self) -> u32;
-    #[cfg(feature = "visualisation")]
     fn get_dim_input(&self) -> Dim3;
     fn get_weight_size(&self) -> u32;
     fn get_bias_size(&self) -> u32;
@@ -66,7 +65,6 @@ impl LayerType for ConvolutionLayer {
         self.dim_output.length()
     }
 
-    #[cfg(feature = "visualisation")]
     fn get_dim_input(&self) -> Dim3 {
         self.dim_input
     }
@@ -84,10 +82,10 @@ impl LayerType for ConvolutionLayer {
             PaddingMode::Valid => (0, 0),
             PaddingMode::Same => (self.dim_kernel.x - 1, self.dim_kernel.y - 1),
         };
-        let x = ((self.dim_input.x + 2 * padding.0 - self.dim_kernel.x) / self.stripe) + 1;
-        let y = ((self.dim_input.y + 2 * padding.1 - self.dim_kernel.y) / self.stripe) + 1;
+        let x = ((self.dim_input.x + 2 * padding.0 - self.dim_kernel.x) / self.stride) + 1;
+        let y = ((self.dim_input.y + 2 * padding.1 - self.dim_kernel.y) / self.stride) + 1;
         let z = self.nb_kernel;
-        let res = Dim3 { x, y, z };
+        let res = Dim3::new((x, y, z));
         self.dim_output = res;
         self.dim_output
     }
@@ -100,7 +98,7 @@ impl LayerType for ConvolutionLayer {
         SavedLayerArchitecture::Convolution {
             nb_kernel: self.nb_kernel,
             dim_kernel: self.dim_kernel,
-            stripe: self.stripe,
+            stripe: self.stride,
             mode: self.mode,
             dim_input: self.dim_input,
             dim_output: self.dim_output,
@@ -121,7 +119,6 @@ impl LayerType for ActivationLayer {
         self.dim_output.length()
     }
 
-    #[cfg(feature = "visualisation")]
     fn get_dim_input(&self) -> Dim3 {
         self.dim_input
     }
@@ -157,12 +154,12 @@ impl ConvolutionLayer {
         let mut instance = Self {
             nb_kernel: spec.nb_kernel,
             dim_kernel: spec.dim_kernel,
-            stripe: spec.stripe,
+            stride: spec.stripe,
             mode: spec.mode,
             dim_input: spec
                 .dim_input
                 .expect("Convolution layer requires dim_input during construction"),
-            dim_output: Dim3::new(),
+            dim_output: Dim3::new((0,0,0)),
         };
         instance.set_dim_output();
         instance
@@ -176,7 +173,7 @@ impl ActivationLayer {
             dim_input: spec
                 .dim_input
                 .expect("Activation layer requires dim_input during construction"),
-            dim_output: Dim3::new(),
+            dim_output: Dim3::new((0,0,0)),
         };
         instance.set_dim_output();
         instance
@@ -202,6 +199,7 @@ struct GpuBuffers {
     output: Option<Arc<Buffer>>,
     weights: Option<Arc<Buffer>>,
     bias: Option<Arc<Buffer>>,
+    spec_uniform: Option<Arc<Buffer>>,  // For convolution spec (dim_input, stride, mode)
 }
 
 #[derive(Debug)]
@@ -229,6 +227,7 @@ impl GpuBuffers {
             output: None,
             weights: None,
             bias: None,
+            spec_uniform: None,
         }
     }
 }
@@ -254,7 +253,7 @@ impl CpuBuffers {
 }
 
 #[derive(Debug)]
-pub(crate) struct Layer {
+pub struct Layer {
     ty: Box<dyn LayerType>,
     buffers: LayerBuffers,
     shader: ShaderModule,
@@ -337,50 +336,75 @@ impl Layer {
     }
 
     pub(crate) fn set_pipeline(&mut self, device: &Device) {
+        // build layout entries dynamically to support both convolution and
+        // activation layers. training buffers are *not* included in the forward
+        // pass layout (they belong only to the backprop pipeline) which keeps
+        // the storage buffer count low and prevents runtime validation errors
+        // on devices with a small limit.
+        let mut entries = vec![
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ];
+
+        // only convolution layers need the spec uniform
+        if let SavedLayerArchitecture::Convolution { .. } = self.saved_architecture() {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: Some(
+                        std::num::NonZeroU64::new(
+                            std::mem::size_of::<ConvolutionSpecUniform>() as u64
+                        ).unwrap()
+                    ),
+                },
+                count: None,
+            });
+        }
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("bind_group_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &entries,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -400,6 +424,59 @@ impl Layer {
     }
 
     pub(crate) fn set_bind_group(&mut self, device: &Device) {
+        // build entries corresponding to the layout we constructed earlier;
+        // for activation layers the spec_uniform will be omitted so we only push
+        // it when a buffer is available.
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self
+                    .buffers
+                    .gpu
+                    .input
+                    .as_ref()
+                    .expect("input GPU buffer must be initialized before set_bind_group")
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: self
+                    .buffers
+                    .gpu
+                    .weights
+                    .as_ref()
+                    .expect("weights GPU buffer must be initialized before set_bind_group")
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self
+                    .buffers
+                    .gpu
+                    .bias
+                    .as_ref()
+                    .expect("bias GPU buffer must be initialized before set_bind_group")
+                    .as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self
+                    .buffers
+                    .gpu
+                    .output
+                    .as_ref()
+                    .expect("output GPU buffer must be initialized before set_bind_group")
+                    .as_entire_binding(),
+            },
+        ];
+
+        if let Some(spec_buf) = &self.buffers.gpu.spec_uniform {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 8,
+                resource: spec_buf.as_entire_binding(),
+            });
+        }
+
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self
@@ -407,48 +484,7 @@ impl Layer {
                 .as_ref()
                 .expect("pipeline must be initialized before set_bind_group")
                 .get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self
-                        .buffers
-                        .gpu
-                        .input
-                        .as_ref()
-                        .expect("input GPU buffer must be initialized before set_bind_group")
-                        .as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self
-                        .buffers
-                        .gpu
-                        .weights
-                        .as_ref()
-                        .expect("weights GPU buffer must be initialized before set_bind_group")
-                        .as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self
-                        .buffers
-                        .gpu
-                        .bias
-                        .as_ref()
-                        .expect("bias GPU buffer must be initialized before set_bind_group")
-                        .as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self
-                        .buffers
-                        .gpu
-                        .output
-                        .as_ref()
-                        .expect("output GPU buffer must be initialized before set_bind_group")
-                        .as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         }));
     }
 
@@ -654,19 +690,19 @@ impl Layer {
         }));
     }
 
-    pub(crate) fn input_size_bytes(&self) -> u64 {
+    pub fn input_size_bytes(&self) -> u64 {
         self.ty.get_input_size_bytes()
     }
 
-    pub(crate) fn output_size_bytes(&self) -> u64 {
+    pub fn output_size_bytes(&self) -> u64 {
         self.ty.get_output_size_bytes()
     }
 
-    pub(crate) fn weight_size_bytes(&self) -> u64 {
+    pub fn weight_size_bytes(&self) -> u64 {
         self.ty.get_weight_size_bytes()
     }
 
-    pub(crate) fn bias_size_bytes(&self) -> u64 {
+    pub fn bias_size_bytes(&self) -> u64 {
         self.ty.get_bias_size_bytes()
     }
 
@@ -678,16 +714,15 @@ impl Layer {
         self.ty.get_bias_size() as usize
     }
 
-    pub(crate) fn dim_output(&self) -> Dim3 {
+    pub fn dim_output(&self) -> Dim3 {
         self.ty.get_dim_output()
     }
 
-    #[cfg(feature = "visualisation")]
-    pub(crate) fn dim_input(&self) -> Dim3 {
+    pub fn dim_input(&self) -> Dim3 {
         self.ty.get_dim_input()
     }
 
-    pub(crate) fn set_gpu_buffers(
+    pub fn set_gpu_buffers(
         &mut self,
         input: Arc<Buffer>,
         weights: Arc<Buffer>,
@@ -699,10 +734,16 @@ impl Layer {
             output: Some(output),
             weights: Some(weights),
             bias: Some(bias),
+            spec_uniform: None,  // Will be set separately
         };
     }
 
-    pub(crate) fn set_training_buffers(
+    /// Set the convolution spec uniform buffer containing dim_input, stride, and mode.
+    pub fn set_spec_uniform(&mut self, spec_uniform: Arc<Buffer>) {
+        self.buffers.gpu.spec_uniform = Some(spec_uniform);
+    }
+
+    pub fn set_training_buffers(
         &mut self,
         grad_output: Arc<Buffer>,
         grad_input: Arc<Buffer>,
@@ -717,35 +758,75 @@ impl Layer {
         };
     }
 
-    pub(crate) fn num_workgroups(&self) -> u32 {
+    /// Create and set the convolution spec uniform buffer from a ConvolutionLayerSpec.
+    pub fn create_spec_uniform(
+        &mut self,
+        device: &Device,
+        _queue: &Queue,
+        spec: &ConvolutionLayerSpec,
+    ) {
+        use encase::UniformBuffer;
+        
+        let padding_mode = match spec.mode {
+            PaddingMode::Valid => 0u32,
+            PaddingMode::Same => 1u32,
+        };
+        
+        let uniform = ConvolutionSpecUniform {
+            dim_input: spec.dim_input.unwrap_or_default(),
+            stride: spec.stripe,
+            padding_mode,
+        };
+        
+        // `UniformBuffer::new` takes an array and calculates size from its
+        // length. using an array of `u8` ensures we end up with raw bytes and
+        // keeps the borrow/repr logic simple.
+        let mut buffer_contents = UniformBuffer::new([
+            0u8; std::mem::size_of::<ConvolutionSpecUniform>()
+        ]);
+        buffer_contents.write(&uniform).expect("failed to encode uniform");
+
+        let spec_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("convolution_spec_uniform"),
+            size: buffer_contents.as_ref().len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        spec_buffer.slice(..).get_mapped_range_mut().copy_from_slice(buffer_contents.as_ref());
+        spec_buffer.unmap();
+
+        self.set_spec_uniform(Arc::new(spec_buffer));
+    }
+
+    pub fn num_workgroups(&self) -> u32 {
         self.num_workgroups
     }
 
-    pub(crate) fn pipeline(&self) -> &ComputePipeline {
+    pub fn pipeline(&self) -> &ComputePipeline {
         self.pipeline
             .as_ref()
             .expect("pipeline not initialized: call build_model first")
     }
 
-    pub(crate) fn backprop_pipeline(&self) -> &ComputePipeline {
+    pub fn backprop_pipeline(&self) -> &ComputePipeline {
         self.backprop_pipeline
             .as_ref()
             .expect("backprop pipeline not initialized: call train() to initialize training resources")
     }
 
-    pub(crate) fn bind_group(&self) -> &BindGroup {
+    pub fn bind_group(&self) -> &BindGroup {
         self.bind_group
             .as_ref()
             .expect("bind_group not initialized: call build_model first")
     }
 
-    pub(crate) fn backprop_bind_group(&self) -> &BindGroup {
+    pub fn backprop_bind_group(&self) -> &BindGroup {
         self.backprop_bind_group
             .as_ref()
             .expect("backprop bind_group not initialized: call train() to initialize training resources")
     }
 
-    pub(crate) fn gpu_input(&self) -> &Buffer {
+    pub fn gpu_input(&self) -> &Buffer {
         self.buffers
             .gpu
             .input
@@ -754,7 +835,16 @@ impl Layer {
             .as_ref()
     }
 
-    pub(crate) fn gpu_output(&self) -> &Buffer {
+    pub fn gpu_input_arc(&self) -> Arc<Buffer> {
+        self.buffers
+            .gpu
+            .input
+            .as_ref()
+            .expect("input buffer not initialized")
+            .clone()
+    }
+
+    pub fn gpu_output(&self) -> &Buffer {
         self.buffers
             .gpu
             .output
@@ -763,7 +853,16 @@ impl Layer {
             .as_ref()
     }
 
-    pub(crate) fn gpu_weights(&self) -> &Buffer {
+    pub fn gpu_output_arc(&self) -> Arc<Buffer> {
+        self.buffers
+            .gpu
+            .output
+            .as_ref()
+            .expect("output buffer not initialized")
+            .clone()
+    }
+
+    pub fn gpu_weights(&self) -> &Buffer {
         self.buffers
             .gpu
             .weights
@@ -772,7 +871,7 @@ impl Layer {
             .as_ref()
     }
 
-    pub(crate) fn gpu_bias(&self) -> &Buffer {
+    pub fn gpu_bias(&self) -> &Buffer {
         self.buffers
             .gpu
             .bias
@@ -781,7 +880,7 @@ impl Layer {
             .as_ref()
     }
 
-    pub(crate) fn grad_output_arc(&self) -> Arc<Buffer> {
+    pub fn grad_output_arc(&self) -> Arc<Buffer> {
         self.buffers
             .training
             .grad_output
@@ -790,7 +889,7 @@ impl Layer {
             .clone()
     }
 
-    pub(crate) fn output_arc(&self) -> Arc<Buffer> {
+    pub fn output_arc(&self) -> Arc<Buffer> {
         self.buffers
             .gpu
             .output
@@ -799,20 +898,20 @@ impl Layer {
             .clone()
     }
 
-    pub(crate) fn cpu_weights(&self) -> Option<&Arc<Vec<f32>>> {
+    pub fn cpu_weights(&self) -> Option<&Arc<Vec<f32>>> {
         self.buffers.cpu.weights.as_ref()
     }
 
-    pub(crate) fn cpu_bias(&self) -> Option<&Arc<Vec<f32>>> {
+    pub fn cpu_bias(&self) -> Option<&Arc<Vec<f32>>> {
         self.buffers.cpu.bias.as_ref()
     }
 
-    pub(crate) fn set_cpu_params(&mut self, weights: Arc<Vec<f32>>, bias: Arc<Vec<f32>>) {
+    pub fn set_cpu_params(&mut self, weights: Arc<Vec<f32>>, bias: Arc<Vec<f32>>) {
         self.buffers.cpu.weights = Some(weights);
         self.buffers.cpu.bias = Some(bias);
     }
 
-    pub(crate) fn saved_architecture(&self) -> SavedLayerArchitecture {
+    pub fn saved_architecture(&self) -> SavedLayerArchitecture {
         self.ty.to_saved_architecture()
     }
 }

@@ -7,8 +7,17 @@ use crate::layer::Layer;
 use crate::persistence::{SavedLayer, SavedLayerArchitecture, SavedModel, SavedTrainingSpec};
 use crate::spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
 use crate::types::Optimizer;
-#[cfg(feature = "visualisation")]
-use crate::visualiser::{ModelVisualState, Visualiser};
+
+/// Snapshot of model state useful for external visualisers or logging.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelVisualState {
+    pub layer_count: usize,
+    pub has_training_spec: bool,
+    pub training_initialized: bool,
+    pub has_loss_pipeline: bool,
+    pub infer_revision: u64,
+    pub train_revision: u64,
+}
 
 #[derive(Debug)]
 pub struct TrainingSpec {
@@ -23,8 +32,7 @@ pub struct Model {
     device: Device,
     queue: Queue,
     layers: Vec<Layer>,
-    #[cfg(feature = "visualisation")]
-    visualiser: Option<Visualiser>,
+    specs: Vec<LayerSpec>,  // Store original layer specs for building uniforms
     training: Option<TrainingSpec>,
     loss_shader: Option<ShaderModule>,
     loss_pipeline: Option<ComputePipeline>,
@@ -49,11 +57,7 @@ impl Model {
             device,
             queue,
             layers: Vec::new(),
-            #[cfg(feature = "visualisation")]
-            visualiser: Some(Visualiser::new(
-                Arc::new(gpu.device.clone()),
-                Arc::new(gpu.queue.clone()),
-            )),
+            specs: Vec::new(),
             training,
             loss_shader: None,
             loss_pipeline: None,
@@ -69,8 +73,18 @@ impl Model {
         self.gpu.clone()
     }
 
-    #[cfg(feature = "visualisation")]
-    fn visual_state(&self) -> ModelVisualState {
+    /// Borrow slice of layers for external inspection.
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// Get a specific layer by index (panics if out of range).
+    pub fn layer(&self, idx: usize) -> &Layer {
+        &self.layers[idx]
+    }
+
+    /// Returns a snapshot of the model's current visual state.
+    pub fn visual_state(&self) -> ModelVisualState {
         ModelVisualState {
             layer_count: self.layers.len(),
             has_training_spec: self.training.is_some(),
@@ -81,25 +95,8 @@ impl Model {
         }
     }
 
-    #[cfg(feature = "visualisation")]
-    pub fn visualiser(&self) -> Option<&Visualiser> {
-        self.visualiser.as_ref()
-    }
 
-    #[cfg(feature = "visualisation")]
-    pub fn enable_visualisation(&mut self) {
-        if self.visualiser.is_none() {
-            self.visualiser = Some(Visualiser::new(
-                Arc::new(self.gpu.device.clone()),
-                Arc::new(self.gpu.queue.clone()),
-            ));
-        }
-    }
 
-    #[cfg(feature = "visualisation")]
-    pub fn disable_visualisation(&mut self) {
-        self.visualiser = None;
-    }
 
     pub async fn load(name: &str) -> Self {
         let content = std::fs::read_to_string(name).expect("failed to read model file");
@@ -433,7 +430,8 @@ impl Model {
 
         {
             let device = &self.device;
-            for layer in self.layers.iter_mut() {
+            let queue = &self.queue;
+            for (layer, spec) in self.layers.iter_mut().zip(self.specs.iter()) {
                 let output_bytes = layer.output_size_bytes();
 
                 let weights = Self::create_buffer(device, layer.weight_size_bytes());
@@ -441,6 +439,11 @@ impl Model {
                 let output = Self::create_buffer(device, output_bytes);
                 layer.set_gpu_buffers(last_output, weights, bias, output);
                 last_output = layer.output_arc();
+
+                // Create spec uniform for convolution layers
+                if let LayerSpec::Convolution(conv_spec) = spec {
+                    layer.create_spec_uniform(device, queue, conv_spec);
+                }
 
                 layer.set_pipeline(device);
                 layer.set_bind_group(device);
@@ -471,18 +474,7 @@ impl Model {
         self.queue.submit([encoder.finish()]);
 
         let result = self.read_back_f32_buffer(last_layer.gpu_output(), last_layer.output_size_bytes());
-        #[cfg(feature = "visualisation")]
-        let input_dim = first_layer.dim_input();
-        #[cfg(feature = "visualisation")]
-        let output_dim = last_layer.dim_output();
         self.infer_revision = self.infer_revision.saturating_add(1);
-
-        #[cfg(feature = "visualisation")]
-        let visual_state = self.visual_state();
-        #[cfg(feature = "visualisation")]
-        if let Some(visualiser) = self.visualiser.as_mut() {
-            visualiser.on_inference(input, input_dim, &result, output_dim, visual_state);
-        }
 
         result
     }
@@ -535,6 +527,7 @@ impl Model {
                 }
             }
         }
+        self.specs.push(spec);  // Store the spec for later use
         self.layers.push(Layer::new(&self.device, spec));
     }
 

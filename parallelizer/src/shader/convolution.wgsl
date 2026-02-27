@@ -7,6 +7,12 @@
 @group(0) @binding(6) var<storage, read_write> grad_bias: array<f32>;
 @group(0) @binding(7) var<storage, read_write> grad_output: array<f32>;
 
+@group(0) @binding(8) var<uniform> layer_spec: LayerSpec;
+struct LayerSpec {
+    dim_input: vec3<f32>,
+    stride: u32,
+    padding_mode: u32,  // 0 = Valid, 1 = Same
+}
 @compute
 @workgroup_size(64)
 fn inference(

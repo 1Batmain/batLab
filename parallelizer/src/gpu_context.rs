@@ -35,4 +35,22 @@ impl GpuContext {
             .create_surface(window)
             .map_err(|error| format!("failed to create wgpu surface: {}", error))
     }
+
+    /// Access to the underlying wgpu device for callers outside the crate.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Access to the underlying wgpu queue for callers outside the crate.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Provides access to the adapter used to create the device/queue.
+    ///
+    /// This is mostly useful for surface configuration, where the supported
+    /// formats must be queried.
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self._adapter
+    }
 }
