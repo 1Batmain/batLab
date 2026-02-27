@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ActivationMethod, Dim3, PaddingMode};
+use crate::model::types::{ActivationMethod, Dim3, PaddingMode};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum LayerSpec {

@@ -3,12 +3,12 @@ use std::sync::Arc;
 use wgpu::{BindGroup, Buffer, BufferDescriptor, BufferUsages, ComputePipeline, Device, ShaderModule};
 
 use crate::gpu_context::GpuContext;
-use crate::layer::Layer;
-use crate::persistence::{SavedLayer, SavedLayerArchitecture, SavedModel, SavedTrainingSpec};
-use crate::spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
-use crate::types::Optimizer;
+use crate::model::layer::Layer;
+use crate::model::persistence::{SavedLayer, SavedLayerArchitecture, SavedModel, SavedTrainingSpec};
+use crate::model::spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
+use crate::model::types::Optimizer;
 
-/// Snapshot of model state useful for external visualisers or logging.
+/// Snapshot of model state useful for external Visualizers or logging.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelVisualState {
     pub layer_count: usize,

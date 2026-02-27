@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ActivationMethod, Dim3, Optimizer, PaddingMode};
+use crate::model::types::{ActivationMethod, Dim3, Optimizer, PaddingMode};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]

@@ -1,14 +1,8 @@
-mod gpu_context;
-mod layer;
-mod model;
-mod visualizer;
-mod persistence;
-mod spec;
-mod types;
+pub mod gpu_context;
+pub mod model;
+pub mod visualizer;
 
 pub use gpu_context::GpuContext;
-pub use model::{Model, TrainingSpec};
-pub use spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
-pub use types::{ActivationMethod, Dim3, Optimizer, PaddingMode};
-
-pub use model::ModelVisualState;
+pub use model::{Model, TrainingSpec, ModelVisualState};
+pub use model::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
+pub use model::{ActivationMethod, Dim3, Optimizer, PaddingMode};

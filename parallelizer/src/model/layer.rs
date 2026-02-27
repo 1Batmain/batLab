@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use wgpu::{BindGroup, Buffer, ComputePipeline, Device, Queue, ShaderModule};
 
-use crate::persistence::SavedLayerArchitecture;
-use crate::spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
-use crate::types::{ActivationMethod, ConvolutionSpecUniform, Dim3, PaddingMode};
+use crate::model::persistence::SavedLayerArchitecture;
+use crate::model::spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
+use crate::model::types::{ActivationMethod, ConvolutionSpecUniform, Dim3, PaddingMode};
 
 #[derive(Debug)]
 struct ConvolutionLayer {

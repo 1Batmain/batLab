@@ -43,4 +43,9 @@ impl GpuContext {
     pub fn adapter(&self) -> &wgpu::Adapter {
         &self._adapter
     }
+
+    /// Provides access to the wgpu instance for surface creation.
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self._instance
+    }
 }
