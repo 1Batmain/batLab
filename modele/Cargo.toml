@@ -8,5 +8,4 @@ edition = "2024"
 image = "0.25.9"
 
 parallelizer = { path = "../parallelizer", default-features = false }
-parallelizer_visualisation = { path = "../parallelizer_visualisation" }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }

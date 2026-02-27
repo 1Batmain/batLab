@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use wgpu::{BindGroup, Buffer, BufferDescriptor, BufferUsages, ComputePipeline, Device, Queue, ShaderModule};
+use wgpu::{BindGroup, Buffer, BufferDescriptor, BufferUsages, ComputePipeline, Device, ShaderModule};
 
 use crate::gpu_context::GpuContext;
 use crate::layer::Layer;
@@ -28,34 +28,24 @@ pub struct TrainingSpec {
 
 #[derive(Debug)]
 pub struct Model {
-    gpu: Arc<GpuContext>,
-    device: Device,
-    queue: Queue,
-    layers: Vec<Layer>,
-    specs: Vec<LayerSpec>,  // Store original layer specs for building uniforms
-    training: Option<TrainingSpec>,
-    loss_shader: Option<ShaderModule>,
-    loss_pipeline: Option<ComputePipeline>,
-    loss_bind_group: Option<BindGroup>,
-    loss_target: Option<Arc<Buffer>>,
-    training_initialized: bool,
-    infer_revision: u64,
-    train_revision: u64,
+    pub (crate) gpu: Arc<GpuContext>,
+                layers: Vec<Layer>,
+                specs: Vec<LayerSpec>,  // Store original layer specs for building uniforms
+                training: Option<TrainingSpec>,
+                loss_shader: Option<ShaderModule>,
+                loss_pipeline: Option<ComputePipeline>,
+                loss_bind_group: Option<BindGroup>,
+                loss_target: Option<Arc<Buffer>>,
+                training_initialized: bool,
+                infer_revision: u64,
+                train_revision: u64,
 }
 
 impl Model {
-    pub async fn new(training: Option<TrainingSpec>) -> Self {
-        let gpu = Arc::new(GpuContext::new_headless().await);
-        Self::with_gpu(gpu, training).await
-    }
 
-    pub async fn with_gpu(gpu: Arc<GpuContext>, training: Option<TrainingSpec>) -> Self {
-        let device = gpu.device.clone();
-        let queue = gpu.queue.clone();
+    pub async fn new(gpu: Arc<GpuContext>, training: Option<TrainingSpec>) -> Self {
         Self {
             gpu: gpu.clone(),
-            device,
-            queue,
             layers: Vec::new(),
             specs: Vec::new(),
             training,
@@ -67,10 +57,6 @@ impl Model {
             infer_revision: 0,
             train_revision: 0,
         }
-    }
-
-    pub fn gpu_context(&self) -> Arc<GpuContext> {
-        self.gpu.clone()
     }
 
     /// Borrow slice of layers for external inspection.
@@ -98,7 +84,7 @@ impl Model {
 
 
 
-    pub async fn load(name: &str) -> Self {
+    pub async fn load(gpu: Arc<GpuContext>, name: &str) -> Self {
         let content = std::fs::read_to_string(name).expect("failed to read model file");
         let saved_model: SavedModel =
             serde_json::from_str(&content).expect("failed to parse model JSON");
@@ -113,7 +99,7 @@ impl Model {
             optimizer: training.optimizer,
         });
 
-        let mut model = Model::new(training).await;
+        let mut model = Model::new(gpu, training).await;
 
         for saved_layer in &saved_model.layers {
             let spec = match &saved_layer.architecture {
@@ -169,12 +155,12 @@ impl Model {
                 Arc::new(saved_layer.bias.clone()),
             );
 
-            model.queue.write_buffer(
+            model.gpu.queue.write_buffer(
                 layer.gpu_weights(),
                 0,
                 bytemuck::cast_slice(&saved_layer.weights),
             );
-            model.queue.write_buffer(
+            model.gpu.queue.write_buffer(
                 layer.gpu_bias(),
                 0,
                 bytemuck::cast_slice(&saved_layer.bias),
@@ -309,7 +295,7 @@ impl Model {
         let mut grad_bias: Vec<Arc<Buffer>> = Vec::with_capacity(self.layers.len());
 
         {
-            let device = &self.device;
+            let device = &self.gpu.device;
             for layer in self.layers.iter() {
                 let output_bytes = layer.output_size_bytes();
                 let input_bytes = layer.input_size_bytes();
@@ -322,7 +308,7 @@ impl Model {
         }
 
         {
-            let device = &self.device;
+            let device = &self.gpu.device;
             let num_layers = self.layers.len();
             for (idx, layer) in self.layers.iter_mut().enumerate() {
                 let spec = match &layer.saved_architecture() {
@@ -380,7 +366,7 @@ impl Model {
         };
 
         self.loss_shader = {
-            let device = &self.device;
+            let device = &self.gpu.device;
             Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("loss_mse"),
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shader/loss_mse.wgsl"))),
@@ -388,17 +374,17 @@ impl Model {
         };
 
         let loss_pipeline = {
-            let device = &self.device;
+            let device = &self.gpu.device;
             Self::create_loss_pipeline(device, self.loss_shader.as_ref().expect("loss shader must be initialized"))
         };
 
         self.loss_target = {
-            let device = &self.device;
+            let device = &self.gpu.device;
             Some(Self::create_buffer(device, output_bytes))
         };
 
         let loss_bind_group = {
-            let device = &self.device;
+            let device = &self.gpu.device;
             Self::create_loss_bind_group(
                 device,
                 &loss_pipeline,
@@ -424,13 +410,13 @@ impl Model {
             .input_size_bytes();
 
         let mut last_output = {
-            let device = &self.device;
+            let device = &self.gpu.device;
             Self::create_buffer(device, input_bytes)
         };
 
         {
-            let device = &self.device;
-            let queue = &self.queue;
+            let device = &self.gpu.device;
+            let queue = &self.gpu.queue;
             for (layer, spec) in self.layers.iter_mut().zip(self.specs.iter()) {
                 let output_bytes = layer.output_size_bytes();
 
@@ -461,7 +447,7 @@ impl Model {
             .last()
             .expect("infer requires at least one layer");
 
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         for layer in self.layers.iter() {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(layer.pipeline());
@@ -469,9 +455,9 @@ impl Model {
             pass.dispatch_workgroups(layer.num_workgroups(), 1, 1);
         }
 
-        self.queue
+        self.gpu.queue
             .write_buffer(first_layer.gpu_input(), 0, bytemuck::cast_slice(input));
-        self.queue.submit([encoder.finish()]);
+        self.gpu.queue.submit([encoder.finish()]);
 
         let result = self.read_back_f32_buffer(last_layer.gpu_output(), last_layer.output_size_bytes());
         self.infer_revision = self.infer_revision.saturating_add(1);
@@ -528,7 +514,7 @@ impl Model {
             }
         }
         self.specs.push(spec);  // Store the spec for later use
-        self.layers.push(Layer::new(&self.device, spec));
+        self.layers.push(Layer::new(&self.gpu.device, spec));
     }
 
     pub fn train(&mut self, input: Vec<f32>, target: Vec<f32>) {
@@ -550,7 +536,7 @@ impl Model {
             panic!("target length does not match model output size");
         }
 
-        self.queue.write_buffer(
+        self.gpu.queue.write_buffer(
             self.layers
                 .first()
                 .expect("train requires at least one layer")
@@ -558,10 +544,10 @@ impl Model {
             0,
             bytemuck::cast_slice(&input),
         );
-        self.queue
+        self.gpu.queue
             .write_buffer(self.loss_target(), 0, bytemuck::cast_slice(&target));
 
-        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
 
         for layer in self.layers.iter() {
             let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -586,7 +572,7 @@ impl Model {
             pass.dispatch_workgroups(layer.num_workgroups(), 1, 1);
         }
 
-        self.queue.submit([encoder.finish()]);
+        self.gpu.queue.submit([encoder.finish()]);
         self.train_revision = self.train_revision.saturating_add(1);
 
         match training.optimizer {
@@ -605,8 +591,8 @@ impl Model {
             return Vec::new();
         }
 
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        let staging_buffer = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("staging_readback"),
             size: size_bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -614,7 +600,7 @@ impl Model {
         });
 
         encoder.copy_buffer_to_buffer(source, 0, &staging_buffer, 0, size_bytes);
-        self.queue.submit([encoder.finish()]);
+        self.gpu.queue.submit([encoder.finish()]);
 
         let buffer_slice = staging_buffer.slice(..);
         let (gpu, cpu) = futures::channel::oneshot::channel();
@@ -622,7 +608,7 @@ impl Model {
             let _ = gpu.send(result);
         });
 
-        if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+        if let Err(error) = self.gpu.device.poll(wgpu::PollType::wait_indefinitely()) {
             panic!("failed to poll device while reading buffer: {}", error);
         }
 

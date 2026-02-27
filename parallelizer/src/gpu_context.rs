@@ -26,16 +26,6 @@ impl GpuContext {
         }
     }
 
-    #[cfg(feature = "visualisation")]
-    pub fn create_surface<'window>(
-        &self,
-        window: &'window winit::window::Window,
-    ) -> Result<wgpu::Surface<'window>, String> {
-        self._instance
-            .create_surface(window)
-            .map_err(|error| format!("failed to create wgpu surface: {}", error))
-    }
-
     /// Access to the underlying wgpu device for callers outside the crate.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
