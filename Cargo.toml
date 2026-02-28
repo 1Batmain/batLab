@@ -8,6 +8,6 @@ name = "bat_builder"
 path = "src/lib.rs"
 
 [workspace]
-members = ["parallelizer", "modele"]
+members = ["parallelizer", "main"]
 
 

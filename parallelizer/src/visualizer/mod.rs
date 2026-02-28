@@ -7,7 +7,5 @@ pub mod visualizer;
 // Re-export key types for easier access
 pub use visualizer::Visualizer;
 
-/// Creates an event loop and window for desktop visualization
-pub fn create_desktop_event_loop() -> winit::event_loop::EventLoop<()> {
-    winit::event_loop::EventLoop::new().unwrap()
-}
+use std::sync::Arc;
+use crate::visualizer::{desktop::DesktopWindow, platform::PlatformWindow};

@@ -23,7 +23,7 @@ struct ActivationLayer {
     dim_output: Dim3,
 }
 
-pub trait LayerType: std::fmt::Debug {
+pub trait LayerType: std::fmt::Debug + Send {
     fn get_nb_workgroups(&self) -> u32;
     fn get_input_size(&self) -> u32;
     fn get_output_size(&self) -> u32;

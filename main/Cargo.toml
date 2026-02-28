@@ -1,11 +1,12 @@
 [package]
-name = "modele"
+name = "main"
 version = "0.1.0"
 edition = "2024"
 
 
 [dependencies]
 image = "0.25.9"
+winit = "0.30.12"
 
 parallelizer = { path = "../parallelizer", default-features = false }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }

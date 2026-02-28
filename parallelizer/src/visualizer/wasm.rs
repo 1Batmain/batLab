@@ -1,7 +1,6 @@
 // wasm.rs
 use crate::visualizer::platform::PlatformWindow;
 use crate::GpuContext;
-use winit::event_loop::ActiveEventLoop;
 use winit::window::WindowAttributes;
 use wgpu::Surface;
 use std::sync::Arc;
@@ -11,21 +10,29 @@ pub struct WasmWindow {
 }
 
 impl WasmWindow {
-    pub fn create_in_resumed(event_loop: &ActiveEventLoop, _width: u32, _height: u32) -> Self {
-        let window = event_loop
-            .create_window(WindowAttributes::default().with_title("Visualizer"))
-            .expect("Failed to create window");
-
-        Self { window }
-    }
+    // Constructor is now handled by the PlatformWindow trait methods
 }
 
 impl PlatformWindow for WasmWindow {
+    fn new(event_loop: &winit::event_loop::ActiveEventLoop, width: u32, height: u32) -> Self {
+        let window = WindowAttributes::default()
+            .with_title("Model Visualizer")
+            .with_inner_size(winit::dpi::LogicalSize::new(width as f64, height as f64))
+            .with_visible(true);
+        let window = event_loop.create_window(window).expect("Failed to create window");
+
+        Self { window }
+    }
+    
     fn create_surface(&self, gpu: &Arc<GpuContext>) -> Surface<'_> {
         gpu.instance().create_surface(&self.window).unwrap()
     }
 
     fn request_redraw(&self) {
         // WASM redraws usually happen in a callback; you can leave empty or hook in JS
+    }
+    
+    fn window_id(&self) -> winit::window::WindowId {
+        self.window.id()
     }
 }

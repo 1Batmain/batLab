@@ -9,3 +9,4 @@ pub mod model;
 pub use model::{Model, TrainingSpec, ModelVisualState};
 pub use spec::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
 pub use types::{ActivationMethod, Dim3, Optimizer, PaddingMode};
+

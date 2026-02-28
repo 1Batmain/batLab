@@ -1,7 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::RwLock;
+use parallelizer::visualizer;
 use parallelizer::{
-    ActivationLayerSpec, ActivationMethod, ConvolutionLayerSpec, Dim3, GpuContext, LayerSpec, Model, PaddingMode, visualizer::{Visualizer, desktop::DesktopWindow}, 
+    ActivationLayerSpec, ActivationMethod, ConvolutionLayerSpec, Dim3, GpuContext, LayerSpec, Model, PaddingMode, visualizer::{Visualizer, desktop::DesktopWindow, platform::PlatformWindow}, 
 };
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
 
 fn load_image_as_f32(path :&str, width: u32, height: u32) -> Vec<f32>
 {
@@ -22,11 +29,9 @@ fn load_image_as_f32(path :&str, width: u32, height: u32) -> Vec<f32>
 
 #[tokio::main]
 async fn main() {
-    println!("Starting visualisation smoke test...");
-    
     let gpu = Arc::new(GpuContext::new_headless().await);
-
     let mut model = Model::new(gpu.clone(), None).await;
+    
     model.add_layer(LayerSpec::Convolution(ConvolutionLayerSpec {
         nb_kernel: 1,
         dim_kernel: Dim3::new((1,1,1)),
@@ -37,20 +42,13 @@ async fn main() {
     model.add_layer(LayerSpec::Activation(ActivationLayerSpec { method: ActivationMethod::Linear, dim_input: None }));
     model.build_model();
 
-    // Create event loop and window for visualization
-    let event_loop = parallelizer::visualizer::create_desktop_event_loop();
-    let window = Arc::new(DesktopWindow::new(&event_loop, 800, 600));
-    let mut model_arc = Arc::new(model);
-    let _vis = Visualizer::new(gpu.clone(), model_arc.clone(), window);
+    let image = load_image_as_f32("images/bear.jpg", 512, 512);
+    model.infer(image).await;
+    let model = Arc::new(model);
     
-    println!("Visualizer window spawned on background thread");
-    println!("Loading input image...");
-    let input = load_image_as_f32("images/bear.jpg", 512, 512);
+    let event_loop = EventLoop::new().unwrap();
+    let mut visualizer = Visualizer::new(gpu.clone(), model.clone());
+    event_loop.run_app(&mut visualizer).unwrap();
     
-    println!("Running inference...");
-    let res = Arc::get_mut(&mut model_arc).unwrap().infer(input).await;
-    println!("Result({}) : {:?}", res.len(), res);
-    println!("Close the visualizer window to continue");
-    //let _ = _vis_handle.join();
 
 }
