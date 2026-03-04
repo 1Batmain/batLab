@@ -8,6 +8,8 @@ use wgpu::{
 
 #[enum_dispatch]
 pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
+    // TODO
+    // fn new<T:LayerType>(spec: T)-> Self;
     fn get_dim_input(&self) -> Dim3;
     fn get_dim_output(&self) -> Dim3;
     fn set_dim_output(&mut self) -> Dim3;
