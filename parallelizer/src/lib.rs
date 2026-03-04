@@ -3,6 +3,5 @@ pub mod model;
 pub mod visualizer;
 
 pub use gpu_context::GpuContext;
-pub use model::{Model, TrainingSpec, ModelVisualState};
-pub use model::{ActivationLayerSpec, ConvolutionLayerSpec, LayerSpec};
-pub use model::{ActivationMethod, Dim3, Optimizer, PaddingMode};
+pub use model::Model;
+pub use model::{ActivationMethod, ActivationType, ConvolutionType, Dim3, Optimizer, PaddingMode};

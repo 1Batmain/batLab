@@ -1,12 +1,17 @@
 use encase::ShaderType;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub enum PaddingMode {
+    #[default]
     Valid,
     Same,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum Loss {
+    MeanSquare,
+}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Optimizer {
     Sgd,
@@ -26,9 +31,31 @@ pub struct Dim3 {
     pub _padding: u32,
 }
 
+impl std::ops::Mul<u32> for Dim3 {
+    type Output = Dim3;
+
+    fn mul(self, fct: u32) -> Dim3 {
+        Dim3 {
+            x: self.x * fct,
+            y: self.y * fct,
+            z: self.z * fct,
+            _padding: self._padding,
+        }
+    }
+}
+
 impl Dim3 {
     pub fn new(i: (u32, u32, u32)) -> Self {
-        Self { x: i.0, y: i.1, z: i.2, _padding: 0 }
+        Self {
+            x: i.0,
+            y: i.1,
+            z: i.2,
+            _padding: 0,
+        }
+    }
+
+    pub fn bytes_size(&self) -> u32 {
+        self.x * self.y * self.z * std::mem::size_of::<u32>() as u32
     }
 
     pub fn length(&self) -> u32 {
@@ -36,11 +63,33 @@ impl Dim3 {
     }
 }
 
-/// Uniform struct for convolution layer parameters.
-/// Maps to WGSL uniform buffer binding.
-#[derive(ShaderType, Debug, Clone, Copy)]
-pub struct ConvolutionSpecUniform {
-    pub dim_input: Dim3,
+pub(crate) struct BufferSpec {
+    pub size: u32,
+    pub usage: wgpu::BufferUsages,
+    pub visibility: wgpu::ShaderStages,
+    pub ty: wgpu::BindingType,
+}
+
+#[derive(ShaderType, Clone, Copy)]
+pub struct ConvolutionUniform {
+    pub nb_kernel: u32,
     pub stride: u32,
-    pub padding_mode: u32,  // 0 = Valid, 1 = Same
+    pub padding_mode: u32, // 0 = Valid, 1 = Same
+    pub _padding: u32,
+    pub dim_kernel: Dim3,
+    pub dim_input: Dim3,
+    pub dim_output: Dim3,
+}
+
+#[derive(ShaderType, Clone, Copy)]
+pub struct ActivationUniform {
+    pub dim_input: Dim3,
+    pub dim_output: Dim3,
+}
+
+pub(crate) enum SpecUniform {
+    #[allow(dead_code)]
+    Convolution(ConvolutionUniform),
+    #[allow(dead_code)]
+    Activation(ActivationUniform),
 }

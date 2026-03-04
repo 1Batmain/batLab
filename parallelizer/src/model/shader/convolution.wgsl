@@ -9,23 +9,24 @@
 
 @group(0) @binding(8) var<uniform> layer_spec: LayerSpec;
 struct LayerSpec {
-    dim_input: vec3<f32>,
+    nb_kernel: u32,
     stride: u32,
     padding_mode: u32,  // 0 = Valid, 1 = Same
+    dim_kernel: vec3<f32>,
+    dim_input: vec3<f32>,
+    dim_output: vec3<f32>,
 }
+
 @compute
 @workgroup_size(64)
 fn inference(
     @builtin(global_invocation_id) global_invocation_id: vec3<u32>
 ) {
     let index = global_invocation_id.x;
-    let total = arrayLength(&input);
+    let test = vec3<f32>(layer_spec.dim_output.xyz);
 
-    if (index >= total) {
-        return;
-    }
     
-    output[index] = input[index];
+    output[index] = layer_spec.dim_kernel.x;
 }
 
 @compute

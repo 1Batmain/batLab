@@ -1,41 +1,48 @@
 // Visualizer.rs
-use std::sync::{Arc, Mutex};
-use wgpu::Buffer;
-use crate::{GpuContext};
+use crate::GpuContext;
 use crate::model::Model;
-use crate::visualizer::platform::PlatformWindow;
+use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::ActiveEventLoop,
     window::{Window, WindowId},
 };
 
 pub struct Visualizer {
+    #[allow(dead_code)]
     gpu: Arc<GpuContext>,
-    model: Arc<Model>,  // Thread-safe access to model
+    #[allow(dead_code)]
+    model: Arc<Model>,
     window: Option<Window>,
 }
 
-impl Visualizer
-{
-    pub fn new(gpu: Arc<GpuContext>, model: Arc<Model>) -> Self
-    {
+impl Visualizer {
+    pub fn new(gpu: Arc<GpuContext>, model: Arc<Model>) -> Self {
         Self {
-            gpu, 
+            gpu,
             model,
             window: None,
         }
     }
+
+    // pub fn create_surface(&mut self) {
+    //     if let Some(window) = &self.window {
+    //         self.surface = Some(
+    //             self.gpu
+    //                 .instance()
+    //                 .create_surface(window)
+    //                 .unwrap()
+    //         );
+    //     }
+    // }
 }
+
 impl ApplicationHandler for Visualizer {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_attributes = Window::default_attributes()
-            .with_title("Ma fenêtre");
-        
-        self.window = Some(
-            event_loop.create_window(window_attributes).unwrap()
-        );
+        let window_attributes = Window::default_attributes().with_title("Ma fenêtre");
+
+        self.window = Some(event_loop.create_window(window_attributes).unwrap());
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -44,5 +51,4 @@ impl ApplicationHandler for Visualizer {
             _ => {}
         }
     }
-
 }
