@@ -214,6 +214,9 @@ dependencies = [
 [[package]]
 name = "batBuilder"
 version = "0.1.0"
+dependencies = [
+ "parallelizer",
+]
 
 [[package]]
 name = "bit-set"

@@ -1,197 +1,10 @@
-use crate::model::types::{ActivationMethod, BufferSpec, Dim3, PaddingMode, SpecUniform};
-use enum_dispatch::enum_dispatch;
+use crate::gpu_context::GpuContext;
+use crate::model::layer_types::{LayerType, LayerTypes};
+use crate::model::types::Dim3;
 use std::sync::Arc;
 use wgpu::{
-    BindGroup, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, ComputePipeline, Device,
-    ShaderModule,
+    BindGroup, Buffer, BufferDescriptor, CommandEncoder, ComputePipeline, Device, ShaderModule,
 };
-
-#[enum_dispatch]
-pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
-    // TODO
-    // fn new<T:LayerType>(spec: T)-> Self;
-    fn get_dim_input(&self) -> Dim3;
-    fn get_dim_output(&self) -> Dim3;
-    fn set_dim_output(&mut self) -> Dim3;
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)>;
-}
-
-#[derive(Debug, Clone)]
-#[enum_dispatch(LayerType)]
-pub enum LayerTypes {
-    Convolution(ConvolutionType),
-    Activation(ActivationType),
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ConvolutionType {
-    pub nb_kernel: u32,
-    pub dim_kernel: Dim3,
-    pub stride: u32,
-    pub mode: PaddingMode,
-    pub dim_input: Dim3,
-    dim_output: Dim3,
-}
-
-impl LayerType for ConvolutionType {
-    fn get_dim_input(&self) -> Dim3 {
-        self.dim_output
-    }
-    fn get_dim_output(&self) -> Dim3 {
-        self.dim_output
-    }
-    fn set_dim_output(&mut self) -> Dim3 {
-        let padding = match self.mode {
-            PaddingMode::Valid => (0, 0),
-            PaddingMode::Same => (self.dim_kernel.x - 1, self.dim_kernel.y - 1),
-        };
-        let x = ((self.dim_input.x + 2 * padding.0 - self.dim_kernel.x) / self.stride) + 1;
-        let y = ((self.dim_input.y + 2 * padding.1 - self.dim_kernel.y) / self.stride) + 1;
-        let z = self.nb_kernel;
-        let res = Dim3::new((x, y, z));
-        self.dim_output = res;
-        self.dim_output
-    }
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
-        vec![
-            (
-                "input".to_string(),
-                BufferSpec {
-                    size: self.get_dim_input().bytes_size().max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
-            (
-                "weights".to_string(),
-                BufferSpec {
-                    size: (self.dim_kernel.bytes_size() * self.nb_kernel).max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
-            (
-                "bias".to_string(),
-                BufferSpec {
-                    size: (self.nb_kernel * (std::mem::size_of_val(&self.nb_kernel)).max(4) as u32),
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
-            (
-                "specs".to_string(),
-                BufferSpec {
-                    size: self.get_dim_input().bytes_size().max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            std::num::NonZeroU64::new(std::mem::size_of::<SpecUniform>() as u64)
-                                .unwrap(),
-                        ),
-                    },
-                },
-            ),
-            (
-                "output".to_string(),
-                BufferSpec {
-                    size: (self.get_dim_output().bytes_size()).max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
-        ]
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ActivationType {
-    #[allow(dead_code)]
-    pub method: ActivationMethod,
-    pub dim_input: Dim3,
-    pub dim_output: Dim3,
-}
-impl LayerType for ActivationType {
-    fn get_dim_input(&self) -> Dim3 {
-        self.dim_output
-    }
-    fn get_dim_output(&self) -> Dim3 {
-        self.dim_output
-    }
-    fn set_dim_output(&mut self) -> Dim3 {
-        self.dim_output = self.dim_input;
-        self.dim_output
-    }
-
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
-        vec![
-            (
-                "input".to_string(),
-                BufferSpec {
-                    size: self.get_dim_input().bytes_size().max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
-            (
-                "specs".to_string(),
-                BufferSpec {
-                    size: self.get_dim_input().bytes_size().max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            std::num::NonZeroU64::new(std::mem::size_of::<SpecUniform>() as u64)
-                                .unwrap(),
-                        ),
-                    },
-                },
-            ),
-            (
-                "output".to_string(),
-                BufferSpec {
-                    size: (self.get_dim_output().bytes_size()).max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
-        ]
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Layer {
@@ -206,8 +19,11 @@ pub(crate) struct Layer {
 
 #[allow(dead_code)]
 impl Layer {
-    pub(crate) fn new(device: &Device, spec: LayerTypes) -> Self {
+    pub(crate) fn new(device: &Device, spec: LayerTypes, last_output: Option<Dim3>) -> Self {
         let mut ty = spec;
+        if let Some(input) = last_output {
+            ty.set_dim_input(input);
+        }
         ty.set_dim_output();
         let buffers = vec![];
         let shader = Self::create_shader(device, &ty);
@@ -234,38 +50,30 @@ impl Layer {
         })
     }
 
-    fn create_backprop_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
-        let (code, name): (&str, &str) = match spec {
-            LayerTypes::Convolution(_) => (include_str!("shader/convolution.wgsl"), "convolution"),
-            LayerTypes::Activation(_) => (include_str!("shader/activation.wgsl"), "activation"),
-        };
-
-        device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(code)),
-        })
-    }
-
     pub(crate) fn create_buffers(
         &mut self,
-        device: &Device,
+        gpu: &GpuContext,
         last_output: Option<Arc<Buffer>>,
     ) -> Arc<Buffer> {
         let buffers_specs = self.ty.get_buffers_specs();
         for (i, buff) in buffers_specs.iter().enumerate() {
-            if i == 0 {
-                if let Some(ref prev_buff) = last_output {
-                    self.buffers.push(Arc::clone(prev_buff));
-                    continue;
-                }
-                self.buffers
-                    .push(Arc::new(device.create_buffer(&BufferDescriptor {
-                        label: Some(&buff.0),
-                        size: buff.1.size as u64,
-                        usage: buff.1.usage,
-                        mapped_at_creation: false,
-                    })));
+            if i == 0
+                && let Some(ref prev_buff) = last_output
+            {
+                self.buffers.push(Arc::clone(prev_buff));
+                continue;
             }
+            let new_buffer = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
+                label: Some(&buff.0),
+                size: buff.1.size as u64,
+                usage: buff.1.usage,
+                mapped_at_creation: false,
+            }));
+            if buff.0 == "specs" {
+                let uniform = self.ty.get_spec_uniform_bytes();
+                gpu.queue.write_buffer(new_buffer.as_ref(), 0, &uniform);
+            }
+            self.buffers.push(new_buffer);
         }
         self.buffers.last().unwrap().clone()
     }
@@ -302,12 +110,13 @@ impl Layer {
                 label: Some("pipeline"),
                 layout: Some(&pipeline_layout),
                 module: &self.shader,
-                entry_point: Some("main"),
+                entry_point: Some(self.ty.get_entrypoint()),
                 compilation_options: Default::default(),
                 cache: Default::default(),
             }),
         );
     }
+
     pub(crate) fn set_bind_group(&mut self, device: &Device) {
         let entries = self
             .buffers

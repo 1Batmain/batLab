@@ -17,12 +17,6 @@ pub enum Optimizer {
     Sgd,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ActivationMethod {
-    Relu,
-    Linear,
-}
-
 #[derive(ShaderType, Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct Dim3 {
     pub x: u32,
@@ -63,33 +57,10 @@ impl Dim3 {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct BufferSpec {
     pub size: u32,
     pub usage: wgpu::BufferUsages,
     pub visibility: wgpu::ShaderStages,
     pub ty: wgpu::BindingType,
-}
-
-#[derive(ShaderType, Clone, Copy)]
-pub struct ConvolutionUniform {
-    pub nb_kernel: u32,
-    pub stride: u32,
-    pub padding_mode: u32, // 0 = Valid, 1 = Same
-    pub _padding: u32,
-    pub dim_kernel: Dim3,
-    pub dim_input: Dim3,
-    pub dim_output: Dim3,
-}
-
-#[derive(ShaderType, Clone, Copy)]
-pub struct ActivationUniform {
-    pub dim_input: Dim3,
-    pub dim_output: Dim3,
-}
-
-pub(crate) enum SpecUniform {
-    #[allow(dead_code)]
-    Convolution(ConvolutionUniform),
-    #[allow(dead_code)]
-    Activation(ActivationUniform),
 }

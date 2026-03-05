@@ -1,6 +1,7 @@
 use crate::gpu_context::GpuContext;
-use crate::model::layer::{Layer, LayerType, LayerTypes};
-use crate::model::types::{Loss, Optimizer};
+use crate::model::layer::Layer;
+use crate::model::layer_types::{LayerType, LayerTypes};
+use crate::model::types::{Dim3, Loss, Optimizer};
 use std::sync::Arc;
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 
@@ -36,7 +37,7 @@ impl Model<Infer> {
         // - bind group
         let mut last_output: Option<Arc<Buffer>> = None;
         for layer in &mut self.layers {
-            last_output = Some(layer.create_buffers(&self.gpu.device, last_output));
+            last_output = Some(layer.create_buffers(&self.gpu, last_output));
             layer.set_pipeline(&self.gpu.device);
             layer.set_bind_group(&self.gpu.device);
         }
@@ -139,7 +140,12 @@ impl<State> Model<State> {
     }
 
     pub fn add_layer(&mut self, spec: LayerTypes) {
-        self.layers.push(Layer::new(&self.gpu.device, spec));
+        let mut last_output: Option<Dim3> = None;
+        if self.layers.len() > 0 {
+            last_output = Some(self.layers.last().unwrap().ty.get_dim_output());
+        }
+        self.layers
+            .push(Layer::new(&self.gpu.device, spec, last_output));
     }
     fn read_back_f32_buffer(&self, source: &Buffer, size_bytes: u64) -> Vec<f32> {
         if size_bytes == 0 {

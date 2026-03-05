@@ -1,6 +1,6 @@
 use parallelizer::{
-    ActivationMethod, ActivationType, ConvolutionType, Dim3, GpuContext, Model, PaddingMode,
-    model::layer::LayerTypes,
+    ActivationMethod, ActivationType, ConvolutionType, Dim3, GpuContext, LayerTypes, Model,
+    PaddingMode,
 };
 use std::sync::Arc;
 
@@ -32,27 +32,34 @@ async fn main() {
     let gpu = Arc::new(GpuContext::new_headless().await);
     let mut model = Model::new(gpu.clone()).await;
 
-    model.add_layer(LayerTypes::Convolution(ConvolutionType {
-        nb_kernel: 10,
-        dim_kernel: Dim3::new((1, 1, 1)),
-        stride: 1,
-        mode: PaddingMode::Valid,
-        dim_input: Some(Dim3::new((5, 5, 1))),
-    }));
-    model.add_layer(LayerSpec::Activation(ActivationType {
-        method: ActivationMethod::Linear,
-        dim_input: None,
-    }));
+    model.add_layer(LayerTypes::Convolution(ConvolutionType::new(
+        Dim3::new((512, 512, 1)),
+        10,
+        Dim3::new((3, 3, 1)),
+        1,
+        PaddingMode::Valid,
+    )));
+    model.add_layer(LayerTypes::Convolution(ConvolutionType::new(
+        Dim3::new((512, 512, 1)),
+        10,
+        Dim3::new((3, 3, 10)),
+        1,
+        PaddingMode::Same,
+    )));
+    model.add_layer(LayerTypes::Activation(ActivationType::new(
+        ActivationMethod::Linear,
+        Dim3::default(),
+    )));
     model.build_model();
-
     println!("loading image");
     //let image = load_image_as_f32("images/bear.jpg", 512, 512);
-    let image = vec![10.; 25];
+    let image = vec![10.; 512 * 512];
 
     println!("Running inference");
     let result = model.infer_batch(image).await;
 
     println!("{:?}", result);
+    dbg!(&model);
     //let event_loop = EventLoop::new().unwrap();
     //let mut visualizer = Visualizer::new(gpu.clone(), model.clone());
     //event_loop.run_app(&mut visualizer).unwrap();
