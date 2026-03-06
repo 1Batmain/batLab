@@ -1,3 +1,4 @@
+use crate::model::error::ModelError;
 use crate::model::layer_types::LayerType;
 use crate::model::types::{BufferSpec, Dim3, PaddingMode};
 use encase::{ShaderSize, ShaderType, UniformBuffer};
@@ -53,19 +54,42 @@ impl LayerType for ConvolutionType {
     fn set_dim_input(&mut self, input: Dim3) {
         self.dim_input = input;
     }
-    fn set_dim_output(&mut self) -> Dim3 {
+    fn set_dim_output(&mut self) -> Result<Dim3, ModelError> {
+        if self.stride == 0 {
+            return Err(ModelError::InvalidStride {
+                stride: self.stride,
+            });
+        }
         let x = match self.mode {
-            PaddingMode::Valid => ((self.dim_input.x - self.dim_kernel.x) / self.stride) + 1,
+            PaddingMode::Valid => {
+                let delta = self.dim_input.x.checked_sub(self.dim_kernel.x).ok_or(
+                    ModelError::KernelLargerThanInput {
+                        input: self.dim_input,
+                        kernel: self.dim_kernel,
+                        mode: self.mode,
+                    },
+                )?;
+                (delta / self.stride) + 1
+            }
             PaddingMode::Same => self.dim_input.x.div_ceil(self.stride),
         };
         let y = match self.mode {
-            PaddingMode::Valid => ((self.dim_input.y - self.dim_kernel.y) / self.stride) + 1,
+            PaddingMode::Valid => {
+                let delta = self.dim_input.y.checked_sub(self.dim_kernel.y).ok_or(
+                    ModelError::KernelLargerThanInput {
+                        input: self.dim_input,
+                        kernel: self.dim_kernel,
+                        mode: self.mode,
+                    },
+                )?;
+                (delta / self.stride) + 1
+            }
             PaddingMode::Same => self.dim_input.y.div_ceil(self.stride),
         };
         let z = self.nb_kernel;
         let res = Dim3::new((x, y, z));
         self.dim_output = res;
-        self.dim_output
+        Ok(self.dim_output)
     }
     fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
         vec![

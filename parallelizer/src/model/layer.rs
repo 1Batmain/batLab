@@ -1,4 +1,5 @@
 use crate::gpu_context::GpuContext;
+use crate::model::error::ModelError;
 use crate::model::layer_types::{LayerType, LayerTypes};
 use crate::model::types::Dim3;
 use std::sync::Arc;
@@ -7,7 +8,12 @@ use wgpu::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct Layer {
+pub struct Forward;
+#[derive(Debug, Clone)]
+pub struct Backward;
+
+#[derive(Debug, Clone)]
+pub(crate) struct Layer<State = Forward> {
     pub(crate) ty: LayerTypes,
     pub(crate) buffers: Vec<Arc<Buffer>>,
     #[allow(dead_code)]
@@ -15,27 +21,38 @@ pub(crate) struct Layer {
     pub(crate) pipeline: Option<ComputePipeline>,
     pub(crate) num_workgroups: u32,
     pub(crate) bind_group: Option<BindGroup>,
+    _phantom: std::marker::PhantomData<State>,
 }
 
-#[allow(dead_code)]
-impl Layer {
-    pub(crate) fn new(device: &Device, spec: LayerTypes, last_output: Option<Dim3>) -> Self {
+impl<State> Layer<State> {
+    pub(crate) fn new(
+        device: &Device,
+        spec: LayerTypes,
+        last_output: Option<Dim3>,
+    ) -> Result<Self, ModelError> {
         let mut ty = spec;
         if let Some(input) = last_output {
             ty.set_dim_input(input);
         }
-        ty.set_dim_output();
+        ty.set_dim_output()?;
         let buffers = vec![];
         let shader = Self::create_shader(device, &ty);
         let num_workgroups = ty.get_dim_output().length().div_ceil(64);
-        Self {
+        Ok(Self {
             ty,
             shader,
             buffers,
             pipeline: None,
             num_workgroups,
             bind_group: None,
-        }
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.buffers.clear();
+        self.pipeline = None;
+        self.bind_group = None;
     }
 
     fn create_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
@@ -152,7 +169,7 @@ impl Layer {
         pass.dispatch_workgroups(self.num_workgroups, 1, 1);
     }
 
-    pub(crate) fn get_output_buffer(&self) -> Arc<Buffer> {
-        self.buffers.last().unwrap().clone()
-    }
+    // pub(crate) fn get_output_buffer(&self) -> Arc<Buffer> {
+    //     self.buffers.last().unwrap().clone()
+    // }
 }
