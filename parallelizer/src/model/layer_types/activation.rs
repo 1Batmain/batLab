@@ -1,3 +1,4 @@
+use crate::model::error::ModelError;
 use crate::model::layer_types::LayerType;
 use crate::model::types::{BufferSpec, Dim3};
 use encase::{ShaderSize, ShaderType, UniformBuffer};
@@ -49,9 +50,9 @@ impl LayerType for ActivationType {
     fn set_dim_input(&mut self, input: Dim3) {
         self.dim_input = input;
     }
-    fn set_dim_output(&mut self) -> Dim3 {
+    fn set_dim_output(&mut self) -> Result<Dim3, ModelError> {
         self.dim_output = self.dim_input;
-        self.dim_output
+        Ok(self.dim_output)
     }
 
     fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {

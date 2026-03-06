@@ -1,4 +1,5 @@
 use crate::gpu_context::GpuContext;
+use crate::model::error::ModelError;
 use crate::model::layer::Layer;
 use crate::model::layer_types::{LayerType, LayerTypes};
 use crate::model::types::{Dim3, Loss, Optimizer};
@@ -105,14 +106,22 @@ impl Model<Infer> {
 
 impl Model<Training> {
     pub fn build(&mut self) {
-        todo!();
+        // Let each layer create :
+        // - buffers (take the previous layer's output as input)
+        // - pipeline
+        // - bind group
+        let mut last_output: Option<Arc<Buffer>> = None;
+        for layer in &mut self.layers {
+            last_output = Some(layer.create_buffers(&self.gpu, last_output));
+            layer.set_pipeline(&self.gpu.device);
+            layer.set_bind_group(&self.gpu.device);
+        }
     }
     pub fn run(&mut self, _input: Vec<f32>, _target: Vec<f32>) {
         todo!();
     }
 }
 
-#[allow(dead_code)]
 impl<State> Model<State> {
     pub async fn new(gpu: Arc<GpuContext>) -> Self {
         Self {
@@ -123,29 +132,37 @@ impl<State> Model<State> {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.layers.iter_mut().for_each(|layer| layer.clear());
+        self.layers.clear();
+        self.state.is_build = false;
+    }
+
     pub fn training_mode(&mut self, training: Option<State>) {
+        self.clear();
         self.training = training;
         self.state.is_build = false;
     }
 
-    fn create_buffer(device: &Device, size: u64) -> Arc<Buffer> {
-        let buffer_size = size.max(4);
-        let buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("buffer"),
-            size: buffer_size,
-            usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        Arc::new(buffer)
-    }
+    // fn create_buffer(device: &Device, size: u64) -> Arc<Buffer> {
+    //     let buffer_size = size.max(4);
+    //     let buffer = device.create_buffer(&BufferDescriptor {
+    //         label: Some("buffer"),
+    //         size: buffer_size,
+    //         usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+    //         mapped_at_creation: false,
+    //     });
+    //     Arc::new(buffer)
+    // }
 
-    pub fn add_layer(&mut self, spec: LayerTypes) {
+    pub fn add_layer(&mut self, spec: LayerTypes) -> Result<(), ModelError> {
         let mut last_output: Option<Dim3> = None;
         if self.layers.len() > 0 {
             last_output = Some(self.layers.last().unwrap().ty.get_dim_output());
         }
-        self.layers
-            .push(Layer::new(&self.gpu.device, spec, last_output));
+        let layer = Layer::new(&self.gpu.device, spec, last_output)?;
+        self.layers.push(layer);
+        Ok(())
     }
     fn read_back_f32_buffer(&self, source: &Buffer, size_bytes: u64) -> Vec<f32> {
         if size_bytes == 0 {
