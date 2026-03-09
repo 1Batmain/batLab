@@ -51,6 +51,9 @@ impl LayerType for ConvolutionType {
     fn get_dim_output(&self) -> Dim3 {
         self.dim_output
     }
+    fn get_byte_weights(&self) -> u32 {
+        self.dim_kernel.bytes_size() * self.nb_kernel
+    }
     fn set_dim_input(&mut self, input: Dim3) {
         self.dim_input = input;
     }
@@ -90,6 +93,63 @@ impl LayerType for ConvolutionType {
         let res = Dim3::new((x, y, z));
         self.dim_output = res;
         Ok(self.dim_output)
+    }
+    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+        vec![
+            (
+                "grad_input".to_string(),
+                BufferSpec {
+                    size: self.get_byte_weights().max(4) as u32,
+                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                },
+            ),
+            (
+                "grad_weights".to_string(),
+                BufferSpec {
+                    size: self.get_byte_weights().max(4) as u32,
+                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                },
+            ),
+            (
+                "grad_bias".to_string(),
+                BufferSpec {
+                    size: (self.nb_kernel * (std::mem::size_of_val(&self.nb_kernel)).max(4) as u32)
+                        .max(4) as u32,
+                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                },
+            ),
+            (
+                "grad_output".to_string(),
+                BufferSpec {
+                    size: self.get_byte_weights().max(4) as u32,
+                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                },
+            ),
+        ]
     }
     fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
         vec![

@@ -35,12 +35,10 @@ impl Model<Infer> {
         // - buffers (take the previous layer's output as input)
         // - pipeline
         // - bind group
-        let mut last_output: Option<Arc<Buffer>> = None;
-        for layer in &mut self.layers {
-            last_output = Some(layer.create_buffers(&self.gpu, last_output));
-            layer.set_pipeline(&self.gpu.device);
-            layer.set_bind_group(&self.gpu.device);
+        if (self.state.is_build) {
+            self.clear();
         }
+        self.build_forwards();
     }
 
     fn run(&mut self, input: &[f32]) -> Vec<f32> {
@@ -109,17 +107,27 @@ impl Model<Training> {
         // - buffers (take the previous layer's output as input)
         // - pipeline
         // - bind group
-        if (self.state.is_build) {
-            self.clear();
-        }
-        let mut last_output: Option<Arc<Buffer>> = None;
-        let mut last_backprop_output: Option<Arc<Buffer>> = None;
-        for layer in &mut self.layers {
-            last_output = Some(layer.create_buffers(&self.gpu, last_output));
-            last_backprop_output = Some(layer.create_back_buffers(&self.gpu, last_backprop_output));
+        self.build_forwards();
+        let mut last_back_output: Option<Arc<Buffer>> = None;
+        for layer in self.layers.iter_mut().rev() {
+            last_back_output = Some(layer.create_back_buffers(&self.gpu, last_back_output));
             layer.set_back_pipeline(&self.gpu.device);
             layer.set_back_bind_group(&self.gpu.device);
         }
+        self.create_loss_layer(
+            self.layers.last().unwrap().buffers.last().unwrap().clone(),
+            self.layers
+                .last()
+                .unwrap()
+                .back_buffers
+                .first()
+                .unwrap()
+                .clone(),
+        );
+        self.create_optimizer();
+    }
+    fn create_loss_layer(&mut self, input: Arc<Buffer>, output: Arc<Buffer>) {
+        self.training.unwrap().loss.build(&self.gpu);
     }
     pub fn run(&mut self, _input: Vec<f32>, _target: Vec<f32>) {
         todo!();
@@ -146,6 +154,22 @@ impl<State> Model<State> {
         self.clear();
         self.training = training;
         self.state.is_build = false;
+    }
+
+    fn build_forwards(&mut self) {
+        // Let each layer create :
+        // - buffers (take the previous layer's output as input)
+        // - pipeline
+        // - bind group
+        if (self.state.is_build) {
+            self.clear();
+        }
+        let mut last_output: Option<Arc<Buffer>> = None;
+        for layer in &mut self.layers {
+            last_output = Some(layer.create_buffers(&self.gpu, last_output));
+            layer.set_pipeline(&self.gpu.device);
+            layer.set_bind_group(&self.gpu.device);
+        }
     }
 
     pub fn add_layer(&mut self, spec: LayerTypes) -> Result<(), ModelError> {
