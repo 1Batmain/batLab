@@ -8,15 +8,6 @@ pub enum PaddingMode {
     Same,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum Loss {
-    MeanSquare,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum Optimizer {
-    Sgd,
-}
-
 #[derive(ShaderType, Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct Dim3 {
     pub x: u32,
