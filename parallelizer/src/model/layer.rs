@@ -13,18 +13,18 @@ pub struct Forward;
 pub struct Backward;
 
 #[derive(Debug, Clone)]
-pub(crate) struct Layer<State = Forward> {
+pub(crate) struct Layer {
     pub(crate) ty: LayerTypes,
     pub(crate) buffers: Vec<Arc<Buffer>>,
     #[allow(dead_code)]
     pub(crate) shader: ShaderModule,
+    pub(crate) back_shader: ShaderModule,
     pub(crate) pipeline: Option<ComputePipeline>,
     pub(crate) num_workgroups: u32,
     pub(crate) bind_group: Option<BindGroup>,
-    _phantom: std::marker::PhantomData<State>,
 }
 
-impl<State> Layer<State> {
+impl Layer {
     pub(crate) fn new(
         device: &Device,
         spec: LayerTypes,
@@ -37,15 +37,16 @@ impl<State> Layer<State> {
         ty.set_dim_output()?;
         let buffers = vec![];
         let shader = Self::create_shader(device, &ty);
+        let back_shader = Self::create_back_shader(device, &ty);
         let num_workgroups = ty.get_dim_output().length().div_ceil(64);
         Ok(Self {
             ty,
             shader,
+            back_shader,
             buffers,
             pipeline: None,
             num_workgroups,
             bind_group: None,
-            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -55,6 +56,23 @@ impl<State> Layer<State> {
         self.bind_group = None;
     }
 
+    fn create_back_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
+        let (code, name): (&str, &str) = match spec {
+            LayerTypes::Convolution(_) => (
+                include_str!("shader/back_convolution.wgsl"),
+                "back_convolution",
+            ),
+            LayerTypes::Activation(_) => (
+                include_str!("shader/back_activation.wgsl"),
+                "back_activation",
+            ),
+        };
+
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(name),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(code)),
+        })
+    }
     fn create_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
         let (code, name): (&str, &str) = match spec {
             LayerTypes::Convolution(_) => (include_str!("shader/convolution.wgsl"), "convolution"),
@@ -93,6 +111,33 @@ impl<State> Layer<State> {
             self.buffers.push(new_buffer);
         }
         self.buffers.last().unwrap().clone()
+    }
+    pub(crate) fn create_back_buffers(
+        &mut self,
+        gpu: &GpuContext,
+        last_output: Option<Arc<Buffer>>,
+    ) -> Arc<Buffer> {
+        let training_buffers_specs = self.ty.get_back_buffers_specs();
+        for (i, buff) in training_buffers_specs.iter().enumerate() {
+            if i == 0
+                && let Some(ref prev_buff) = last_output
+            {
+                self.back_buffers.push(Arc::clone(prev_buff));
+                continue;
+            }
+            let new_buffer = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
+                label: Some(&buff.0),
+                size: buff.1.size as u64,
+                usage: buff.1.usage,
+                mapped_at_creation: false,
+            }));
+            if buff.0 == "specs" {
+                let uniform = self.ty.get_spec_uniform_bytes();
+                gpu.queue.write_buffer(new_buffer.as_ref(), 0, &uniform);
+            }
+            self.back_buffers.push(new_buffer);
+        }
+        self.back_buffers.last().unwrap().clone()
     }
 
     pub(crate) fn set_pipeline(&mut self, device: &Device) {

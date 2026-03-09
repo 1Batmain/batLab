@@ -9,7 +9,6 @@ use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 #[derive(Debug)]
 pub struct Infer;
 
-#[allow(dead_code)]
 pub struct Training {
     pub(crate) lr: f32,
     pub(crate) batch_size: u32,
@@ -110,11 +109,16 @@ impl Model<Training> {
         // - buffers (take the previous layer's output as input)
         // - pipeline
         // - bind group
+        if (self.state.is_build) {
+            self.clear();
+        }
         let mut last_output: Option<Arc<Buffer>> = None;
+        let mut last_backprop_output: Option<Arc<Buffer>> = None;
         for layer in &mut self.layers {
             last_output = Some(layer.create_buffers(&self.gpu, last_output));
-            layer.set_pipeline(&self.gpu.device);
-            layer.set_bind_group(&self.gpu.device);
+            last_backprop_output = Some(layer.create_back_buffers(&self.gpu, last_backprop_output));
+            layer.set_back_pipeline(&self.gpu.device);
+            layer.set_back_bind_group(&self.gpu.device);
         }
     }
     pub fn run(&mut self, _input: Vec<f32>, _target: Vec<f32>) {
@@ -143,17 +147,6 @@ impl<State> Model<State> {
         self.training = training;
         self.state.is_build = false;
     }
-
-    // fn create_buffer(device: &Device, size: u64) -> Arc<Buffer> {
-    //     let buffer_size = size.max(4);
-    //     let buffer = device.create_buffer(&BufferDescriptor {
-    //         label: Some("buffer"),
-    //         size: buffer_size,
-    //         usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-    //         mapped_at_creation: false,
-    //     });
-    //     Arc::new(buffer)
-    // }
 
     pub fn add_layer(&mut self, spec: LayerTypes) -> Result<(), ModelError> {
         let mut last_output: Option<Dim3> = None;
