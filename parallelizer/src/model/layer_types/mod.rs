@@ -4,9 +4,11 @@ use enum_dispatch::enum_dispatch;
 
 mod activation;
 mod convolution;
+mod loss;
 
 pub use activation::{ActivationMethod, ActivationType};
 pub use convolution::ConvolutionType;
+pub use loss::{LossMethod, LossType};
 
 #[enum_dispatch]
 pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
@@ -29,4 +31,5 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
 pub enum LayerTypes {
     Convolution(ConvolutionType),
     Activation(ActivationType),
+    Loss(LossType),
 }

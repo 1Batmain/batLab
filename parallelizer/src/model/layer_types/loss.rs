@@ -6,26 +6,25 @@ use serde::{Deserialize, Serialize};
 use wgpu::BufferUsages;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum ActivationMethod {
-    Relu,
-    Linear,
+pub enum LossMethod {
+    MeanSquared,
 }
 
 #[derive(Debug, Clone)]
-pub struct ActivationType {
-    pub method: ActivationMethod,
+pub struct LossType {
+    pub method: LossMethod,
     pub dim_input: Dim3,
     pub dim_output: Dim3,
 }
 
 #[derive(ShaderType, Clone, Copy)]
-pub struct ActivationUniform {
+pub struct LossUniform {
     pub dim_input: Dim3,
     pub dim_output: Dim3,
 }
 
-impl ActivationType {
-    pub fn new(method: ActivationMethod, dim_input: Dim3) -> Self {
+impl LossType {
+    pub fn new(method: LossMethod, dim_input: Dim3) -> Self {
         Self {
             method,
             dim_input,
@@ -34,11 +33,10 @@ impl ActivationType {
     }
 }
 
-impl LayerType for ActivationType {
+impl LayerType for LossType {
     fn get_entrypoint(&self) -> &str {
         match self.method {
-            ActivationMethod::Relu => "relu",
-            ActivationMethod::Linear => "linear",
+            LossMethod::MeanSquared => "mean_squared",
         }
     }
     fn get_byte_weights(&self) -> u32 {
@@ -61,7 +59,7 @@ impl LayerType for ActivationType {
     fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
         vec![
             (
-                "input".to_string(),
+                "model_result".to_string(),
                 BufferSpec {
                     size: self.get_dim_input().bytes_size().max(4) as u32,
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
@@ -74,7 +72,20 @@ impl LayerType for ActivationType {
                 },
             ),
             (
-                "specs".to_string(),
+                "target_result".to_string(),
+                BufferSpec {
+                    size: (self.get_dim_output().bytes_size()).max(4) as u32,
+                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                },
+            ),
+            (
+                "grad_output".to_string(),
                 BufferSpec {
                     size: self.get_spec_uniform_bytes_size().max(4),
                     usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
@@ -89,28 +100,15 @@ impl LayerType for ActivationType {
                     },
                 },
             ),
-            (
-                "output".to_string(),
-                BufferSpec {
-                    size: (self.get_dim_output().bytes_size()).max(4) as u32,
-                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                },
-            ),
         ]
     }
 
     fn get_spec_uniform_bytes_size(&self) -> u32 {
-        ActivationUniform::SHADER_SIZE.get() as u32
+        LossUniform::SHADER_SIZE.get() as u32
     }
 
     fn get_spec_uniform_bytes(&self) -> Vec<u8> {
-        let uniform = ActivationUniform {
+        let uniform = LossUniform {
             dim_input: self.dim_input,
             dim_output: self.dim_output,
         };
@@ -118,7 +116,7 @@ impl LayerType for ActivationType {
         let mut buffer = UniformBuffer::new(Vec::new());
         buffer
             .write(&uniform)
-            .expect("failed to encode activation uniform");
+            .expect("failed to encode Loss uniform");
         buffer.into_inner()
     }
     fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {

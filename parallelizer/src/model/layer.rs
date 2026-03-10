@@ -179,6 +179,26 @@ impl Layer {
     // // // // // // // // //
     //   BACK PROPAGATION   //
     // // // // // // // // //
+    pub(crate) fn encode_optimizer_pass(&self, encoder: &mut CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(
+            self.back_pipeline
+                .as_ref()
+                .expect("pipeline must be initialized before encode"),
+        );
+        pass.set_bind_group(0, &self.back_bind_group, &[]);
+        pass.dispatch_workgroups(self.num_workgroups, 1, 1);
+    }
+    pub(crate) fn encode_back_pass(&self, encoder: &mut CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(
+            self.back_pipeline
+                .as_ref()
+                .expect("pipeline must be initialized before encode"),
+        );
+        pass.set_bind_group(0, &self.back_bind_group, &[]);
+        pass.dispatch_workgroups(self.num_workgroups, 1, 1);
+    }
 
     fn create_back_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
         let (code, name): (&str, &str) = match spec {
