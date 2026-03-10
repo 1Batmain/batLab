@@ -9,4 +9,4 @@ pub mod types;
 pub use error::ModelError;
 pub use layer_types::{ActivationMethod, ActivationType, ConvolutionType, LayerTypes};
 pub use model::Model;
-pub use types::{Dim3, Optimizer, PaddingMode};
+pub use types::{Dim3, PaddingMode};

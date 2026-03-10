@@ -2,7 +2,7 @@ use crate::gpu_context::GpuContext;
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
 use crate::model::layer_types::{LayerType, LayerTypes};
-use crate::model::types::{Dim3, Loss, Optimizer};
+use crate::model::types::Dim3;
 use std::sync::Arc;
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device};
 
@@ -12,8 +12,8 @@ pub struct Infer;
 pub struct Training {
     pub(crate) lr: f32,
     pub(crate) batch_size: u32,
-    pub(crate) optimizer: Optimizer,
-    pub(crate) loss: Loss,
+    pub(crate) optimizer: Layer,
+    pub(crate) loss: Layer,
 }
 
 #[derive(Debug)]
@@ -108,31 +108,57 @@ impl Model<Training> {
         // - pipeline
         // - bind group
         self.build_forwards();
-        let mut last_back_output: Option<Arc<Buffer>> = None;
+        let mut last_output: Option<Arc<Buffer>> =
+            Some(self.layers.last().unwrap().buffers.last().unwrap().clone());
+        let training = self.training.as_mut().unwrap();
+        let layer = &mut training.loss;
+        last_output = Some(layer.create_buffers(&self.gpu, last_output));
+        layer.set_pipeline(&self.gpu.device);
+        layer.set_bind_group(&self.gpu.device);
+
         for layer in self.layers.iter_mut().rev() {
-            last_back_output = Some(layer.create_back_buffers(&self.gpu, last_back_output));
+            last_output = Some(layer.create_back_buffers(&self.gpu, last_output));
             layer.set_back_pipeline(&self.gpu.device);
             layer.set_back_bind_group(&self.gpu.device);
         }
-        self.create_loss_layer(
-            self.layers.last().unwrap().buffers.last().unwrap().clone(),
+    }
+    fn run(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        for layer in &self.layers {
+            layer.encode_pass(&mut encoder);
+        }
+        self.gpu.queue.write_buffer(
             self.layers
-                .last()
-                .unwrap()
-                .back_buffers
                 .first()
-                .unwrap()
-                .clone(),
+                .expect("input layer that takes an input, actually")
+                .buffers[0]
+                .as_ref(),
+            0,
+            bytemuck::cast_slice(input),
         );
-        self.create_optimizer();
+
+        let loss = &mut self.training.as_mut().unwrap().loss;
+        loss.encode_pass(&mut encoder);
+
+        for layer in &self.layers.rev() {
+            layer.encode_back_pass(&mut encoder);
+        }
+        for layer in &self.layers {
+            layer.encode_optimizer_pass(&mut encoder);
+        }
+
+        self.gpu.queue.submit([encoder.finish()]);
+
+        let last_layer = self.layers.last().expect("No layers to output from");
+        let result = self.read_back_f32_buffer(
+            last_layer
+                .buffers
+                .last()
+                .expect("no output buffer on last layer"),
+            last_layer.ty.get_dim_output().bytes_size() as u64,
+        );
+        result
     }
-    fn create_loss_layer(&mut self, input: Arc<Buffer>, output: Arc<Buffer>) {
-        self.training.unwrap().loss.build(&self.gpu);
-    }
-    pub fn run(&mut self, _input: Vec<f32>, _target: Vec<f32>) {
-        todo!();
-    }
-}
 
 impl<State> Model<State> {
     pub async fn new(gpu: Arc<GpuContext>) -> Self {
