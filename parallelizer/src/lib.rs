@@ -5,5 +5,6 @@ pub mod visualizer;
 pub use gpu_context::GpuContext;
 pub use model::Model;
 pub use model::{
-    ActivationMethod, ActivationType, ConvolutionType, Dim3, LayerTypes, ModelError, PaddingMode,
+    ActivationMethod, ActivationType, ConvolutionType, Dim3, LayerTypes, LossMethod, LossType,
+    ModelError, PaddingMode,
 };

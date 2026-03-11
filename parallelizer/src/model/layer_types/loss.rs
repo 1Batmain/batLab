@@ -39,18 +39,28 @@ impl LayerType for LossType {
             LossMethod::MeanSquared => "mean_squared",
         }
     }
-    fn get_byte_weights(&self) -> u32 {
-        0
+
+    // Loss has no separate backward pass — its forward IS the gradient computation.
+    fn get_back_entrypoints(&self) -> Vec<&'static str> {
+        vec![]
     }
+
+    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+        vec![]
+    }
+
     fn get_dim_input(&self) -> Dim3 {
         self.dim_input
     }
+
     fn get_dim_output(&self) -> Dim3 {
         self.dim_output
     }
+
     fn set_dim_input(&mut self, input: Dim3) {
         self.dim_input = input;
     }
+
     fn set_dim_output(&mut self) -> Result<Dim3, ModelError> {
         self.dim_output = self.dim_input;
         Ok(self.dim_output)
@@ -58,10 +68,11 @@ impl LayerType for LossType {
 
     fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
         vec![
+            // [0] model_result — shared from the last forward layer's output
             (
                 "model_result".to_string(),
                 BufferSpec {
-                    size: self.get_dim_input().bytes_size().max(4) as u32,
+                    size: self.dim_input.bytes_size().max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -71,10 +82,11 @@ impl LayerType for LossType {
                     },
                 },
             ),
+            // [1] target — CPU writes ground-truth labels here each step
             (
-                "target_result".to_string(),
+                "target".to_string(),
                 BufferSpec {
-                    size: (self.get_dim_output().bytes_size()).max(4) as u32,
+                    size: self.dim_input.bytes_size().max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -84,19 +96,17 @@ impl LayerType for LossType {
                     },
                 },
             ),
+            // [2] grad_output — the gradient fed into the first backward layer (NEW, read_write storage)
             (
                 "grad_output".to_string(),
                 BufferSpec {
-                    size: self.get_spec_uniform_bytes_size().max(4),
-                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    size: self.dim_input.bytes_size().max(4),
+                    usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            std::num::NonZeroU64::new(self.get_spec_uniform_bytes_size() as u64)
-                                .unwrap(),
-                        ),
+                        min_binding_size: None,
                     },
                 },
             ),
@@ -112,14 +122,15 @@ impl LayerType for LossType {
             dim_input: self.dim_input,
             dim_output: self.dim_output,
         };
-
         let mut buffer = UniformBuffer::new(Vec::new());
         buffer
             .write(&uniform)
-            .expect("failed to encode Loss uniform");
+            .expect("failed to encode loss uniform");
         buffer.into_inner()
     }
+
     fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
-        todo!();
+        // Loss has no backward pass — the forward pass IS the gradient computation.
+        vec![]
     }
 }
