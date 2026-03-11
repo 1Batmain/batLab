@@ -1,8 +1,10 @@
 use crate::gpu_context::GpuContext;
+use crate::model::debug::LayerDebugView;
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
 use crate::model::layer_types::{LayerType, LayerTypes, LossMethod, LossType};
 
+use std::fmt;
 use std::sync::Arc;
 use wgpu::Buffer;
 
@@ -13,12 +15,11 @@ use wgpu::Buffer;
 #[derive(Debug)]
 pub struct Infer;
 
+#[derive(Debug)]
 pub struct Training {
     pub lr: f32,
     pub batch_size: u32,
     pub(crate) loss_method: LossMethod,
-    /// Populated during build().
-    pub(crate) loss: Option<Layer>,
 }
 
 #[derive(Debug)]
@@ -30,10 +31,10 @@ pub struct ModelState {
 // Model
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
 pub struct Model<State = Infer> {
     pub(crate) gpu: Arc<GpuContext>,
     pub(crate) layers: Vec<Layer>,
+    pub(crate) loss_layer: Option<Layer>,
     pub(crate) training: Option<State>,
     pub(crate) state: ModelState,
 }
@@ -120,11 +121,11 @@ impl Model<Training> {
         Self {
             gpu,
             layers: Vec::new(),
+            loss_layer: None,
             training: Some(Training {
                 lr,
                 batch_size,
                 loss_method,
-                loss: None,
             }),
             state: ModelState { is_build: false },
         }
@@ -178,7 +179,7 @@ impl Model<Training> {
             }
         }
 
-        self.training.as_mut().unwrap().loss = Some(loss_layer);
+        self.loss_layer = Some(loss_layer);
         self.state.is_build = true;
     }
 
@@ -195,10 +196,7 @@ impl Model<Training> {
         );
         // loss forward buffers: [0]=model_result (shared), [1]=target, [2]=grad_output
         let loss_buf = self
-            .training
-            .as_ref()
-            .unwrap()
-            .loss
+            .loss_layer
             .as_ref()
             .expect("call build() before train_step()")
             .buffers
@@ -215,13 +213,7 @@ impl Model<Training> {
             layer.encode_pass(&mut encoder);
         }
         // Loss / initial gradient computation
-        self.training
-            .as_ref()
-            .unwrap()
-            .loss
-            .as_ref()
-            .unwrap()
-            .encode_pass(&mut encoder);
+        self.loss_layer.as_ref().unwrap().encode_pass(&mut encoder);
 
         // Backward (reverse order)
         for layer in self.layers.iter().rev() {
@@ -246,6 +238,7 @@ impl<State> Model<State> {
         Self {
             gpu,
             layers: Vec::new(),
+            loss_layer: None,
             training: None,
             state: ModelState { is_build: false },
         }
@@ -254,6 +247,7 @@ impl<State> Model<State> {
     pub fn clear(&mut self) {
         self.layers.iter_mut().for_each(|l| l.clear());
         self.layers.clear();
+        self.loss_layer = None;
         self.state.is_build = false;
     }
 
@@ -314,5 +308,42 @@ impl<State> Model<State> {
         };
         staging.unmap();
         values
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Custom Debug for Model<State>
+// ---------------------------------------------------------------------------
+
+impl<State> fmt::Debug for Model<State> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Model");
+        s.field("built", &self.state.is_build);
+        s.field("num_layers", &self.layers.len());
+
+        let layer_views: Vec<LayerDebugView<'_>> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| LayerDebugView {
+                idx: i,
+                layer: l,
+                gpu: &self.gpu,
+            })
+            .collect();
+        s.field("layers", &layer_views);
+
+        if let Some(ref loss) = self.loss_layer {
+            s.field(
+                "loss_layer",
+                &LayerDebugView {
+                    idx: 0,
+                    layer: loss,
+                    gpu: &self.gpu,
+                },
+            );
+        }
+
+        s.finish()
     }
 }
