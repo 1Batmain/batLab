@@ -5,10 +5,12 @@ use enum_dispatch::enum_dispatch;
 mod activation;
 mod convolution;
 mod loss;
+mod pooling;
 
 pub use activation::{ActivationMethod, ActivationType};
 pub use convolution::ConvolutionType;
 pub use loss::{LossMethod, LossType};
+pub use pooling::PoolingType;
 
 #[enum_dispatch]
 pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
