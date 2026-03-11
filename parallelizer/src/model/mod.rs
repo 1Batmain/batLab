@@ -1,4 +1,5 @@
 // Model module declarations
+pub mod debug;
 pub mod error;
 pub mod layer;
 pub mod layer_types;
