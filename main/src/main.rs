@@ -50,7 +50,7 @@ async fn main() {
     // Input: 512x512x1; after valid 3x3 conv → 510x510x10
     let input = vec![0.5_f32; 10 * 10];
     let target = vec![1.0_f32; 10 * 10];
-    println!("Training step...");
+    println!("Training loop...");
     for step in 0..5 {
         model.train_step(&input, &target);
         println!("Step {step} complete");
