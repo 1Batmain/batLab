@@ -12,18 +12,39 @@ pub struct Forward;
 #[derive(Debug, Clone)]
 pub struct Backward;
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Buffers {
+    pub(crate) forward: Vec<Arc<Buffer>>,
+    pub(crate) backward: Option<Vec<Arc<Buffer>>>,
+    pub(crate) optimizer: Option<Vec<Arc<Buffer>>>,
+}
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Pipelines {
+    pub(crate) forward: Option<ComputePipeline>,
+    pub(crate) backward: Option<ComputePipeline>,
+    pub(crate) optimizer: Option<ComputePipeline>,
+}
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BindGroups {
+    pub(crate) forward: Option<BindGroup>,
+    pub(crate) backward: Option<BindGroup>,
+    pub(crate) optimizer: Option<BindGroup>,
+}
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Shaders {
+    pub(crate) forward: ShaderModule,
+    pub(crate) backward: Option<ShaderModule>,
+    pub(crate) optimizer: Option<ShaderModule>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Layer {
     pub(crate) ty: LayerTypes,
-    pub(crate) buffers: Vec<Arc<Buffer>>,
-    pub(crate) back_buffers: Vec<Arc<Buffer>>,
-    pub(crate) shader: ShaderModule,
-    pub(crate) back_shader: ShaderModule,
-    pub(crate) pipeline: Option<ComputePipeline>,
-    pub(crate) back_pipeline: Option<ComputePipeline>,
+    pub(crate) buffers: Buffers,
+    pub(crate) shader: Shaders,
+    pub(crate) pipeline: Pipelines,
     pub(crate) num_workgroups: u32,
-    pub(crate) bind_group: Option<BindGroup>,
-    pub(crate) back_bind_group: Option<BindGroup>,
+    pub(crate) bind_group: BindGroups,
 }
 
 impl Layer {
@@ -37,15 +58,16 @@ impl Layer {
             ty.set_dim_input(input);
         }
         ty.set_dim_output()?;
-        let buffers = vec![];
-        let back_buffers = vec![];
-        let shader = Self::create_shader(device, &ty);
-        let back_shader = Self::create_back_shader(device, &ty);
+        let buffers = Buffers::default();
+        let shader = Shaders {
+            forward: Self::create_shader(device, &ty),
+            backward: None,
+            optimizer: None,
+        };
         let num_workgroups = ty.get_dim_output().length().div_ceil(64);
         Ok(Self {
             ty,
             shader,
-            back_shader,
             buffers,
             pipeline: None,
             num_workgroups,
@@ -54,15 +76,22 @@ impl Layer {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.buffers.clear();
-        self.pipeline = None;
-        self.bind_group = None;
+        self.buffers.forward.clear();
+        self.buffers.backward.clear();
+        self.buffers.optimizer.clear();
+        self.pipeline.forward = None;
+        self.pipeline.backward = None;
+        self.pipeline.optimizer = None;
+        self.bind_group.forward = None;
+        self.bind_group.backward = None;
+        self.bind_group.optimizer = None;
     }
 
     fn create_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
         let (code, name): (&str, &str) = match spec {
             LayerTypes::Convolution(_) => (include_str!("shader/convolution.wgsl"), "convolution"),
             LayerTypes::Activation(_) => (include_str!("shader/activation.wgsl"), "activation"),
+            LayerTypes::Loss(_) => (include_str!("shader/loss.wgsl"), "loss"),
         };
 
         device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -94,9 +123,9 @@ impl Layer {
                 let uniform = self.ty.get_spec_uniform_bytes();
                 gpu.queue.write_buffer(new_buffer.as_ref(), 0, &uniform);
             }
-            self.buffers.push(new_buffer);
+            self.buffers.forward.push(new_buffer);
         }
-        self.buffers.last().unwrap().clone()
+        self.buffers.forward.last().unwrap().clone()
     }
     pub(crate) fn set_pipeline(&mut self, device: &Device) {
         let buffers_specs = self.ty.get_buffers_specs();
@@ -125,16 +154,16 @@ impl Layer {
             immediate_size: 0,
         });
 
-        self.pipeline = Some(
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        self.pipeline.forward = Some(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
                 label: Some("pipeline"),
                 layout: Some(&pipeline_layout),
-                module: &self.shader,
+                module: &self.shader.forward,
                 entry_point: Some(self.ty.get_entrypoint()),
                 compilation_options: Default::default(),
                 cache: Default::default(),
-            }),
-        );
+            },
+        ));
     }
 
     pub(crate) fn set_bind_group(&mut self, device: &Device) {
@@ -148,11 +177,12 @@ impl Layer {
             })
             .collect::<Vec<_>>();
 
-        self.bind_group = Some(
+        self.bind_group.forward = Some(
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self
                     .pipeline
+                    .forward
                     .as_ref()
                     .expect("pipeline must be initialized before set_bind_group")
                     .get_bind_group_layout(0),
@@ -165,6 +195,7 @@ impl Layer {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(
             self.pipeline
+                .forward
                 .as_ref()
                 .expect("pipeline must be initialized before encode"),
         );
@@ -182,21 +213,23 @@ impl Layer {
     pub(crate) fn encode_optimizer_pass(&self, encoder: &mut CommandEncoder) {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(
-            self.back_pipeline
+            self.pipeline
+                .backward
                 .as_ref()
                 .expect("pipeline must be initialized before encode"),
         );
-        pass.set_bind_group(0, &self.back_bind_group, &[]);
+        pass.set_bind_group(0, &self.bind_group.backward, &[]);
         pass.dispatch_workgroups(self.num_workgroups, 1, 1);
     }
     pub(crate) fn encode_back_pass(&self, encoder: &mut CommandEncoder) {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(
-            self.back_pipeline
+            self.pipeline
+                .backward
                 .as_ref()
                 .expect("pipeline must be initialized before encode"),
         );
-        pass.set_bind_group(0, &self.back_bind_group, &[]);
+        pass.set_bind_group(0, &self.bind_group.backward, &[]);
         pass.dispatch_workgroups(self.num_workgroups, 1, 1);
     }
 
@@ -210,6 +243,7 @@ impl Layer {
                 include_str!("shader/back_activation.wgsl"),
                 "back_activation",
             ),
+            _ => panic!("Called backshader creation on an unsupported layer type"),
         };
 
         device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -227,7 +261,7 @@ impl Layer {
             if i == 0
                 && let Some(ref prev_buff) = last_output
             {
-                self.back_buffers.push(Arc::clone(prev_buff));
+                self.buffers.backward.push(Arc::clone(prev_buff));
                 continue;
             }
             let new_buffer = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
@@ -236,9 +270,9 @@ impl Layer {
                 usage: buff.1.usage,
                 mapped_at_creation: false,
             }));
-            self.back_buffers.push(new_buffer);
+            self.buffers.backward.push(new_buffer);
         }
-        self.back_buffers.last().unwrap().clone()
+        self.buffers.backward.last().unwrap().clone()
     }
 
     pub(crate) fn set_back_pipeline(&mut self, device: &Device) {
@@ -268,11 +302,11 @@ impl Layer {
             immediate_size: 0,
         });
 
-        self.back_pipeline = Some(device.create_compute_pipeline(
+        self.pipeline.bacward = Some(device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some("pipeline"),
                 layout: Some(&pipeline_layout),
-                module: &self.back_shader,
+                module: &self.shader.backward,
                 entry_point: Some(self.ty.get_entrypoint()),
                 compilation_options: Default::default(),
                 cache: Default::default(),
@@ -282,7 +316,8 @@ impl Layer {
 
     pub(crate) fn set_back_bind_group(&mut self, device: &Device) {
         let entries = self
-            .back_buffers
+            .buffers
+            .backward
             .iter()
             .enumerate()
             .map(|(idx, buffer)| wgpu::BindGroupEntry {
@@ -291,11 +326,12 @@ impl Layer {
             })
             .collect::<Vec<_>>();
 
-        self.back_bind_group = Some(
+        self.bind_group.backward = Some(
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &self
-                    .back_pipeline
+                    .pipeline
+                    .backward
                     .as_ref()
                     .expect("pipeline must be initialized before set_bind_group")
                     .get_bind_group_layout(0),
