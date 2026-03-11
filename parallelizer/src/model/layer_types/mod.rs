@@ -15,10 +15,23 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
     fn get_entrypoint(&self) -> &str {
         "main"
     }
+    /// Entry points for the backward compute passes (one per sub-pass).
+    /// Empty for layers that have no backward pass (e.g. Loss).
+    fn get_back_entrypoints(&self) -> Vec<&'static str> {
+        vec![]
+    }
+    /// Workgroup counts for each backward sub-pass (must match get_back_entrypoints length).
+    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+        vec![]
+    }
+    /// Whether this layer has trainable weight buffers.
+    fn has_weights(&self) -> bool {
+        false
+    }
     fn get_dim_input(&self) -> Dim3;
     fn get_dim_output(&self) -> Dim3;
     fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)>;
-    fn get_byte_weights(&self) -> u32;
+    /// Specs for ALL bindings in the backward bind group (shared forward + new buffers).
     fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)>;
     fn set_dim_input(&mut self, input: Dim3);
     fn set_dim_output(&mut self) -> Result<Dim3, ModelError>;
