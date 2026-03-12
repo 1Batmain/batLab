@@ -14,6 +14,10 @@ struct LayerSpec {
     dim_output: vec3<u32>,
 }
 
+fn sigmoid(value: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-value));
+}
+
 // d/dx max(x, 0)  =  1 if x > 0 else 0
 @compute @workgroup_size(64)
 fn relu_back(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -28,4 +32,14 @@ fn linear_back(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= arrayLength(&fwd_input) { return; }
     grad_input[i] = grad_output[i];
+}
+
+// d/dx (x * sigmoid(x))
+@compute @workgroup_size(64)
+fn silu_back(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= arrayLength(&fwd_input) { return; }
+    let sig = sigmoid(fwd_input[i]);
+    let grad = sig * (1.0 + fwd_input[i] * (1.0 - sig));
+    grad_input[i] = grad_output[i] * grad;
 }

@@ -7,6 +7,10 @@ struct LayerSpec {
     dim_output: vec3<u32>,
 }
 
+fn sigmoid(value: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-value));
+}
+
 @compute @workgroup_size(64)
 fn relu(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -19,4 +23,12 @@ fn linear(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if i >= arrayLength(&input) { return; }
     output[i] = input[i]; // identity
+}
+
+@compute @workgroup_size(64)
+fn silu(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if i >= arrayLength(&input) { return; }
+    let sig = sigmoid(input[i]);
+    output[i] = input[i] * sig;
 }

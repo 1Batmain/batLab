@@ -1,5 +1,8 @@
 use crate::model::error::ModelError;
-use crate::model::layer_types::LayerType;
+use crate::model::layer_types::{
+    BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding, LayerType,
+    ShaderDescriptor,
+};
 use crate::model::types::{BufferSpec, Dim3};
 use encase::{ShaderSize, ShaderType, UniformBuffer};
 use serde::{Deserialize, Serialize};
@@ -8,7 +11,34 @@ use wgpu::BufferUsages;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ActivationMethod {
     Relu,
+    Silu,
     Linear,
+}
+
+impl ActivationMethod {
+    pub(crate) fn shader_index(self) -> u32 {
+        match self {
+            ActivationMethod::Relu => 0,
+            ActivationMethod::Linear => 1,
+            ActivationMethod::Silu => 2,
+        }
+    }
+
+    pub(crate) fn forward_entrypoint(self) -> &'static str {
+        match self {
+            ActivationMethod::Relu => "relu",
+            ActivationMethod::Linear => "linear",
+            ActivationMethod::Silu => "silu",
+        }
+    }
+
+    pub(crate) fn backward_entrypoint(self) -> &'static str {
+        match self {
+            ActivationMethod::Relu => "relu_back",
+            ActivationMethod::Linear => "linear_back",
+            ActivationMethod::Silu => "silu_back",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -35,18 +65,26 @@ impl ActivationType {
 }
 
 impl LayerType for ActivationType {
-    fn get_entrypoint(&self) -> &str {
-        match self.method {
-            ActivationMethod::Relu => "relu",
-            ActivationMethod::Linear => "linear",
+    fn get_forward_shader(&self) -> ShaderDescriptor {
+        ShaderDescriptor {
+            label: "activation",
+            source: include_str!("../shader/activation.wgsl"),
         }
     }
 
+    fn get_backward_shader(&self) -> Option<ShaderDescriptor> {
+        Some(ShaderDescriptor {
+            label: "back_activation",
+            source: include_str!("../shader/back_activation.wgsl"),
+        })
+    }
+
+    fn get_entrypoint(&self) -> &str {
+        self.method.forward_entrypoint()
+    }
+
     fn get_back_entrypoints(&self) -> Vec<&'static str> {
-        match self.method {
-            ActivationMethod::Relu => vec!["relu_back"],
-            ActivationMethod::Linear => vec!["linear_back"],
-        }
+        vec![self.method.backward_entrypoint()]
     }
 
     fn get_back_workgroup_counts(&self) -> Vec<u32> {
@@ -59,6 +97,42 @@ impl LayerType for ActivationType {
 
     fn get_dim_output(&self) -> Dim3 {
         self.dim_output
+    }
+
+    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs()
+            .into_iter()
+            .map(|(name, spec)| ForwardBufferBinding {
+                init: if name == "specs" {
+                    BufferInit::SpecsUniform
+                } else {
+                    BufferInit::None
+                },
+                name,
+                spec,
+            })
+            .collect()
+    }
+
+    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, spec))| BackwardBufferBinding {
+                name,
+                spec,
+                source: match index {
+                    0 => BackwardBufferSource::Forward(0),
+                    1 => BackwardBufferSource::Forward(1),
+                    2 => BackwardBufferSource::IncomingGradient,
+                    _ => BackwardBufferSource::Allocate,
+                },
+            })
+            .collect()
+    }
+
+    fn get_back_grad_input_index(&self) -> Option<usize> {
+        Some(3)
     }
 
     fn set_dim_input(&mut self, input: Dim3) {
@@ -199,5 +273,17 @@ impl LayerType for ActivationType {
             .write(&uniform)
             .expect("failed to encode activation uniform");
         buffer.into_inner()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ActivationMethod;
+
+    #[test]
+    fn silu_uses_expected_shader_metadata() {
+        assert_eq!(ActivationMethod::Silu.shader_index(), 2);
+        assert_eq!(ActivationMethod::Silu.forward_entrypoint(), "silu");
+        assert_eq!(ActivationMethod::Silu.backward_entrypoint(), "silu_back");
     }
 }

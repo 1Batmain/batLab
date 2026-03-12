@@ -1,6 +1,4 @@
-use crate::app::{
-    App, LayerKind, Screen, INPUT_SIZE_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
-};
+use crate::app::{App, INPUT_SIZE_FIELD_NAMES, LayerKind, Screen, TRAINING_PARAM_FIELD_NAMES};
 use ratatui::{prelude::*, widgets::*};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -58,13 +56,7 @@ fn focused_value(focused: bool) -> Style {
 }
 
 /// Generic "choose one of N options" screen.
-fn draw_choice_screen(
-    f: &mut Frame,
-    title: &str,
-    choices: &[&str],
-    selected: usize,
-    hint: &str,
-) {
+fn draw_choice_screen(f: &mut Frame, title: &str, choices: &[&str], selected: usize, hint: &str) {
     let area = f.area();
     let popup = centered_rect(44, 50, area);
     f.render_widget(Clear, popup);
@@ -130,7 +122,11 @@ fn draw_form_screen(
         lines.push(Line::from(vec![
             Span::styled(format!("  {:>16} : ", name), focused_label(focused)),
             Span::styled(
-                format!("{}{}", fields.get(i).map(String::as_str).unwrap_or(""), cursor),
+                format!(
+                    "{}{}",
+                    fields.get(i).map(String::as_str).unwrap_or(""),
+                    cursor
+                ),
                 focused_value(focused),
             ),
         ]));
@@ -298,7 +294,11 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
         width: inner.width,
         height: 1,
     };
-    let kinds = [LayerKind::Convolution, LayerKind::Activation];
+    let kinds = [
+        LayerKind::Convolution,
+        LayerKind::Activation,
+        LayerKind::FullyConnected,
+    ];
     let mut kind_spans: Vec<Span> = kinds
         .iter()
         .flat_map(|k| {
@@ -313,10 +313,7 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     kind_spans.push(Span::styled(
-        format!(
-            "  Input: {} -> {}",
-            inferred_str, preview_str
-        ),
+        format!("  Input: {} -> {}", inferred_str, preview_str),
         Style::default().fg(Color::Cyan),
     ));
     f.render_widget(Paragraph::new(Line::from(kind_spans)), type_area);
@@ -412,11 +409,8 @@ fn draw_monitor(f: &mut Frame, app: &App) {
     let main_area = vertical[0];
     let hint_area = vertical[1];
 
-    let horizontal = Layout::horizontal([
-        Constraint::Percentage(35),
-        Constraint::Percentage(65),
-    ])
-    .split(main_area);
+    let horizontal = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(main_area);
 
     let right = Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(horizontal[1]);
