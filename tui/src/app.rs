@@ -28,9 +28,10 @@ impl PaddingMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActivationMethod {
     Relu,
+    Silu,
     Linear,
 }
 
@@ -38,15 +39,26 @@ impl fmt::Display for ActivationMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ActivationMethod::Relu => write!(f, "ReLU"),
+            ActivationMethod::Silu => write!(f, "SiLU"),
             ActivationMethod::Linear => write!(f, "Linear"),
         }
     }
 }
 
 impl ActivationMethod {
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "ReLU" => Some(ActivationMethod::Relu),
+            "SiLU" => Some(ActivationMethod::Silu),
+            "Linear" => Some(ActivationMethod::Linear),
+            _ => None,
+        }
+    }
+
     pub fn toggle(&self) -> Self {
         match self {
-            ActivationMethod::Relu => ActivationMethod::Linear,
+            ActivationMethod::Relu => ActivationMethod::Silu,
+            ActivationMethod::Silu => ActivationMethod::Linear,
             ActivationMethod::Linear => ActivationMethod::Relu,
         }
     }
@@ -80,6 +92,11 @@ pub enum LayerDraft {
         dim_input: (u32, u32, u32),
         method: ActivationMethod,
     },
+    FullyConnected {
+        dim_input: (u32, u32, u32),
+        nb_neurons: u32,
+        method: ActivationMethod,
+    },
 }
 
 pub fn compute_out_conv(
@@ -93,10 +110,7 @@ pub fn compute_out_conv(
     let (kw, kh, _) = dim_kernel;
     let s = stride.max(1);
     let (ow, oh) = match padding {
-        PaddingMode::Valid => (
-            iw.saturating_sub(kw) / s + 1,
-            ih.saturating_sub(kh) / s + 1,
-        ),
+        PaddingMode::Valid => (iw.saturating_sub(kw) / s + 1, ih.saturating_sub(kh) / s + 1),
         PaddingMode::Same => (iw.div_ceil(s), ih.div_ceil(s)),
     };
     (ow, oh, nb_kernel)
@@ -117,6 +131,7 @@ pub fn compute_inferred_input(
                 ..
             } => compute_out_conv(current, *dim_kernel, *stride, *nb_kernel, padding),
             LayerDraft::Activation { .. } => current,
+            LayerDraft::FullyConnected { nb_neurons, .. } => (1, 1, *nb_neurons),
         };
     }
     current
@@ -148,6 +163,16 @@ impl LayerDraft {
                     dim_input.2
                 )
             }
+            LayerDraft::FullyConnected {
+                dim_input,
+                nb_neurons,
+                method,
+            } => {
+                format!(
+                    "Perceptron({}) {}x{}x{} -> 1x1x{}",
+                    method, dim_input.0, dim_input.1, dim_input.2, nb_neurons
+                )
+            }
         }
     }
 
@@ -155,13 +180,15 @@ impl LayerDraft {
         match self {
             LayerDraft::Convolution { .. } => "Conv",
             LayerDraft::Activation { .. } => "Activation",
+            LayerDraft::FullyConnected { .. } => "Perceptron",
         }
     }
 
     pub fn input_dim_str(&self) -> String {
         let (x, y, z) = match self {
             LayerDraft::Convolution { dim_input, .. }
-            | LayerDraft::Activation { dim_input, .. } => *dim_input,
+            | LayerDraft::Activation { dim_input, .. }
+            | LayerDraft::FullyConnected { dim_input, .. } => *dim_input,
         };
         format!("{}x{}x{}", x, y, z)
     }
@@ -182,6 +209,9 @@ impl LayerDraft {
             LayerDraft::Activation { dim_input, .. } => {
                 format!("{}x{}x{}", dim_input.0, dim_input.1, dim_input.2)
             }
+            LayerDraft::FullyConnected { nb_neurons, .. } => {
+                format!("1x1x{}", nb_neurons)
+            }
         }
     }
 }
@@ -194,6 +224,7 @@ impl LayerDraft {
 pub enum LayerKind {
     Convolution,
     Activation,
+    FullyConnected,
 }
 
 impl fmt::Display for LayerKind {
@@ -201,6 +232,7 @@ impl fmt::Display for LayerKind {
         match self {
             LayerKind::Convolution => write!(f, "Conv"),
             LayerKind::Activation => write!(f, "Activ"),
+            LayerKind::FullyConnected => write!(f, "Perceptron"),
         }
     }
 }
@@ -335,7 +367,13 @@ fn conv_field_names() -> Vec<&'static str> {
 }
 
 fn conv_field_defaults() -> Vec<String> {
-    vec!["4".into(), "3".into(), "3".into(), "1".into(), "Valid".into()]
+    vec![
+        "4".into(),
+        "3".into(),
+        "3".into(),
+        "1".into(),
+        "Valid".into(),
+    ]
 }
 
 fn activation_field_names() -> Vec<&'static str> {
@@ -344,6 +382,14 @@ fn activation_field_names() -> Vec<&'static str> {
 
 fn activation_field_defaults() -> Vec<String> {
     vec!["ReLU".into()]
+}
+
+fn fully_connected_field_names() -> Vec<&'static str> {
+    vec!["Neurons", "Method"]
+}
+
+fn fully_connected_field_defaults() -> Vec<String> {
+    vec!["10".into(), "ReLU".into()]
 }
 
 fn is_toggle_field(name: &str) -> bool {
@@ -394,6 +440,7 @@ impl App {
         match self.layer_builder.current_kind {
             LayerKind::Convolution => conv_field_names(),
             LayerKind::Activation => activation_field_names(),
+            LayerKind::FullyConnected => fully_connected_field_names(),
         }
     }
 
@@ -401,16 +448,14 @@ impl App {
         self.layer_builder.fields = match self.layer_builder.current_kind {
             LayerKind::Convolution => conv_field_defaults(),
             LayerKind::Activation => activation_field_defaults(),
+            LayerKind::FullyConnected => fully_connected_field_defaults(),
         };
         self.layer_builder.field_idx = 0;
         self.layer_builder.error = None;
     }
 
     pub fn inferred_input(&self) -> (u32, u32, u32) {
-        compute_inferred_input(
-            &self.layer_builder.layers,
-            self.layer_builder.model_input,
-        )
+        compute_inferred_input(&self.layer_builder.layers, self.layer_builder.model_input)
     }
 
     /// Live preview of output dims based on current form values (best-effort).
@@ -438,9 +483,21 @@ impl App {
                 } else {
                     PaddingMode::Valid
                 };
-                Some(compute_out_conv(inferred, (kw, kh, kc), stride, nb_kernel, &padding))
+                Some(compute_out_conv(
+                    inferred,
+                    (kw, kh, kc),
+                    stride,
+                    nb_kernel,
+                    &padding,
+                ))
             }
             LayerKind::Activation => Some(inferred),
+            LayerKind::FullyConnected => {
+                let names = self.layer_field_names();
+                let idx = names.iter().position(|&n| n == "Neurons")?;
+                let nb_neurons = lb.fields.get(idx)?.parse().ok()?;
+                Some((1, 1, nb_neurons))
+            }
         }
     }
 
@@ -484,13 +541,24 @@ impl App {
                 }
             }
             LayerKind::Activation => {
-                let method = if fields[0] == "ReLU" {
-                    ActivationMethod::Relu
-                } else {
-                    ActivationMethod::Linear
-                };
+                let method = ActivationMethod::from_label(&fields[0])
+                    .ok_or_else(|| format!("Unknown activation method '{}'", fields[0]))?;
                 LayerDraft::Activation {
                     dim_input: inferred,
+                    method,
+                }
+            }
+            LayerKind::FullyConnected => {
+                let nb_neurons = parse_u32("Neurons")?;
+                if nb_neurons == 0 {
+                    return Err("Neurons must be > 0".into());
+                }
+                let method_idx = names.iter().position(|&n| n == "Method").unwrap();
+                let method = ActivationMethod::from_label(&fields[method_idx])
+                    .ok_or_else(|| format!("Unknown activation method '{}'", fields[method_idx]))?;
+                LayerDraft::FullyConnected {
+                    dim_input: inferred,
+                    nb_neurons,
                     method,
                 }
             }
@@ -510,7 +578,8 @@ impl App {
     pub fn cycle_kind_forward(&mut self) {
         self.layer_builder.current_kind = match self.layer_builder.current_kind {
             LayerKind::Convolution => LayerKind::Activation,
-            LayerKind::Activation => LayerKind::Convolution,
+            LayerKind::Activation => LayerKind::FullyConnected,
+            LayerKind::FullyConnected => LayerKind::Convolution,
         };
         self.reset_layer_form();
     }
@@ -559,11 +628,8 @@ impl App {
                 self.layer_builder.fields[idx] = cur.toggle().to_string();
             }
             "Method" => {
-                let cur = if self.layer_builder.fields[idx] == "ReLU" {
-                    ActivationMethod::Relu
-                } else {
-                    ActivationMethod::Linear
-                };
+                let cur = ActivationMethod::from_label(&self.layer_builder.fields[idx])
+                    .expect("invalid activation method label");
                 self.layer_builder.fields[idx] = cur.toggle().to_string();
             }
             _ => {}
@@ -615,7 +681,11 @@ impl App {
 
     pub fn finish_mode_selector(&mut self) {
         match self.mode_selector.selected {
-            0 => self.run_config = Some(RunConfig { mode: RunMode::Infer }),
+            0 => {
+                self.run_config = Some(RunConfig {
+                    mode: RunMode::Infer,
+                })
+            }
             _ => self.screen = Screen::TrainingParams,
         }
     }

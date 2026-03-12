@@ -10,7 +10,11 @@ use crate::model::layer_types::{LayerType, LayerTypes};
 
 /// Read an f32 buffer back from the GPU synchronously.
 /// Returns `None` if the buffer has no `COPY_SRC` usage (e.g. uniform buffers).
-pub(crate) fn read_back_f32(gpu: &GpuContext, buf: &wgpu::Buffer, size_bytes: u64) -> Option<Vec<f32>> {
+pub(crate) fn read_back_f32(
+    gpu: &GpuContext,
+    buf: &wgpu::Buffer,
+    size_bytes: u64,
+) -> Option<Vec<f32>> {
     if size_bytes == 0 {
         return Some(vec![]);
     }
@@ -34,7 +38,11 @@ pub(crate) fn read_back_f32(gpu: &GpuContext, buf: &wgpu::Buffer, size_bytes: u6
         let _ = tx.send(r);
     });
 
-    if gpu.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+    if gpu
+        .device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .is_err()
+    {
         return None;
     }
     match pollster::block_on(async { rx.await }) {
@@ -62,7 +70,11 @@ pub(crate) fn summarize_f32(values: &[f32]) -> String {
         .take(PREVIEW_LEN)
         .map(|v| format!("{v:.4}"))
         .collect();
-    let ellipsis = if values.len() > PREVIEW_LEN { ", ..." } else { "" };
+    let ellipsis = if values.len() > PREVIEW_LEN {
+        ", ..."
+    } else {
+        ""
+    };
 
     let has_nan = values.iter().any(|v| v.is_nan());
     let has_inf = values.iter().any(|v| v.is_infinite());
@@ -112,6 +124,7 @@ impl fmt::Debug for LayerDebugView<'_> {
         let ty_name = match &layer.ty {
             LayerTypes::Convolution(_) => "Convolution",
             LayerTypes::Activation(_) => "Activation",
+            LayerTypes::FullyConnected(_) => "FullyConnected",
             LayerTypes::Loss(_) => "Loss",
         };
 

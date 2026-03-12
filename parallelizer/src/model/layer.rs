@@ -1,6 +1,6 @@
 use crate::gpu_context::GpuContext;
 use crate::model::error::ModelError;
-use crate::model::layer_types::{LayerType, LayerTypes};
+use crate::model::layer_types::{BackwardBufferSource, BufferInit, LayerType, LayerTypes};
 use crate::model::types::Dim3;
 use std::sync::Arc;
 use wgpu::{
@@ -109,33 +109,20 @@ impl Layer {
     // -----------------------------------------------------------------------
 
     fn create_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
-        let (code, name): (&str, &str) = match spec {
-            LayerTypes::Convolution(_) => (include_str!("shader/convolution.wgsl"), "convolution"),
-            LayerTypes::Activation(_) => (include_str!("shader/activation.wgsl"), "activation"),
-            LayerTypes::Loss(_) => (include_str!("shader/loss.wgsl"), "loss"),
-        };
+        let shader = spec.get_forward_shader();
         device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(code)),
+            label: Some(shader.label),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader.source)),
         })
     }
 
     fn create_back_shader(device: &Device, spec: &LayerTypes) -> ShaderModule {
-        let (code, name): (&str, &str) = match spec {
-            LayerTypes::Convolution(_) => {
-                (include_str!("shader/back_convolution.wgsl"), "back_convolution")
-            }
-            LayerTypes::Activation(_) => {
-                (include_str!("shader/back_activation.wgsl"), "back_activation")
-            }
-            other => panic!(
-                "backward shader not supported for layer type {:?}",
-                other
-            ),
-        };
+        let shader = spec
+            .get_backward_shader()
+            .expect("backward shader not supported for layer type");
         device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(code)),
+            label: Some(shader.label),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader.source)),
         })
     }
 
@@ -153,8 +140,8 @@ impl Layer {
         gpu: &GpuContext,
         last_output: Option<Arc<Buffer>>,
     ) -> Arc<Buffer> {
-        let specs = self.ty.get_buffers_specs();
-        for (i, (name, spec)) in specs.iter().enumerate() {
+        let bindings = self.ty.get_forward_buffer_bindings();
+        for (i, binding) in bindings.iter().enumerate() {
             // Binding 0 is always the "input" — share the previous layer's output buffer.
             if i == 0 {
                 if let Some(ref prev) = last_output {
@@ -163,23 +150,23 @@ impl Layer {
                 }
             }
             let buf = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
-                label: Some(name.as_str()),
-                size: spec.size as u64,
-                usage: spec.usage,
+                label: Some(binding.name.as_str()),
+                size: binding.spec.size as u64,
+                usage: binding.spec.usage,
                 mapped_at_creation: false,
             }));
-            match name.as_str() {
-                "specs" => {
+            match binding.init {
+                BufferInit::SpecsUniform => {
                     let bytes = self.ty.get_spec_uniform_bytes();
                     gpu.queue.write_buffer(&buf, 0, &bytes);
                 }
-                "weights" => {
-                    let count = spec.size as usize / 4;
+                BufferInit::RandomWeights => {
+                    let count = binding.spec.size as usize / 4;
                     let weights = Self::init_random_weights(count);
-                    gpu.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
+                    gpu.queue
+                        .write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
                 }
-                // bias — zero-init is the wgpu default, nothing to do
-                _ => {}
+                BufferInit::None => {}
             }
             self.buffers.forward.push(buf);
         }
@@ -230,16 +217,18 @@ impl Layer {
                 resource: buf.as_entire_binding(),
             })
             .collect();
-        self.bind_group.forward = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fwd_bg"),
-            layout: &self
-                .pipeline
-                .forward
-                .as_ref()
-                .expect("set_pipeline must be called before set_bind_group")
-                .get_bind_group_layout(0),
-            entries: &entries,
-        }));
+        self.bind_group.forward = Some(
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fwd_bg"),
+                layout: &self
+                    .pipeline
+                    .forward
+                    .as_ref()
+                    .expect("set_pipeline must be called before set_bind_group")
+                    .get_bind_group_layout(0),
+                entries: &entries,
+            }),
+        );
     }
 
     pub(crate) fn encode_pass(&self, encoder: &mut CommandEncoder) {
@@ -273,80 +262,33 @@ impl Layer {
         gpu: &GpuContext,
         grad_output: Option<Arc<Buffer>>,
     ) -> Arc<Buffer> {
-        let (buffers_to_add, grad_input) = match &self.ty {
-            LayerTypes::Convolution(conv) => {
-                let gi_size = conv.dim_input.bytes_size().max(4) as u64;
-                let gw_size = (conv.dim_kernel.bytes_size() * conv.nb_kernel).max(4) as u64;
-                let gb_size = (conv.nb_kernel * 4).max(4) as u64;
-
-                // Shared from forward:
-                //   forward[0] = input (fwd_input)
-                //   forward[1] = weights
-                //   forward[3] = specs uniform
-                let fwd_input = Arc::clone(&self.buffers.forward[0]);
-                let fwd_weights = Arc::clone(&self.buffers.forward[1]);
-                let fwd_specs = Arc::clone(&self.buffers.forward[3]);
-
-                let go = grad_output
-                    .expect("conv backward requires an incoming grad_output buffer");
-
-                let make = |label, size| {
+        let bindings = self.ty.get_back_buffer_bindings();
+        let incoming_grad = grad_output
+            .as_ref()
+            .expect("backward pass requires an incoming grad_output buffer");
+        let buffers: Vec<_> = bindings
+            .iter()
+            .map(|binding| match binding.source {
+                BackwardBufferSource::Forward(index) => Arc::clone(&self.buffers.forward[index]),
+                BackwardBufferSource::IncomingGradient => Arc::clone(incoming_grad),
+                BackwardBufferSource::Allocate => {
                     Arc::new(gpu.device.create_buffer(&BufferDescriptor {
-                        label: Some(label),
-                        size,
-                        usage: BufferUsages::COPY_SRC
-                            | BufferUsages::COPY_DST
-                            | BufferUsages::STORAGE,
+                        label: Some(binding.name.as_str()),
+                        size: binding.spec.size as u64,
+                        usage: binding.spec.usage,
                         mapped_at_creation: false,
                     }))
-                };
+                }
+            })
+            .collect();
 
-                let gi = make("grad_input", gi_size);
-                let gw = make("grad_weights", gw_size);
-                let gb = make("grad_bias", gb_size);
-
-                let bufs = vec![
-                    fwd_input,
-                    fwd_weights,
-                    fwd_specs,
-                    go,
-                    Arc::clone(&gi),
-                    gw,
-                    gb,
-                ];
-                (bufs, gi)
-            }
-
-            LayerTypes::Activation(act) => {
-                let gi_size = act.dim_input.bytes_size().max(4) as u64;
-
-                // Shared from forward:
-                //   forward[0] = input (fwd_input)
-                //   forward[1] = specs uniform
-                let fwd_input = Arc::clone(&self.buffers.forward[0]);
-                let fwd_specs = Arc::clone(&self.buffers.forward[1]);
-
-                let go = grad_output
-                    .expect("activation backward requires an incoming grad_output buffer");
-
-                let gi = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
-                    label: Some("grad_input"),
-                    size: gi_size,
-                    usage: BufferUsages::COPY_SRC | BufferUsages::COPY_DST | BufferUsages::STORAGE,
-                    mapped_at_creation: false,
-                }));
-
-                let bufs = vec![fwd_input, fwd_specs, go, Arc::clone(&gi)];
-                (bufs, gi)
-            }
-
-            other => panic!(
-                "create_back_buffers not supported for layer type {:?}",
-                other
-            ),
-        };
-
-        self.buffers.backward = Some(buffers_to_add);
+        let grad_input = Arc::clone(
+            &buffers[self
+                .ty
+                .get_back_grad_input_index()
+                .expect("backward pass must expose grad_input buffer index")],
+        );
+        self.buffers.backward = Some(buffers);
         grad_input
     }
 
@@ -419,12 +361,11 @@ impl Layer {
                 resource: buf.as_entire_binding(),
             })
             .collect();
-        self.bind_group.backward =
-            Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("back_bg"),
-                layout: &self.pipeline.backward[0].0.get_bind_group_layout(0),
-                entries: &entries,
-            }));
+        self.bind_group.backward = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("back_bg"),
+            layout: &self.pipeline.backward[0].0.get_bind_group_layout(0),
+            entries: &entries,
+        }));
     }
 
     /// Encode all backward sub-passes (e.g. Conv encodes 3 sequential passes).
@@ -447,31 +388,19 @@ impl Layer {
     // -----------------------------------------------------------------------
 
     /// Build the SGD compute pass for this layer.
-    /// Conv backward buffers must already exist before calling this.
     pub(crate) fn create_opt_pass(&mut self, gpu: &GpuContext, lr: f32) {
-        let opt_data = match &self.ty {
-            LayerTypes::Convolution(conv) => {
-                // weight_count drives workgroup dispatch
-                let weight_count = (conv.dim_kernel.bytes_size() * conv.nb_kernel) / 4;
-                // Forward buffers: [0]=input, [1]=weights, [2]=bias, [3]=specs, [4]=output
-                let weights = Arc::clone(&self.buffers.forward[1]);
-                let bias = Arc::clone(&self.buffers.forward[2]);
-                // Backward buffers: [0-3]=shared+grad_out, [4]=grad_input, [5]=grad_weights, [6]=grad_bias
-                let bwd = self
-                    .buffers
-                    .backward
-                    .as_ref()
-                    .expect("backward buffers must be built before create_opt_pass");
-                let grad_weights = Arc::clone(&bwd[5]);
-                let grad_bias = Arc::clone(&bwd[6]);
-                Some((weight_count, weights, bias, grad_weights, grad_bias))
-            }
-            _ => None,
-        };
-
-        let Some((weight_count, weights, bias, grad_weights, grad_bias)) = opt_data else {
+        let Some(layout) = self.ty.get_optimizer_bindings() else {
             return;
         };
+        let bwd = self
+            .buffers
+            .backward
+            .as_ref()
+            .expect("backward buffers must be built before create_opt_pass");
+        let weights = Arc::clone(&self.buffers.forward[layout.weights_forward_index]);
+        let bias = Arc::clone(&self.buffers.forward[layout.bias_forward_index]);
+        let grad_weights = Arc::clone(&bwd[layout.grad_weights_backward_index]);
+        let grad_bias = Arc::clone(&bwd[layout.grad_bias_backward_index]);
 
         // lr uniform: 4 bytes f32 padded to 16 bytes for alignment safety
         let lr_buf = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
@@ -484,12 +413,14 @@ impl Layer {
         lr_bytes[0..4].copy_from_slice(&lr.to_le_bytes());
         gpu.queue.write_buffer(&lr_buf, 0, &lr_bytes);
 
-        let sgd_shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sgd"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "shader/sgd.wgsl"
-            ))),
-        });
+        let sgd_shader = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("sgd"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                    "shader/sgd.wgsl"
+                ))),
+            });
 
         let layout_entries = [
             // [0] weights  read_write storage
@@ -549,10 +480,12 @@ impl Layer {
             },
         ];
 
-        let bgl = gpu.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("sgd_bgl"),
-            entries: &layout_entries,
-        });
+        let bgl = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sgd_bgl"),
+                entries: &layout_entries,
+            });
         let pl = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -560,16 +493,16 @@ impl Layer {
                 bind_group_layouts: &[&bgl],
                 immediate_size: 0,
             });
-        let pipeline =
-            gpu.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("sgd_pipeline"),
-                    layout: Some(&pl),
-                    module: &sgd_shader,
-                    entry_point: Some("sgd"),
-                    compilation_options: Default::default(),
-                    cache: Default::default(),
-                });
+        let pipeline = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("sgd_pipeline"),
+                layout: Some(&pl),
+                module: &sgd_shader,
+                entry_point: Some("sgd"),
+                compilation_options: Default::default(),
+                cache: Default::default(),
+            });
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sgd_bg"),
             layout: &pipeline.get_bind_group_layout(0),
@@ -601,7 +534,7 @@ impl Layer {
             pipeline,
             bind_group,
             buffers: vec![lr_buf],
-            num_workgroups: weight_count.div_ceil(64),
+            num_workgroups: layout.weight_count.div_ceil(64),
         });
     }
 

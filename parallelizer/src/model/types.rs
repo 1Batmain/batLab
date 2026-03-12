@@ -48,7 +48,7 @@ impl Dim3 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct BufferSpec {
     pub size: u32,
     pub usage: wgpu::BufferUsages,

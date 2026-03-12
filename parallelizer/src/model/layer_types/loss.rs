@@ -1,5 +1,5 @@
 use crate::model::error::ModelError;
-use crate::model::layer_types::LayerType;
+use crate::model::layer_types::{BufferInit, ForwardBufferBinding, LayerType, ShaderDescriptor};
 use crate::model::types::{BufferSpec, Dim3};
 use encase::{ShaderSize, ShaderType, UniformBuffer};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,13 @@ impl LossType {
 }
 
 impl LayerType for LossType {
+    fn get_forward_shader(&self) -> ShaderDescriptor {
+        ShaderDescriptor {
+            label: "loss",
+            source: include_str!("../shader/loss.wgsl"),
+        }
+    }
+
     fn get_entrypoint(&self) -> &str {
         match self.method {
             LossMethod::MeanSquared => "mean_squared",
@@ -55,6 +62,17 @@ impl LayerType for LossType {
 
     fn get_dim_output(&self) -> Dim3 {
         self.dim_output
+    }
+
+    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs()
+            .into_iter()
+            .map(|(name, spec)| ForwardBufferBinding {
+                init: BufferInit::None,
+                name,
+                spec,
+            })
+            .collect()
     }
 
     fn set_dim_input(&mut self, input: Dim3) {

@@ -8,7 +8,8 @@ pub mod types;
 
 pub use error::ModelError;
 pub use layer_types::{
-    ActivationMethod, ActivationType, ConvolutionType, LayerTypes, LossMethod, LossType,
+    ActivationMethod, ActivationType, ConvolutionType, FullyConnectedType, LayerTypes, LossMethod,
+    LossType,
 };
 pub use model::{Infer, Model, Training};
 pub use types::{Dim3, PaddingMode};

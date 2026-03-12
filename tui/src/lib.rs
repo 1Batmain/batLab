@@ -35,7 +35,7 @@ fn run_builder_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<ModelConfig, Box<dyn std::error::Error>> {
-    use crossterm::event::{poll, read, Event, KeyEventKind};
+    use crossterm::event::{Event, KeyEventKind, poll, read};
     use std::time::Duration;
 
     loop {
@@ -99,7 +99,7 @@ fn run_monitor_loop(
     app: &mut App,
     rx: Receiver<TrainingEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crossterm::event::{poll, read, Event, KeyEventKind};
+    use crossterm::event::{Event, KeyEventKind, poll, read};
     use std::time::Duration;
 
     loop {

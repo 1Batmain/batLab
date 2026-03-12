@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use bat_tui::{ActivationMethod, LayerDraft, PaddingMode, RunMode};
 use parallelizer::{
-    ActivationMethod as PActivation, ActivationType, ConvolutionType, Dim3, GpuContext,
-    LayerTypes, LossMethod as PLoss, Model, PaddingMode as PPadding,
+    ActivationMethod as PActivation, ActivationType, ConvolutionType, Dim3, FullyConnectedType,
+    GpuContext, LayerTypes, LossMethod as PLoss, Model, PaddingMode as PPadding,
 };
 
 fn main() {
@@ -21,9 +21,13 @@ fn main() {
                 let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
                 rt.block_on(async {
                     let gpu = Arc::new(GpuContext::new_headless().await);
-                    let mut model =
-                        Model::new_training(gpu, train_cfg.lr, train_cfg.batch_size, PLoss::MeanSquared)
-                            .await;
+                    let mut model = Model::new_training(
+                        gpu,
+                        train_cfg.lr,
+                        train_cfg.batch_size,
+                        PLoss::MeanSquared,
+                    )
+                    .await;
 
                     for draft in &config_clone.layers {
                         let layer = convert_layer(draft);
@@ -65,9 +69,17 @@ fn convert_layer(draft: &LayerDraft) -> LayerTypes {
             *stride,
             convert_padding(padding),
         )),
-        LayerDraft::Activation { method, .. } => {
-            LayerTypes::Activation(ActivationType::new(convert_activation(method), Dim3::default()))
-        }
+        LayerDraft::Activation { method, .. } => LayerTypes::Activation(ActivationType::new(
+            convert_activation(method),
+            Dim3::default(),
+        )),
+        LayerDraft::FullyConnected {
+            nb_neurons, method, ..
+        } => LayerTypes::FullyConnected(FullyConnectedType::new(
+            Dim3::default(),
+            *nb_neurons,
+            convert_activation(method),
+        )),
     }
 }
 
@@ -81,6 +93,7 @@ fn convert_padding(p: &PaddingMode) -> PPadding {
 fn convert_activation(a: &ActivationMethod) -> PActivation {
     match a {
         ActivationMethod::Relu => PActivation::Relu,
+        ActivationMethod::Silu => PActivation::Silu,
         ActivationMethod::Linear => PActivation::Linear,
     }
 }

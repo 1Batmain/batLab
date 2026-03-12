@@ -1,4 +1,4 @@
-use crate::app::{App, Screen, INPUT_SIZE_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES};
+use crate::app::{App, INPUT_SIZE_FIELD_NAMES, Screen, TRAINING_PARAM_FIELD_NAMES};
 use crossterm::event::KeyCode;
 
 #[derive(Debug)]

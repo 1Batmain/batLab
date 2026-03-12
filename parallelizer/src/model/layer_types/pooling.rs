@@ -1,5 +1,8 @@
 use crate::model::error::ModelError;
-use crate::model::layer_types::LayerType;
+use crate::model::layer_types::{
+    BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding, LayerType,
+    ShaderDescriptor,
+};
 use crate::model::types::{BufferSpec, Dim3, PaddingMode};
 use encase::{ShaderSize, ShaderType, UniformBuffer};
 use wgpu::BufferUsages;
@@ -49,12 +52,57 @@ impl PoolingType {
 }
 
 impl LayerType for PoolingType {
+    fn get_forward_shader(&self) -> ShaderDescriptor {
+        panic!("pooling shaders are not wired yet")
+    }
+
+    fn get_backward_shader(&self) -> Option<ShaderDescriptor> {
+        panic!("pooling shaders are not wired yet")
+    }
+
     fn get_dim_input(&self) -> Dim3 {
         self.dim_input
     }
 
     fn get_dim_output(&self) -> Dim3 {
         self.dim_output
+    }
+
+    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs()
+            .into_iter()
+            .map(|(name, spec)| ForwardBufferBinding {
+                init: match name.as_str() {
+                    "weights" => BufferInit::RandomWeights,
+                    "specs" => BufferInit::SpecsUniform,
+                    _ => BufferInit::None,
+                },
+                name,
+                spec,
+            })
+            .collect()
+    }
+
+    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs()
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, spec))| BackwardBufferBinding {
+                name,
+                spec,
+                source: match index {
+                    0 => BackwardBufferSource::Forward(0),
+                    1 => BackwardBufferSource::Forward(1),
+                    2 => BackwardBufferSource::Forward(3),
+                    3 => BackwardBufferSource::IncomingGradient,
+                    _ => BackwardBufferSource::Allocate,
+                },
+            })
+            .collect()
+    }
+
+    fn get_back_grad_input_index(&self) -> Option<usize> {
+        Some(4)
     }
 
     fn get_back_entrypoints(&self) -> Vec<&'static str> {
