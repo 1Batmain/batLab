@@ -10,3 +10,4 @@ winit = "0.30.12"
 
 parallelizer = { path = "../parallelizer", default-features = false }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+bat-tui = { path = "../tui" }

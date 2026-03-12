@@ -16,3 +16,9 @@ fn mean_squared(@builtin(global_invocation_id) gid: vec3<u32>) {
     let diff = model_result[i] - target_result[i];
     grad_output[i] = 2.0 * diff / f32(n);
 }
+Conv
+GroupNorm
+SiLU
+Strided Conv (downsample)
+Upsample + Conv
+Residual connections
