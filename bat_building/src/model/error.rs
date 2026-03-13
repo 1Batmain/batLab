@@ -33,6 +33,17 @@ pub enum ModelError {
         input: Dim3,
         skip: Dim3,
     },
+    CheckpointIo {
+        path: String,
+        message: String,
+    },
+    InvalidCheckpointFormat {
+        message: String,
+    },
+    CheckpointLayerMismatch {
+        layer_index: usize,
+        message: String,
+    },
 }
 
 impl Display for ModelError {
@@ -82,6 +93,19 @@ impl Display for ModelError {
                 f,
                 "concat requires matching spatial dimensions: input=({}, {}, {}), skip=({}, {}, {})",
                 input.x, input.y, input.z, skip.x, skip.y, skip.z
+            ),
+            ModelError::CheckpointIo { path, message } => {
+                write!(f, "checkpoint I/O error at '{path}': {message}")
+            }
+            ModelError::InvalidCheckpointFormat { message } => {
+                write!(f, "invalid checkpoint format: {message}")
+            }
+            ModelError::CheckpointLayerMismatch {
+                layer_index,
+                message,
+            } => write!(
+                f,
+                "checkpoint parameter mismatch for layer {layer_index}: {message}"
             ),
         }
     }

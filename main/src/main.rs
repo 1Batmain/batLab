@@ -9,7 +9,7 @@ use bat_building::tui::{
 };
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
-    FullyConnectedType, GpuContext, GroupNormType, LayerTypes, LinearNoiseSchedule,
+    FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
     LossMethod as PLoss, Model, PaddingMode as PPadding, Trainer, UpsampleConvType,
     model::Training,
 };
@@ -77,13 +77,29 @@ async fn run_training(
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
 ) -> Result<(), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
-    let mut model =
-        Model::new_training(gpu, train_cfg.lr, train_cfg.batch_size, PLoss::MeanSquared).await;
+    let mut model = Model::new_training(
+        gpu.clone(),
+        train_cfg.lr,
+        train_cfg.batch_size,
+        PLoss::MeanSquared,
+    )
+    .await;
 
     for draft in &config.layers {
         append_layer(&mut model, draft).map_err(|err| err.to_string())?;
     }
     model.build().map_err(|err| err.to_string())?;
+    let checkpoint_path = config
+        .model_name
+        .as_deref()
+        .map(tui::storage::checkpoint_path_for_model_name)
+        .transpose()
+        .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?;
+    if let Some(path) = checkpoint_path.as_ref().filter(|path| path.exists()) {
+        model
+            .load_checkpoint(path)
+            .map_err(|err| format!("failed to load checkpoint {}: {err}", path.display()))?;
+    }
 
     let input_dims = model
         .input_dim()
@@ -106,22 +122,24 @@ async fn run_training(
     let diffusion = trainer.task().schedule().clone();
 
     let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
+    let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+    let gpu_samples: Vec<Vec<f32>> = dataset.into_iter().map(|sample| sample.target).collect();
+    let mut gpu_dataset = GpuDataset::from_samples(gpu.as_ref(), gpu_samples, sample_len)
+        .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
     let sample_dir = prepare_sample_dir(&train_cfg.dataset_path)?;
     let export_interval = train_cfg.steps.div_ceil(SAMPLE_EXPORT_COUNT.max(1));
 
     for step in 0..train_cfg.steps {
-        let sample_index = step % dataset.len();
-        let sample = &dataset[sample_index];
-        let diffusion_step = diffusion_step_for(step, sample_index, diffusion.len());
         let loss = trainer
             .task_mut()
-            .train_step_report(
+            .train_step_report_batch(
                 &mut model,
-                &sample.target,
-                diffusion_step,
-                ((step as u64) << 32) ^ sample_index as u64,
+                &mut gpu_dataset,
+                step,
+                train_cfg.batch_size as usize,
+                (step as u64) << 32,
             )
-            .map_err(|err| format!("failed diffusion GPU prepare step: {err}"))?;
+            .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?;
 
         let sample_path = if step % export_interval == 0 || step + 1 == train_cfg.steps {
             let output = sample_diffusion_image(
@@ -149,6 +167,12 @@ async fn run_training(
         {
             return Ok(());
         }
+    }
+
+    if let Some(path) = checkpoint_path.as_ref() {
+        model
+            .save_checkpoint(path)
+            .map_err(|err| format!("failed to save checkpoint {}: {err}", path.display()))?;
     }
 
     let _ = tx.send(tui::TrainingEvent::Done);
@@ -438,13 +462,6 @@ fn sample_diffusion_image(
     }
 
     latent
-}
-
-fn diffusion_step_for(step: usize, sample_index: usize, schedule_len: usize) -> usize {
-    if schedule_len <= 1 {
-        return 0;
-    }
-    ((step.wrapping_mul(97)) ^ (sample_index.wrapping_mul(31))) % schedule_len
 }
 
 fn prepare_sample_dir(dataset_path: &str) -> Result<PathBuf, String> {

@@ -1,0 +1,12 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running `/home/bat/.cargo/target/debug/main`
+
+thread '<unnamed>' (69738) panicked at /home/bat/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-28.0.0/src/backend/wgpu_core.rs:1591:18:
+wgpu error: Validation Error
+
+Caused by:
+  In Device::create_buffer, label = 'training_dataset'
+    Buffer size 614400000 is greater than the maximum buffer size (268435456)
+
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
