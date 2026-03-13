@@ -35,17 +35,32 @@ pub fn datasets_dir() -> io::Result<PathBuf> {
 }
 
 pub fn save_model_config(config: &ModelConfig) -> io::Result<PathBuf> {
+    let name = next_model_name()?;
+    save_model_config_named(config, &name)
+}
+
+/// Returns the next unused default model name stem, e.g. "model-003".
+pub fn next_model_name() -> io::Result<String> {
     let dir = saved_models_dir()?;
     let mut next_index = 1usize;
     loop {
-        let path = dir.join(format!("model-{next_index:03}.json"));
+        let name = format!("model-{next_index:03}");
+        let path = dir.join(format!("{name}.json"));
         if !path.exists() {
-            let bytes = serde_json::to_vec_pretty(config).map_err(serde_to_io)?;
-            fs::write(&path, bytes)?;
-            return Ok(path);
+            return Ok(name);
         }
         next_index += 1;
     }
+}
+
+/// Saves a model config with an explicit file name stem (no extension required).
+/// Overwrites any existing file with the same name.
+pub fn save_model_config_named(config: &ModelConfig, name: &str) -> io::Result<PathBuf> {
+    let dir = saved_models_dir()?;
+    let path = dir.join(format!("{name}.json"));
+    let bytes = serde_json::to_vec_pretty(config).map_err(serde_to_io)?;
+    fs::write(&path, bytes)?;
+    Ok(path)
 }
 
 pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {

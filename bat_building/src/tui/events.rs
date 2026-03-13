@@ -1,4 +1,6 @@
-use super::app::{App, INPUT_SIZE_FIELD_NAMES, Screen, TRAINING_PARAM_FIELD_NAMES};
+use super::app::{
+    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen, TRAINING_PARAM_FIELD_NAMES,
+};
 use crossterm::event::KeyCode;
 
 #[derive(Debug)]
@@ -23,6 +25,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::ModeSelector => handle_mode_selector(app, code),
         Screen::TrainingParams => handle_training_params(app, code),
         Screen::Monitor => handle_monitor(app, code),
+        Screen::SaveModel => handle_save_model(app, code),
     }
 }
 
@@ -92,15 +95,19 @@ fn handle_input_size(app: &mut App, code: KeyCode) {
 }
 
 fn handle_layer_builder(app: &mut App, code: KeyCode) {
+    match app.layer_builder.mode {
+        LayerBuilderMode::Add => handle_lb_add(app, code),
+        LayerBuilderMode::Browse => handle_lb_browse(app, code),
+        LayerBuilderMode::Edit => handle_lb_edit(app, code),
+    }
+}
+
+fn handle_lb_add(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('b') => app.finish_layer_builder(),
         KeyCode::Char('d') => app.delete_last_layer(),
-        KeyCode::Char('a') => {
-            if let Err(e) = app.try_add_layer() {
-                app.layer_builder.error = Some(e);
-            }
-        }
+        KeyCode::Char('e') => app.enter_browse_mode(),
         KeyCode::Left => app.cycle_kind_backward(),
         KeyCode::Right => app.cycle_kind_forward(),
         KeyCode::Up => {
@@ -117,6 +124,47 @@ fn handle_layer_builder(app: &mut App, code: KeyCode) {
         KeyCode::Char(' ') => app.toggle_layer_field(),
         KeyCode::Enter => {
             if let Err(e) = app.try_add_layer() {
+                app.layer_builder.error = Some(e);
+            }
+        }
+        KeyCode::Backspace => app.handle_backspace_layer(),
+        KeyCode::Char(c) => app.handle_char_layer(c),
+        _ => {}
+    }
+}
+
+fn handle_lb_browse(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('e') => app.exit_browse_mode(),
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => app.browse_move_up(),
+        KeyCode::Down => app.browse_move_down(),
+        KeyCode::Enter => app.enter_edit_mode(),
+        KeyCode::Char('d') => app.delete_selected_layer(),
+        _ => {}
+    }
+}
+
+fn handle_lb_edit(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.cancel_edit(),
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Left => app.cycle_kind_backward(),
+        KeyCode::Right => app.cycle_kind_forward(),
+        KeyCode::Up => {
+            if app.layer_builder.field_idx > 0 {
+                app.layer_builder.field_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            let max = app.layer_field_names().len().saturating_sub(1);
+            if app.layer_builder.field_idx < max {
+                app.layer_builder.field_idx += 1;
+            }
+        }
+        KeyCode::Char(' ') => app.toggle_layer_field(),
+        KeyCode::Enter => {
+            if let Err(e) = app.confirm_layer_edit() {
                 app.layer_builder.error = Some(e);
             }
         }
@@ -184,7 +232,31 @@ fn handle_training_params(app: &mut App, code: KeyCode) {
 }
 
 fn handle_monitor(app: &mut App, code: KeyCode) {
-    if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
-        app.should_quit = true;
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('s') => app.open_save_model(),
+        KeyCode::Char('r') if app.monitor.done => app.request_restart(),
+        _ => {}
+    }
+}
+
+fn handle_save_model(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            // Cancel – go back to the monitor.
+            app.screen = Screen::Monitor;
+        }
+        KeyCode::Enter => match app.finish_save_model() {
+            Ok(path) => {
+                app.monitor.save_status = Some(format!("Saved → {path}"));
+                app.screen = Screen::Monitor;
+            }
+            Err(e) => {
+                app.save_model.error = Some(e);
+            }
+        },
+        KeyCode::Backspace => app.handle_backspace_save_model(),
+        KeyCode::Char(c) => app.handle_char_save_model(c),
+        _ => {}
     }
 }
