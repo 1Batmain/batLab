@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bat_building::tui::{
-    self, ActivationMethod, LayerDraft, ModelConfig, PaddingMode, RunMode, TrainingConfig,
+    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, RunMode,
+    TrainingConfig,
 };
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, Dim3, FullyConnectedType,
@@ -35,30 +36,42 @@ fn main() {
         Ok(c) => c,
         Err(_) => return,
     };
-    if let Err(err) = tui::storage::save_model_config(&config) {
-        eprintln!("failed to save model config: {err}");
-        return;
-    }
 
     match config.run.mode.clone() {
-        RunMode::Train(train_cfg) => {
-            let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
-            let config_clone = config.clone();
-
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-                rt.block_on(async {
-                    if let Err(message) = run_training(config_clone, train_cfg, &tx).await {
-                        let _ = tx.send(tui::TrainingEvent::Error { message });
-                        let _ = tx.send(tui::TrainingEvent::Done);
-                    }
-                });
-            });
-
-            tui::run_monitor(config, rx).ok();
+        RunMode::Train(_) => {
+            run_training_loop(config);
         }
         RunMode::Infer => {
             println!("Inference mode — not yet implemented.");
+        }
+    }
+}
+
+fn run_training_loop(mut config: ModelConfig) {
+    loop {
+        let train_cfg = match &config.run.mode {
+            RunMode::Train(tc) => tc.clone(),
+            RunMode::Infer => break,
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
+        let config_clone = config.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                if let Err(message) = run_training(config_clone, train_cfg, &tx).await {
+                    let _ = tx.send(tui::TrainingEvent::Error { message });
+                    let _ = tx.send(tui::TrainingEvent::Done);
+                }
+            });
+        });
+
+        match tui::run_monitor(config.clone(), rx) {
+            Ok(MonitorOutcome::Restart(new_config)) => {
+                config = new_config;
+            }
+            _ => break,
         }
     }
 }

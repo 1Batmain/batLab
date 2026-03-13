@@ -372,6 +372,86 @@ impl LayerDraft {
     }
 }
 
+/// Return a copy of `layer` with `dim_input` replaced by `new_input`.
+fn update_layer_dim_input(layer: &LayerDraft, new_input: (u32, u32, u32)) -> LayerDraft {
+    match layer {
+        LayerDraft::Convolution {
+            nb_kernel,
+            dim_kernel,
+            stride,
+            padding,
+            save_key,
+            ..
+        } => {
+            let kc = new_input.2;
+            LayerDraft::Convolution {
+                dim_input: new_input,
+                nb_kernel: *nb_kernel,
+                dim_kernel: (dim_kernel.0, dim_kernel.1, kc),
+                stride: *stride,
+                padding: padding.clone(),
+                save_key: save_key.clone(),
+            }
+        }
+        LayerDraft::Activation {
+            method, save_key, ..
+        } => LayerDraft::Activation {
+            dim_input: new_input,
+            method: method.clone(),
+            save_key: save_key.clone(),
+        },
+        LayerDraft::GroupNorm {
+            num_groups,
+            save_key,
+            ..
+        } => LayerDraft::GroupNorm {
+            dim_input: new_input,
+            num_groups: *num_groups,
+            save_key: save_key.clone(),
+        },
+        LayerDraft::FullyConnected {
+            nb_neurons,
+            method,
+            save_key,
+            ..
+        } => LayerDraft::FullyConnected {
+            dim_input: new_input,
+            nb_neurons: *nb_neurons,
+            method: method.clone(),
+            save_key: save_key.clone(),
+        },
+        LayerDraft::UpsampleConv {
+            scale_factor,
+            nb_kernel,
+            dim_kernel,
+            padding,
+            save_key,
+            ..
+        } => {
+            let kc = new_input.2;
+            LayerDraft::UpsampleConv {
+                dim_input: new_input,
+                scale_factor: *scale_factor,
+                nb_kernel: *nb_kernel,
+                dim_kernel: (dim_kernel.0, dim_kernel.1, kc),
+                padding: padding.clone(),
+                save_key: save_key.clone(),
+            }
+        }
+        LayerDraft::Concat {
+            dim_skip,
+            skip_key,
+            save_key,
+            ..
+        } => LayerDraft::Concat {
+            dim_input: new_input,
+            dim_skip: *dim_skip,
+            skip_key: skip_key.clone(),
+            save_key: save_key.clone(),
+        },
+    }
+}
+
 fn display_save_key(save_key: &Option<String>) -> String {
     save_key
         .as_ref()
@@ -461,6 +541,7 @@ pub enum Screen {
     ModeSelector,
     TrainingParams,
     Monitor,
+    SaveModel,
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +573,18 @@ pub struct LayerBuilderState {
     pub field_idx: usize,
     pub model_input: (u32, u32, u32),
     pub error: Option<String>,
+    /// Whether we are adding, browsing, or editing a layer.
+    pub mode: LayerBuilderMode,
+    /// The currently selected (highlighted) layer index when in Browse/Edit mode.
+    pub browse_selected: usize,
+}
+
+/// The operational mode of the layer builder screen.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerBuilderMode {
+    Add,
+    Browse,
+    Edit,
 }
 
 pub struct ModeSelectorState {
@@ -509,12 +602,28 @@ pub struct TrainingParamsState {
 pub const TRAINING_PARAM_FIELD_NAMES: [&str; 4] =
     ["Learning Rate", "Batch Size", "Steps", "Dataset Path"];
 
+#[derive(Default)]
 pub struct MonitorState {
     pub step: usize,
     pub loss_history: Vec<f64>,
     pub done: bool,
     pub total_steps: usize,
     pub last_sample_path: Option<String>,
+    pub error: Option<String>,
+    /// Set to `true` when the user requests a new training run.
+    pub restart_training: bool,
+    /// Set after the user successfully saves the model config.
+    pub save_status: Option<String>,
+    /// The model config currently being monitored (used when saving).
+    pub model_config: Option<ModelConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Save Model screen state
+// ---------------------------------------------------------------------------
+
+pub struct SaveModelState {
+    pub name: String,
     pub error: Option<String>,
 }
 
@@ -531,6 +640,7 @@ pub struct App {
     pub mode_selector: ModeSelectorState,
     pub training_params: TrainingParamsState,
     pub monitor: MonitorState,
+    pub save_model: SaveModelState,
     pub run_config: Option<RunConfig>,
     pub should_quit: bool,
 }
@@ -658,6 +768,8 @@ impl App {
                 field_idx: 0,
                 model_input: (28, 28, 1),
                 error: None,
+                mode: LayerBuilderMode::Add,
+                browse_selected: 0,
             },
             mode_selector: ModeSelectorState { selected: 1 },
             training_params: TrainingParamsState {
@@ -673,6 +785,13 @@ impl App {
                 done: false,
                 total_steps: 0,
                 last_sample_path: None,
+                error: None,
+                restart_training: false,
+                save_status: None,
+                model_config: None,
+            },
+            save_model: SaveModelState {
+                name: String::new(),
                 error: None,
             },
             run_config: None,
@@ -902,9 +1021,43 @@ impl App {
     }
 
     pub fn try_add_layer(&mut self) -> Result<(), String> {
+        let inferred = self.inferred_input();
+        let draft = self.build_draft_from_form(inferred, None)?;
+        self.layer_builder.layers.push(draft);
+        self.layer_builder.error = None;
+        self.reset_layer_form();
+        Ok(())
+    }
+
+    pub fn delete_last_layer(&mut self) {
+        self.layer_builder.layers.pop();
+        self.reset_layer_form();
+    }
+
+    // --- Layer editing helpers ---
+
+    /// Compute the inferred input dimensions for a layer at a given index
+    /// (i.e. the output dims of the previous layer, or model_input for index 0).
+    pub fn inferred_input_for(&self, idx: usize) -> (u32, u32, u32) {
+        if idx == 0 {
+            self.layer_builder.model_input
+        } else {
+            compute_inferred_input(
+                &self.layer_builder.layers[..idx],
+                self.layer_builder.model_input,
+            )
+        }
+    }
+
+    /// Reconstruct a `LayerDraft` from the current form fields using the provided
+    /// `inferred` input dims and optionally excluding a save key from the duplicate check.
+    fn build_draft_from_form(
+        &self,
+        inferred: (u32, u32, u32),
+        exclude_save_key: Option<&str>,
+    ) -> Result<LayerDraft, String> {
         let names = self.layer_field_names();
         let fields = self.layer_builder.fields.clone();
-        let inferred = self.inferred_input();
 
         let parse_u32 = |name: &str| -> Result<u32, String> {
             let idx = names
@@ -922,19 +1075,20 @@ impl App {
             };
             let save_key = normalize_key(&fields[idx]);
             if let Some(ref key) = save_key {
-                if existing_saved.contains_key(key) {
+                // Allow reusing the same key that was already on this layer (editing).
+                if Some(key.as_str()) != exclude_save_key && existing_saved.contains_key(key) {
                     return Err(format!("Save key '{key}' already exists"));
                 }
             }
             Ok(save_key)
         };
 
-        let draft = match self.layer_builder.current_kind {
+        match self.layer_builder.current_kind {
             LayerKind::Convolution => {
                 let nb_kernel = parse_u32("Num Kernels")?;
                 let kw = parse_u32("Kernel W")?;
                 let kh = parse_u32("Kernel H")?;
-                let kc = inferred.2; // always inferred from input depth
+                let kc = inferred.2;
                 let stride = parse_u32("Stride")?;
                 if stride == 0 {
                     return Err("Stride must be > 0".into());
@@ -945,14 +1099,14 @@ impl App {
                 } else {
                     PaddingMode::Valid
                 };
-                LayerDraft::Convolution {
+                Ok(LayerDraft::Convolution {
                     dim_input: inferred,
                     nb_kernel,
                     dim_kernel: (kw, kh, kc),
                     stride,
                     padding,
                     save_key: parse_save_key()?,
-                }
+                })
             }
             LayerKind::GroupNorm => {
                 let num_groups = parse_u32("Groups")?;
@@ -962,20 +1116,20 @@ impl App {
                         inferred.2
                     ));
                 }
-                LayerDraft::GroupNorm {
+                Ok(LayerDraft::GroupNorm {
                     dim_input: inferred,
                     num_groups,
                     save_key: parse_save_key()?,
-                }
+                })
             }
             LayerKind::Activation => {
                 let method = ActivationMethod::from_label(&fields[0])
                     .ok_or_else(|| format!("Unknown activation method '{}'", fields[0]))?;
-                LayerDraft::Activation {
+                Ok(LayerDraft::Activation {
                     dim_input: inferred,
                     method,
                     save_key: parse_save_key()?,
-                }
+                })
             }
             LayerKind::FullyConnected => {
                 let nb_neurons = parse_u32("Neurons")?;
@@ -985,12 +1139,12 @@ impl App {
                 let method_idx = names.iter().position(|&n| n == "Method").unwrap();
                 let method = ActivationMethod::from_label(&fields[method_idx])
                     .ok_or_else(|| format!("Unknown activation method '{}'", fields[method_idx]))?;
-                LayerDraft::FullyConnected {
+                Ok(LayerDraft::FullyConnected {
                     dim_input: inferred,
                     nb_neurons,
                     method,
                     save_key: parse_save_key()?,
-                }
+                })
             }
             LayerKind::UpsampleConv => {
                 let scale_factor = parse_u32("Scale")?;
@@ -1007,14 +1161,14 @@ impl App {
                 } else {
                     PaddingMode::Valid
                 };
-                LayerDraft::UpsampleConv {
+                Ok(LayerDraft::UpsampleConv {
                     dim_input: inferred,
                     scale_factor,
                     nb_kernel,
                     dim_kernel: (kw, kh, kc),
                     padding,
                     save_key: parse_save_key()?,
-                }
+                })
             }
             LayerKind::Concat => {
                 let skip_idx = names.iter().position(|&n| n == "Skip Key").unwrap();
@@ -1030,24 +1184,232 @@ impl App {
                         inferred.0, inferred.1, dim_skip.0, dim_skip.1
                     ));
                 }
-                LayerDraft::Concat {
+                Ok(LayerDraft::Concat {
                     dim_input: inferred,
                     dim_skip,
                     skip_key,
                     save_key: parse_save_key()?,
-                }
+                })
             }
-        };
+        }
+    }
 
-        self.layer_builder.layers.push(draft);
+    /// Rebuild `dim_input` for all layers starting from `start_idx` so that the
+    /// chain stays consistent after an edit.  Invalid Concat spatial mismatches are
+    /// left in place so the user can see and correct them.
+    fn rebuild_layer_dims_from(&mut self, start_idx: usize) {
+        for i in start_idx..self.layer_builder.layers.len() {
+            let new_input = if i == 0 {
+                self.layer_builder.model_input
+            } else {
+                self.layer_builder.layers[i - 1].output_dims()
+            };
+            self.layer_builder.layers[i] =
+                update_layer_dim_input(&self.layer_builder.layers[i], new_input);
+        }
+    }
+
+    /// Populate the form fields from an existing layer so the user can edit it.
+    pub fn populate_form_from_layer(&mut self, idx: usize) {
+        let layer = self.layer_builder.layers[idx].clone();
+        self.layer_builder.current_kind = match &layer {
+            LayerDraft::Convolution { .. } => LayerKind::Convolution,
+            LayerDraft::Activation { .. } => LayerKind::Activation,
+            LayerDraft::GroupNorm { .. } => LayerKind::GroupNorm,
+            LayerDraft::FullyConnected { .. } => LayerKind::FullyConnected,
+            LayerDraft::UpsampleConv { .. } => LayerKind::UpsampleConv,
+            LayerDraft::Concat { .. } => LayerKind::Concat,
+        };
+        self.layer_builder.fields = match &layer {
+            LayerDraft::Convolution {
+                nb_kernel,
+                dim_kernel,
+                stride,
+                padding,
+                save_key,
+                ..
+            } => vec![
+                nb_kernel.to_string(),
+                dim_kernel.0.to_string(),
+                dim_kernel.1.to_string(),
+                stride.to_string(),
+                padding.to_string(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+            LayerDraft::Activation {
+                method, save_key, ..
+            } => vec![
+                method.to_string(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+            LayerDraft::GroupNorm {
+                num_groups,
+                save_key,
+                ..
+            } => vec![
+                num_groups.to_string(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+            LayerDraft::FullyConnected {
+                nb_neurons,
+                method,
+                save_key,
+                ..
+            } => vec![
+                nb_neurons.to_string(),
+                method.to_string(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+            LayerDraft::UpsampleConv {
+                scale_factor,
+                nb_kernel,
+                dim_kernel,
+                padding,
+                save_key,
+                ..
+            } => vec![
+                scale_factor.to_string(),
+                nb_kernel.to_string(),
+                dim_kernel.0.to_string(),
+                dim_kernel.1.to_string(),
+                padding.to_string(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+            LayerDraft::Concat {
+                skip_key, save_key, ..
+            } => vec![
+                skip_key.clone(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+        };
+        self.layer_builder.field_idx = 0;
         self.layer_builder.error = None;
+    }
+
+    // --- Browse / Edit mode transitions ---
+
+    pub fn enter_browse_mode(&mut self) {
+        if self.layer_builder.layers.is_empty() {
+            return;
+        }
+        self.layer_builder.mode = LayerBuilderMode::Browse;
+        self.layer_builder.browse_selected = self
+            .layer_builder
+            .browse_selected
+            .min(self.layer_builder.layers.len().saturating_sub(1));
+        self.layer_builder.error = None;
+    }
+
+    pub fn exit_browse_mode(&mut self) {
+        self.layer_builder.mode = LayerBuilderMode::Add;
         self.reset_layer_form();
+    }
+
+    pub fn enter_edit_mode(&mut self) {
+        if self.layer_builder.layers.is_empty() {
+            return;
+        }
+        let idx = self.layer_builder.browse_selected;
+        self.populate_form_from_layer(idx);
+        self.layer_builder.mode = LayerBuilderMode::Edit;
+    }
+
+    pub fn cancel_edit(&mut self) {
+        self.layer_builder.mode = LayerBuilderMode::Browse;
+        self.layer_builder.error = None;
+    }
+
+    pub fn confirm_layer_edit(&mut self) -> Result<(), String> {
+        let idx = self.layer_builder.browse_selected;
+        let inferred = self.inferred_input_for(idx);
+        // Find the current save key of the layer being edited so we don't flag it as duplicate.
+        let existing_key = self.layer_builder.layers[idx]
+            .save_key()
+            .map(|s| s.to_string());
+        let draft = self.build_draft_from_form(inferred, existing_key.as_deref())?;
+        self.layer_builder.layers[idx] = draft;
+        self.rebuild_layer_dims_from(idx + 1);
+        self.layer_builder.error = None;
+        self.layer_builder.mode = LayerBuilderMode::Browse;
         Ok(())
     }
 
-    pub fn delete_last_layer(&mut self) {
-        self.layer_builder.layers.pop();
-        self.reset_layer_form();
+    pub fn browse_move_up(&mut self) {
+        if self.layer_builder.browse_selected > 0 {
+            self.layer_builder.browse_selected -= 1;
+        }
+    }
+
+    pub fn browse_move_down(&mut self) {
+        if self.layer_builder.layers.is_empty() {
+            return;
+        }
+        let last = self.layer_builder.layers.len() - 1;
+        if self.layer_builder.browse_selected < last {
+            self.layer_builder.browse_selected += 1;
+        }
+    }
+
+    pub fn delete_selected_layer(&mut self) {
+        if self.layer_builder.layers.is_empty() {
+            return;
+        }
+        let idx = self.layer_builder.browse_selected;
+        self.layer_builder.layers.remove(idx);
+        self.rebuild_layer_dims_from(idx);
+        if self.layer_builder.layers.is_empty() {
+            self.exit_browse_mode();
+        } else {
+            self.layer_builder.browse_selected =
+                idx.min(self.layer_builder.layers.len().saturating_sub(1));
+        }
+    }
+
+    // --- Save model ---
+
+    pub fn open_save_model(&mut self) {
+        let default_name = storage::next_model_name().unwrap_or_else(|_| "model-001".to_string());
+        self.save_model.name = default_name;
+        self.save_model.error = None;
+        self.screen = Screen::SaveModel;
+    }
+
+    /// Save the current model config with the name stored in `save_model.name`.
+    /// Returns the saved path as a string on success.
+    pub fn finish_save_model(&mut self) -> Result<String, String> {
+        let config = self
+            .monitor
+            .model_config
+            .as_ref()
+            .ok_or_else(|| "No model config available".to_string())?
+            .clone();
+        let name = self.save_model.name.trim().to_string();
+        if name.is_empty() {
+            return Err("Name must not be empty".to_string());
+        }
+        if name.contains('/') || name.contains('\\') {
+            return Err("Name must not contain path separators".to_string());
+        }
+        storage::save_model_config_named(&config, &name)
+            .map_err(|err| err.to_string())
+            .map(|path| path.display().to_string())
+    }
+
+    pub fn handle_char_save_model(&mut self, c: char) {
+        if !c.is_control() {
+            self.save_model.name.push(c);
+            self.save_model.error = None;
+        }
+    }
+
+    pub fn handle_backspace_save_model(&mut self) {
+        self.save_model.name.pop();
+    }
+
+    // --- Monitor restart ---
+
+    pub fn request_restart(&mut self) {
+        self.monitor.restart_training = true;
     }
 
     pub fn cycle_kind_forward(&mut self) {

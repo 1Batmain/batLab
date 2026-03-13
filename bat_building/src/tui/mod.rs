@@ -12,6 +12,15 @@ pub use events::TrainingEvent;
 use std::io;
 use std::sync::mpsc::Receiver;
 
+/// Outcome returned by [`run_monitor`].
+pub enum MonitorOutcome {
+    /// The user quit without requesting a new training run.
+    Done,
+    /// The user pressed `[r]` and configured a new training run.
+    /// The returned [`ModelConfig`] should be used to start the next run.
+    Restart(ModelConfig),
+}
+
 pub fn run() -> Result<ModelConfig, Box<dyn std::error::Error>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -68,7 +77,7 @@ fn run_builder_loop(
 pub fn run_monitor(
     config: ModelConfig,
     rx: Receiver<TrainingEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<MonitorOutcome, Box<dyn std::error::Error>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
@@ -77,13 +86,14 @@ pub fn run_monitor(
 
     let mut app = App::new();
     app.screen = Screen::Monitor;
-    app.layer_builder.layers = config.layers;
+    app.layer_builder.layers = config.layers.clone();
     app.layer_builder.model_input = config.input_size;
+    app.monitor.model_config = Some(config.clone());
     if let RunMode::Train(ref tc) = config.run.mode {
         app.monitor.total_steps = tc.steps;
     }
 
-    let result = run_monitor_loop(&mut terminal, &mut app, rx);
+    let outcome = run_monitor_session(&mut terminal, &mut app, rx);
 
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -92,7 +102,30 @@ pub fn run_monitor(
     )?;
     terminal.show_cursor()?;
 
-    result
+    outcome
+}
+
+fn run_monitor_session(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    rx: Receiver<TrainingEvent>,
+) -> Result<MonitorOutcome, Box<dyn std::error::Error>> {
+    run_monitor_loop(terminal, app, rx)?;
+
+    if app.monitor.restart_training {
+        // Reset to training-params screen with the same architecture so the user
+        // can tweak hyperparameters and start a new run.
+        app.screen = Screen::TrainingParams;
+        app.monitor = Default::default();
+        app.should_quit = false;
+
+        match run_builder_loop(terminal, app) {
+            Ok(new_config) => return Ok(MonitorOutcome::Restart(new_config)),
+            Err(_) => {}
+        }
+    }
+
+    Ok(MonitorOutcome::Done)
 }
 
 fn run_monitor_loop(
@@ -137,7 +170,7 @@ fn run_monitor_loop(
             }
         }
 
-        if app.should_quit {
+        if app.should_quit || app.monitor.restart_training {
             break;
         }
     }
