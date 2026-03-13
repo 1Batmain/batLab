@@ -653,10 +653,7 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
             .cloned()
             .fold(f64::NEG_INFINITY, f64::max)
             .max(1e-10);
-        window
-            .iter()
-            .map(|v| ((v / max) * 100.0) as u64)
-            .collect()
+        window.iter().map(|v| ((v / max) * 100.0) as u64).collect()
     };
 
     let sparkline = Sparkline::default()
@@ -667,9 +664,7 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Analytics ");
+    let block = Block::default().borders(Borders::ALL).title(" Analytics ");
 
     let history = &app.monitor.loss_history;
     let current_loss = history.last().copied();
@@ -679,8 +674,7 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
     // Trend: compare average of the last 10 % of samples to the first 10 %.
     let trend = if history.len() >= 10 {
         let window = (history.len() / 10).max(1);
-        let recent: f64 =
-            history[history.len() - window..].iter().sum::<f64>() / window as f64;
+        let recent: f64 = history[history.len() - window..].iter().sum::<f64>() / window as f64;
         let early: f64 = history[..window].iter().sum::<f64>() / window as f64;
         if recent < early * 0.99 {
             "\u{2193} Improving"
@@ -694,27 +688,22 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Extract hyper-parameters from the stored config when available.
-    let (lr_str, batch_str, loss_fn_str) =
-        if let Some(config) = &app.monitor.model_config {
-            if let RunMode::Train(ref tc) = config.run.mode {
-                (
-                    format!("{}", tc.lr),
-                    format!("{}", tc.batch_size),
-                    tc.loss.to_string(),
-                )
-            } else {
-                ("—".into(), "—".into(), "—".into())
-            }
+    let (lr_str, batch_str, loss_fn_str) = if let Some(config) = &app.monitor.model_config {
+        if let RunMode::Train(ref tc) = config.run.mode {
+            (
+                format!("{}", tc.lr),
+                format!("{}", tc.batch_size),
+                tc.loss.to_string(),
+            )
         } else {
             ("—".into(), "—".into(), "—".into())
-        };
+        }
+    } else {
+        ("—".into(), "—".into(), "—".into())
+    };
 
     let step_str = if app.monitor.total_steps > 0 {
-        format!(
-            "{}/{}",
-            app.monitor.step + 1,
-            app.monitor.total_steps
-        )
+        format!("{}/{}", app.monitor.step + 1, app.monitor.total_steps)
     } else {
         format!("{}", app.monitor.step + 1)
     };

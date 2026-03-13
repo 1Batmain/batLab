@@ -66,6 +66,7 @@ fn run_builder_loop(
 
         if let Some(run) = app.run_config.take() {
             return Ok(ModelConfig {
+                model_name: app.active_model_name.clone(),
                 input_size: app.layer_builder.model_input,
                 layers: app.layer_builder.layers.clone(),
                 run,
@@ -88,6 +89,7 @@ pub fn run_monitor(
     app.screen = Screen::Monitor;
     app.layer_builder.layers = config.layers.clone();
     app.layer_builder.model_input = config.input_size;
+    app.active_model_name = config.model_name.clone();
     app.monitor.model_config = Some(config.clone());
     if let RunMode::Train(ref tc) = config.run.mode {
         app.monitor.total_steps = tc.steps;

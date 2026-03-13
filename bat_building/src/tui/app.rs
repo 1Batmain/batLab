@@ -512,6 +512,8 @@ pub struct RunConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    #[serde(default)]
+    pub model_name: Option<String>,
     pub input_size: (u32, u32, u32),
     pub layers: Vec<LayerDraft>,
     pub run: RunConfig,
@@ -642,6 +644,7 @@ pub struct App {
     pub monitor: MonitorState,
     pub save_model: SaveModelState,
     pub run_config: Option<RunConfig>,
+    pub active_model_name: Option<String>,
     pub should_quit: bool,
 }
 
@@ -795,6 +798,7 @@ impl App {
                 error: None,
             },
             run_config: None,
+            active_model_name: None,
             should_quit: false,
         };
         app.sync_selected_dataset_from_field();
@@ -836,6 +840,7 @@ impl App {
     }
 
     fn apply_loaded_model(&mut self, config: ModelConfig) {
+        self.active_model_name = config.model_name.clone();
         self.layer_builder.model_input = config.input_size;
         self.input_size.fields = vec![
             config.input_size.0.to_string(),
@@ -1024,6 +1029,7 @@ impl App {
         let inferred = self.inferred_input();
         let draft = self.build_draft_from_form(inferred, None)?;
         self.layer_builder.layers.push(draft);
+        self.active_model_name = None;
         self.layer_builder.error = None;
         self.reset_layer_form();
         Ok(())
@@ -1031,6 +1037,7 @@ impl App {
 
     pub fn delete_last_layer(&mut self) {
         self.layer_builder.layers.pop();
+        self.active_model_name = None;
         self.reset_layer_form();
     }
 
@@ -1328,6 +1335,7 @@ impl App {
             .map(|s| s.to_string());
         let draft = self.build_draft_from_form(inferred, existing_key.as_deref())?;
         self.layer_builder.layers[idx] = draft;
+        self.active_model_name = None;
         self.rebuild_layer_dims_from(idx + 1);
         self.layer_builder.error = None;
         self.layer_builder.mode = LayerBuilderMode::Browse;
@@ -1356,6 +1364,7 @@ impl App {
         }
         let idx = self.layer_builder.browse_selected;
         self.layer_builder.layers.remove(idx);
+        self.active_model_name = None;
         self.rebuild_layer_dims_from(idx);
         if self.layer_builder.layers.is_empty() {
             self.exit_browse_mode();
@@ -1377,7 +1386,7 @@ impl App {
     /// Save the current model config with the name stored in `save_model.name`.
     /// Returns the saved path as a string on success.
     pub fn finish_save_model(&mut self) -> Result<String, String> {
-        let config = self
+        let mut config = self
             .monitor
             .model_config
             .as_ref()
@@ -1390,9 +1399,14 @@ impl App {
         if name.contains('/') || name.contains('\\') {
             return Err("Name must not contain path separators".to_string());
         }
+        config.model_name = Some(name.clone());
         storage::save_model_config_named(&config, &name)
             .map_err(|err| err.to_string())
-            .map(|path| path.display().to_string())
+            .map(|path| {
+                self.active_model_name = Some(name.clone());
+                self.monitor.model_config = Some(config);
+                path.display().to_string()
+            })
     }
 
     pub fn handle_char_save_model(&mut self, c: char) {
@@ -1526,6 +1540,7 @@ impl App {
         if w == 0 || h == 0 || c == 0 {
             return Err("Dimensions must be > 0".into());
         }
+        self.active_model_name = None;
         self.layer_builder.model_input = (w, h, c);
         self.layer_builder.layers.clear();
         self.reset_layer_form();

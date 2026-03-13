@@ -7,8 +7,12 @@ use crate::model::types::Dim3;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use wgpu::Buffer;
+
+const CHECKPOINT_MAGIC: &[u8; 7] = b"BBCKPT1";
 
 // ---------------------------------------------------------------------------
 // State markers
@@ -205,6 +209,17 @@ impl Model<Training> {
         self.read_last_loss()
     }
 
+    pub(crate) fn train_step_with_prepass<F>(&mut self, prepass: F)
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder),
+    {
+        debug_assert!(self.state.is_build, "call build() before train_step()");
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        prepass(&mut encoder);
+        self.encode_train_graph(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+    }
+
     fn run_train_step(&mut self, input: &[f32], target: &[f32]) {
         debug_assert!(self.state.is_build, "call build() before train_step()");
 
@@ -287,6 +302,180 @@ impl<State> Model<State> {
 
     pub fn output_dim(&self) -> Option<Dim3> {
         self.layers.last().map(|layer| layer.ty.get_dim_output())
+    }
+
+    pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<(), ModelError> {
+        if !self.state.is_build {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: "model must be built before saving checkpoint".to_string(),
+            });
+        }
+
+        #[derive(Debug)]
+        struct Entry {
+            layer_index: u32,
+            weights: Vec<f32>,
+            bias: Vec<f32>,
+        }
+
+        let mut entries = Vec::new();
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let Some(bindings) = layer.ty.get_optimizer_bindings() else {
+                continue;
+            };
+            let weights_buf = layer
+                .buffers
+                .forward
+                .get(bindings.weights_forward_index)
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "missing weights buffer".to_string(),
+                })?;
+            let bias_buf = layer
+                .buffers
+                .forward
+                .get(bindings.bias_forward_index)
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "missing bias buffer".to_string(),
+                })?;
+
+            let weights = read_back_f32(self.gpu.as_ref(), weights_buf, weights_buf.size())
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "weights buffer is not readable from GPU".to_string(),
+                })?;
+            let bias =
+                read_back_f32(self.gpu.as_ref(), bias_buf, bias_buf.size()).ok_or_else(|| {
+                    ModelError::CheckpointLayerMismatch {
+                        layer_index,
+                        message: "bias buffer is not readable from GPU".to_string(),
+                    }
+                })?;
+            entries.push(Entry {
+                layer_index: layer_index as u32,
+                weights,
+                bias,
+            });
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry.layer_index.to_le_bytes());
+            bytes.extend_from_slice(&(entry.weights.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(bytemuck::cast_slice(&entry.weights));
+            bytes.extend_from_slice(&(entry.bias.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(bytemuck::cast_slice(&entry.bias));
+        }
+
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ModelError::CheckpointIo {
+                path: parent.display().to_string(),
+                message: err.to_string(),
+            })?;
+        }
+        fs::write(path, bytes).map_err(|err| ModelError::CheckpointIo {
+            path: path.display().to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    pub fn load_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<(), ModelError> {
+        if !self.state.is_build {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: "model must be built before loading checkpoint".to_string(),
+            });
+        }
+
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|err| ModelError::CheckpointIo {
+            path: path.display().to_string(),
+            message: err.to_string(),
+        })?;
+        if bytes.len() < CHECKPOINT_MAGIC.len() + 4
+            || &bytes[..CHECKPOINT_MAGIC.len()] != CHECKPOINT_MAGIC
+        {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: "missing or invalid checkpoint magic".to_string(),
+            });
+        }
+
+        let mut offset = CHECKPOINT_MAGIC.len();
+        let entry_count = read_u32_le(&bytes, &mut offset)? as usize;
+        for _ in 0..entry_count {
+            let layer_index = read_u32_le(&bytes, &mut offset)? as usize;
+            let weight_len = read_u32_le(&bytes, &mut offset)? as usize;
+            let weights = read_f32_vec_le(&bytes, &mut offset, weight_len)?;
+            let bias_len = read_u32_le(&bytes, &mut offset)? as usize;
+            let bias = read_f32_vec_le(&bytes, &mut offset, bias_len)?;
+
+            let layer = self.layers.get(layer_index).ok_or_else(|| {
+                ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "layer index not found in model".to_string(),
+                }
+            })?;
+            let bindings = layer.ty.get_optimizer_bindings().ok_or_else(|| {
+                ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "layer has no trainable parameters".to_string(),
+                }
+            })?;
+            let weights_buf = layer
+                .buffers
+                .forward
+                .get(bindings.weights_forward_index)
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "missing weights buffer".to_string(),
+                })?;
+            let bias_buf = layer
+                .buffers
+                .forward
+                .get(bindings.bias_forward_index)
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "missing bias buffer".to_string(),
+                })?;
+
+            let expected_weights = (weights_buf.size() as usize) / std::mem::size_of::<f32>();
+            let expected_bias = (bias_buf.size() as usize) / std::mem::size_of::<f32>();
+            if weights.len() != expected_weights {
+                return Err(ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: format!(
+                        "weights length mismatch (expected {expected_weights}, got {})",
+                        weights.len()
+                    ),
+                });
+            }
+            if bias.len() != expected_bias {
+                return Err(ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: format!(
+                        "bias length mismatch (expected {expected_bias}, got {})",
+                        bias.len()
+                    ),
+                });
+            }
+
+            self.gpu
+                .queue
+                .write_buffer(weights_buf.as_ref(), 0, bytemuck::cast_slice(&weights));
+            self.gpu
+                .queue
+                .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(&bias));
+        }
+
+        if offset != bytes.len() {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: "checkpoint has trailing bytes".to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn predict(&mut self, input: &[f32]) -> Vec<f32> {
@@ -401,6 +590,38 @@ impl<State> Model<State> {
     }
 }
 
+fn read_u32_le(bytes: &[u8], offset: &mut usize) -> Result<u32, ModelError> {
+    let end = offset.saturating_add(4);
+    if end > bytes.len() {
+        return Err(ModelError::InvalidCheckpointFormat {
+            message: "unexpected end of checkpoint while reading u32".to_string(),
+        });
+    }
+    let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
+}
+
+fn read_f32_vec_le(bytes: &[u8], offset: &mut usize, len: usize) -> Result<Vec<f32>, ModelError> {
+    let byte_len = len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        ModelError::InvalidCheckpointFormat {
+            message: "overflow while reading f32 vector".to_string(),
+        }
+    })?;
+    let end = offset.saturating_add(byte_len);
+    if end > bytes.len() {
+        return Err(ModelError::InvalidCheckpointFormat {
+            message: "unexpected end of checkpoint while reading f32 vector".to_string(),
+        });
+    }
+    let mut values = Vec::with_capacity(len);
+    for chunk in bytes[*offset..end].chunks_exact(4) {
+        values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    *offset = end;
+    Ok(values)
+}
+
 // ---------------------------------------------------------------------------
 // Custom Debug for Model<State>
 // ---------------------------------------------------------------------------
@@ -446,6 +667,7 @@ mod tests {
         ActivationMethod, ActivationType, GroupNormType, LayerTypes, LossMethod,
     };
     use crate::model::types::Dim3;
+    use std::fs;
     use std::sync::Arc;
 
     #[test]
@@ -503,6 +725,57 @@ mod tests {
             assert!((output[1] - 1.0).abs() < 1e-3);
             assert!((output[2] + 1.0).abs() < 1e-3);
             assert!((output[3] - 1.0).abs() < 1e-3);
+        });
+    }
+
+    #[test]
+    fn checkpoints_roundtrip_group_norm_parameters() {
+        pollster::block_on(async {
+            let gpu = Arc::new(GpuContext::new_headless().await);
+            let checkpoint_path = std::env::temp_dir().join(format!(
+                "bat-building-checkpoint-{}-{}.ckpt",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+
+            let mut trained =
+                Model::new_training(gpu.clone(), 0.05, 1, LossMethod::MeanSquared).await;
+            trained
+                .add_layer(LayerTypes::GroupNorm(GroupNormType::new(
+                    Dim3::new((1, 1, 4)),
+                    2,
+                )))
+                .unwrap();
+            trained.build().unwrap();
+            let input = [0.1, 0.4, -0.2, 0.8];
+            let target = [0.9, -0.7, 0.2, -0.4];
+            let _ = trained.train_step_report(&input, &target);
+            let expected_output = trained.predict(&input);
+            trained.save_checkpoint(&checkpoint_path).unwrap();
+
+            let mut restored =
+                Model::new_training(gpu.clone(), 0.05, 1, LossMethod::MeanSquared).await;
+            restored
+                .add_layer(LayerTypes::GroupNorm(GroupNormType::new(
+                    Dim3::new((1, 1, 4)),
+                    2,
+                )))
+                .unwrap();
+            restored.build().unwrap();
+            restored.load_checkpoint(&checkpoint_path).unwrap();
+            let restored_output = restored.predict(&input);
+
+            for (a, b) in expected_output.iter().zip(restored_output.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "checkpoint output mismatch: {a} vs {b}"
+                );
+            }
+
+            let _ = fs::remove_file(checkpoint_path);
         });
     }
 }

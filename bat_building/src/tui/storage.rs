@@ -58,14 +58,27 @@ pub fn next_model_name() -> io::Result<String> {
 pub fn save_model_config_named(config: &ModelConfig, name: &str) -> io::Result<PathBuf> {
     let dir = saved_models_dir()?;
     let path = dir.join(format!("{name}.json"));
-    let bytes = serde_json::to_vec_pretty(config).map_err(serde_to_io)?;
+    let mut persisted = config.clone();
+    persisted.model_name = Some(name.to_string());
+    let bytes = serde_json::to_vec_pretty(&persisted).map_err(serde_to_io)?;
     fs::write(&path, bytes)?;
     Ok(path)
 }
 
 pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {
     let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes).map_err(serde_to_io)
+    let mut config: ModelConfig = serde_json::from_slice(&bytes).map_err(serde_to_io)?;
+    if config.model_name.is_none() {
+        config.model_name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.to_string());
+    }
+    Ok(config)
+}
+
+pub fn checkpoint_path_for_model_name(name: &str) -> io::Result<PathBuf> {
+    Ok(saved_models_dir()?.join(format!("{name}.ckpt")))
 }
 
 pub fn list_saved_models() -> io::Result<Vec<SavedModelEntry>> {

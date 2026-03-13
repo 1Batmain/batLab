@@ -12,5 +12,6 @@ pub use model::{
     UpsampleConvType,
 };
 pub use training::{
-    DiffusionTask, TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups,
+    DiffusionTask, GpuDataset, GpuDatasetError, TaskPassSpec, Trainer, TrainingTask,
+    TrainingTaskError, Workgroups,
 };
