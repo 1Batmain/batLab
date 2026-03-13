@@ -7,9 +7,10 @@ use bat_building::tui::{
     self, ActivationMethod, LayerDraft, ModelConfig, PaddingMode, RunMode, TrainingConfig,
 };
 use bat_building::{
-    ActivationMethod as PActivation, ActivationType, ConvolutionType, Dim3, FullyConnectedType,
-    GpuContext, GroupNormType, LayerTypes, LinearNoiseSchedule, LossMethod as PLoss, Model,
-    PaddingMode as PPadding, UpsampleConvType, model::Training, tui::app::compute_inferred_input,
+    ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
+    FullyConnectedType, GpuContext, GroupNormType, LayerTypes, LinearNoiseSchedule,
+    LossMethod as PLoss, Model, PaddingMode as PPadding, Trainer, UpsampleConvType,
+    model::Training,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -22,12 +23,6 @@ const DIFFUSION_BETA_END: f32 = 2e-2;
 #[derive(Debug, Clone)]
 struct ImageSample {
     target: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-struct DiffusionTrainingExample {
-    input: Vec<f32>,
-    target_noise: Vec<f32>,
 }
 
 fn main() {
@@ -77,35 +72,48 @@ async fn run_training(
     }
     model.build().map_err(|err| err.to_string())?;
 
-    let output_size = compute_inferred_input(&config.layers, config.input_size);
-    validate_diffusion_layout(config.input_size, output_size)?;
-    let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
-    let sample_dir = prepare_sample_dir(&train_cfg.dataset_path)?;
-    let export_interval = train_cfg.steps.div_ceil(SAMPLE_EXPORT_COUNT.max(1));
-    let diffusion = LinearNoiseSchedule::new_linear(
+    let input_dims = model
+        .input_dim()
+        .ok_or_else(|| "model has no input dimensions".to_string())?;
+    let output_dims = model
+        .output_dim()
+        .ok_or_else(|| "model has no output dimensions".to_string())?;
+    let input_size = (input_dims.x, input_dims.y, input_dims.z);
+    let output_size = (output_dims.x, output_dims.y, output_dims.z);
+
+    let schedule = LinearNoiseSchedule::new_linear(
         DIFFUSION_SCHEDULE_STEPS,
         DIFFUSION_BETA_START,
         DIFFUSION_BETA_END,
     );
+    let mut trainer = Trainer::new(DiffusionTask::new(schedule));
+    trainer
+        .configure_for_model(&model)
+        .map_err(|err| format!("failed to configure diffusion task: {err}"))?;
+    let diffusion = trainer.task().schedule().clone();
+
+    let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
+    let sample_dir = prepare_sample_dir(&train_cfg.dataset_path)?;
+    let export_interval = train_cfg.steps.div_ceil(SAMPLE_EXPORT_COUNT.max(1));
 
     for step in 0..train_cfg.steps {
         let sample_index = step % dataset.len();
         let sample = &dataset[sample_index];
         let diffusion_step = diffusion_step_for(step, sample_index, diffusion.len());
-        let training_example = prepare_diffusion_training_example(
-            &sample.target,
-            config.input_size,
-            output_size,
-            &diffusion,
-            diffusion_step,
-            ((step as u64) << 32) ^ sample_index as u64,
-        );
-        let loss = model.train_step_report(&training_example.input, &training_example.target_noise);
+        let loss = trainer
+            .task_mut()
+            .train_step_report(
+                &mut model,
+                &sample.target,
+                diffusion_step,
+                ((step as u64) << 32) ^ sample_index as u64,
+            )
+            .map_err(|err| format!("failed diffusion GPU prepare step: {err}"))?;
 
         let sample_path = if step % export_interval == 0 || step + 1 == train_cfg.steps {
             let output = sample_diffusion_image(
                 &mut model,
-                config.input_size,
+                input_size,
                 output_size,
                 &diffusion,
                 step as u64,
@@ -361,25 +369,6 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
     tensor
 }
 
-fn validate_diffusion_layout(
-    input_dims: (u32, u32, u32),
-    output_dims: (u32, u32, u32),
-) -> Result<(), String> {
-    if input_dims.0 != output_dims.0 || input_dims.1 != output_dims.1 {
-        return Err(format!(
-            "diffusion training requires matching input/output spatial dims, got input {}x{} and output {}x{}",
-            input_dims.0, input_dims.1, output_dims.0, output_dims.1
-        ));
-    }
-    if input_dims.2 < output_dims.2 {
-        return Err(format!(
-            "diffusion training requires input channels >= output channels, got input {} and output {}",
-            input_dims.2, output_dims.2
-        ));
-    }
-    Ok(())
-}
-
 fn compose_diffusion_input(
     signal: &[f32],
     input_dims: (u32, u32, u32),
@@ -407,26 +396,6 @@ fn compose_diffusion_input(
         }
     }
     packed
-}
-
-fn prepare_diffusion_training_example(
-    clean_target: &[f32],
-    input_dims: (u32, u32, u32),
-    output_dims: (u32, u32, u32),
-    schedule: &LinearNoiseSchedule,
-    diffusion_step: usize,
-    seed: u64,
-) -> DiffusionTrainingExample {
-    let (noisy_signal, target_noise) = schedule.add_noise(clean_target, diffusion_step, seed);
-    let timestep_features = schedule.timestep_embedding(
-        diffusion_step,
-        input_dims.2.saturating_sub(output_dims.2) as usize,
-    );
-    let input = compose_diffusion_input(&noisy_signal, input_dims, output_dims, &timestep_features);
-    DiffusionTrainingExample {
-        input,
-        target_noise,
-    }
 }
 
 fn sample_diffusion_image(
