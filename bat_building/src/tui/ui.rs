@@ -1,5 +1,6 @@
 use super::app::{
-    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, Screen, TRAINING_PARAM_FIELD_NAMES,
+    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, RunMode, Screen,
+    TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -572,7 +573,7 @@ fn draw_monitor(f: &mut Frame, app: &App) {
 
     draw_monitor_architecture(f, app, horizontal[0]);
     draw_sparkline(f, app, right[0]);
-    draw_stats_table(f, app, right[1]);
+    draw_analytics(f, app, right[1]);
 
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(hint_area);
@@ -606,36 +607,53 @@ fn draw_monitor_architecture(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
+    let current_loss = app.monitor.loss_history.last().copied();
+    let loss_str = current_loss.map_or_else(|| "—".to_string(), |l| format!("{:.6}", l));
+
     let title = if app.monitor.done {
         if app.monitor.error.is_some() {
-            format!(" Loss \u{2717} Stopped at step {} ", app.monitor.step + 1)
+            format!(
+                " Loss: {}  \u{2717} Stopped at step {} ",
+                loss_str,
+                app.monitor.step + 1
+            )
         } else {
-            format!(" Loss \u{2713} Done ({} steps) ", app.monitor.step + 1)
+            format!(
+                " Loss: {}  \u{2713} Done ({} steps) ",
+                loss_str,
+                app.monitor.step + 1
+            )
         }
     } else if app.monitor.total_steps > 0 {
         format!(
-            " Loss  step {}/{} ",
+            " Loss: {}  step {}/{} ",
+            loss_str,
             app.monitor.step + 1,
             app.monitor.total_steps
         )
     } else {
-        format!(" Loss  step {} ", app.monitor.step)
+        format!(" Loss: {}  step {} ", loss_str, app.monitor.step)
     };
 
     let block = Block::default().borders(Borders::ALL).title(title);
+    // Reserve space for the borders (2 columns) when computing the visible window.
+    let max_points = (area.width.saturating_sub(2)) as usize;
 
     let data: Vec<u64> = if app.monitor.loss_history.is_empty() {
         vec![0]
     } else {
-        let max = app
-            .monitor
-            .loss_history
+        let history = &app.monitor.loss_history;
+        // Show only the most-recent `max_points` values so the chart scrolls
+        // to keep the latest iterations visible once the width is exceeded.
+        let start = history.len().saturating_sub(max_points);
+        let window = &history[start..];
+
+        let max = window
             .iter()
             .cloned()
             .fold(f64::NEG_INFINITY, f64::max)
             .max(1e-10);
-        app.monitor
-            .loss_history
+        window
             .iter()
             .map(|v| ((v / max) * 100.0) as u64)
             .collect()
@@ -648,44 +666,105 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(sparkline, area);
 }
 
-fn draw_stats_table(f: &mut Frame, app: &App, area: Rect) {
+fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Layer Stats ");
+        .title(" Analytics ");
 
-    let header = Row::new(vec!["#", "Type", "Input", "Output"])
-        .style(Style::default().add_modifier(Modifier::BOLD))
-        .height(1);
+    let history = &app.monitor.loss_history;
+    let current_loss = history.last().copied();
+    let best_loss = history.iter().cloned().reduce(f64::min);
+    let worst_loss = history.iter().cloned().reduce(f64::max);
 
-    let rows: Vec<Row> = app
-        .layer_builder
-        .layers
+    // Trend: compare average of the last 10 % of samples to the first 10 %.
+    let trend = if history.len() >= 10 {
+        let window = (history.len() / 10).max(1);
+        let recent: f64 =
+            history[history.len() - window..].iter().sum::<f64>() / window as f64;
+        let early: f64 = history[..window].iter().sum::<f64>() / window as f64;
+        if recent < early * 0.99 {
+            "\u{2193} Improving"
+        } else if recent > early * 1.01 {
+            "\u{2191} Worsening"
+        } else {
+            "\u{2192} Stable"
+        }
+    } else {
+        "—"
+    };
+
+    // Extract hyper-parameters from the stored config when available.
+    let (lr_str, batch_str, loss_fn_str) =
+        if let Some(config) = &app.monitor.model_config {
+            if let RunMode::Train(ref tc) = config.run.mode {
+                (
+                    format!("{}", tc.lr),
+                    format!("{}", tc.batch_size),
+                    tc.loss.to_string(),
+                )
+            } else {
+                ("—".into(), "—".into(), "—".into())
+            }
+        } else {
+            ("—".into(), "—".into(), "—".into())
+        };
+
+    let step_str = if app.monitor.total_steps > 0 {
+        format!(
+            "{}/{}",
+            app.monitor.step + 1,
+            app.monitor.total_steps
+        )
+    } else {
+        format!("{}", app.monitor.step + 1)
+    };
+
+    let progress_str = if app.monitor.total_steps > 0 {
+        let pct = ((app.monitor.step + 1) * 100)
+            .checked_div(app.monitor.total_steps)
+            .unwrap_or(0)
+            .min(100);
+        // Progress bar width in character cells.
+        const BAR_WIDTH: usize = 10;
+        let filled = pct * BAR_WIDTH / 100;
+        let bar: String = (0..BAR_WIDTH)
+            .map(|i| if i < filled { '\u{2588}' } else { '\u{2591}' })
+            .collect();
+        format!("{bar} {pct}%")
+    } else {
+        "—".to_string()
+    };
+
+    let format_loss = |v: Option<f64>| v.map_or_else(|| "—".to_string(), |x| format!("{:.6}", x));
+
+    let rows: &[(&str, String)] = &[
+        ("Current Loss", format_loss(current_loss)),
+        ("Best Loss   ", format_loss(best_loss)),
+        ("Worst Loss  ", format_loss(worst_loss)),
+        ("Trend       ", trend.to_string()),
+        ("Step        ", step_str),
+        ("Progress    ", progress_str),
+        ("Learning Rt ", lr_str),
+        ("Batch Size  ", batch_str),
+        ("Loss Fn     ", loss_fn_str),
+    ];
+
+    let label_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let lines: Vec<Line> = rows
         .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            Row::new(vec![
-                i.to_string(),
-                l.type_name().to_string(),
-                l.input_dim_str(),
-                l.output_dim_str(),
+        .map(|(label, value)| {
+            Line::from(vec![
+                Span::styled(format!("  {} : ", label), label_style),
+                Span::styled(value.clone(), value_style),
             ])
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(3),
-        Constraint::Length(10),
-        Constraint::Min(10),
-        Constraint::Min(10),
-    ];
-
-    f.render_widget(
-        Table::new(rows, widths)
-            .header(header)
-            .block(block)
-            .column_spacing(1),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 // ---------------------------------------------------------------------------
