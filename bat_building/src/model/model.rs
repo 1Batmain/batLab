@@ -193,6 +193,18 @@ impl Model<Training> {
         self.read_last_loss()
     }
 
+    pub(crate) fn train_step_report_with_prepass<F>(&mut self, prepass: F) -> f32
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder),
+    {
+        debug_assert!(self.state.is_build, "call build() before train_step()");
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        prepass(&mut encoder);
+        self.encode_train_graph(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+        self.read_last_loss()
+    }
+
     fn run_train_step(&mut self, input: &[f32], target: &[f32]) {
         debug_assert!(self.state.is_build, "call build() before train_step()");
 
@@ -215,26 +227,28 @@ impl Model<Training> {
             .write_buffer(loss_buf.as_ref(), 0, bytemuck::cast_slice(target));
 
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.encode_train_graph(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+    }
 
+    fn encode_train_graph(&self, encoder: &mut wgpu::CommandEncoder) {
         // Forward
         for layer in &self.layers {
-            layer.encode_pass(&mut encoder);
+            layer.encode_pass(encoder);
         }
         // Loss / initial gradient computation
-        self.loss_layer.as_ref().unwrap().encode_pass(&mut encoder);
+        self.loss_layer.as_ref().unwrap().encode_pass(encoder);
 
         // Backward (reverse order)
         for layer in self.layers.iter().rev() {
-            layer.encode_merge_pass(&mut encoder);
-            layer.encode_back_pass(&mut encoder);
+            layer.encode_merge_pass(encoder);
+            layer.encode_back_pass(encoder);
         }
 
         // SGD weight updates
         for layer in &self.layers {
-            layer.encode_opt_pass(&mut encoder);
+            layer.encode_opt_pass(encoder);
         }
-
-        self.gpu.queue.submit([encoder.finish()]);
     }
 }
 
@@ -265,6 +279,14 @@ impl<State> Model<State> {
     pub fn training_mode(&mut self, training: Option<State>) {
         self.clear();
         self.training = training;
+    }
+
+    pub fn input_dim(&self) -> Option<Dim3> {
+        self.layers.first().map(|layer| layer.ty.get_dim_input())
+    }
+
+    pub fn output_dim(&self) -> Option<Dim3> {
+        self.layers.last().map(|layer| layer.ty.get_dim_output())
     }
 
     pub fn predict(&mut self, input: &[f32]) -> Vec<f32> {
