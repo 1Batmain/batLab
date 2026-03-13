@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["parallelizer", "main", "tui"]
+members = ["bat_building", "main"]
 
 [dependencies]
-parallelizer = { path = "parallelizer" }
+bat_building = { path = "bat_building" }
 
 [lib]
 name = "bat_builder"

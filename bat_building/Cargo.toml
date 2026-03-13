@@ -1,0 +1,18 @@
+[package]
+name = "bat_building"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+bytemuck = "1.25.0"
+crossterm = "0.28"
+encase = "0.12.0"
+enum_dispatch = "0.3.13"
+futures = "0.3.32"
+pollster = "0.4.0"
+ratatui = "0.29"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+wgpu = "28.0.0"
+winit = "0.30.12"

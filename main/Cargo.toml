@@ -8,6 +8,5 @@ edition = "2024"
 image = "0.25.9"
 winit = "0.30.12"
 
-parallelizer = { path = "../parallelizer", default-features = false }
+bat_building = { path = "../bat_building", default-features = false }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
-bat-tui = { path = "../tui" }
