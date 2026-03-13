@@ -212,18 +212,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "bat-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ratatui",
-]
-
-[[package]]
 name = "batBuilder"
 version = "0.1.0"
 dependencies = [
- "parallelizer",
+ "bat_building",
+]
+
+[[package]]
+name = "bat_building"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "crossterm",
+ "encase",
+ "enum_dispatch",
+ "futures",
+ "pollster",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
@@ -1366,9 +1375,8 @@ dependencies = [
 name = "main"
 version = "0.1.0"
 dependencies = [
- "bat-tui",
+ "bat_building",
  "image",
- "parallelizer",
  "tokio",
  "winit",
 ]
@@ -1848,21 +1856,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
-]
-
-[[package]]
-name = "parallelizer"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "encase",
- "enum_dispatch",
- "futures",
- "pollster",
- "serde",
- "serde_json",
- "wgpu",
- "winit",
 ]
 
 [[package]]
