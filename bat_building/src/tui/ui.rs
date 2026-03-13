@@ -1,4 +1,6 @@
-use super::app::{App, INPUT_SIZE_FIELD_NAMES, LayerKind, Screen, TRAINING_PARAM_FIELD_NAMES};
+use super::app::{
+    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, Screen, TRAINING_PARAM_FIELD_NAMES,
+};
 use ratatui::{prelude::*, widgets::*};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -10,6 +12,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::ModeSelector => draw_mode_selector(f, app),
         Screen::TrainingParams => draw_training_params(f, app),
         Screen::Monitor => draw_monitor(f, app),
+        Screen::SaveModel => {
+            draw_monitor(f, app);
+            draw_save_model(f, app);
+        }
     }
 }
 
@@ -249,6 +255,30 @@ fn draw_input_size(f: &mut Frame, app: &App) {
 fn draw_layer_builder(f: &mut Frame, app: &App) {
     let area = f.area();
 
+    match app.layer_builder.mode {
+        LayerBuilderMode::Browse => draw_lb_browse_mode(f, app, area),
+        LayerBuilderMode::Add | LayerBuilderMode::Edit => draw_lb_add_edit_mode(f, app, area),
+    }
+}
+
+fn draw_lb_browse_mode(f: &mut Frame, app: &App, area: Rect) {
+    let vertical = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(area);
+
+    let arch_area = vertical[0];
+    let hint_area = vertical[1];
+
+    draw_lb_architecture(f, app, arch_area);
+
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(hint_area);
+    f.render_widget(block, hint_area);
+    f.render_widget(
+        hint_bar(" [up/down] navigate  [Enter] edit selected  [d] delete selected  [e/Esc] back to add  [q] quit"),
+        inner,
+    );
+}
+
+fn draw_lb_add_edit_mode(f: &mut Frame, app: &App, area: Rect) {
     let vertical = Layout::vertical([
         Constraint::Percentage(30),
         Constraint::Min(0),
@@ -266,10 +296,13 @@ fn draw_layer_builder(f: &mut Frame, app: &App) {
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(hint_area);
     f.render_widget(block, hint_area);
-    f.render_widget(
-        hint_bar(" [left/right] type  [up/down] field  [Space] toggle  [type] value/key  [Enter] add  [d] del last  [b] done  [q] quit"),
-        inner,
-    );
+
+    let hint = if app.layer_builder.mode == LayerBuilderMode::Edit {
+        " [left/right] type  [up/down] field  [Space] toggle  [type] value  [Enter] save  [Esc] cancel  [q] quit"
+    } else {
+        " [left/right] type  [up/down] field  [Space] toggle  [type] value  [Enter] add  [d] del last  [e] edit layers  [b] done  [q] quit"
+    };
+    f.render_widget(hint_bar(hint), inner);
 }
 
 fn draw_lb_architecture(f: &mut Frame, app: &App, area: Rect) {
@@ -283,11 +316,27 @@ fn draw_lb_architecture(f: &mut Frame, app: &App, area: Rect) {
     );
     let block = Block::default().borders(Borders::ALL).title(title);
 
+    let in_browse_or_edit =
+        lb.mode == LayerBuilderMode::Browse || lb.mode == LayerBuilderMode::Edit;
     let items: Vec<ListItem> = lb
         .layers
         .iter()
         .enumerate()
-        .map(|(i, l)| ListItem::new(format!("  {}: {}", i, l.display())))
+        .map(|(i, l)| {
+            let selected = in_browse_or_edit && i == lb.browse_selected;
+            let prefix = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Span::styled(
+                format!("{}{}: {}", prefix, i, l.display()),
+                style,
+            ))
+        })
         .collect();
 
     let list = List::new(items).block(block);
@@ -296,8 +345,14 @@ fn draw_lb_architecture(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
     let lb = &app.layer_builder;
-    let inferred = app.inferred_input();
-    let preview = app.preview_output();
+    let (inferred, preview) = if lb.mode == LayerBuilderMode::Edit {
+        let idx = lb.browse_selected;
+        let inf = app.inferred_input_for(idx);
+        let prev = app.preview_output();
+        (inf, prev)
+    } else {
+        (app.inferred_input(), app.preview_output())
+    };
 
     let inferred_str = format!("{}x{}x{}", inferred.0, inferred.1, inferred.2);
     let preview_str = match preview {
@@ -305,7 +360,11 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
         None => "?".to_string(),
     };
 
-    let title = format!(" Add Layer {} ", lb.layers.len());
+    let title = if lb.mode == LayerBuilderMode::Edit {
+        format!(" Edit Layer {} ", lb.browse_selected)
+    } else {
+        format!(" Add Layer {} ", lb.layers.len())
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -518,12 +577,16 @@ fn draw_monitor(f: &mut Frame, app: &App) {
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(hint_area);
     f.render_widget(block, hint_area);
-    let hint_text = if let Some(error) = &app.monitor.error {
-        format!(" error: {error} | [q] quit")
+    let hint_text = if let Some(save_status) = &app.monitor.save_status {
+        format!(" ✓ {save_status} | [s] save  [q] quit")
+    } else if let Some(error) = &app.monitor.error {
+        format!(" error: {error} | [s] save  [q] quit")
+    } else if app.monitor.done {
+        " [r] new training  [s] save model  [q] quit".to_string()
     } else if let Some(sample_path) = &app.monitor.last_sample_path {
-        format!(" sample: {sample_path} | [q] quit")
+        format!(" sample: {sample_path} | [s] save  [q] quit")
     } else {
-        " [q] quit".to_string()
+        " [s] save model  [q] quit".to_string()
     };
     f.render_widget(hint_bar(&hint_text), inner);
 }
@@ -623,4 +686,51 @@ fn draw_stats_table(f: &mut Frame, app: &App, area: Rect) {
             .column_spacing(1),
         area,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Save Model (popup over Monitor)
+// ---------------------------------------------------------------------------
+
+fn draw_save_model(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup = centered_rect(54, 30, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Save Model Config ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let cursor = "\u{2588}";
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Name : ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{}{}", app.save_model.name, cursor),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+
+    if let Some(err) = &app.save_model.error {
+        lines.push(Line::from(Span::styled(
+            format!("  \u{2717} {err}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  [type] edit name  [Enter] save  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    f.render_widget(Paragraph::new(lines), inner);
 }
