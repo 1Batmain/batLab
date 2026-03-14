@@ -139,6 +139,10 @@ impl GpuDataset {
         self.sample_len
     }
 
+    pub fn gpu_buffer_bytes(&self) -> u64 {
+        self.chunk_buffer.size()
+    }
+
     pub fn copy_sample_to(
         &mut self,
         gpu: &GpuContext,

@@ -76,7 +76,7 @@ fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // ---------------------------------------------------------------------------
 // Pass 2 — grad_weights
-//   grad_weights[k][ky][kx][kz] = Σ_{oy,ox} grad_output[oy][ox][k] * fwd_input[oy*s+ky][ox*s+kx][kz]
+//   grad_weights[k][ky][kx][kz] += Σ_{oy,ox} grad_output[oy][ox][k] * fwd_input[oy*s+ky][ox*s+kx][kz]
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
 fn conv_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -107,12 +107,12 @@ fn conv_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
             g += grad_output[go_i] * fwd_input[in_i];
         }
     }
-    grad_weights[idx] = g;
+    grad_weights[idx] += g;
 }
 
 // ---------------------------------------------------------------------------
 // Pass 3 — grad_bias
-//   grad_bias[k] = Σ_{oy,ox} grad_output[oy][ox][k]
+//   grad_bias[k] += Σ_{oy,ox} grad_output[oy][ox][k]
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
 fn conv_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -129,6 +129,5 @@ fn conv_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
             g += grad_output[oy * OW * K + ox * K + k];
         }
     }
-    grad_bias[k] = g;
+    grad_bias[k] += g;
 }
-

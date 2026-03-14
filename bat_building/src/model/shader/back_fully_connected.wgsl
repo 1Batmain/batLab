@@ -66,13 +66,13 @@ fn fully_connected_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
     let neuron_idx = idx / layer_spec.input_len;
     let local_grad =
         grad_output[neuron_idx] * activation_grad(pre_activation[neuron_idx], layer_spec.activation_method);
-    grad_weights[idx] = local_grad * fwd_input[in_idx];
+    grad_weights[idx] += local_grad * fwd_input[in_idx];
 }
 
 @compute @workgroup_size(64)
 fn fully_connected_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
     let neuron_idx = gid.x;
     if neuron_idx >= layer_spec.nb_neurons { return; }
-    grad_bias[neuron_idx] =
+    grad_bias[neuron_idx] +=
         grad_output[neuron_idx] * activation_grad(pre_activation[neuron_idx], layer_spec.activation_method);
 }

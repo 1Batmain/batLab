@@ -16,10 +16,10 @@ use bat_building::{
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
-const SAMPLE_EXPORT_COUNT: usize = 10;
 const DIFFUSION_SCHEDULE_STEPS: usize = 256;
 const DIFFUSION_BETA_START: f32 = 1e-4;
 const DIFFUSION_BETA_END: f32 = 2e-2;
+const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
 
 #[derive(Debug, Clone)]
 struct ImageSample {
@@ -126,13 +126,23 @@ async fn run_training(
     let gpu_samples: Vec<Vec<f32>> = dataset.into_iter().map(|sample| sample.target).collect();
     let mut gpu_dataset = GpuDataset::from_samples(gpu.as_ref(), gpu_samples, sample_len)
         .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
+    let limits = gpu.device().limits();
+    let estimated_training_bytes = model
+        .estimated_gpu_bytes()
+        .saturating_add(gpu_dataset.gpu_buffer_bytes())
+        .saturating_add(trainer.task().estimated_prepare_gpu_bytes(output_dims));
+    let _ = tx.send(tui::TrainingEvent::ResourceReport {
+        max_buffer_bytes: limits.max_buffer_size,
+        max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
+        estimated_training_bytes,
+    });
     let sample_dir = prepare_sample_dir(&train_cfg.dataset_path)?;
-    let export_interval = train_cfg.steps.div_ceil(SAMPLE_EXPORT_COUNT.max(1));
+    let mut has_pending_loss_readback = false;
 
     for step in 0..train_cfg.steps {
-        let loss = trainer
+        trainer
             .task_mut()
-            .train_step_report_batch(
+            .train_step_batch(
                 &mut model,
                 &mut gpu_dataset,
                 step,
@@ -141,33 +151,54 @@ async fn run_training(
             )
             .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?;
 
-        let sample_path = if step % export_interval == 0 || step + 1 == train_cfg.steps {
-            let output = sample_diffusion_image(
-                &mut model,
-                input_size,
-                output_size,
-                &diffusion,
-                step as u64,
-            );
-            Some(
-                save_tensor_as_image(&output, output_size, &sample_dir, step)
-                    .map(|path| path.display().to_string())?,
-            )
-        } else {
-            None
-        };
+        if !has_pending_loss_readback
+            && (step % LOSS_REPORT_INTERVAL_STEPS == 0 || step + 1 == train_cfg.steps)
+        {
+            has_pending_loss_readback = model.request_loss_readback();
+        }
+
+        let loss = model.poll_loss_readback();
+        if loss.is_some() {
+            has_pending_loss_readback = false;
+        }
 
         if tx
             .send(tui::TrainingEvent::Step {
                 step,
                 loss,
-                sample_path,
+                sample_path: None,
             })
             .is_err()
         {
             return Ok(());
         }
     }
+
+    if has_pending_loss_readback {
+        let final_loss = model.read_last_loss();
+        let final_step = train_cfg.steps.saturating_sub(1);
+        let _ = tx.send(tui::TrainingEvent::Step {
+            step: final_step,
+            loss: Some(final_loss),
+            sample_path: None,
+        });
+    }
+
+    let final_step = train_cfg.steps.saturating_sub(1);
+    let output = sample_diffusion_image(
+        &mut model,
+        input_size,
+        output_size,
+        &diffusion,
+        final_step as u64,
+    );
+    let sample_path = save_tensor_as_image(&output, output_size, &sample_dir, final_step)
+        .map(|path| path.display().to_string())?;
+    let _ = tx.send(tui::TrainingEvent::Step {
+        step: final_step,
+        loss: None,
+        sample_path: Some(sample_path),
+    });
 
     if let Some(path) = checkpoint_path.as_ref() {
         model
