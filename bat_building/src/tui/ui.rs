@@ -9,6 +9,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Home => draw_home(f, app),
         Screen::LoadPath => draw_load_path(f, app),
         Screen::TemplateSelector => draw_template_selector(f, app),
+        Screen::WeightSelector => draw_weight_selector(f, app),
         Screen::InputSize => draw_input_size(f, app),
         Screen::LayerBuilder => draw_layer_builder(f, app),
         Screen::ModeSelector => draw_mode_selector(f, app),
@@ -161,12 +162,12 @@ fn draw_form_screen(
 // Screen: Home
 // ---------------------------------------------------------------------------
 
-fn draw_home(f: &mut Frame, app: &App) {
+fn draw_home(f: &mut Frame, _app: &App) {
     draw_choice_screen(
         f,
         "batBuilder",
-        &["Load Saved Model", "Use Template"],
-        app.home.selected,
+        &["Select Model Template"],
+        0,
         "[arrow] select  [Enter] confirm  [q] quit",
     );
 }
@@ -284,6 +285,81 @@ fn draw_template_selector(f: &mut Frame, app: &App) {
         lines.push(Line::from(""));
     }
 
+    lines.push(Line::from(Span::styled(
+        "  [arrow] select  [Enter] continue  [Esc] quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_weight_selector(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup = centered_rect(70, 66, area);
+    f.render_widget(Clear, popup);
+
+    let model_name = app.active_model_name.as_deref().unwrap_or("Selected Model");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {model_name} — Weights "))
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![Line::from("")];
+    let random_selected = app.weight_selector.selected == 0;
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} Start from random weights (new run)",
+            if random_selected { ">" } else { " " }
+        ),
+        if random_selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        },
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Load existing pretrained weights:",
+        Style::default().fg(Color::Cyan),
+    )));
+
+    if app.weight_selector.checkpoints.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (none found in Models/<model>/pretrained_weights/)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (idx, checkpoint) in app.weight_selector.checkpoints.iter().enumerate() {
+            let selected = app.weight_selector.selected == idx + 1;
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {} {}",
+                    if selected { ">" } else { " " },
+                    checkpoint.name
+                ),
+                if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            )));
+        }
+    }
+
+    if let Some(error) = app.weight_selector.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  [arrow] select  [Enter] continue  [Esc] quit",
         Style::default().fg(Color::DarkGray),

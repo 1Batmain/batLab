@@ -104,6 +104,8 @@ pub fn run_monitor(
                 tc.steps.to_string(),
                 tc.dataset_path.clone(),
             ];
+            app.selected_checkpoint_path = tc.checkpoint_path.clone();
+            app.load_checkpoint_on_start = tc.load_checkpoint;
             app.sync_selected_dataset_from_field();
         }
     }

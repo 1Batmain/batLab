@@ -11,6 +11,12 @@ pub struct SavedModelEntry {
     pub layer_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct CheckpointEntry {
+    pub name: String,
+    pub path: String,
+}
+
 fn serde_to_io(err: serde_json::Error) -> io::Error {
     io::Error::other(err)
 }
@@ -79,6 +85,71 @@ pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {
 
 pub fn checkpoint_path_for_model_name(name: &str) -> io::Result<PathBuf> {
     Ok(saved_models_dir()?.join(format!("{name}.ckpt")))
+}
+
+pub fn models_dir() -> io::Result<PathBuf> {
+    let dir = project_root().join("Models");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn model_dir(model_name: &str) -> io::Result<PathBuf> {
+    let dir = models_dir()?.join(model_name);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn model_weights_dir(model_name: &str) -> io::Result<PathBuf> {
+    let dir = model_dir(model_name)?.join("pretrained_weights");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn default_model_checkpoint_path(model_name: &str) -> io::Result<PathBuf> {
+    Ok(model_weights_dir(model_name)?.join("latest.ckpt"))
+}
+
+pub fn model_config_path(model_name: &str) -> io::Result<PathBuf> {
+    Ok(model_dir(model_name)?.join("config_file"))
+}
+
+pub fn write_model_template_config(model_name: &str, config: &ModelConfig) -> io::Result<PathBuf> {
+    let path = model_config_path(model_name)?;
+    let mut persisted = config.clone();
+    persisted.model_name = Some(model_name.to_string());
+    let bytes = serde_json::to_vec_pretty(&persisted).map_err(serde_to_io)?;
+    fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+pub fn list_model_checkpoints(model_name: &str) -> io::Result<Vec<CheckpointEntry>> {
+    let dir = model_weights_dir(model_name)?;
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'))
+        {
+            continue;
+        }
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("checkpoint")
+            .to_string();
+        entries.push(CheckpointEntry {
+            name: display_name,
+            path: path.to_string_lossy().to_string(),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
 }
 
 pub fn list_saved_models() -> io::Result<Vec<SavedModelEntry>> {

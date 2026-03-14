@@ -8,11 +8,31 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub async fn new_headless() -> Self {
-        let instance = wgpu::Instance::new(&Default::default());
-        let adapter = instance
-            .request_adapter(&Default::default())
-            .await
-            .expect("failed to request a wgpu adapter");
+        let adapter_options = wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        };
+
+        // Prefer primary native backends first to avoid noisy GL/X11 probing.
+        let primary_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let (instance, adapter) = match primary_instance.request_adapter(&adapter_options).await {
+            Ok(adapter) => (primary_instance, adapter),
+            Err(_) => {
+                let fallback_instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::all(),
+                    ..Default::default()
+                });
+                let adapter = fallback_instance
+                    .request_adapter(&adapter_options)
+                    .await
+                    .expect("failed to request a wgpu adapter");
+                (fallback_instance, adapter)
+            }
+        };
         let (device, queue) = adapter
             .request_device(&Default::default())
             .await
