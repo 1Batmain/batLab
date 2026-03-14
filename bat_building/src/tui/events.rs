@@ -24,6 +24,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::Home => handle_home(app, code),
         Screen::LoadPath => handle_load_path(app, code),
         Screen::TemplateSelector => handle_template_selector(app, code),
+        Screen::WeightSelector => handle_weight_selector(app, code),
         Screen::InputSize => handle_input_size(app, code),
         Screen::LayerBuilder => handle_layer_builder(app, code),
         Screen::ModeSelector => handle_mode_selector(app, code),
@@ -37,16 +38,6 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
 fn handle_home(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Up => {
-            if app.home.selected > 0 {
-                app.home.selected -= 1;
-            }
-        }
-        KeyCode::Down => {
-            if app.home.selected < 1 {
-                app.home.selected += 1;
-            }
-        }
         KeyCode::Enter => app.finish_home(),
         _ => {}
     }
@@ -84,6 +75,25 @@ fn handle_template_selector(app: &mut App, code: KeyCode) {
             }
         }
         KeyCode::Enter => app.finish_template_selector(),
+        _ => {}
+    }
+}
+
+fn handle_weight_selector(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => {
+            if app.weight_selector.selected > 0 {
+                app.weight_selector.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            let max = app.weight_selector.checkpoints.len();
+            if app.weight_selector.selected < max {
+                app.weight_selector.selected += 1;
+            }
+        }
+        KeyCode::Enter => app.finish_weight_selector(),
         _ => {}
     }
 }

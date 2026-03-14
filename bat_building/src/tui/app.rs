@@ -488,6 +488,7 @@ impl fmt::Display for LayerKind {
 
 #[derive(Debug, Clone)]
 pub struct ModelTemplate {
+    pub key: String,
     pub name: String,
     pub description: String,
     pub input_size: (u32, u32, u32),
@@ -499,14 +500,16 @@ pub struct ModelTemplate {
 
 fn diffusion_template() -> ModelTemplate {
     ModelTemplate {
-        name: "Diffusion (CIFAR)".to_string(),
-        description: "UNet-like diffusion backbone for 32x32 RGB targets".to_string(),
-        input_size: (32, 32, 8),
+        key: "Stable_Diffusion".to_string(),
+        name: "Stable Diffusion".to_string(),
+        description: "RGB diffusion backbone (32x32x3) with optional pretrained checkpoints."
+            .to_string(),
+        input_size: (32, 32, 3),
         layers: vec![
             LayerDraft::Convolution {
-                dim_input: (32, 32, 8),
+                dim_input: (32, 32, 3),
                 nb_kernel: 16,
-                dim_kernel: (3, 3, 8),
+                dim_kernel: (3, 3, 3),
                 stride: 1,
                 padding: PaddingMode::Same,
                 save_key: Some("enc1".to_string()),
@@ -601,6 +604,10 @@ pub struct TrainingConfig {
     pub steps: usize,
     pub dataset_path: String,
     pub loss: LossMethod,
+    #[serde(default)]
+    pub checkpoint_path: Option<String>,
+    #[serde(default)]
+    pub load_checkpoint: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,6 +650,7 @@ pub enum Screen {
     Home,
     LoadPath,
     TemplateSelector,
+    WeightSelector,
     InputSize,
     LayerBuilder,
     ModeSelector,
@@ -669,6 +677,12 @@ pub struct LoadPathState {
 pub struct TemplateSelectorState {
     pub templates: Vec<ModelTemplate>,
     pub selected: usize,
+    pub error: Option<String>,
+}
+
+pub struct WeightSelectorState {
+    pub checkpoints: Vec<storage::CheckpointEntry>,
+    pub selected: usize, // 0 = random init, 1.. = existing checkpoints
     pub error: Option<String>,
 }
 
@@ -755,6 +769,7 @@ pub struct App {
     pub home: HomeState,
     pub load_path: LoadPathState,
     pub template_selector: TemplateSelectorState,
+    pub weight_selector: WeightSelectorState,
     pub input_size: InputSizeState,
     pub layer_builder: LayerBuilderState,
     pub mode_selector: ModeSelectorState,
@@ -763,6 +778,8 @@ pub struct App {
     pub save_model: SaveModelState,
     pub run_config: Option<RunConfig>,
     pub active_model_name: Option<String>,
+    pub selected_checkpoint_path: Option<String>,
+    pub load_checkpoint_on_start: bool,
     pub should_quit: bool,
 }
 
@@ -881,7 +898,7 @@ impl App {
         let datasets = storage::list_datasets().unwrap_or_default();
         let dataset_path = datasets.first().cloned().unwrap_or_default();
         let mut app = Self {
-            screen: Screen::Home,
+            screen: Screen::TemplateSelector,
             home: HomeState { selected: 1 },
             load_path: LoadPathState {
                 models,
@@ -890,6 +907,11 @@ impl App {
             },
             template_selector: TemplateSelectorState {
                 templates,
+                selected: 0,
+                error: None,
+            },
+            weight_selector: WeightSelectorState {
+                checkpoints: Vec::new(),
                 selected: 0,
                 error: None,
             },
@@ -941,19 +963,14 @@ impl App {
             },
             run_config: None,
             active_model_name: None,
+            selected_checkpoint_path: None,
+            load_checkpoint_on_start: false,
             should_quit: false,
         };
+        app.refresh_templates();
         app.sync_selected_dataset_from_field();
         app.reset_layer_form();
         app
-    }
-
-    fn refresh_saved_models(&mut self) {
-        self.load_path.models = storage::list_saved_models().unwrap_or_default();
-        if self.load_path.selected >= self.load_path.models.len() {
-            self.load_path.selected = self.load_path.models.len().saturating_sub(1);
-        }
-        self.load_path.error = None;
     }
 
     fn refresh_templates(&mut self) {
@@ -963,6 +980,30 @@ impl App {
                 self.template_selector.templates.len().saturating_sub(1);
         }
         self.template_selector.error = None;
+    }
+
+    fn refresh_weight_selector(&mut self) {
+        let Some(model_name) = self.active_model_name.clone() else {
+            self.weight_selector.checkpoints.clear();
+            self.weight_selector.selected = 0;
+            self.weight_selector.error = Some("No model selected.".to_string());
+            return;
+        };
+        match storage::list_model_checkpoints(&model_name) {
+            Ok(checkpoints) => {
+                self.weight_selector.checkpoints = checkpoints;
+                if self.weight_selector.selected > self.weight_selector.checkpoints.len() {
+                    self.weight_selector.selected = 0;
+                }
+                self.weight_selector.error = None;
+            }
+            Err(err) => {
+                self.weight_selector.checkpoints.clear();
+                self.weight_selector.selected = 0;
+                self.weight_selector.error =
+                    Some(format!("Failed to read pretrained weights: {err}"));
+            }
+        }
     }
 
     fn refresh_datasets(&mut self) {
@@ -990,8 +1031,15 @@ impl App {
         }
     }
 
-    fn apply_template(&mut self, template: &ModelTemplate) {
-        self.active_model_name = None;
+    fn apply_template(&mut self, template: &ModelTemplate) -> Result<(), String> {
+        self.active_model_name = Some(template.key.clone());
+        self.load_checkpoint_on_start = false;
+        self.selected_checkpoint_path = Some(
+            storage::default_model_checkpoint_path(&template.key)
+                .map_err(|err| format!("Failed to prepare model folder: {err}"))?
+                .to_string_lossy()
+                .to_string(),
+        );
         self.layer_builder.model_input = template.input_size;
         self.input_size.fields = vec![
             template.input_size.0.to_string(),
@@ -1019,7 +1067,20 @@ impl App {
         }
 
         self.mode_selector.selected = 1;
-        self.screen = Screen::ModeSelector;
+        let config = ModelConfig {
+            model_name: Some(template.key.clone()),
+            input_size: template.input_size,
+            layers: template.layers.clone(),
+            run: RunConfig {
+                mode: RunMode::Infer,
+            },
+        };
+        storage::write_model_template_config(&template.key, &config)
+            .map_err(|err| format!("Failed to write template config_file: {err}"))?;
+        self.refresh_weight_selector();
+        self.weight_selector.selected = 0;
+        self.screen = Screen::WeightSelector;
+        Ok(())
     }
 
     fn apply_loaded_model(&mut self, config: ModelConfig) {
@@ -1038,6 +1099,8 @@ impl App {
         match config.run.mode {
             RunMode::Infer => {
                 self.mode_selector.selected = 0;
+                self.selected_checkpoint_path = None;
+                self.load_checkpoint_on_start = false;
             }
             RunMode::Train(train) => {
                 self.mode_selector.selected = 1;
@@ -1047,6 +1110,8 @@ impl App {
                     train.steps.to_string(),
                     train.dataset_path,
                 ];
+                self.selected_checkpoint_path = train.checkpoint_path.clone();
+                self.load_checkpoint_on_start = train.load_checkpoint;
                 self.sync_selected_dataset_from_field();
             }
         }
@@ -1225,6 +1290,8 @@ impl App {
         let draft = self.build_draft_from_form(inferred, None)?;
         self.layer_builder.layers.push(draft);
         self.active_model_name = None;
+        self.selected_checkpoint_path = None;
+        self.load_checkpoint_on_start = false;
         self.layer_builder.error = None;
         self.reset_layer_form();
         Ok(())
@@ -1233,6 +1300,8 @@ impl App {
     pub fn delete_last_layer(&mut self) {
         self.layer_builder.layers.pop();
         self.active_model_name = None;
+        self.selected_checkpoint_path = None;
+        self.load_checkpoint_on_start = false;
         self.reset_layer_form();
     }
 
@@ -1531,6 +1600,8 @@ impl App {
         let draft = self.build_draft_from_form(inferred, existing_key.as_deref())?;
         self.layer_builder.layers[idx] = draft;
         self.active_model_name = None;
+        self.selected_checkpoint_path = None;
+        self.load_checkpoint_on_start = false;
         self.rebuild_layer_dims_from(idx + 1);
         self.layer_builder.error = None;
         self.layer_builder.mode = LayerBuilderMode::Browse;
@@ -1560,6 +1631,8 @@ impl App {
         let idx = self.layer_builder.browse_selected;
         self.layer_builder.layers.remove(idx);
         self.active_model_name = None;
+        self.selected_checkpoint_path = None;
+        self.load_checkpoint_on_start = false;
         self.rebuild_layer_dims_from(idx);
         if self.layer_builder.layers.is_empty() {
             self.exit_browse_mode();
@@ -1700,16 +1773,8 @@ impl App {
     // --- Screen transitions ---
 
     pub fn finish_home(&mut self) {
-        self.screen = match self.home.selected {
-            0 => {
-                self.refresh_saved_models();
-                Screen::LoadPath
-            }
-            _ => {
-                self.refresh_templates();
-                Screen::TemplateSelector
-            }
-        };
+        self.refresh_templates();
+        self.screen = Screen::TemplateSelector;
     }
 
     pub fn finish_template_selector(&mut self) {
@@ -1723,7 +1788,42 @@ impl App {
             return;
         };
         self.template_selector.error = None;
-        self.apply_template(&template);
+        if let Err(err) = self.apply_template(&template) {
+            self.template_selector.error = Some(err);
+        }
+    }
+
+    pub fn finish_weight_selector(&mut self) {
+        let Some(model_name) = self.active_model_name.clone() else {
+            self.weight_selector.error = Some("No model selected.".to_string());
+            return;
+        };
+
+        if self.weight_selector.selected == 0 {
+            self.load_checkpoint_on_start = false;
+            match storage::default_model_checkpoint_path(&model_name) {
+                Ok(path) => {
+                    self.selected_checkpoint_path = Some(path.to_string_lossy().to_string());
+                    self.weight_selector.error = None;
+                    self.screen = Screen::ModeSelector;
+                }
+                Err(err) => {
+                    self.weight_selector.error =
+                        Some(format!("Failed to prepare default checkpoint path: {err}"));
+                }
+            }
+            return;
+        }
+
+        let checkpoint_index = self.weight_selector.selected - 1;
+        let Some(entry) = self.weight_selector.checkpoints.get(checkpoint_index) else {
+            self.weight_selector.error = Some("Selected checkpoint is invalid.".to_string());
+            return;
+        };
+        self.load_checkpoint_on_start = true;
+        self.selected_checkpoint_path = Some(entry.path.clone());
+        self.weight_selector.error = None;
+        self.screen = Screen::ModeSelector;
     }
 
     pub fn finish_load_path(&mut self) {
@@ -1753,6 +1853,8 @@ impl App {
             return Err("Dimensions must be > 0".into());
         }
         self.active_model_name = None;
+        self.selected_checkpoint_path = None;
+        self.load_checkpoint_on_start = false;
         self.layer_builder.model_input = (w, h, c);
         self.layer_builder.layers.clear();
         self.reset_layer_form();
@@ -1838,6 +1940,8 @@ impl App {
                 steps,
                 dataset_path,
                 loss: LossMethod::MeanSquared,
+                checkpoint_path: self.selected_checkpoint_path.clone(),
+                load_checkpoint: self.load_checkpoint_on_start,
             }),
         });
         Ok(())
@@ -1922,34 +2026,40 @@ mod tests {
     }
 
     #[test]
-    fn home_template_path_opens_template_selector() {
-        let mut app = App::new();
-        app.home.selected = 1;
-
-        app.finish_home();
-
+    fn app_starts_on_template_selector() {
+        let app = App::new();
         assert!(matches!(app.screen, Screen::TemplateSelector));
     }
 
     #[test]
-    fn selecting_template_prefills_architecture_and_advances_to_mode() {
+    fn selecting_template_prefills_architecture_and_advances_to_weight_selector() {
         let mut app = App::new();
-        app.home.selected = 1;
-        app.finish_home();
 
         app.finish_template_selector();
 
-        assert!(matches!(app.screen, Screen::ModeSelector));
+        assert!(matches!(app.screen, Screen::WeightSelector));
         assert!(!app.layer_builder.layers.is_empty());
-        assert_eq!(app.layer_builder.model_input, (32, 32, 8));
+        assert_eq!(app.layer_builder.model_input, (32, 32, 3));
+    }
+
+    #[test]
+    fn selecting_random_weights_advances_to_mode_selector() {
+        let mut app = App::new();
+        app.finish_template_selector();
+        app.weight_selector.selected = 0;
+
+        app.finish_weight_selector();
+
+        assert!(matches!(app.screen, Screen::ModeSelector));
+        assert!(!app.load_checkpoint_on_start);
+        assert!(app.selected_checkpoint_path.is_some());
     }
 
     #[test]
     fn training_selection_advances_to_training_params() {
         let mut app = App::new();
-        app.home.selected = 1;
-        app.finish_home();
         app.finish_template_selector();
+        app.finish_weight_selector();
         app.mode_selector.selected = 1;
 
         app.finish_mode_selector();
@@ -1960,9 +2070,8 @@ mod tests {
     #[test]
     fn dataset_selector_requires_available_dataset() {
         let mut app = App::new();
-        app.home.selected = 1;
-        app.finish_home();
         app.finish_template_selector();
+        app.finish_weight_selector();
         app.mode_selector.selected = 1;
         app.finish_mode_selector();
         app.training_params.fields[0] = "0.01".to_string();
@@ -1981,9 +2090,8 @@ mod tests {
     #[test]
     fn training_params_and_dataset_build_train_run_config() {
         let mut app = App::new();
-        app.home.selected = 1;
-        app.finish_home();
         app.finish_template_selector();
+        app.finish_weight_selector();
         app.mode_selector.selected = 1;
         app.finish_mode_selector();
 
@@ -2010,6 +2118,8 @@ mod tests {
                 assert_eq!(train.batch_size, 3);
                 assert_eq!(train.steps, 77);
                 assert_eq!(train.dataset_path, ".");
+                assert_eq!(train.load_checkpoint, false);
+                assert!(train.checkpoint_path.is_some());
             }
             _ => panic!("expected training run mode"),
         }

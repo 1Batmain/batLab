@@ -89,16 +89,32 @@ async fn run_training(
         append_layer(&mut model, draft).map_err(|err| err.to_string())?;
     }
     model.build().map_err(|err| err.to_string())?;
-    let checkpoint_path = config
-        .model_name
-        .as_deref()
-        .map(tui::storage::checkpoint_path_for_model_name)
-        .transpose()
-        .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?;
-    if let Some(path) = checkpoint_path.as_ref().filter(|path| path.exists()) {
-        model
-            .load_checkpoint(path)
-            .map_err(|err| format!("failed to load checkpoint {}: {err}", path.display()))?;
+    let checkpoint_path = match train_cfg.checkpoint_path.as_deref() {
+        Some(path) => Some(PathBuf::from(path)),
+        None => config
+            .model_name
+            .as_deref()
+            .map(tui::storage::default_model_checkpoint_path)
+            .transpose()
+            .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?,
+    };
+    if let Some(path) = checkpoint_path.as_ref() {
+        if train_cfg.load_checkpoint {
+            if !path.exists() {
+                return Err(format!(
+                    "selected checkpoint does not exist: {}",
+                    path.display()
+                ));
+            }
+            model
+                .load_checkpoint(path)
+                .map_err(|err| format!("failed to load checkpoint {}: {err}", path.display()))?;
+        } else if train_cfg.checkpoint_path.is_none() && path.exists() {
+            // Backward compatibility for legacy configs without explicit load mode.
+            model
+                .load_checkpoint(path)
+                .map_err(|err| format!("failed to load checkpoint {}: {err}", path.display()))?;
+        }
     }
 
     let input_dims = model
@@ -201,6 +217,14 @@ async fn run_training(
     });
 
     if let Some(path) = checkpoint_path.as_ref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create checkpoint directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
         model
             .save_checkpoint(path)
             .map_err(|err| format!("failed to save checkpoint {}: {err}", path.display()))?;
