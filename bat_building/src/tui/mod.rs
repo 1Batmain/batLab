@@ -91,8 +91,21 @@ pub fn run_monitor(
     app.layer_builder.model_input = config.input_size;
     app.active_model_name = config.model_name.clone();
     app.monitor.model_config = Some(config.clone());
-    if let RunMode::Train(ref tc) = config.run.mode {
-        app.monitor.total_steps = tc.steps;
+    match &config.run.mode {
+        RunMode::Infer => {
+            app.mode_selector.selected = 0;
+        }
+        RunMode::Train(tc) => {
+            app.mode_selector.selected = 1;
+            app.monitor.total_steps = tc.steps;
+            app.training_params.fields = vec![
+                tc.lr.to_string(),
+                tc.batch_size.to_string(),
+                tc.steps.to_string(),
+                tc.dataset_path.clone(),
+            ];
+            app.sync_selected_dataset_from_field();
+        }
     }
 
     let outcome = run_monitor_session(&mut terminal, &mut app, rx);
@@ -115,9 +128,9 @@ fn run_monitor_session(
     run_monitor_loop(terminal, app, rx)?;
 
     if app.monitor.restart_training {
-        // Reset to training-params screen with the same architecture so the user
-        // can tweak hyperparameters and start a new run.
-        app.screen = Screen::TrainingParams;
+        // Reset to mode selection with the same architecture so the user can
+        // quickly pick infer/train again and choose a dataset for training.
+        app.screen = Screen::ModeSelector;
         app.monitor = Default::default();
         app.should_quit = false;
 
@@ -141,13 +154,24 @@ fn run_monitor_loop(
     loop {
         while let Ok(event) = rx.try_recv() {
             match event {
+                TrainingEvent::ResourceReport {
+                    max_buffer_bytes,
+                    max_storage_binding_bytes,
+                    estimated_training_bytes,
+                } => {
+                    app.monitor.max_buffer_bytes = Some(max_buffer_bytes);
+                    app.monitor.max_storage_binding_bytes = Some(max_storage_binding_bytes);
+                    app.monitor.estimated_training_bytes = Some(estimated_training_bytes);
+                }
                 TrainingEvent::Step {
                     step,
                     loss,
                     sample_path,
                 } => {
                     app.monitor.step = step;
-                    app.monitor.loss_history.push(loss as f64);
+                    if let Some(loss) = loss {
+                        app.monitor.loss_history.push(loss as f64);
+                    }
                     if let Some(path) = sample_path {
                         app.monitor.last_sample_path = Some(path);
                     }

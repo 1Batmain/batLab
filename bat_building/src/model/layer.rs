@@ -595,6 +595,33 @@ impl Layer {
         pass.dispatch_workgroups(opt.num_workgroups, 1, 1);
     }
 
+    pub(crate) fn set_opt_learning_rate(&self, gpu: &GpuContext, lr: f32) {
+        let Some(opt) = &self.opt_pass else {
+            return;
+        };
+        let Some(lr_buf) = opt.buffers.first() else {
+            return;
+        };
+        let mut lr_bytes = [0u8; 16];
+        lr_bytes[0..4].copy_from_slice(&lr.to_le_bytes());
+        gpu.queue.write_buffer(lr_buf, 0, &lr_bytes);
+    }
+
+    pub(crate) fn encode_zero_opt_gradients(&self, encoder: &mut CommandEncoder) {
+        let Some(layout) = self.ty.get_optimizer_bindings() else {
+            return;
+        };
+        let Some(backward) = self.buffers.backward.as_ref() else {
+            return;
+        };
+        encoder.clear_buffer(
+            backward[layout.grad_weights_backward_index].as_ref(),
+            0,
+            None,
+        );
+        encoder.clear_buffer(backward[layout.grad_bias_backward_index].as_ref(), 0, None);
+    }
+
     pub(crate) fn create_merge_pass(
         &mut self,
         gpu: &GpuContext,

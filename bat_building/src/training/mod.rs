@@ -1,5 +1,6 @@
 pub mod dataset;
 pub mod diffusion;
+pub mod schedule;
 
 use crate::model::{Dim3, Model};
 use std::error::Error;
@@ -7,6 +8,7 @@ use std::fmt;
 
 pub use dataset::{GpuDataset, GpuDatasetError};
 pub use diffusion::DiffusionTask;
+pub use schedule::LinearNoiseSchedule;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Workgroups {

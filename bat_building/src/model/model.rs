@@ -5,7 +5,7 @@ use crate::model::layer::Layer;
 use crate::model::layer_types::{ConcatType, LayerType, LayerTypes, LossMethod, LossType};
 use crate::model::types::Dim3;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -33,6 +33,11 @@ pub struct ModelState {
     pub(crate) is_build: bool,
 }
 
+struct PendingLossReadback {
+    staging: wgpu::Buffer,
+    rx: futures::channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -44,6 +49,7 @@ pub struct Model<State = Infer> {
     pub(crate) training: Option<State>,
     pub(crate) state: ModelState,
     pub(crate) saved_outputs: HashMap<String, usize>,
+    pending_loss_readback: Option<PendingLossReadback>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +117,7 @@ impl Model<Training> {
             }),
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
+            pending_loss_readback: None,
         }
     }
 
@@ -204,19 +211,62 @@ impl Model<Training> {
         debug_assert!(self.state.is_build, "call build() before train_step()");
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         prepass(&mut encoder);
+        self.encode_zero_optimizer_gradients(&mut encoder);
         self.encode_train_graph(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
         self.read_last_loss()
     }
 
-    pub(crate) fn train_step_with_prepass<F>(&mut self, prepass: F)
+    pub(crate) fn train_step_report_with_prepass_no_opt<F>(&mut self, prepass: F) -> f32
     where
         F: FnOnce(&mut wgpu::CommandEncoder),
     {
         debug_assert!(self.state.is_build, "call build() before train_step()");
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         prepass(&mut encoder);
-        self.encode_train_graph(&mut encoder);
+        self.encode_train_graph_without_opt(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+        self.read_last_loss()
+    }
+
+    pub(crate) fn train_step_with_prepass_no_opt<F>(&mut self, prepass: F)
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder),
+    {
+        debug_assert!(self.state.is_build, "call build() before train_step()");
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        prepass(&mut encoder);
+        self.encode_train_graph_without_opt(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+    }
+
+    pub(crate) fn begin_batch_accumulation(&mut self) {
+        debug_assert!(
+            self.state.is_build,
+            "call build() before begin_batch_accumulation()"
+        );
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.encode_zero_optimizer_gradients(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+    }
+
+    pub(crate) fn finish_batch_accumulation(&mut self, batch_size: usize) {
+        debug_assert!(
+            self.state.is_build,
+            "call build() before finish_batch_accumulation()"
+        );
+        let batch_size = batch_size.max(1) as f32;
+        let base_lr = self
+            .training
+            .as_ref()
+            .expect("training config unavailable")
+            .lr;
+        let scaled_lr = base_lr / batch_size;
+        for layer in &self.layers {
+            layer.set_opt_learning_rate(self.gpu.as_ref(), scaled_lr);
+        }
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.encode_train_optimizer_graph(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
     }
 
@@ -242,11 +292,17 @@ impl Model<Training> {
             .write_buffer(loss_buf.as_ref(), 0, bytemuck::cast_slice(target));
 
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.encode_zero_optimizer_gradients(&mut encoder);
         self.encode_train_graph(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
     }
 
     fn encode_train_graph(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_train_graph_without_opt(encoder);
+        self.encode_train_optimizer_graph(encoder);
+    }
+
+    fn encode_train_graph_without_opt(&self, encoder: &mut wgpu::CommandEncoder) {
         // Forward
         for layer in &self.layers {
             layer.encode_pass(encoder);
@@ -259,10 +315,18 @@ impl Model<Training> {
             layer.encode_merge_pass(encoder);
             layer.encode_back_pass(encoder);
         }
+    }
 
+    fn encode_train_optimizer_graph(&self, encoder: &mut wgpu::CommandEncoder) {
         // SGD weight updates
         for layer in &self.layers {
             layer.encode_opt_pass(encoder);
+        }
+    }
+
+    fn encode_zero_optimizer_gradients(&self, encoder: &mut wgpu::CommandEncoder) {
+        for layer in &self.layers {
+            layer.encode_zero_opt_gradients(encoder);
         }
     }
 }
@@ -280,6 +344,7 @@ impl<State> Model<State> {
             training: None,
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
+            pending_loss_readback: None,
         }
     }
 
@@ -289,6 +354,7 @@ impl<State> Model<State> {
         self.loss_layer = None;
         self.state.is_build = false;
         self.saved_outputs.clear();
+        self.pending_loss_readback = None;
     }
 
     pub fn training_mode(&mut self, training: Option<State>) {
@@ -571,6 +637,49 @@ impl<State> Model<State> {
         .expect("failed to read last output buffer")
     }
 
+    /// Best-effort estimate of GPU bytes currently held by model-related buffers.
+    /// Shared buffers are counted once.
+    pub fn estimated_gpu_bytes(&self) -> u64 {
+        fn add_unique(total: &mut u64, seen: &mut HashSet<usize>, buffer: &Arc<wgpu::Buffer>) {
+            let key = Arc::as_ptr(buffer) as usize;
+            if seen.insert(key) {
+                *total = total.saturating_add(buffer.size());
+            }
+        }
+
+        let mut total = 0u64;
+        let mut seen = HashSet::new();
+
+        for layer in &self.layers {
+            for buffer in &layer.buffers.forward {
+                add_unique(&mut total, &mut seen, buffer);
+            }
+            if let Some(backward) = &layer.buffers.backward {
+                for buffer in backward {
+                    add_unique(&mut total, &mut seen, buffer);
+                }
+            }
+            if let Some(opt) = &layer.opt_pass {
+                for buffer in &opt.buffers {
+                    add_unique(&mut total, &mut seen, buffer);
+                }
+            }
+        }
+
+        if let Some(loss_layer) = &self.loss_layer {
+            for buffer in &loss_layer.buffers.forward {
+                add_unique(&mut total, &mut seen, buffer);
+            }
+            if let Some(backward) = &loss_layer.buffers.backward {
+                for buffer in backward {
+                    add_unique(&mut total, &mut seen, buffer);
+                }
+            }
+        }
+
+        total
+    }
+
     pub fn read_last_loss(&self) -> f32 {
         let loss_layer = self
             .loss_layer
@@ -586,6 +695,76 @@ impl<State> Model<State> {
             0.0
         } else {
             loss_terms.iter().sum::<f32>() / loss_terms.len() as f32
+        }
+    }
+
+    /// Schedule a non-blocking loss readback from GPU.
+    /// Returns false when no loss buffer is available or a prior request is still pending.
+    pub fn request_loss_readback(&mut self) -> bool {
+        if self.pending_loss_readback.is_some() {
+            return false;
+        }
+
+        let Some(loss_layer) = self.loss_layer.as_ref() else {
+            return false;
+        };
+        let Some(loss_terms_buf) = loss_layer.buffers.forward.get(2) else {
+            return false;
+        };
+        if !loss_terms_buf
+            .usage()
+            .contains(wgpu::BufferUsages::COPY_SRC)
+        {
+            return false;
+        }
+        let size_bytes = loss_layer.ty.get_dim_output().bytes_size() as u64;
+        if size_bytes == 0 {
+            return false;
+        }
+
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        let staging = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("loss_readback_staging"),
+            size: size_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(loss_terms_buf.as_ref(), 0, &staging, 0, size_bytes);
+        self.gpu.queue.submit([encoder.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.pending_loss_readback = Some(PendingLossReadback { staging, rx });
+        true
+    }
+
+    /// Poll a pending non-blocking loss readback.
+    /// Returns a value only when a pending request has completed.
+    pub fn poll_loss_readback(&mut self) -> Option<f32> {
+        let mut pending = self.pending_loss_readback.take()?;
+        let _ = self.gpu.device.poll(wgpu::PollType::Poll);
+
+        match pending.rx.try_recv() {
+            Ok(None) => {
+                self.pending_loss_readback = Some(pending);
+                None
+            }
+            Ok(Some(Ok(()))) => {
+                let loss_terms = {
+                    let bytes = pending.staging.slice(..).get_mapped_range();
+                    bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+                };
+                pending.staging.unmap();
+                if loss_terms.is_empty() {
+                    Some(0.0)
+                } else {
+                    Some(loss_terms.iter().sum::<f32>() / loss_terms.len() as f32)
+                }
+            }
+            Ok(Some(Err(_))) | Err(_) => None,
         }
     }
 }

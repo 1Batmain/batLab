@@ -1,13 +1,16 @@
-use super::app::{
-    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen, TRAINING_PARAM_FIELD_NAMES,
-};
+use super::app::{App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen};
 use crossterm::event::KeyCode;
 
 #[derive(Debug)]
 pub enum TrainingEvent {
+    ResourceReport {
+        max_buffer_bytes: u64,
+        max_storage_binding_bytes: u64,
+        estimated_training_bytes: u64,
+    },
     Step {
         step: usize,
-        loss: f32,
+        loss: Option<f32>,
         sample_path: Option<String>,
     },
     Error {
@@ -20,10 +23,12 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
     match app.screen {
         Screen::Home => handle_home(app, code),
         Screen::LoadPath => handle_load_path(app, code),
+        Screen::TemplateSelector => handle_template_selector(app, code),
         Screen::InputSize => handle_input_size(app, code),
         Screen::LayerBuilder => handle_layer_builder(app, code),
         Screen::ModeSelector => handle_mode_selector(app, code),
         Screen::TrainingParams => handle_training_params(app, code),
+        Screen::DatasetSelector => handle_dataset_selector(app, code),
         Screen::Monitor => handle_monitor(app, code),
         Screen::SaveModel => handle_save_model(app, code),
     }
@@ -61,6 +66,24 @@ fn handle_load_path(app: &mut App, code: KeyCode) {
             }
         }
         KeyCode::Enter => app.finish_load_path(),
+        _ => {}
+    }
+}
+
+fn handle_template_selector(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => {
+            if app.template_selector.selected > 0 {
+                app.template_selector.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.template_selector.selected + 1 < app.template_selector.templates.len() {
+                app.template_selector.selected += 1;
+            }
+        }
+        KeyCode::Enter => app.finish_template_selector(),
         _ => {}
     }
 }
@@ -177,6 +200,7 @@ fn handle_lb_edit(app: &mut App, code: KeyCode) {
 fn handle_mode_selector(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('e') => app.enter_layer_builder_from_mode(),
         KeyCode::Up => {
             if app.mode_selector.selected > 0 {
                 app.mode_selector.selected -= 1;
@@ -192,20 +216,36 @@ fn handle_mode_selector(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_training_params(app: &mut App, code: KeyCode) {
-    let max_field = TRAINING_PARAM_FIELD_NAMES.len() - 1;
+fn handle_dataset_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => app.should_quit = true,
-        KeyCode::Left => {
-            if app.training_params.field_idx == 3 {
-                app.cycle_dataset_backward();
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Left => app.cycle_dataset_backward(),
+        KeyCode::Right => app.cycle_dataset_forward(),
+        KeyCode::Up => {
+            if app.training_params.selected_dataset > 0 {
+                let next = app.training_params.selected_dataset - 1;
+                app.select_dataset(next);
             }
         }
-        KeyCode::Right => {
-            if app.training_params.field_idx == 3 {
-                app.cycle_dataset_forward();
+        KeyCode::Down => {
+            if app.training_params.selected_dataset + 1 < app.training_params.datasets.len() {
+                let next = app.training_params.selected_dataset + 1;
+                app.select_dataset(next);
             }
         }
+        KeyCode::Enter => {
+            if let Err(e) = app.finish_dataset_selector() {
+                app.training_params.error = Some(e);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_training_params(app: &mut App, code: KeyCode) {
+    let max_field = 2;
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.training_params.field_idx > 0 {
                 app.training_params.field_idx -= 1;
@@ -220,10 +260,8 @@ fn handle_training_params(app: &mut App, code: KeyCode) {
         KeyCode::Enter => {
             if app.training_params.field_idx < max_field {
                 app.training_params.field_idx += 1;
-            } else {
-                if let Err(e) = app.finish_training_params() {
-                    app.training_params.error = Some(e);
-                }
+            } else if let Err(e) = app.finish_training_params() {
+                app.training_params.error = Some(e);
             }
         }
         KeyCode::Char(c) => app.handle_char_training(c),

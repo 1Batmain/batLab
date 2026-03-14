@@ -1,5 +1,7 @@
-use super::{GpuDataset, TaskPassSpec, TrainingTask, TrainingTaskError, Workgroups};
-use crate::model::{Dim3, LinearNoiseSchedule, Model, Training};
+use super::{
+    GpuDataset, LinearNoiseSchedule, TaskPassSpec, TrainingTask, TrainingTaskError, Workgroups,
+};
+use crate::model::{Dim3, Model, Training};
 use encase::{ShaderSize, ShaderType, UniformBuffer};
 use std::sync::Arc;
 
@@ -56,6 +58,12 @@ impl DiffusionTask {
         self.timestep_channels
     }
 
+    pub fn estimated_prepare_gpu_bytes(&self, output: Dim3) -> u64 {
+        let target_bytes = (output.length() as u64 * std::mem::size_of::<f32>() as u64).max(4);
+        let specs_bytes = (DiffusionPrepareUniform::SHADER_SIZE.get() as u64).max(4);
+        target_bytes.saturating_add(specs_bytes)
+    }
+
     pub fn train_step_report(
         &mut self,
         model: &mut Model<Training>,
@@ -110,6 +118,33 @@ impl DiffusionTask {
         batch_size: usize,
         seed: u64,
     ) -> Result<f32, TrainingTaskError> {
+        self.train_step_batch_inner(model, dataset, step, batch_size, seed, true)?
+            .ok_or_else(|| TrainingTaskError::DatasetError {
+                message: "loss report was not produced".to_string(),
+            })
+    }
+
+    pub fn train_step_batch(
+        &mut self,
+        model: &mut Model<Training>,
+        dataset: &mut GpuDataset,
+        step: usize,
+        batch_size: usize,
+        seed: u64,
+    ) -> Result<(), TrainingTaskError> {
+        let _ = self.train_step_batch_inner(model, dataset, step, batch_size, seed, false)?;
+        Ok(())
+    }
+
+    fn train_step_batch_inner(
+        &mut self,
+        model: &mut Model<Training>,
+        dataset: &mut GpuDataset,
+        step: usize,
+        batch_size: usize,
+        seed: u64,
+        report_last_loss: bool,
+    ) -> Result<Option<f32>, TrainingTaskError> {
         if batch_size == 0 {
             return Err(TrainingTaskError::InvalidBatchSize { batch_size });
         }
@@ -131,8 +166,9 @@ impl DiffusionTask {
         }
         let gpu = model.gpu.clone();
 
-        let mut last_loss = 0.0f32;
+        let mut last_loss = None;
         let sample_count = dataset.sample_count();
+        model.begin_batch_accumulation();
         for batch_offset in 0..batch_size {
             let sample_index = (step * batch_size + batch_offset) % sample_count;
             let diffusion_step = diffusion_step_for(step, sample_index, schedule_len);
@@ -149,18 +185,20 @@ impl DiffusionTask {
             });
             model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
 
-            if batch_offset + 1 == batch_size {
-                last_loss = model.train_step_report_with_prepass(|encoder| {
+            let is_last = batch_offset + 1 == batch_size;
+            if is_last && report_last_loss {
+                last_loss = Some(model.train_step_report_with_prepass_no_opt(|encoder| {
                     pass.encode_with_dataset(encoder, gpu.as_ref(), dataset, sample_index)
                         .expect("diffusion dataset sample copy should be valid");
-                });
+                }));
             } else {
-                model.train_step_with_prepass(|encoder| {
+                model.train_step_with_prepass_no_opt(|encoder| {
                     pass.encode_with_dataset(encoder, gpu.as_ref(), dataset, sample_index)
                         .expect("diffusion dataset sample copy should be valid");
                 });
             }
         }
+        model.finish_batch_accumulation(batch_size);
 
         Ok(last_loss)
     }
@@ -433,10 +471,8 @@ fn same_dims(saved: Option<Dim3>, target: Dim3) -> bool {
 mod tests {
     use super::DiffusionTask;
     use crate::gpu_context::GpuContext;
-    use crate::model::{
-        ActivationMethod, ActivationType, Dim3, LayerTypes, LinearNoiseSchedule, LossMethod, Model,
-    };
-    use crate::training::{GpuDataset, TrainingTask};
+    use crate::model::{ActivationMethod, ActivationType, Dim3, LayerTypes, LossMethod, Model};
+    use crate::training::{GpuDataset, LinearNoiseSchedule, TrainingTask};
     use std::sync::Arc;
 
     #[test]

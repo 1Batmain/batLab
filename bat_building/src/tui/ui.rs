@@ -8,10 +8,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.screen {
         Screen::Home => draw_home(f, app),
         Screen::LoadPath => draw_load_path(f, app),
+        Screen::TemplateSelector => draw_template_selector(f, app),
         Screen::InputSize => draw_input_size(f, app),
         Screen::LayerBuilder => draw_layer_builder(f, app),
         Screen::ModeSelector => draw_mode_selector(f, app),
         Screen::TrainingParams => draw_training_params(f, app),
+        Screen::DatasetSelector => draw_dataset_selector(f, app),
         Screen::Monitor => draw_monitor(f, app),
         Screen::SaveModel => {
             draw_monitor(f, app);
@@ -163,7 +165,7 @@ fn draw_home(f: &mut Frame, app: &App) {
     draw_choice_screen(
         f,
         "batBuilder",
-        &["Load Model", "Build Model"],
+        &["Load Saved Model", "Use Template"],
         app.home.selected,
         "[arrow] select  [Enter] confirm  [q] quit",
     );
@@ -228,6 +230,62 @@ fn draw_load_path(f: &mut Frame, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  [arrow] select  [Enter] load  [Esc] quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_template_selector(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup = centered_rect(70, 62, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Model Templates ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![Line::from("")];
+    if app.template_selector.templates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No templates available",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (index, template) in app.template_selector.templates.iter().enumerate() {
+            let selected = index == app.template_selector.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let marker = if selected { ">" } else { " " };
+            lines.push(Line::from(Span::styled(
+                format!("  {} {}", marker, template.name),
+                style,
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("      {}", template.description),
+                Style::default().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(""));
+        }
+    }
+
+    if let Some(error) = app.template_selector.error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {error}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  [arrow] select  [Enter] continue  [Esc] quit",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -468,7 +526,7 @@ fn draw_mode_selector(f: &mut Frame, app: &App) {
         "Run Mode",
         &["Inference", "Training"],
         app.mode_selector.selected,
-        "[arrow] select  [Enter] confirm  [q] quit",
+        "[arrow] select  [Enter] confirm  [e] edit layers  [q] quit",
     );
 }
 
@@ -477,37 +535,58 @@ fn draw_mode_selector(f: &mut Frame, app: &App) {
 // ---------------------------------------------------------------------------
 
 fn draw_training_params(f: &mut Frame, app: &App) {
+    let training_fields = &app.training_params.fields[..3];
+    draw_form_screen(
+        f,
+        "Training Parameters",
+        &TRAINING_PARAM_FIELD_NAMES,
+        training_fields,
+        app.training_params.field_idx,
+        app.training_params.error.as_deref(),
+        "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] quit",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Dataset Selector
+// ---------------------------------------------------------------------------
+
+fn draw_dataset_selector(f: &mut Frame, app: &App) {
     let area = f.area();
-    let popup = centered_rect(64, 78, area);
+    let popup = centered_rect(66, 70, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Training Parameters ")
+        .title(" Training Dataset ")
         .title_alignment(Alignment::Center);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
-    for (i, name) in TRAINING_PARAM_FIELD_NAMES.iter().enumerate() {
-        let focused = i == app.training_params.field_idx;
-        let cursor = if focused { "\u{2588}" } else { "" };
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {:>16} : ", name), focused_label(focused)),
-            Span::styled(
-                format!(
-                    "{}{}",
-                    app.training_params
-                        .fields
-                        .get(i)
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                    cursor
-                ),
-                focused_value(focused),
-            ),
-        ]));
-    }
+    let lr = app
+        .training_params
+        .fields
+        .first()
+        .map(String::as_str)
+        .unwrap_or("?");
+    let batch = app
+        .training_params
+        .fields
+        .get(1)
+        .map(String::as_str)
+        .unwrap_or("?");
+    let steps = app
+        .training_params
+        .fields
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("?");
+
+    lines.push(Line::from(Span::styled(
+        format!("  Configured params: lr={lr}, batch={batch}, steps={steps}"),
+        Style::default().fg(Color::DarkGray),
+    )));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -547,7 +626,7 @@ fn draw_training_params(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] field  [type] edit  [<- / ->] cycle dataset  [Enter] next/start  [Backspace] del  [Esc] quit",
+        "  [arrow] select dataset  [<- / ->] cycle  [Enter] start training  [Esc] quit",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -664,6 +743,25 @@ fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
+    fn format_bytes(value: Option<u64>) -> String {
+        let Some(bytes) = value else {
+            return "—".to_string();
+        };
+        const KIB: f64 = 1024.0;
+        const MIB: f64 = KIB * 1024.0;
+        const GIB: f64 = MIB * 1024.0;
+        let bytes_f = bytes as f64;
+        if bytes_f >= GIB {
+            format!("{:.2} GiB", bytes_f / GIB)
+        } else if bytes_f >= MIB {
+            format!("{:.2} MiB", bytes_f / MIB)
+        } else if bytes_f >= KIB {
+            format!("{:.2} KiB", bytes_f / KIB)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+
     let block = Block::default().borders(Borders::ALL).title(" Analytics ");
 
     let history = &app.monitor.loss_history;
@@ -736,6 +834,15 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
         ("Learning Rt ", lr_str),
         ("Batch Size  ", batch_str),
         ("Loss Fn     ", loss_fn_str),
+        ("Max Buffer  ", format_bytes(app.monitor.max_buffer_bytes)),
+        (
+            "Max Storage ",
+            format_bytes(app.monitor.max_storage_binding_bytes),
+        ),
+        (
+            "Est. Usage  ",
+            format_bytes(app.monitor.estimated_training_bytes),
+        ),
     ];
 
     let label_style = Style::default().fg(Color::DarkGray);

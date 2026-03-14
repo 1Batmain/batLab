@@ -93,7 +93,7 @@ fn group_norm_back_gamma(@builtin(global_invocation_id) gid: vec3<u32>) {
         let x_hat = (fwd_input[index] - mean) * inv_std;
         accum += grad_output[index] * x_hat;
     }
-    grad_gamma[channel] = accum;
+    grad_gamma[channel] += accum;
 }
 
 @compute @workgroup_size(64)
@@ -105,5 +105,5 @@ fn group_norm_back_beta(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var spatial_idx: u32 = 0u; spatial_idx < layer_spec.spatial_len; spatial_idx++) {
         accum += grad_output[flat_index(spatial_idx, channel)];
     }
-    grad_beta[channel] = accum;
+    grad_beta[channel] += accum;
 }

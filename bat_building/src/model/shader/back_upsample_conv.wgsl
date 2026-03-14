@@ -135,7 +135,7 @@ fn upsample_conv_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
             g += grad_output[go_i] * fwd_input[in_i];
         }
     }
-    grad_weights[idx] = g;
+    grad_weights[idx] += g;
 }
 
 @compute @workgroup_size(64)
@@ -153,5 +153,5 @@ fn upsample_conv_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
             g += grad_output[oy * OW * K + ox * K + k];
         }
     }
-    grad_bias[k] = g;
+    grad_bias[k] += g;
 }

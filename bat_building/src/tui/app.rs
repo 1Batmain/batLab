@@ -486,6 +486,110 @@ impl fmt::Display for LayerKind {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelTemplate {
+    pub name: String,
+    pub description: String,
+    pub input_size: (u32, u32, u32),
+    pub layers: Vec<LayerDraft>,
+    pub default_lr: f32,
+    pub default_batch_size: u32,
+    pub default_steps: usize,
+}
+
+fn diffusion_template() -> ModelTemplate {
+    ModelTemplate {
+        name: "Diffusion (CIFAR)".to_string(),
+        description: "UNet-like diffusion backbone for 32x32 RGB targets".to_string(),
+        input_size: (32, 32, 8),
+        layers: vec![
+            LayerDraft::Convolution {
+                dim_input: (32, 32, 8),
+                nb_kernel: 16,
+                dim_kernel: (3, 3, 8),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: Some("enc1".to_string()),
+            },
+            LayerDraft::GroupNorm {
+                dim_input: (32, 32, 16),
+                num_groups: 4,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (32, 32, 16),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (32, 32, 16),
+                nb_kernel: 32,
+                dim_kernel: (3, 3, 16),
+                stride: 2,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::GroupNorm {
+                dim_input: (16, 16, 32),
+                num_groups: 8,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (16, 16, 32),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (16, 16, 32),
+                nb_kernel: 32,
+                dim_kernel: (3, 3, 32),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::UpsampleConv {
+                dim_input: (16, 16, 32),
+                scale_factor: 2,
+                nb_kernel: 16,
+                dim_kernel: (3, 3, 32),
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::Concat {
+                dim_input: (32, 32, 16),
+                dim_skip: (32, 32, 16),
+                skip_key: "enc1".to_string(),
+                save_key: None,
+            },
+            LayerDraft::GroupNorm {
+                dim_input: (32, 32, 32),
+                num_groups: 8,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (32, 32, 32),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (32, 32, 32),
+                nb_kernel: 3,
+                dim_kernel: (3, 3, 32),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+        ],
+        default_lr: 0.01,
+        default_batch_size: 1,
+        default_steps: 200,
+    }
+}
+
+fn built_in_templates() -> Vec<ModelTemplate> {
+    vec![diffusion_template()]
+}
+
 // ---------------------------------------------------------------------------
 // Run / model configuration
 // ---------------------------------------------------------------------------
@@ -538,10 +642,12 @@ impl ModelConfig {
 pub enum Screen {
     Home,
     LoadPath,
+    TemplateSelector,
     InputSize,
     LayerBuilder,
     ModeSelector,
     TrainingParams,
+    DatasetSelector,
     Monitor,
     SaveModel,
 }
@@ -551,11 +657,17 @@ pub enum Screen {
 // ---------------------------------------------------------------------------
 
 pub struct HomeState {
-    pub selected: usize, // 0 = Load, 1 = Build
+    pub selected: usize, // 0 = Load saved, 1 = Use template
 }
 
 pub struct LoadPathState {
     pub models: Vec<SavedModelEntry>,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+pub struct TemplateSelectorState {
+    pub templates: Vec<ModelTemplate>,
     pub selected: usize,
     pub error: Option<String>,
 }
@@ -601,8 +713,7 @@ pub struct TrainingParamsState {
     pub selected_dataset: usize,
 }
 
-pub const TRAINING_PARAM_FIELD_NAMES: [&str; 4] =
-    ["Learning Rate", "Batch Size", "Steps", "Dataset Path"];
+pub const TRAINING_PARAM_FIELD_NAMES: [&str; 3] = ["Learning Rate", "Batch Size", "Steps"];
 
 #[derive(Default)]
 pub struct MonitorState {
@@ -618,6 +729,12 @@ pub struct MonitorState {
     pub save_status: Option<String>,
     /// The model config currently being monitored (used when saving).
     pub model_config: Option<ModelConfig>,
+    /// Device limit proxy for largest single GPU buffer allocation.
+    pub max_buffer_bytes: Option<u64>,
+    /// Device limit proxy for largest storage-binding allocation.
+    pub max_storage_binding_bytes: Option<u64>,
+    /// Best-effort estimate of current model+training GPU allocation.
+    pub estimated_training_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +754,7 @@ pub struct App {
     pub screen: Screen,
     pub home: HomeState,
     pub load_path: LoadPathState,
+    pub template_selector: TemplateSelectorState,
     pub input_size: InputSizeState,
     pub layer_builder: LayerBuilderState,
     pub mode_selector: ModeSelectorState,
@@ -749,6 +867,17 @@ fn normalize_key(value: &str) -> Option<String> {
 impl App {
     pub fn new() -> Self {
         let models = storage::list_saved_models().unwrap_or_default();
+        let templates = built_in_templates();
+        let (default_lr, default_batch, default_steps) = templates
+            .first()
+            .map(|template| {
+                (
+                    template.default_lr,
+                    template.default_batch_size,
+                    template.default_steps,
+                )
+            })
+            .unwrap_or((0.01, 1, 50));
         let datasets = storage::list_datasets().unwrap_or_default();
         let dataset_path = datasets.first().cloned().unwrap_or_default();
         let mut app = Self {
@@ -756,6 +885,11 @@ impl App {
             home: HomeState { selected: 1 },
             load_path: LoadPathState {
                 models,
+                selected: 0,
+                error: None,
+            },
+            template_selector: TemplateSelectorState {
+                templates,
                 selected: 0,
                 error: None,
             },
@@ -776,7 +910,12 @@ impl App {
             },
             mode_selector: ModeSelectorState { selected: 1 },
             training_params: TrainingParamsState {
-                fields: vec!["0.01".into(), "1".into(), "50".into(), dataset_path],
+                fields: vec![
+                    default_lr.to_string(),
+                    default_batch.to_string(),
+                    default_steps.to_string(),
+                    dataset_path,
+                ],
                 field_idx: 0,
                 error: None,
                 datasets,
@@ -792,6 +931,9 @@ impl App {
                 restart_training: false,
                 save_status: None,
                 model_config: None,
+                max_buffer_bytes: None,
+                max_storage_binding_bytes: None,
+                estimated_training_bytes: None,
             },
             save_model: SaveModelState {
                 name: String::new(),
@@ -814,6 +956,15 @@ impl App {
         self.load_path.error = None;
     }
 
+    fn refresh_templates(&mut self) {
+        self.template_selector.templates = built_in_templates();
+        if self.template_selector.selected >= self.template_selector.templates.len() {
+            self.template_selector.selected =
+                self.template_selector.templates.len().saturating_sub(1);
+        }
+        self.template_selector.error = None;
+    }
+
     fn refresh_datasets(&mut self) {
         self.training_params.datasets = storage::list_datasets().unwrap_or_default();
         if self.training_params.datasets.is_empty() {
@@ -828,7 +979,7 @@ impl App {
         }
     }
 
-    fn sync_selected_dataset_from_field(&mut self) {
+    pub fn sync_selected_dataset_from_field(&mut self) {
         if let Some(index) = self
             .training_params
             .datasets
@@ -837,6 +988,38 @@ impl App {
         {
             self.training_params.selected_dataset = index;
         }
+    }
+
+    fn apply_template(&mut self, template: &ModelTemplate) {
+        self.active_model_name = None;
+        self.layer_builder.model_input = template.input_size;
+        self.input_size.fields = vec![
+            template.input_size.0.to_string(),
+            template.input_size.1.to_string(),
+            template.input_size.2.to_string(),
+        ];
+        self.layer_builder.layers = template.layers.clone();
+        self.layer_builder.error = None;
+        self.layer_builder.mode = LayerBuilderMode::Add;
+        self.layer_builder.browse_selected = self.layer_builder.layers.len().saturating_sub(1);
+        self.input_size.error = None;
+
+        self.training_params.fields[0] = template.default_lr.to_string();
+        self.training_params.fields[1] = template.default_batch_size.to_string();
+        self.training_params.fields[2] = template.default_steps.to_string();
+        self.training_params.error = None;
+        self.training_params.field_idx = 0;
+        self.refresh_datasets();
+        if self.training_params.datasets.is_empty() {
+            self.training_params.fields[3].clear();
+            self.training_params.selected_dataset = 0;
+        } else {
+            self.training_params.selected_dataset = 0;
+            self.training_params.fields[3] = self.training_params.datasets[0].clone();
+        }
+
+        self.mode_selector.selected = 1;
+        self.screen = Screen::ModeSelector;
     }
 
     fn apply_loaded_model(&mut self, config: ModelConfig) {
@@ -893,6 +1076,18 @@ impl App {
         }
         self.training_params.fields[3] =
             self.training_params.datasets[self.training_params.selected_dataset].clone();
+        self.training_params.error = None;
+    }
+
+    pub fn select_dataset(&mut self, index: usize) {
+        if self.training_params.datasets.is_empty() {
+            self.training_params.selected_dataset = 0;
+            self.training_params.fields[3].clear();
+            return;
+        }
+        let clamped = index.min(self.training_params.datasets.len() - 1);
+        self.training_params.selected_dataset = clamped;
+        self.training_params.fields[3] = self.training_params.datasets[clamped].clone();
         self.training_params.error = None;
     }
 
@@ -1510,8 +1705,25 @@ impl App {
                 self.refresh_saved_models();
                 Screen::LoadPath
             }
-            _ => Screen::InputSize,
+            _ => {
+                self.refresh_templates();
+                Screen::TemplateSelector
+            }
         };
+    }
+
+    pub fn finish_template_selector(&mut self) {
+        let Some(template) = self
+            .template_selector
+            .templates
+            .get(self.template_selector.selected)
+            .cloned()
+        else {
+            self.template_selector.error = Some("No templates are available.".to_string());
+            return;
+        };
+        self.template_selector.error = None;
+        self.apply_template(&template);
     }
 
     pub fn finish_load_path(&mut self) {
@@ -1565,11 +1777,28 @@ impl App {
                     mode: RunMode::Infer,
                 })
             }
-            _ => self.screen = Screen::TrainingParams,
+            _ => {
+                self.training_params.error = None;
+                self.training_params.field_idx = 0;
+                self.screen = Screen::TrainingParams;
+            }
         }
     }
 
-    pub fn finish_training_params(&mut self) -> Result<(), String> {
+    pub fn enter_layer_builder_from_mode(&mut self) {
+        self.layer_builder.error = None;
+        if self.layer_builder.layers.is_empty() {
+            self.layer_builder.mode = LayerBuilderMode::Add;
+        } else {
+            self.layer_builder.mode = LayerBuilderMode::Browse;
+            if self.layer_builder.browse_selected >= self.layer_builder.layers.len() {
+                self.layer_builder.browse_selected = self.layer_builder.layers.len() - 1;
+            }
+        }
+        self.screen = Screen::LayerBuilder;
+    }
+
+    pub fn finish_dataset_selector(&mut self) -> Result<(), String> {
         let lr = self.training_params.fields[0]
             .parse::<f32>()
             .map_err(|_| "Learning rate must be a number".to_string())?;
@@ -1579,7 +1808,6 @@ impl App {
         let steps = self.training_params.fields[2]
             .parse::<usize>()
             .map_err(|_| "Steps must be an integer".to_string())?;
-        let dataset_path = self.training_params.fields[3].clone();
         if lr <= 0.0 {
             return Err("Learning rate must be > 0".into());
         }
@@ -1589,6 +1817,11 @@ impl App {
         if steps == 0 {
             return Err("Steps must be > 0".into());
         }
+        if self.training_params.datasets.is_empty() {
+            return Err("No datasets found in datasets/".into());
+        }
+        self.select_dataset(self.training_params.selected_dataset);
+        let dataset_path = self.training_params.fields[3].clone();
         if dataset_path.trim().is_empty() {
             return Err("Dataset path must not be empty".into());
         }
@@ -1607,6 +1840,34 @@ impl App {
                 loss: LossMethod::MeanSquared,
             }),
         });
+        Ok(())
+    }
+
+    pub fn finish_training_params(&mut self) -> Result<(), String> {
+        let lr = self.training_params.fields[0]
+            .parse::<f32>()
+            .map_err(|_| "Learning rate must be a number".to_string())?;
+        let batch = self.training_params.fields[1]
+            .parse::<u32>()
+            .map_err(|_| "Batch size must be an integer".to_string())?;
+        let steps = self.training_params.fields[2]
+            .parse::<usize>()
+            .map_err(|_| "Steps must be an integer".to_string())?;
+        if lr <= 0.0 {
+            return Err("Learning rate must be > 0".into());
+        }
+        if batch == 0 {
+            return Err("Batch size must be > 0".into());
+        }
+        if steps == 0 {
+            return Err("Steps must be > 0".into());
+        }
+        self.monitor.total_steps = steps;
+        self.training_params.error = None;
+        self.training_params.fields[0] = lr.to_string();
+        self.training_params.fields[1] = batch.to_string();
+        self.training_params.fields[2] = steps.to_string();
+        self.screen = Screen::DatasetSelector;
         Ok(())
     }
 
@@ -1630,30 +1891,23 @@ impl App {
         let accepted = match idx {
             0 => c.is_ascii_digit() || c == '.',
             1 | 2 => c.is_ascii_digit(),
-            3 => !c.is_control(),
             _ => false,
         };
         if accepted {
             self.training_params.fields[idx].push(c);
             self.training_params.error = None;
-            if idx == 3 {
-                self.sync_selected_dataset_from_field();
-            }
         }
     }
 
     pub fn handle_backspace_training(&mut self) {
         let idx = self.training_params.field_idx;
         self.training_params.fields[idx].pop();
-        if idx == 3 {
-            self.sync_selected_dataset_from_field();
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{App, LayerKind};
+    use super::{App, LayerKind, RunMode, Screen};
 
     #[test]
     fn cycle_kind_backward_moves_in_reverse_order() {
@@ -1665,5 +1919,99 @@ mod tests {
 
         app.cycle_kind_backward();
         assert_eq!(app.layer_builder.current_kind, LayerKind::UpsampleConv);
+    }
+
+    #[test]
+    fn home_template_path_opens_template_selector() {
+        let mut app = App::new();
+        app.home.selected = 1;
+
+        app.finish_home();
+
+        assert!(matches!(app.screen, Screen::TemplateSelector));
+    }
+
+    #[test]
+    fn selecting_template_prefills_architecture_and_advances_to_mode() {
+        let mut app = App::new();
+        app.home.selected = 1;
+        app.finish_home();
+
+        app.finish_template_selector();
+
+        assert!(matches!(app.screen, Screen::ModeSelector));
+        assert!(!app.layer_builder.layers.is_empty());
+        assert_eq!(app.layer_builder.model_input, (32, 32, 8));
+    }
+
+    #[test]
+    fn training_selection_advances_to_training_params() {
+        let mut app = App::new();
+        app.home.selected = 1;
+        app.finish_home();
+        app.finish_template_selector();
+        app.mode_selector.selected = 1;
+
+        app.finish_mode_selector();
+
+        assert!(matches!(app.screen, Screen::TrainingParams));
+    }
+
+    #[test]
+    fn dataset_selector_requires_available_dataset() {
+        let mut app = App::new();
+        app.home.selected = 1;
+        app.finish_home();
+        app.finish_template_selector();
+        app.mode_selector.selected = 1;
+        app.finish_mode_selector();
+        app.training_params.fields[0] = "0.01".to_string();
+        app.training_params.fields[1] = "1".to_string();
+        app.training_params.fields[2] = "10".to_string();
+        app.finish_training_params()
+            .expect("training params should be valid");
+        app.training_params.datasets.clear();
+        app.training_params.fields[3].clear();
+
+        let result = app.finish_dataset_selector();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn training_params_and_dataset_build_train_run_config() {
+        let mut app = App::new();
+        app.home.selected = 1;
+        app.finish_home();
+        app.finish_template_selector();
+        app.mode_selector.selected = 1;
+        app.finish_mode_selector();
+
+        app.training_params.fields[0] = "0.005".to_string();
+        app.training_params.fields[1] = "3".to_string();
+        app.training_params.fields[2] = "77".to_string();
+        app.finish_training_params()
+            .expect("training params should be accepted");
+        assert!(matches!(app.screen, Screen::DatasetSelector));
+
+        app.training_params.datasets = vec![".".to_string()];
+        app.training_params.selected_dataset = 0;
+        app.training_params.fields[3] = ".".to_string();
+        app.finish_dataset_selector()
+            .expect("dataset selector should produce run config");
+
+        let Some(run) = app.run_config.as_ref() else {
+            panic!("run config should be set");
+        };
+
+        match &run.mode {
+            RunMode::Train(train) => {
+                assert_eq!(train.lr, 0.005);
+                assert_eq!(train.batch_size, 3);
+                assert_eq!(train.steps, 77);
+                assert_eq!(train.dataset_path, ".");
+            }
+            _ => panic!("expected training run mode"),
+        }
     }
 }
