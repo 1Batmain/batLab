@@ -28,63 +28,10 @@ pub fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
-pub fn saved_models_dir() -> io::Result<PathBuf> {
-    let dir = project_root().join("saved_models");
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 pub fn datasets_dir() -> io::Result<PathBuf> {
     let dir = project_root().join("datasets");
     fs::create_dir_all(&dir)?;
     Ok(dir)
-}
-
-pub fn save_model_config(config: &ModelConfig) -> io::Result<PathBuf> {
-    let name = next_model_name()?;
-    save_model_config_named(config, &name)
-}
-
-/// Returns the next unused default model name stem, e.g. "model-003".
-pub fn next_model_name() -> io::Result<String> {
-    let dir = saved_models_dir()?;
-    let mut next_index = 1usize;
-    loop {
-        let name = format!("model-{next_index:03}");
-        let path = dir.join(format!("{name}.json"));
-        if !path.exists() {
-            return Ok(name);
-        }
-        next_index += 1;
-    }
-}
-
-/// Saves a model config with an explicit file name stem (no extension required).
-/// Overwrites any existing file with the same name.
-pub fn save_model_config_named(config: &ModelConfig, name: &str) -> io::Result<PathBuf> {
-    let dir = saved_models_dir()?;
-    let path = dir.join(format!("{name}.json"));
-    let mut persisted = config.clone();
-    persisted.model_name = Some(name.to_string());
-    let bytes = serde_json::to_vec_pretty(&persisted).map_err(serde_to_io)?;
-    fs::write(&path, bytes)?;
-    Ok(path)
-}
-
-pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {
-    let bytes = fs::read(path)?;
-    let mut config: ModelConfig = serde_json::from_slice(&bytes).map_err(serde_to_io)?;
-    if config.model_name.is_none() {
-        config.model_name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| stem.to_string());
-    }
-    Ok(config)
-}
-
-pub fn checkpoint_path_for_model_name(name: &str) -> io::Result<PathBuf> {
-    Ok(saved_models_dir()?.join(format!("{name}.ckpt")))
 }
 
 pub fn models_dir() -> io::Result<PathBuf> {
@@ -113,13 +60,48 @@ pub fn model_config_path(model_name: &str) -> io::Result<PathBuf> {
     Ok(model_dir(model_name)?.join("config_file"))
 }
 
-pub fn write_model_template_config(model_name: &str, config: &ModelConfig) -> io::Result<PathBuf> {
+pub fn next_model_name() -> io::Result<String> {
+    let root = models_dir()?;
+    let mut next_index = 1usize;
+    loop {
+        let name = format!("model-{next_index:03}");
+        if !root.join(&name).exists() {
+            return Ok(name);
+        }
+        next_index += 1;
+    }
+}
+
+pub fn write_model_config(model_name: &str, config: &ModelConfig) -> io::Result<PathBuf> {
     let path = model_config_path(model_name)?;
     let mut persisted = config.clone();
     persisted.model_name = Some(model_name.to_string());
     let bytes = serde_json::to_vec_pretty(&persisted).map_err(serde_to_io)?;
     fs::write(&path, bytes)?;
     Ok(path)
+}
+
+pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {
+    let bytes = fs::read(path)?;
+    let mut config: ModelConfig = serde_json::from_slice(&bytes).map_err(serde_to_io)?;
+    if config.model_name.is_none() {
+        config.model_name = path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.to_string())
+            });
+    }
+    Ok(config)
+}
+
+pub fn load_model_config_for_model(model_name: &str) -> io::Result<ModelConfig> {
+    let path = model_config_path(model_name)?;
+    load_model_config(&path)
 }
 
 pub fn list_model_checkpoints(model_name: &str) -> io::Result<Vec<CheckpointEntry>> {
@@ -152,26 +134,32 @@ pub fn list_model_checkpoints(model_name: &str) -> io::Result<Vec<CheckpointEntr
     Ok(entries)
 }
 
-pub fn list_saved_models() -> io::Result<Vec<SavedModelEntry>> {
-    let dir = saved_models_dir()?;
+pub fn list_models() -> io::Result<Vec<SavedModelEntry>> {
     let mut models = Vec::new();
-    for entry in fs::read_dir(dir)? {
+    let root = models_dir()?;
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        if !path.is_dir() {
             continue;
         }
-        let config = match load_model_config(&path) {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let config_path = path.join("config_file");
+        if !config_path.is_file() {
+            continue;
+        }
+        let config = match load_model_config(&config_path) {
             Ok(config) => config,
             Err(_) => continue,
         };
         models.push(SavedModelEntry {
-            name: path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("model")
-                .to_string(),
-            path,
+            name: name.to_string(),
+            path: config_path,
             input_size: config.input_size,
             layer_count: config.layers.len(),
         });

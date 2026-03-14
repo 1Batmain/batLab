@@ -13,6 +13,24 @@ pub enum TrainingEvent {
         loss: Option<f32>,
         sample_path: Option<String>,
     },
+    InferenceImage {
+        width: u32,
+        height: u32,
+        channels: u32,
+        pixels: Vec<u8>,
+        checkpoint_path: String,
+        seed: u64,
+    },
+    TrainingState {
+        paused: bool,
+        lr: f32,
+        batch_size: u32,
+        total_steps: usize,
+    },
+    SaveStatus {
+        message: String,
+        is_error: bool,
+    },
     Error {
         message: String,
     },
@@ -31,7 +49,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::TrainingParams => handle_training_params(app, code),
         Screen::DatasetSelector => handle_dataset_selector(app, code),
         Screen::Monitor => handle_monitor(app, code),
-        Screen::SaveModel => handle_save_model(app, code),
+        Screen::TrainingControl => handle_training_control(app, code),
     }
 }
 
@@ -282,29 +300,49 @@ fn handle_training_params(app: &mut App, code: KeyCode) {
 fn handle_monitor(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('s') => app.open_save_model(),
+        KeyCode::Char('s') => {
+            if let Err(e) = app.trigger_monitor_save() {
+                app.monitor.error = Some(e);
+            }
+        }
+        KeyCode::Char('p') if !app.monitor.done && app.monitor.current_lr.is_some() => {
+            app.toggle_training_pause();
+        }
+        KeyCode::Char('t') if !app.monitor.done && app.monitor.current_lr.is_some() => {
+            if let Err(e) = app.open_training_control() {
+                app.monitor.error = Some(e);
+            }
+        }
         KeyCode::Char('r') if app.monitor.done => app.request_restart(),
         _ => {}
     }
 }
 
-fn handle_save_model(app: &mut App, code: KeyCode) {
+fn handle_training_control(app: &mut App, code: KeyCode) {
+    let max_field = 2;
     match code {
         KeyCode::Esc => {
-            // Cancel – go back to the monitor.
             app.screen = Screen::Monitor;
         }
-        KeyCode::Enter => match app.finish_save_model() {
-            Ok(path) => {
-                app.monitor.save_status = Some(format!("Saved → {path}"));
-                app.screen = Screen::Monitor;
+        KeyCode::Up => {
+            if app.training_control.field_idx > 0 {
+                app.training_control.field_idx -= 1;
             }
-            Err(e) => {
-                app.save_model.error = Some(e);
+        }
+        KeyCode::Down => {
+            if app.training_control.field_idx < max_field {
+                app.training_control.field_idx += 1;
             }
-        },
-        KeyCode::Backspace => app.handle_backspace_save_model(),
-        KeyCode::Char(c) => app.handle_char_save_model(c),
+        }
+        KeyCode::Backspace => app.handle_backspace_training_control(),
+        KeyCode::Enter => {
+            if app.training_control.field_idx < max_field {
+                app.training_control.field_idx += 1;
+            } else if let Err(e) = app.finish_training_control() {
+                app.training_control.error = Some(e);
+            }
+        }
+        KeyCode::Char(c) => app.handle_char_training_control(c),
         _ => {}
     }
 }

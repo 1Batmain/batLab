@@ -4,13 +4,13 @@ pub mod storage;
 pub mod ui;
 
 pub use app::{
-    ActivationMethod, App, LayerDraft, LayerKind, LossMethod, ModelConfig, PaddingMode, RunConfig,
-    RunMode, Screen, TrainingConfig,
+    ActivationMethod, App, LayerDraft, LayerKind, LossMethod, ModelConfig, MonitorImage,
+    PaddingMode, RunConfig, RunMode, Screen, TrainingConfig, TrainingControlCommand,
 };
 pub use events::TrainingEvent;
 
 use std::io;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 /// Outcome returned by [`run_monitor`].
 pub enum MonitorOutcome {
@@ -78,6 +78,7 @@ fn run_builder_loop(
 pub fn run_monitor(
     config: ModelConfig,
     rx: Receiver<TrainingEvent>,
+    control_tx: Option<Sender<TrainingControlCommand>>,
 ) -> Result<MonitorOutcome, Box<dyn std::error::Error>> {
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -98,6 +99,9 @@ pub fn run_monitor(
         RunMode::Train(tc) => {
             app.mode_selector.selected = 1;
             app.monitor.total_steps = tc.steps;
+            app.monitor.current_lr = Some(tc.lr);
+            app.monitor.current_batch_size = Some(tc.batch_size);
+            app.monitor.is_training_paused = false;
             app.training_params.fields = vec![
                 tc.lr.to_string(),
                 tc.batch_size.to_string(),
@@ -110,7 +114,7 @@ pub fn run_monitor(
         }
     }
 
-    let outcome = run_monitor_session(&mut terminal, &mut app, rx);
+    let outcome = run_monitor_session(&mut terminal, &mut app, rx, control_tx);
 
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -126,8 +130,9 @@ fn run_monitor_session(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut App,
     rx: Receiver<TrainingEvent>,
+    control_tx: Option<Sender<TrainingControlCommand>>,
 ) -> Result<MonitorOutcome, Box<dyn std::error::Error>> {
-    run_monitor_loop(terminal, app, rx)?;
+    run_monitor_loop(terminal, app, rx, control_tx)?;
 
     if app.monitor.restart_training {
         // Reset to mode selection with the same architecture so the user can
@@ -149,6 +154,7 @@ fn run_monitor_loop(
     terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
     app: &mut App,
     rx: Receiver<TrainingEvent>,
+    control_tx: Option<Sender<TrainingControlCommand>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crossterm::event::{Event, KeyEventKind, poll, read};
     use std::time::Duration;
@@ -178,6 +184,48 @@ fn run_monitor_loop(
                         app.monitor.last_sample_path = Some(path);
                     }
                 }
+                TrainingEvent::InferenceImage {
+                    width,
+                    height,
+                    channels,
+                    pixels,
+                    checkpoint_path,
+                    seed,
+                } => {
+                    app.monitor.inference_image = Some(MonitorImage {
+                        width,
+                        height,
+                        channels,
+                        pixels,
+                    });
+                    app.monitor.inference_checkpoint_path = Some(checkpoint_path);
+                    app.monitor.inference_seed = Some(seed);
+                }
+                TrainingEvent::TrainingState {
+                    paused,
+                    lr,
+                    batch_size,
+                    total_steps,
+                } => {
+                    app.monitor.is_training_paused = paused;
+                    app.monitor.current_lr = Some(lr);
+                    app.monitor.current_batch_size = Some(batch_size);
+                    app.monitor.total_steps = total_steps;
+                    if let Some(config) = app.monitor.model_config.as_mut()
+                        && let RunMode::Train(ref mut train) = config.run.mode
+                    {
+                        train.lr = lr;
+                        train.batch_size = batch_size;
+                        train.steps = total_steps;
+                    }
+                }
+                TrainingEvent::SaveStatus { message, is_error } => {
+                    if is_error {
+                        app.monitor.error = Some(message);
+                    } else {
+                        app.monitor.save_status = Some(message);
+                    }
+                }
                 TrainingEvent::Error { message } => {
                     app.monitor.error = Some(message);
                     app.monitor.done = true;
@@ -194,6 +242,14 @@ fn run_monitor_loop(
             if let Event::Key(key) = read()? {
                 if key.kind == KeyEventKind::Press {
                     events::handle_key(app, key.code);
+                }
+            }
+        }
+
+        for command in app.drain_monitor_control_commands() {
+            if let Some(tx) = control_tx.as_ref() {
+                if tx.send(command).is_err() {
+                    app.monitor.error = Some("training control channel disconnected".to_string());
                 }
             }
         }

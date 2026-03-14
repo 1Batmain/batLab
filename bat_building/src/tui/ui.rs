@@ -1,6 +1,6 @@
 use super::app::{
-    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, RunMode, Screen,
-    TRAINING_PARAM_FIELD_NAMES,
+    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, MonitorImage, RunMode, Screen,
+    TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -16,9 +16,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::TrainingParams => draw_training_params(f, app),
         Screen::DatasetSelector => draw_dataset_selector(f, app),
         Screen::Monitor => draw_monitor(f, app),
-        Screen::SaveModel => {
+        Screen::TrainingControl => {
             draw_monitor(f, app);
-            draw_save_model(f, app);
+            draw_training_control(f, app);
         }
     }
 }
@@ -191,7 +191,7 @@ fn draw_load_path(f: &mut Frame, app: &App) {
     let mut lines = vec![Line::from("")];
     if app.load_path.models.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No saved models found in saved_models/",
+            "  No model configs found in Models/",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
@@ -723,12 +723,18 @@ fn draw_monitor(f: &mut Frame, app: &App) {
     let horizontal = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(main_area);
 
-    let right = Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(horizontal[1]);
-
     draw_monitor_architecture(f, app, horizontal[0]);
-    draw_sparkline(f, app, right[0]);
-    draw_analytics(f, app, right[1]);
+    if is_inference_mode(app) {
+        let right = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(horizontal[1]);
+        draw_inference_image(f, app, right[0]);
+        draw_analytics(f, app, right[1]);
+    } else {
+        let right = Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(horizontal[1]);
+        draw_sparkline(f, app, right[0]);
+        draw_analytics(f, app, right[1]);
+    }
 
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(hint_area);
@@ -738,11 +744,22 @@ fn draw_monitor(f: &mut Frame, app: &App) {
     } else if let Some(error) = &app.monitor.error {
         format!(" error: {error} | [s] save  [q] quit")
     } else if app.monitor.done {
-        " [r] new training  [s] save model  [q] quit".to_string()
+        " [r] new run  [s] save config  [q] quit".to_string()
+    } else if is_training_mode(app) {
+        let status = if app.monitor.is_training_paused {
+            "paused"
+        } else {
+            "running"
+        };
+        format!(
+            " training: {status} | [p] pause/resume  [t] tune params  [s] save snapshot  [q] quit"
+        )
+    } else if let Some(checkpoint_path) = &app.monitor.inference_checkpoint_path {
+        format!(" checkpoint: {checkpoint_path} | [s] save  [q] quit")
     } else if let Some(sample_path) = &app.monitor.last_sample_path {
         format!(" sample: {sample_path} | [s] save  [q] quit")
     } else {
-        " [s] save model  [q] quit".to_string()
+        " [s] save config  [q] quit".to_string()
     };
     f.render_widget(hint_bar(&hint_text), inner);
 }
@@ -759,6 +776,92 @@ fn draw_monitor_architecture(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, l)| Line::from(format!("  {}: {}", i, l.display())))
         .collect();
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn is_inference_mode(app: &App) -> bool {
+    app.monitor
+        .model_config
+        .as_ref()
+        .is_some_and(|config| matches!(config.run.mode, RunMode::Infer))
+}
+
+fn is_training_mode(app: &App) -> bool {
+    app.monitor
+        .model_config
+        .as_ref()
+        .is_some_and(|config| matches!(config.run.mode, RunMode::Train(_)))
+}
+
+fn monitor_image_rgb(image: &MonitorImage, x: u32, y: u32) -> (u8, u8, u8) {
+    let idx = ((y * image.width + x) * 3) as usize;
+    let r = *image.pixels.get(idx).unwrap_or(&0);
+    let g = *image.pixels.get(idx + 1).unwrap_or(&0);
+    let b = *image.pixels.get(idx + 2).unwrap_or(&0);
+    (r, g, b)
+}
+
+fn draw_inference_image(f: &mut Frame, app: &App, area: Rect) {
+    let title = app
+        .monitor
+        .inference_image
+        .as_ref()
+        .map(|image| {
+            format!(
+                " Inference Preview ({}x{}x{}) ",
+                image.width, image.height, image.channels
+            )
+        })
+        .unwrap_or_else(|| " Inference Preview ".to_string());
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(image) = app.monitor.inference_image.as_ref() else {
+        let placeholder = Paragraph::new("  Waiting for inference output...");
+        f.render_widget(placeholder, inner);
+        return;
+    };
+    if inner.width == 0 || inner.height == 0 || image.width == 0 || image.height == 0 {
+        return;
+    }
+
+    let max_w = inner.width as u32;
+    let max_h_px = (inner.height as u32).saturating_mul(2);
+    if max_w == 0 || max_h_px == 0 {
+        return;
+    }
+
+    let scale_w = max_w as f32 / image.width as f32;
+    let scale_h = max_h_px as f32 / image.height as f32;
+    let scale = scale_w.min(scale_h).min(1.0);
+    let dst_w = ((image.width as f32 * scale).floor() as u32).max(1);
+    let dst_h_px = ((image.height as f32 * scale).floor() as u32).max(1);
+    let dst_h_cells = (dst_h_px + 1) / 2;
+
+    let mut lines = Vec::with_capacity(dst_h_cells as usize);
+    for y_cell in 0..dst_h_cells {
+        let y_top_px = y_cell * 2;
+        let y_bottom_px = (y_top_px + 1).min(dst_h_px - 1);
+        let src_y_top = (y_top_px * image.height / dst_h_px).min(image.height - 1);
+        let src_y_bottom = (y_bottom_px * image.height / dst_h_px).min(image.height - 1);
+
+        let mut spans = Vec::with_capacity(dst_w as usize);
+        for x in 0..dst_w {
+            let src_x = (x * image.width / dst_w).min(image.width - 1);
+            let (tr, tg, tb) = monitor_image_rgb(image, src_x, src_y_top);
+            let (br, bg, bb) = monitor_image_rgb(image, src_x, src_y_bottom);
+            spans.push(Span::styled(
+                "▀",
+                Style::default()
+                    .fg(Color::Rgb(tr, tg, tb))
+                    .bg(Color::Rgb(br, bg, bb)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
+    f.render_widget(paragraph, inner);
 }
 
 fn draw_sparkline(f: &mut Frame, app: &App, area: Rect) {
@@ -861,20 +964,47 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
         "—"
     };
 
-    // Extract hyper-parameters from the stored config when available.
-    let (lr_str, batch_str, loss_fn_str) = if let Some(config) = &app.monitor.model_config {
-        if let RunMode::Train(ref tc) = config.run.mode {
-            (
-                format!("{}", tc.lr),
-                format!("{}", tc.batch_size),
-                tc.loss.to_string(),
-            )
-        } else {
-            ("—".into(), "—".into(), "—".into())
-        }
-    } else {
-        ("—".into(), "—".into(), "—".into())
-    };
+    // Extract hyper-parameters from live monitor state with config fallback.
+    let lr_str = app
+        .monitor
+        .current_lr
+        .map(|value| value.to_string())
+        .or_else(|| {
+            app.monitor.model_config.as_ref().and_then(|config| {
+                if let RunMode::Train(ref tc) = config.run.mode {
+                    Some(tc.lr.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let batch_str = app
+        .monitor
+        .current_batch_size
+        .map(|value| value.to_string())
+        .or_else(|| {
+            app.monitor.model_config.as_ref().and_then(|config| {
+                if let RunMode::Train(ref tc) = config.run.mode {
+                    Some(tc.batch_size.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let loss_fn_str = app
+        .monitor
+        .model_config
+        .as_ref()
+        .and_then(|config| {
+            if let RunMode::Train(ref tc) = config.run.mode {
+                Some(tc.loss.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "—".to_string());
 
     let step_str = if app.monitor.total_steps > 0 {
         format!("{}/{}", app.monitor.step + 1, app.monitor.total_steps)
@@ -899,8 +1029,37 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let format_loss = |v: Option<f64>| v.map_or_else(|| "—".to_string(), |x| format!("{:.6}", x));
+    let mode_str = if is_inference_mode(app) {
+        "Inference".to_string()
+    } else {
+        "Training".to_string()
+    };
+    let preview_dims = app
+        .monitor
+        .inference_image
+        .as_ref()
+        .map(|image| format!("{}x{}x{}", image.width, image.height, image.channels))
+        .unwrap_or_else(|| "—".to_string());
+    let seed_str = app
+        .monitor
+        .inference_seed
+        .map(|seed| seed.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let status_str = if app.monitor.done {
+        "Done".to_string()
+    } else if is_training_mode(app) {
+        if app.monitor.is_training_paused {
+            "Paused".to_string()
+        } else {
+            "Running".to_string()
+        }
+    } else {
+        "Running".to_string()
+    };
 
     let rows: &[(&str, String)] = &[
+        ("Mode        ", mode_str),
+        ("Status      ", status_str),
         ("Current Loss", format_loss(current_loss)),
         ("Best Loss   ", format_loss(best_loss)),
         ("Worst Loss  ", format_loss(worst_loss)),
@@ -910,6 +1069,8 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
         ("Learning Rt ", lr_str),
         ("Batch Size  ", batch_str),
         ("Loss Fn     ", loss_fn_str),
+        ("Preview     ", preview_dims),
+        ("Seed        ", seed_str),
         ("Max Buffer  ", format_bytes(app.monitor.max_buffer_bytes)),
         (
             "Max Storage ",
@@ -940,48 +1101,17 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Screen: Save Model (popup over Monitor)
+// Screen: Training Control (popup over Monitor)
 // ---------------------------------------------------------------------------
 
-fn draw_save_model(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let popup = centered_rect(54, 30, area);
-    f.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Save Model Config ")
-        .title_alignment(Alignment::Center);
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let cursor = "\u{2588}";
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Name : ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format!("{}{}", app.save_model.name, cursor),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(""),
-    ];
-
-    if let Some(err) = &app.save_model.error {
-        lines.push(Line::from(Span::styled(
-            format!("  \u{2717} {err}"),
-            Style::default().fg(Color::Red),
-        )));
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(Span::styled(
-        "  [type] edit name  [Enter] save  [Esc] cancel",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    f.render_widget(Paragraph::new(lines), inner);
+fn draw_training_control(f: &mut Frame, app: &App) {
+    draw_form_screen(
+        f,
+        "Training Controls",
+        &TRAINING_CONTROL_FIELD_NAMES,
+        &app.training_control.fields,
+        app.training_control.field_idx,
+        app.training_control.error.as_deref(),
+        "[up/down] field  [type] edit  [Enter] apply  [Esc] cancel",
+    );
 }
