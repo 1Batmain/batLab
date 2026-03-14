@@ -198,6 +198,25 @@ impl Model<Training> {
         self.run_train_step(input, target);
     }
 
+    pub fn set_learning_rate(&mut self, lr: f32) {
+        self.training
+            .as_mut()
+            .expect("training config unavailable")
+            .lr = lr;
+    }
+
+    pub fn set_batch_size(&mut self, batch_size: u32) {
+        self.training
+            .as_mut()
+            .expect("training config unavailable")
+            .batch_size = batch_size;
+    }
+
+    pub fn training_hyperparameters(&self) -> (f32, u32) {
+        let training = self.training.as_ref().expect("training config unavailable");
+        (training.lr, training.batch_size)
+    }
+
     /// Run one training step and read the resulting loss back to the CPU.
     pub fn train_step_report(&mut self, input: &[f32], target: &[f32]) -> f32 {
         self.run_train_step(input, target);

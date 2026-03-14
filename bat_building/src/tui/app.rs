@@ -621,6 +621,17 @@ pub struct RunConfig {
     pub mode: RunMode,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrainingControlCommand {
+    SetPaused(bool),
+    SaveCheckpoint,
+    UpdateParams {
+        lr: f32,
+        batch_size: u32,
+        total_steps: usize,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     #[serde(default)]
@@ -657,7 +668,7 @@ pub enum Screen {
     TrainingParams,
     DatasetSelector,
     Monitor,
-    SaveModel,
+    TrainingControl,
 }
 
 // ---------------------------------------------------------------------------
@@ -729,6 +740,22 @@ pub struct TrainingParamsState {
 
 pub const TRAINING_PARAM_FIELD_NAMES: [&str; 3] = ["Learning Rate", "Batch Size", "Steps"];
 
+pub struct TrainingControlState {
+    pub fields: Vec<String>, // [lr, batch_size, total_steps]
+    pub field_idx: usize,
+    pub error: Option<String>,
+}
+
+pub const TRAINING_CONTROL_FIELD_NAMES: [&str; 3] = ["Learning Rate", "Batch Size", "Total Steps"];
+
+#[derive(Debug, Clone)]
+pub struct MonitorImage {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u32,
+    pub pixels: Vec<u8>,
+}
+
 #[derive(Default)]
 pub struct MonitorState {
     pub step: usize,
@@ -749,18 +776,22 @@ pub struct MonitorState {
     pub max_storage_binding_bytes: Option<u64>,
     /// Best-effort estimate of current model+training GPU allocation.
     pub estimated_training_bytes: Option<u64>,
+    /// Inference preview image rendered in the monitor.
+    pub inference_image: Option<MonitorImage>,
+    /// Checkpoint used for the latest inference run.
+    pub inference_checkpoint_path: Option<String>,
+    /// Seed used for the latest inference sample.
+    pub inference_seed: Option<u64>,
+    /// Whether the training worker is currently paused.
+    pub is_training_paused: bool,
+    /// Current runtime learning rate (may differ from initial config).
+    pub current_lr: Option<f32>,
+    /// Current runtime batch size (may differ from initial config).
+    pub current_batch_size: Option<u32>,
+    /// Commands queued from UI to training worker.
+    pub pending_control_commands: Vec<TrainingControlCommand>,
 }
 
-// ---------------------------------------------------------------------------
-// Save Model screen state
-// ---------------------------------------------------------------------------
-
-pub struct SaveModelState {
-    pub name: String,
-    pub error: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -774,8 +805,8 @@ pub struct App {
     pub layer_builder: LayerBuilderState,
     pub mode_selector: ModeSelectorState,
     pub training_params: TrainingParamsState,
+    pub training_control: TrainingControlState,
     pub monitor: MonitorState,
-    pub save_model: SaveModelState,
     pub run_config: Option<RunConfig>,
     pub active_model_name: Option<String>,
     pub selected_checkpoint_path: Option<String>,
@@ -883,7 +914,7 @@ fn normalize_key(value: &str) -> Option<String> {
 
 impl App {
     pub fn new() -> Self {
-        let models = storage::list_saved_models().unwrap_or_default();
+        let models = storage::list_models().unwrap_or_default();
         let templates = built_in_templates();
         let (default_lr, default_batch, default_steps) = templates
             .first()
@@ -943,6 +974,11 @@ impl App {
                 datasets,
                 selected_dataset: 0,
             },
+            training_control: TrainingControlState {
+                fields: vec!["0.01".into(), "1".into(), "1".into()],
+                field_idx: 0,
+                error: None,
+            },
             monitor: MonitorState {
                 step: 0,
                 loss_history: Vec::new(),
@@ -956,10 +992,13 @@ impl App {
                 max_buffer_bytes: None,
                 max_storage_binding_bytes: None,
                 estimated_training_bytes: None,
-            },
-            save_model: SaveModelState {
-                name: String::new(),
-                error: None,
+                inference_image: None,
+                inference_checkpoint_path: None,
+                inference_seed: None,
+                is_training_paused: false,
+                current_lr: None,
+                current_batch_size: None,
+                pending_control_commands: Vec::new(),
             },
             run_config: None,
             active_model_name: None,
@@ -1075,7 +1114,7 @@ impl App {
                 mode: RunMode::Infer,
             },
         };
-        storage::write_model_template_config(&template.key, &config)
+        storage::write_model_config(&template.key, &config)
             .map_err(|err| format!("Failed to write template config_file: {err}"))?;
         self.refresh_weight_selector();
         self.weight_selector.selected = 0;
@@ -1289,9 +1328,12 @@ impl App {
         let inferred = self.inferred_input();
         let draft = self.build_draft_from_form(inferred, None)?;
         self.layer_builder.layers.push(draft);
-        self.active_model_name = None;
-        self.selected_checkpoint_path = None;
         self.load_checkpoint_on_start = false;
+        if let Some(model_name) = self.active_model_name.as_deref() {
+            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+        }
         self.layer_builder.error = None;
         self.reset_layer_form();
         Ok(())
@@ -1299,9 +1341,12 @@ impl App {
 
     pub fn delete_last_layer(&mut self) {
         self.layer_builder.layers.pop();
-        self.active_model_name = None;
-        self.selected_checkpoint_path = None;
         self.load_checkpoint_on_start = false;
+        if let Some(model_name) = self.active_model_name.as_deref() {
+            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+        }
         self.reset_layer_form();
     }
 
@@ -1599,9 +1644,12 @@ impl App {
             .map(|s| s.to_string());
         let draft = self.build_draft_from_form(inferred, existing_key.as_deref())?;
         self.layer_builder.layers[idx] = draft;
-        self.active_model_name = None;
-        self.selected_checkpoint_path = None;
         self.load_checkpoint_on_start = false;
+        if let Some(model_name) = self.active_model_name.as_deref() {
+            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+        }
         self.rebuild_layer_dims_from(idx + 1);
         self.layer_builder.error = None;
         self.layer_builder.mode = LayerBuilderMode::Browse;
@@ -1630,9 +1678,12 @@ impl App {
         }
         let idx = self.layer_builder.browse_selected;
         self.layer_builder.layers.remove(idx);
-        self.active_model_name = None;
-        self.selected_checkpoint_path = None;
         self.load_checkpoint_on_start = false;
+        if let Some(model_name) = self.active_model_name.as_deref() {
+            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+        }
         self.rebuild_layer_dims_from(idx);
         if self.layer_builder.layers.is_empty() {
             self.exit_browse_mode();
@@ -1642,56 +1693,127 @@ impl App {
         }
     }
 
-    // --- Save model ---
-
-    pub fn open_save_model(&mut self) {
-        let default_name = storage::next_model_name().unwrap_or_else(|_| "model-001".to_string());
-        self.save_model.name = default_name;
-        self.save_model.error = None;
-        self.screen = Screen::SaveModel;
-    }
-
-    /// Save the current model config with the name stored in `save_model.name`.
-    /// Returns the saved path as a string on success.
-    pub fn finish_save_model(&mut self) -> Result<String, String> {
+    pub fn trigger_monitor_save(&mut self) -> Result<(), String> {
         let mut config = self
             .monitor
             .model_config
             .as_ref()
             .ok_or_else(|| "No model config available".to_string())?
             .clone();
-        let name = self.save_model.name.trim().to_string();
-        if name.is_empty() {
-            return Err("Name must not be empty".to_string());
-        }
-        if name.contains('/') || name.contains('\\') {
-            return Err("Name must not contain path separators".to_string());
-        }
-        config.model_name = Some(name.clone());
-        storage::save_model_config_named(&config, &name)
-            .map_err(|err| err.to_string())
-            .map(|path| {
-                self.active_model_name = Some(name.clone());
-                self.monitor.model_config = Some(config);
-                path.display().to_string()
-            })
-    }
+        let model_name = config
+            .model_name
+            .clone()
+            .or_else(|| self.active_model_name.clone())
+            .unwrap_or_else(|| {
+                storage::next_model_name().unwrap_or_else(|_| "model-001".to_string())
+            });
+        config.model_name = Some(model_name.clone());
+        let config_path = storage::write_model_config(&model_name, &config)
+            .map_err(|err| format!("failed to save model config: {err}"))?;
+        self.active_model_name = Some(model_name.clone());
+        self.selected_checkpoint_path = storage::default_model_checkpoint_path(&model_name)
+            .ok()
+            .map(|path| path.to_string_lossy().to_string());
+        self.load_checkpoint_on_start = false;
+        self.monitor.model_config = Some(config);
+        self.monitor.error = None;
 
-    pub fn handle_char_save_model(&mut self, c: char) {
-        if !c.is_control() {
-            self.save_model.name.push(c);
-            self.save_model.error = None;
+        if self.monitor.current_lr.is_some() && !self.monitor.done {
+            self.monitor
+                .pending_control_commands
+                .push(TrainingControlCommand::SaveCheckpoint);
+            self.monitor.save_status = Some(format!(
+                "Saved config → {} | checkpoint requested",
+                config_path.display()
+            ));
+        } else {
+            self.monitor
+                .save_status
+                .replace(format!("Saved config → {}", config_path.display()));
         }
-    }
-
-    pub fn handle_backspace_save_model(&mut self) {
-        self.save_model.name.pop();
+        Ok(())
     }
 
     // --- Monitor restart ---
 
     pub fn request_restart(&mut self) {
         self.monitor.restart_training = true;
+    }
+
+    pub fn toggle_training_pause(&mut self) {
+        let next = !self.monitor.is_training_paused;
+        self.monitor.is_training_paused = next;
+        self.monitor
+            .pending_control_commands
+            .push(TrainingControlCommand::SetPaused(next));
+    }
+
+    pub fn open_training_control(&mut self) -> Result<(), String> {
+        let lr = self
+            .monitor
+            .current_lr
+            .ok_or_else(|| "Training controls are available only in training mode.".to_string())?;
+        let batch_size = self
+            .monitor
+            .current_batch_size
+            .ok_or_else(|| "Training controls are available only in training mode.".to_string())?;
+        self.training_control.fields = vec![
+            lr.to_string(),
+            batch_size.to_string(),
+            self.monitor.total_steps.to_string(),
+        ];
+        self.training_control.field_idx = 0;
+        self.training_control.error = None;
+        self.screen = Screen::TrainingControl;
+        Ok(())
+    }
+
+    pub fn finish_training_control(&mut self) -> Result<(), String> {
+        let lr = self.training_control.fields[0]
+            .parse::<f32>()
+            .map_err(|_| "Learning rate must be a number".to_string())?;
+        let batch_size = self.training_control.fields[1]
+            .parse::<u32>()
+            .map_err(|_| "Batch size must be an integer".to_string())?;
+        let total_steps = self.training_control.fields[2]
+            .parse::<usize>()
+            .map_err(|_| "Total steps must be an integer".to_string())?;
+        if lr <= 0.0 {
+            return Err("Learning rate must be > 0".to_string());
+        }
+        if batch_size == 0 {
+            return Err("Batch size must be > 0".to_string());
+        }
+        if total_steps == 0 {
+            return Err("Total steps must be > 0".to_string());
+        }
+
+        self.monitor.current_lr = Some(lr);
+        self.monitor.current_batch_size = Some(batch_size);
+        self.monitor.total_steps = total_steps;
+        self.training_control.error = None;
+        self.monitor
+            .pending_control_commands
+            .push(TrainingControlCommand::UpdateParams {
+                lr,
+                batch_size,
+                total_steps,
+            });
+
+        if let Some(config) = self.monitor.model_config.as_mut()
+            && let RunMode::Train(ref mut train) = config.run.mode
+        {
+            train.lr = lr;
+            train.batch_size = batch_size;
+            train.steps = total_steps;
+        }
+
+        self.screen = Screen::Monitor;
+        Ok(())
+    }
+
+    pub fn drain_monitor_control_commands(&mut self) -> Vec<TrainingControlCommand> {
+        std::mem::take(&mut self.monitor.pending_control_commands)
     }
 
     pub fn cycle_kind_forward(&mut self) {
@@ -1828,7 +1950,7 @@ impl App {
 
     pub fn finish_load_path(&mut self) {
         let Some(model) = self.load_path.models.get(self.load_path.selected) else {
-            self.load_path.error = Some("No saved models found in saved_models/".into());
+            self.load_path.error = Some("No model configs found in Models/".into());
             return;
         };
         match storage::load_model_config(&model.path) {
@@ -1852,9 +1974,12 @@ impl App {
         if w == 0 || h == 0 || c == 0 {
             return Err("Dimensions must be > 0".into());
         }
-        self.active_model_name = None;
-        self.selected_checkpoint_path = None;
         self.load_checkpoint_on_start = false;
+        if let Some(model_name) = self.active_model_name.as_deref() {
+            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+        }
         self.layer_builder.model_input = (w, h, c);
         self.layer_builder.layers.clear();
         self.reset_layer_form();
@@ -2007,11 +2132,32 @@ impl App {
         let idx = self.training_params.field_idx;
         self.training_params.fields[idx].pop();
     }
+
+    pub fn handle_char_training_control(&mut self, c: char) {
+        let idx = self.training_control.field_idx;
+        let accepted = match idx {
+            0 => c.is_ascii_digit() || c == '.',
+            1 | 2 => c.is_ascii_digit(),
+            _ => false,
+        };
+        if accepted {
+            self.training_control.fields[idx].push(c);
+            self.training_control.error = None;
+        }
+    }
+
+    pub fn handle_backspace_training_control(&mut self) {
+        let idx = self.training_control.field_idx;
+        self.training_control.fields[idx].pop();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{App, LayerKind, RunMode, Screen};
+    use super::{
+        App, LayerKind, LossMethod, ModelConfig, RunConfig, RunMode, Screen, TrainingConfig,
+        TrainingControlCommand,
+    };
 
     #[test]
     fn cycle_kind_backward_moves_in_reverse_order() {
@@ -2053,6 +2199,21 @@ mod tests {
         assert!(matches!(app.screen, Screen::ModeSelector));
         assert!(!app.load_checkpoint_on_start);
         assert!(app.selected_checkpoint_path.is_some());
+    }
+
+    #[test]
+    fn inference_selection_builds_infer_run_config() {
+        let mut app = App::new();
+        app.finish_template_selector();
+        app.finish_weight_selector();
+        app.mode_selector.selected = 0;
+
+        app.finish_mode_selector();
+
+        let Some(run) = app.run_config.as_ref() else {
+            panic!("run config should be set");
+        };
+        assert!(matches!(run.mode, RunMode::Infer));
     }
 
     #[test]
@@ -2123,5 +2284,64 @@ mod tests {
             }
             _ => panic!("expected training run mode"),
         }
+    }
+
+    #[test]
+    fn toggle_training_pause_enqueues_set_paused_command() {
+        let mut app = App::new();
+        app.monitor.current_lr = Some(0.01);
+        app.monitor.current_batch_size = Some(1);
+
+        app.toggle_training_pause();
+        let commands = app.drain_monitor_control_commands();
+
+        assert_eq!(commands, vec![TrainingControlCommand::SetPaused(true)]);
+        assert!(app.monitor.is_training_paused);
+    }
+
+    #[test]
+    fn finishing_training_control_enqueues_update_command() {
+        let mut app = App::new();
+        app.monitor.current_lr = Some(0.01);
+        app.monitor.current_batch_size = Some(2);
+        app.monitor.total_steps = 100;
+        app.monitor.model_config = Some(ModelConfig {
+            model_name: Some("unit-test-model".to_string()),
+            input_size: (32, 32, 3),
+            layers: Vec::new(),
+            run: RunConfig {
+                mode: RunMode::Train(TrainingConfig {
+                    lr: 0.01,
+                    batch_size: 2,
+                    steps: 100,
+                    dataset_path: ".".to_string(),
+                    loss: LossMethod::MeanSquared,
+                    checkpoint_path: None,
+                    load_checkpoint: false,
+                }),
+            },
+        });
+
+        app.open_training_control()
+            .expect("training control should open in training mode");
+        app.training_control.fields[0] = "0.005".to_string();
+        app.training_control.fields[1] = "4".to_string();
+        app.training_control.fields[2] = "250".to_string();
+        app.finish_training_control()
+            .expect("valid training control update should succeed");
+
+        let commands = app.drain_monitor_control_commands();
+        assert_eq!(
+            commands,
+            vec![TrainingControlCommand::UpdateParams {
+                lr: 0.005,
+                batch_size: 4,
+                total_steps: 250
+            }]
+        );
+        assert!(matches!(app.screen, Screen::Monitor));
+        assert_eq!(app.monitor.current_lr, Some(0.005));
+        assert_eq!(app.monitor.current_batch_size, Some(4));
+        assert_eq!(app.monitor.total_steps, 250);
     }
 }

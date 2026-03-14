@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 use bat_building::tui::{
     self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, RunMode,
@@ -11,7 +13,7 @@ use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
     FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
     LossMethod as PLoss, Model, PaddingMode as PPadding, Trainer, UpsampleConvType,
-    model::Training,
+    model::{Infer, Training},
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -32,37 +34,43 @@ fn main() {
         Err(_) => return,
     };
 
-    match config.run.mode.clone() {
-        RunMode::Train(_) => {
-            run_training_loop(config);
-        }
-        RunMode::Infer => {
-            println!("Inference mode — not yet implemented.");
-        }
-    }
+    run_execution_loop(config);
 }
 
-fn run_training_loop(mut config: ModelConfig) {
+fn run_execution_loop(mut config: ModelConfig) {
     loop {
-        let train_cfg = match &config.run.mode {
-            RunMode::Train(tc) => tc.clone(),
-            RunMode::Infer => break,
-        };
+        if let Err(err) = normalize_config_for_models_layout(&mut config) {
+            eprintln!("failed to prepare model persistence: {err}");
+            break;
+        }
 
         let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
+        let (control_tx, control_rx) = std::sync::mpsc::channel::<tui::TrainingControlCommand>();
+        let is_training_run = matches!(&config.run.mode, RunMode::Train(_));
         let config_clone = config.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(message) = run_training(config_clone, train_cfg, &tx).await {
+                let run_result = match config_clone.run.mode.clone() {
+                    RunMode::Train(train_cfg) => {
+                        run_training(config_clone, train_cfg, &tx, control_rx).await
+                    }
+                    RunMode::Infer => run_inference(config_clone, &tx).await,
+                };
+                if let Err(message) = run_result {
                     let _ = tx.send(tui::TrainingEvent::Error { message });
                     let _ = tx.send(tui::TrainingEvent::Done);
                 }
             });
         });
 
-        match tui::run_monitor(config.clone(), rx) {
+        let maybe_control_tx = if is_training_run {
+            Some(control_tx)
+        } else {
+            None
+        };
+        match tui::run_monitor(config.clone(), rx, maybe_control_tx) {
             Ok(MonitorOutcome::Restart(new_config)) => {
                 config = new_config;
             }
@@ -71,10 +79,38 @@ fn run_training_loop(mut config: ModelConfig) {
     }
 }
 
+fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<(), String> {
+    let model_name = match config.model_name.clone() {
+        Some(name) => name,
+        None => {
+            let generated = tui::storage::next_model_name()
+                .map_err(|err| format!("failed to allocate model name: {err}"))?;
+            config.model_name = Some(generated.clone());
+            generated
+        }
+    };
+
+    if let RunMode::Train(train) = &mut config.run.mode
+        && train.checkpoint_path.is_none()
+    {
+        train.checkpoint_path = Some(
+            tui::storage::default_model_checkpoint_path(&model_name)
+                .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+
+    tui::storage::write_model_config(&model_name, config)
+        .map_err(|err| format!("failed to write model config for '{model_name}': {err}"))?;
+    Ok(())
+}
+
 async fn run_training(
     config: ModelConfig,
     train_cfg: TrainingConfig,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+    control_rx: Receiver<tui::TrainingControlCommand>,
 ) -> Result<(), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
     let mut model = Model::new_training(
@@ -153,30 +189,90 @@ async fn run_training(
         estimated_training_bytes,
     });
     let sample_dir = prepare_sample_dir(&train_cfg.dataset_path)?;
-    let mut has_pending_loss_readback = false;
+    let mut current_lr = train_cfg.lr;
+    let mut current_batch_size = train_cfg.batch_size.max(1);
+    let mut total_steps = train_cfg.steps.max(1);
+    let mut paused = false;
+    let _ = tx.send(tui::TrainingEvent::TrainingState {
+        paused,
+        lr: current_lr,
+        batch_size: current_batch_size,
+        total_steps,
+    });
 
-    for step in 0..train_cfg.steps {
-        trainer
-            .task_mut()
-            .train_step_batch(
+    let mut step = 0usize;
+    while step < total_steps {
+        while let Ok(command) = control_rx.try_recv() {
+            apply_training_control_command(
+                command,
                 &mut model,
-                &mut gpu_dataset,
-                step,
-                train_cfg.batch_size as usize,
-                (step as u64) << 32,
+                &mut paused,
+                &mut current_lr,
+                &mut current_batch_size,
+                &mut total_steps,
+                checkpoint_path.as_deref(),
+                tx,
+            );
+            let _ = tx.send(tui::TrainingEvent::TrainingState {
+                paused,
+                lr: current_lr,
+                batch_size: current_batch_size,
+                total_steps,
+            });
+        }
+        if paused {
+            match control_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(command) => {
+                    apply_training_control_command(
+                        command,
+                        &mut model,
+                        &mut paused,
+                        &mut current_lr,
+                        &mut current_batch_size,
+                        &mut total_steps,
+                        checkpoint_path.as_deref(),
+                        tx,
+                    );
+                    let _ = tx.send(tui::TrainingEvent::TrainingState {
+                        paused,
+                        lr: current_lr,
+                        batch_size: current_batch_size,
+                        total_steps,
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            continue;
+        }
+
+        let should_report_loss = step % LOSS_REPORT_INTERVAL_STEPS == 0 || step + 1 == total_steps;
+        let loss = if should_report_loss {
+            Some(
+                trainer
+                    .task_mut()
+                    .train_step_report_batch(
+                        &mut model,
+                        &mut gpu_dataset,
+                        step,
+                        current_batch_size as usize,
+                        (step as u64) << 32,
+                    )
+                    .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?,
             )
-            .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?;
-
-        if !has_pending_loss_readback
-            && (step % LOSS_REPORT_INTERVAL_STEPS == 0 || step + 1 == train_cfg.steps)
-        {
-            has_pending_loss_readback = model.request_loss_readback();
-        }
-
-        let loss = model.poll_loss_readback();
-        if loss.is_some() {
-            has_pending_loss_readback = false;
-        }
+        } else {
+            trainer
+                .task_mut()
+                .train_step_batch(
+                    &mut model,
+                    &mut gpu_dataset,
+                    step,
+                    current_batch_size as usize,
+                    (step as u64) << 32,
+                )
+                .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?;
+            None
+        };
 
         if tx
             .send(tui::TrainingEvent::Step {
@@ -188,19 +284,11 @@ async fn run_training(
         {
             return Ok(());
         }
+
+        step += 1;
     }
 
-    if has_pending_loss_readback {
-        let final_loss = model.read_last_loss();
-        let final_step = train_cfg.steps.saturating_sub(1);
-        let _ = tx.send(tui::TrainingEvent::Step {
-            step: final_step,
-            loss: Some(final_loss),
-            sample_path: None,
-        });
-    }
-
-    let final_step = train_cfg.steps.saturating_sub(1);
+    let final_step = step.saturating_sub(1);
     let output = sample_diffusion_image(
         &mut model,
         input_size,
@@ -232,6 +320,149 @@ async fn run_training(
 
     let _ = tx.send(tui::TrainingEvent::Done);
     Ok(())
+}
+
+fn apply_training_control_command(
+    command: tui::TrainingControlCommand,
+    model: &mut Model<Training>,
+    paused: &mut bool,
+    current_lr: &mut f32,
+    current_batch_size: &mut u32,
+    total_steps: &mut usize,
+    checkpoint_path: Option<&Path>,
+    tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+) {
+    match command {
+        tui::TrainingControlCommand::SetPaused(next) => {
+            *paused = next;
+        }
+        tui::TrainingControlCommand::SaveCheckpoint => {
+            let Some(path) = checkpoint_path else {
+                let _ = tx.send(tui::TrainingEvent::SaveStatus {
+                    message: "cannot save checkpoint: no checkpoint path configured".to_string(),
+                    is_error: true,
+                });
+                return;
+            };
+            if let Some(parent) = path.parent()
+                && let Err(err) = fs::create_dir_all(parent)
+            {
+                let _ = tx.send(tui::TrainingEvent::SaveStatus {
+                    message: format!(
+                        "failed to create checkpoint directory {}: {err}",
+                        parent.display()
+                    ),
+                    is_error: true,
+                });
+                return;
+            }
+            match model.save_checkpoint(path) {
+                Ok(()) => {
+                    let _ = tx.send(tui::TrainingEvent::SaveStatus {
+                        message: format!("checkpoint saved → {}", path.display()),
+                        is_error: false,
+                    });
+                }
+                Err(err) => {
+                    let _ = tx.send(tui::TrainingEvent::SaveStatus {
+                        message: format!("failed to save checkpoint {}: {err}", path.display()),
+                        is_error: true,
+                    });
+                }
+            }
+        }
+        tui::TrainingControlCommand::UpdateParams {
+            lr,
+            batch_size,
+            total_steps: new_total_steps,
+        } => {
+            *current_lr = lr;
+            *current_batch_size = batch_size.max(1);
+            *total_steps = new_total_steps.max(1);
+            model.set_learning_rate(*current_lr);
+            model.set_batch_size(*current_batch_size);
+        }
+    }
+}
+
+async fn run_inference(
+    config: ModelConfig,
+    tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+) -> Result<(), String> {
+    let gpu = Arc::new(GpuContext::new_headless().await);
+    let mut model = Model::<Infer>::new(gpu.clone()).await;
+
+    for draft in &config.layers {
+        append_layer(&mut model, draft).map_err(|err| err.to_string())?;
+    }
+    model.build_model().map_err(|err| err.to_string())?;
+
+    let checkpoint_path = resolve_inference_checkpoint_path(&config)?;
+    model.load_checkpoint(&checkpoint_path).map_err(|err| {
+        format!(
+            "failed to load inference checkpoint {}: {err}",
+            checkpoint_path.display()
+        )
+    })?;
+
+    let limits = gpu.device().limits();
+    let _ = tx.send(tui::TrainingEvent::ResourceReport {
+        max_buffer_bytes: limits.max_buffer_size,
+        max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
+        estimated_training_bytes: model.estimated_gpu_bytes(),
+    });
+
+    let input_dims = model
+        .input_dim()
+        .ok_or_else(|| "model has no input dimensions".to_string())?;
+    let output_dims = model
+        .output_dim()
+        .ok_or_else(|| "model has no output dimensions".to_string())?;
+    let input_size = (input_dims.x, input_dims.y, input_dims.z);
+    let output_size = (output_dims.x, output_dims.y, output_dims.z);
+    let diffusion = LinearNoiseSchedule::new_linear(
+        DIFFUSION_SCHEDULE_STEPS,
+        DIFFUSION_BETA_START,
+        DIFFUSION_BETA_END,
+    );
+
+    let seed = 0;
+    let output = sample_diffusion_image(&mut model, input_size, output_size, &diffusion, seed);
+    let pixels = tensor_to_rgb_pixels(&output, output_size)?;
+
+    if tx
+        .send(tui::TrainingEvent::InferenceImage {
+            width: output_size.0,
+            height: output_size.1,
+            channels: output_size.2,
+            pixels,
+            checkpoint_path: checkpoint_path.display().to_string(),
+            seed,
+        })
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let _ = tx.send(tui::TrainingEvent::Done);
+    Ok(())
+}
+
+fn resolve_inference_checkpoint_path(config: &ModelConfig) -> Result<PathBuf, String> {
+    let model_name = config
+        .model_name
+        .as_deref()
+        .ok_or_else(|| "inference requires a named model configuration".to_string())?;
+    let checkpoint = tui::storage::default_model_checkpoint_path(model_name).map_err(|err| {
+        format!("failed to resolve inference checkpoint path for '{model_name}': {err}")
+    })?;
+    if !checkpoint.exists() {
+        return Err(format!(
+            "inference checkpoint not found: {} (train the model first or place weights there)",
+            checkpoint.display()
+        ));
+    }
+    Ok(checkpoint)
 }
 
 fn load_dataset(
@@ -490,8 +721,8 @@ fn compose_diffusion_input(
     packed
 }
 
-fn sample_diffusion_image(
-    model: &mut Model<Training>,
+fn sample_diffusion_image<State>(
+    model: &mut Model<State>,
     input_dims: (u32, u32, u32),
     output_dims: (u32, u32, u32),
     schedule: &LinearNoiseSchedule,
@@ -565,13 +796,7 @@ fn save_tensor_as_image(
         return Ok(path);
     }
 
-    let mut pixels = Vec::with_capacity((width * height * 3) as usize);
-    for pixel in tensor.chunks(channels as usize) {
-        let fallback = *pixel.first().unwrap_or(&0.0);
-        pixels.push(to_u8(fallback));
-        pixels.push(to_u8(*pixel.get(1).unwrap_or(&fallback)));
-        pixels.push(to_u8(*pixel.get(2).unwrap_or(&fallback)));
-    }
+    let pixels = tensor_to_rgb_pixels(tensor, dims)?;
     let image = RgbImage::from_raw(width, height, pixels)
         .ok_or_else(|| format!("failed to build RGB image for {}", path.display()))?;
     image
@@ -584,8 +809,31 @@ fn to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-fn append_layer(
-    model: &mut Model<Training>,
+fn tensor_to_rgb_pixels(tensor: &[f32], dims: (u32, u32, u32)) -> Result<Vec<u8>, String> {
+    let (width, height, channels) = dims;
+    let expected_len = (width * height * channels) as usize;
+    if tensor.len() != expected_len {
+        return Err(format!(
+            "output tensor length mismatch: expected {expected_len}, got {}",
+            tensor.len()
+        ));
+    }
+    if channels == 0 {
+        return Err("output channels must be > 0".to_string());
+    }
+
+    let mut pixels = Vec::with_capacity((width * height * 3) as usize);
+    for pixel in tensor.chunks(channels as usize) {
+        let fallback = *pixel.first().unwrap_or(&0.0);
+        pixels.push(to_u8(fallback));
+        pixels.push(to_u8(*pixel.get(1).unwrap_or(&fallback)));
+        pixels.push(to_u8(*pixel.get(2).unwrap_or(&fallback)));
+    }
+    Ok(pixels)
+}
+
+fn append_layer<State>(
+    model: &mut Model<State>,
     draft: &LayerDraft,
 ) -> Result<(), bat_building::ModelError> {
     match draft {
