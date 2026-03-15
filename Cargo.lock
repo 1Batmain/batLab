@@ -2558,8 +2558,8 @@ dependencies = [
 name = "the_window"
 version = "0.1.0"
 dependencies = [
+ "bat_building",
  "bytemuck",
- "pollster",
  "wgpu",
  "winit",
 ]

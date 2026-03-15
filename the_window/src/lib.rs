@@ -1,126 +1,137 @@
 //! `the_window` – live GPU visualiser for model output buffers.
 //!
-//! Opens a native window that renders the latest snapshot of the model's
-//! pre-loss output tensor in real-time.  The visualiser runs in its own OS
-//! thread and communicates with the training loop through a simple
-//! `Sender<WindowFrame>` / `Receiver<WindowFrame>` channel pair.
+//! Opens a native window that renders the model's actual GPU output buffer
+//! directly – no CPU readback, no snapshot, no extra copy.  The visualiser
+//! shares the same wgpu `Device` / `Queue` as the training process so that
+//! the fragment shader reads the live buffer contents on every frame.
 //!
 //! # Usage
 //! ```no_run
-//! use std::sync::mpsc;
-//! use the_window::{WindowFrame, spawn_window};
+//! use std::sync::Arc;
+//! use bat_building::GpuContext;
+//! use the_window::spawn_window;
 //!
-//! let (tx, rx) = mpsc::channel::<WindowFrame>();
-//! let handle = spawn_window(rx, "Model Output".to_string());
+//! // (during training, after model.build())
+//! let gpu: Arc<GpuContext> = model.gpu_context();
+//! let buf: Arc<wgpu::Buffer> = model.last_output_buffer().unwrap();
 //!
-//! // from the training thread, after each step:
-//! let _ = tx.send(WindowFrame {
-//!     data: vec![0.5_f32; 32 * 32 * 3],
-//!     width: 32,
-//!     height: 32,
-//!     channels: 3,
-//! });
-//!
-//! // When training is done or the sender is dropped, the window closes.
-//! drop(tx);
-//! handle.join().ok();
+//! let handle = spawn_window(
+//!     gpu, buf,
+//!     32, 32, 3,       // width, height, channels of the output tensor
+//!     "Model Output".to_string(),
+//! );
+//! // Press [v] again to close → drops the handle → window exits.
+//! drop(handle);
 //! ```
 
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use bat_building::GpuContext;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-/// A snapshot of the model's output tensor to be rendered in the window.
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// A handle to a running visualiser window.
 ///
-/// `data` is a flat `f32` slice in row-major, interleaved-channel order:
-/// `data[(y * width + x) * channels + c]`.
-/// Values are expected in roughly `[-1, 1]`; the shader normalises them to
-/// `[0, 1]` for display.
-#[derive(Debug, Clone)]
-pub struct WindowFrame {
-    pub data: Vec<f32>,
-    pub width: u32,
-    pub height: u32,
-    pub channels: u32,
+/// Dropping the handle sends a close signal to the window thread, which
+/// causes it to exit on the next event-loop iteration.
+pub struct VisualiserHandle {
+    _close_flag: Arc<AtomicBool>,
 }
 
-/// Spawn a model-output visualiser window in a new OS thread.
-///
-/// The thread blocks on the winit event loop until:
-/// - the user closes the window, or
-/// - the `rx` channel is disconnected (all `Sender`s have been dropped).
-///
-/// Returns a `JoinHandle` that can be used to wait for the thread.
-pub fn spawn_window(rx: Receiver<WindowFrame>, title: String) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || open_window(rx, title))
+impl Drop for VisualiserHandle {
+    fn drop(&mut self) {
+        self._close_flag.store(true, Ordering::Relaxed);
+    }
 }
 
-/// Open a model-output visualiser window, blocking the current thread.
+/// Spawn the model-output visualiser in a new OS thread.
 ///
-/// Returns once the window is closed or the channel is disconnected.
-pub fn open_window(rx: Receiver<WindowFrame>, title: String) {
-    let event_loop = match EventLoop::new() {
-        Ok(el) => el,
-        Err(e) => {
-            eprintln!("[the_window] failed to create event loop: {e}");
-            return;
-        }
-    };
-    event_loop.set_control_flow(ControlFlow::Poll);
+/// The window renders `output_buf` – the model's actual GPU output buffer –
+/// directly on every frame via a read-only storage binding.  No CPU copy is
+/// performed.
+///
+/// The window closes when:
+/// - the user clicks the window's close button, or
+/// - the returned [`VisualiserHandle`] is dropped (e.g. user presses `[v]`
+///   again to toggle off).
+///
+/// `width`, `height`, `channels` describe the tensor layout inside
+/// `output_buf` (row-major, interleaved channels).  Values are expected in
+/// roughly `[-1, 1]`; the shader normalises them to `[0, 1]` for display.
+pub fn spawn_window(
+    gpu: Arc<GpuContext>,
+    output_buf: Arc<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    channels: u32,
+    title: String,
+) -> VisualiserHandle {
+    let close_flag = Arc::new(AtomicBool::new(false));
+    let close_flag_clone = Arc::clone(&close_flag);
 
-    let mut viewer = ModelViewer {
-        rx,
-        title,
-        window: None,
-        gpu: None,
-        pending: None,
-    };
+    std::thread::spawn(move || {
+        open_window(
+            gpu,
+            output_buf,
+            width,
+            height,
+            channels,
+            title,
+            close_flag_clone,
+        );
+    });
 
-    if let Err(e) = event_loop.run_app(&mut viewer) {
-        eprintln!("[the_window] event loop error: {e}");
+    VisualiserHandle {
+        _close_flag: close_flag,
     }
 }
 
 // ---------------------------------------------------------------------------
-// GPU state
+// WGSL shader
 // ---------------------------------------------------------------------------
 
 const SHADER_SRC: &str = include_str!("shader.wgsl");
 
-struct GpuState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+// ---------------------------------------------------------------------------
+// Render state – uses the SHARED wgpu device from GpuContext
+// ---------------------------------------------------------------------------
+
+struct RenderState {
+    /// Shared with the training process.
+    gpu: Arc<GpuContext>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    data_buf: wgpu::Buffer,
-    uniform_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// Currently configured frame dimensions `(width, height, channels)`.
-    frame_dims: (u32, u32, u32),
 }
 
-impl GpuState {
-    /// Create GPU state with an initial 1×1 black frame.
+impl RenderState {
     fn new(
-        device: wgpu::Device,
-        queue: wgpu::Queue,
+        gpu: Arc<GpuContext>,
         surface: wgpu::Surface<'static>,
         config: wgpu::SurfaceConfiguration,
+        output_buf: &Arc<wgpu::Buffer>,
+        width: u32,
+        height: u32,
+        channels: u32,
     ) -> Self {
+        let device = gpu.device();
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("model_viewer_shader"),
+            label: Some("visualiser_shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
         });
 
-        // Bind-group layout: binding 0 = storage buffer (data), binding 1 = uniforms.
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("model_viewer_bgl"),
+            label: Some("visualiser_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -145,15 +156,15 @@ impl GpuState {
             ],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("model_viewer_pl"),
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("visualiser_pl"),
             bind_group_layouts: &[&bgl],
             immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("model_viewer_pipeline"),
-            layout: Some(&pipeline_layout),
+            label: Some("visualiser_pipeline"),
+            layout: Some(&pl),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -180,61 +191,23 @@ impl GpuState {
             cache: None,
         });
 
-        // Start with a minimal 1×1 placeholder frame so all buffers are valid.
-        let init_frame = WindowFrame {
-            data: vec![0.0f32],
-            width: 1,
-            height: 1,
-            channels: 1,
-        };
-        let (data_buf, uniform_buf, bind_group) = Self::build_buffers(&device, &bgl, &init_frame);
-
-        GpuState {
-            device,
-            queue,
-            surface,
-            config,
-            pipeline,
-            bind_group_layout: bgl,
-            data_buf,
-            uniform_buf,
-            bind_group,
-            frame_dims: (1, 1, 1),
-        }
-    }
-
-    /// Create GPU buffers and a matching bind group for `frame`.
-    fn build_buffers(
-        device: &wgpu::Device,
-        bgl: &wgpu::BindGroupLayout,
-        frame: &WindowFrame,
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup) {
+        // Build a uniform buffer with the tensor dimensions.
+        let uniforms = [width, height, channels, 0u32];
         use wgpu::util::DeviceExt as _;
-
-        let raw = bytemuck::cast_slice::<f32, u8>(&frame.data);
-        // Ensure at least 4 bytes so the binding is never empty.
-        let data_bytes: &[u8] = if raw.is_empty() { &[0u8; 4] } else { raw };
-
-        let data_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("model_data"),
-            contents: data_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let uniforms = [frame.width, frame.height, frame.channels, 0u32];
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("model_uniforms"),
+            label: Some("visualiser_uniforms"),
             contents: bytemuck::cast_slice::<u32, u8>(&uniforms),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("model_bg"),
-            layout: bgl,
+            label: Some("visualiser_bg"),
+            layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: data_buf.as_entire_binding(),
+                    // Bind the model's actual output buffer directly – read-only.
+                    resource: output_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -243,28 +216,24 @@ impl GpuState {
             ],
         });
 
-        (data_buf, uniform_buf, bind_group)
-    }
-
-    /// Upload a new frame.  Recreates the storage buffer and bind group when
-    /// the tensor dimensions change (common only at start-up).
-    fn update_frame(&mut self, frame: &WindowFrame) {
-        let new_dims = (frame.width, frame.height, frame.channels);
-        let expected_bytes = (frame.data.len() * std::mem::size_of::<f32>()) as u64;
-
-        if new_dims != self.frame_dims || expected_bytes != self.data_buf.size() {
-            let (db, ub, bg) = Self::build_buffers(&self.device, &self.bind_group_layout, frame);
-            self.data_buf = db;
-            self.uniform_buf = ub;
-            self.bind_group = bg;
-            self.frame_dims = new_dims;
-        } else {
-            let raw = bytemuck::cast_slice::<f32, u8>(&frame.data);
-            self.queue.write_buffer(&self.data_buf, 0, raw);
+        RenderState {
+            gpu,
+            surface,
+            config,
+            pipeline,
+            bind_group,
         }
     }
 
-    fn render(&mut self) {
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.config.width = new_size.width;
+            self.config.height = new_size.height;
+            self.surface.configure(self.gpu.device(), &self.config);
+        }
+    }
+
+    fn render(&self) {
         let output = match self.surface.get_current_texture() {
             Ok(o) => o,
             Err(_) => return,
@@ -272,14 +241,15 @@ impl GpuState {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("render_encoder"),
-            });
+        let mut encoder =
+            self.gpu
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("visualiser_encoder"),
+                });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render_pass"),
+                label: Some("visualiser_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -296,19 +266,14 @@ impl GpuState {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            // 4 vertices → 2 triangles (TriangleStrip) → full-screen quad
+            // 4 vertices → TriangleStrip → full-screen quad.
             pass.draw(0..4, 0..1);
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // Submit to the SHARED queue – training compute commands and render
+        // commands are ordered by the GPU, so the render always sees the
+        // latest buffer state written by the last training pass.
+        self.gpu.queue().submit(std::iter::once(encoder.finish()));
         output.present();
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-        }
     }
 }
 
@@ -316,16 +281,19 @@ impl GpuState {
 // Winit application
 // ---------------------------------------------------------------------------
 
-struct ModelViewer {
-    rx: Receiver<WindowFrame>,
+struct Viewer {
+    gpu: Arc<GpuContext>,
+    output_buf: Arc<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    channels: u32,
     title: String,
+    close_flag: Arc<AtomicBool>,
     window: Option<Arc<Window>>,
-    gpu: Option<GpuState>,
-    /// Latest unrendered frame received from the channel.
-    pending: Option<WindowFrame>,
+    state: Option<RenderState>,
 }
 
-impl ApplicationHandler for ModelViewer {
+impl ApplicationHandler for Viewer {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
@@ -340,42 +308,24 @@ impl ApplicationHandler for ModelViewer {
             }
         };
 
-        let instance = wgpu::Instance::default();
-
-        let surface = match instance.create_surface(Arc::clone(&window)) {
+        // Create a surface using the SAME wgpu instance that the training
+        // device was created with, so they are compatible.
+        let surface = match self.gpu.instance().create_surface(Arc::clone(&window)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[the_window] failed to create wgpu surface: {e}");
+                eprintln!("[the_window] failed to create surface: {e}");
                 event_loop.exit();
                 return;
             }
         };
 
-        let adapter =
-            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::None,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })) {
-                Ok(a) => a,
-                Err(_) => {
-                    eprintln!("[the_window] no suitable GPU adapter found for window surface");
-                    event_loop.exit();
-                    return;
-                }
-            };
+        let caps = surface.get_capabilities(self.gpu.adapter());
+        if caps.formats.is_empty() {
+            eprintln!("[the_window] training GPU adapter does not support surface presentation");
+            event_loop.exit();
+            return;
+        }
 
-        let (device, queue) = match pollster::block_on(adapter.request_device(&Default::default()))
-        {
-            Ok(dq) => dq,
-            Err(e) => {
-                eprintln!("[the_window] failed to create wgpu device: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        let caps = surface.get_capabilities(&adapter);
         let format = caps
             .formats
             .iter()
@@ -394,11 +344,20 @@ impl ApplicationHandler for ModelViewer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
+        surface.configure(self.gpu.device(), &config);
 
-        let gpu = GpuState::new(device, queue, surface, config);
+        let state = RenderState::new(
+            Arc::clone(&self.gpu),
+            surface,
+            config,
+            &self.output_buf,
+            self.width,
+            self.height,
+            self.channels,
+        );
+
         self.window = Some(window);
-        self.gpu = Some(gpu);
+        self.state = Some(state);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -407,25 +366,14 @@ impl ApplicationHandler for ModelViewer {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let Some(gpu) = &mut self.gpu {
-                    gpu.resize(size);
+                if let Some(state) = &mut self.state {
+                    state.resize(size);
                 }
             }
             WindowEvent::RedrawRequested => {
-                // Drain the channel, keeping only the most recent frame.
-                while let Ok(frame) = self.rx.try_recv() {
-                    self.pending = Some(frame);
+                if let Some(state) = &self.state {
+                    state.render();
                 }
-
-                if let (Some(gpu), Some(frame)) = (&mut self.gpu, self.pending.take()) {
-                    gpu.update_frame(&frame);
-                }
-
-                if let Some(gpu) = &mut self.gpu {
-                    gpu.render();
-                }
-
-                // Keep rendering at ~60 fps via continuous redraws.
                 if let Some(win) = &self.window {
                     win.request_redraw();
                 }
@@ -435,20 +383,52 @@ impl ApplicationHandler for ModelViewer {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Close the window when the sender side has been dropped.
-        match self.rx.try_recv() {
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                event_loop.exit();
-                return;
-            }
-            Ok(frame) => {
-                self.pending = Some(frame);
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        // Close when the VisualiserHandle has been dropped.
+        if self.close_flag.load(Ordering::Relaxed) {
+            event_loop.exit();
+            return;
         }
-
         if let Some(win) = &self.window {
             win.request_redraw();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal entry point
+// ---------------------------------------------------------------------------
+
+fn open_window(
+    gpu: Arc<GpuContext>,
+    output_buf: Arc<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    channels: u32,
+    title: String,
+    close_flag: Arc<AtomicBool>,
+) {
+    let event_loop = match EventLoop::new() {
+        Ok(el) => el,
+        Err(e) => {
+            eprintln!("[the_window] failed to create event loop: {e}");
+            return;
+        }
+    };
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut viewer = Viewer {
+        gpu,
+        output_buf,
+        width,
+        height,
+        channels,
+        title,
+        close_flag,
+        window: None,
+        state: None,
+    };
+
+    if let Err(e) = event_loop.run_app(&mut viewer) {
+        eprintln!("[the_window] event loop error: {e}");
     }
 }
