@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck = "1.25.0"
-pollster = "0.4.0"
 wgpu = "28.0.0"
 winit = "0.30.12"
+
+bat_building = { path = "../bat_building", default-features = false }

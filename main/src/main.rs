@@ -22,8 +22,6 @@ const DIFFUSION_SCHEDULE_STEPS: usize = 256;
 const DIFFUSION_BETA_START: f32 = 1e-4;
 const DIFFUSION_BETA_END: f32 = 2e-2;
 const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
-/// Send a visualiser frame at most every N training steps to limit overhead.
-const VISUALISE_INTERVAL_STEPS: usize = 10;
 
 #[derive(Debug, Clone)]
 struct ImageSample {
@@ -202,15 +200,15 @@ async fn run_training(
         total_steps,
     });
 
-    // Sender half of the live-visualiser channel.  `None` until the user
-    // presses [v]; sending fails silently if the window has been closed.
-    let mut window_tx: Option<std::sync::mpsc::SyncSender<the_window::WindowFrame>> = None;
+    // Handle for the live-visualiser window.  `None` until the user presses
+    // [v].  Dropping the handle closes the window.
+    let mut window_handle: Option<the_window::VisualiserHandle> = None;
 
     let mut step = 0usize;
     while step < total_steps {
         while let Ok(command) = control_rx.try_recv() {
             if command == tui::TrainingControlCommand::ToggleWindow {
-                window_tx = toggle_visualiser_window(window_tx, output_size);
+                window_handle = toggle_visualiser_window(window_handle, &model, output_size);
             } else {
                 apply_training_control_command(
                     command,
@@ -234,7 +232,8 @@ async fn run_training(
             match control_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => {
                     if command == tui::TrainingControlCommand::ToggleWindow {
-                        window_tx = toggle_visualiser_window(window_tx, output_size);
+                        window_handle =
+                            toggle_visualiser_window(window_handle, &model, output_size);
                     } else {
                         apply_training_control_command(
                             command,
@@ -299,11 +298,6 @@ async fn run_training(
             return Ok(());
         }
 
-        // Feed the live visualiser at the configured interval.
-        if step % VISUALISE_INTERVAL_STEPS == 0 {
-            window_tx = try_send_visualiser_frame(window_tx, &model, output_size);
-        }
-
         step += 1;
     }
 
@@ -343,51 +337,36 @@ async fn run_training(
 
 /// Open the visualiser window (or close it if it is already running).
 ///
-/// Returns the new `window_tx` – `Some` when the window was just opened,
-/// `None` when it was toggled off (the sender is dropped, which causes the
-/// window thread to exit).
+/// The window binds the model's GPU output buffer directly – no CPU readback.
+/// Dropping the returned [`the_window::VisualiserHandle`] closes the window.
 fn toggle_visualiser_window(
-    existing: Option<std::sync::mpsc::SyncSender<the_window::WindowFrame>>,
+    existing: Option<the_window::VisualiserHandle>,
+    model: &Model<Training>,
     output_size: (u32, u32, u32),
-) -> Option<std::sync::mpsc::SyncSender<the_window::WindowFrame>> {
+) -> Option<the_window::VisualiserHandle> {
     if existing.is_some() {
-        // Drop the sender → the window thread detects channel disconnect and exits.
+        // Drop the handle → AtomicBool signals the window thread to exit.
         return None;
     }
 
-    // Bounded channel: holds at most 2 frames.  If the window is slower than
-    // training the sender uses `try_send` so training is never blocked.
-    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<the_window::WindowFrame>(2);
+    let Some(output_buf) = model.last_output_buffer() else {
+        eprintln!("[visualiser] model has no output buffer yet");
+        return None;
+    };
 
     let title = format!(
         "Model Output  ({}×{}×{} channels)",
         output_size.0, output_size.1, output_size.2
     );
-    the_window::spawn_window(frame_rx, title);
-    Some(frame_tx)
-}
 
-/// Attempt to read the model's current output and forward it to the visualiser.
-///
-/// Returns the (possibly cleared) sender.  If the channel is full or
-/// disconnected the frame is silently dropped and the sender is cleared.
-fn try_send_visualiser_frame(
-    tx: Option<std::sync::mpsc::SyncSender<the_window::WindowFrame>>,
-    model: &Model<Training>,
-    output_size: (u32, u32, u32),
-) -> Option<std::sync::mpsc::SyncSender<the_window::WindowFrame>> {
-    let tx = tx?;
-    let data = model.read_last_output();
-    let frame = the_window::WindowFrame {
-        data,
-        width: output_size.0,
-        height: output_size.1,
-        channels: output_size.2,
-    };
-    match tx.try_send(frame) {
-        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => Some(tx),
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => None,
-    }
+    Some(the_window::spawn_window(
+        model.gpu_context(),
+        output_buf,
+        output_size.0,
+        output_size.1,
+        output_size.2,
+        title,
+    ))
 }
 
 fn apply_training_control_command(
