@@ -26,6 +26,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use bat_building::GpuContext;
 
@@ -233,10 +234,23 @@ impl RenderState {
         }
     }
 
-    fn render(&self) {
+    fn render(&mut self) {
         let output = match self.surface.get_current_texture() {
             Ok(o) => o,
-            Err(_) => return,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                // Swapchain invalidated (resize/minimise/etc.) – reconfigure and
+                // retry on the next frame.
+                self.surface.configure(self.gpu.device(), &self.config);
+                return;
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                eprintln!("[the_window] GPU out of memory");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[the_window] surface error: {e}");
+                return;
+            }
         };
         let view = output
             .texture
@@ -339,7 +353,13 @@ impl ApplicationHandler for Viewer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: caps.present_modes[0],
+            // Prefer FIFO (vsync) to avoid burning CPU/GPU during training.
+            present_mode: caps
+                .present_modes
+                .iter()
+                .find(|&&m| m == wgpu::PresentMode::Fifo)
+                .copied()
+                .unwrap_or(caps.present_modes[0]),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -371,11 +391,8 @@ impl ApplicationHandler for Viewer {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(state) = &self.state {
+                if let Some(state) = &mut self.state {
                     state.render();
-                }
-                if let Some(win) = &self.window {
-                    win.request_redraw();
                 }
             }
             _ => {}
@@ -388,6 +405,10 @@ impl ApplicationHandler for Viewer {
             event_loop.exit();
             return;
         }
+        // Throttle to ~30 fps so the visualiser does not burn CPU/GPU during
+        // training.  FIFO present mode provides additional vsync pacing.
+        let next = Instant::now() + Duration::from_millis(33);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(next));
         if let Some(win) = &self.window {
             win.request_redraw();
         }
@@ -407,6 +428,22 @@ fn open_window(
     title: String,
     close_flag: Arc<AtomicBool>,
 ) {
+    // On Linux (Wayland and X11) winit requires `with_any_thread(true)` when
+    // the event loop is created outside the main OS thread.  Both platform
+    // extensions write to the same underlying `any_thread` flag, so importing
+    // either one is sufficient.
+    #[cfg(target_os = "linux")]
+    let event_loop = {
+        use winit::platform::wayland::EventLoopBuilderExtWayland as _;
+        match EventLoop::builder().with_any_thread(true).build() {
+            Ok(el) => el,
+            Err(e) => {
+                eprintln!("[the_window] failed to create event loop: {e}");
+                return;
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let event_loop = match EventLoop::new() {
         Ok(el) => el,
         Err(e) => {
@@ -414,6 +451,7 @@ fn open_window(
             return;
         }
     };
+
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut viewer = Viewer {
