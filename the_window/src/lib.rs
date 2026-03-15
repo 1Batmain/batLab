@@ -36,6 +36,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Target frame interval for the visualiser (~30 fps).
+/// FIFO present mode provides additional vsync pacing on top of this.
+const FRAME_INTERVAL_MS: u64 = 33;
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -407,7 +415,7 @@ impl ApplicationHandler for Viewer {
         }
         // Throttle to ~30 fps so the visualiser does not burn CPU/GPU during
         // training.  FIFO present mode provides additional vsync pacing.
-        let next = Instant::now() + Duration::from_millis(33);
+        let next = Instant::now() + Duration::from_millis(FRAME_INTERVAL_MS);
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
         if let Some(win) = &self.window {
             win.request_redraw();
