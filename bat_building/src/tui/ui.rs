@@ -752,7 +752,7 @@ fn draw_monitor(f: &mut Frame, app: &App) {
             "running"
         };
         format!(
-            " training: {status} | [p] pause/resume  [t] tune params  [s] save snapshot  [q] quit"
+            " training: {status} | [p] pause/resume  [t] tune params  [v] visualise  [s] save snapshot  [q] quit"
         )
     } else if let Some(checkpoint_path) = &app.monitor.inference_checkpoint_path {
         format!(" checkpoint: {checkpoint_path} | [s] save  [q] quit")
