@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["bat_building", "main", "the_window"]
+members = ["bat_building", "main"]
 
 [dependencies]
 bat_building = { path = "bat_building" }
