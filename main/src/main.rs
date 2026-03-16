@@ -200,19 +200,33 @@ async fn run_training(
         total_steps,
     });
 
+    // Handle for the live-visualiser window.  `None` until the user presses
+    // [v].  Dropping the handle closes the window.
+    let mut window_handle: Option<bat_building::visualiser::VisualiserHandle> = None;
+
     let mut step = 0usize;
     while step < total_steps {
+        // If the user closed the visualiser window via its close button, clear
+        // the stale handle so that pressing [v] opens a fresh window.
+        if window_handle.as_ref().is_some_and(|h| h.is_closed()) {
+            window_handle = None;
+        }
+
         while let Ok(command) = control_rx.try_recv() {
-            apply_training_control_command(
-                command,
-                &mut model,
-                &mut paused,
-                &mut current_lr,
-                &mut current_batch_size,
-                &mut total_steps,
-                checkpoint_path.as_deref(),
-                tx,
-            );
+            if command == tui::TrainingControlCommand::ToggleWindow {
+                window_handle = toggle_visualiser_window(window_handle, &model, output_size);
+            } else {
+                apply_training_control_command(
+                    command,
+                    &mut model,
+                    &mut paused,
+                    &mut current_lr,
+                    &mut current_batch_size,
+                    &mut total_steps,
+                    checkpoint_path.as_deref(),
+                    tx,
+                );
+            }
             let _ = tx.send(tui::TrainingEvent::TrainingState {
                 paused,
                 lr: current_lr,
@@ -223,16 +237,21 @@ async fn run_training(
         if paused {
             match control_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => {
-                    apply_training_control_command(
-                        command,
-                        &mut model,
-                        &mut paused,
-                        &mut current_lr,
-                        &mut current_batch_size,
-                        &mut total_steps,
-                        checkpoint_path.as_deref(),
-                        tx,
-                    );
+                    if command == tui::TrainingControlCommand::ToggleWindow {
+                        window_handle =
+                            toggle_visualiser_window(window_handle, &model, output_size);
+                    } else {
+                        apply_training_control_command(
+                            command,
+                            &mut model,
+                            &mut paused,
+                            &mut current_lr,
+                            &mut current_batch_size,
+                            &mut total_steps,
+                            checkpoint_path.as_deref(),
+                            tx,
+                        );
+                    }
                     let _ = tx.send(tui::TrainingEvent::TrainingState {
                         paused,
                         lr: current_lr,
@@ -322,6 +341,40 @@ async fn run_training(
     Ok(())
 }
 
+/// Open the visualiser window (or close it if it is already running).
+///
+/// The window binds the model's GPU output buffer directly – no CPU readback.
+/// Dropping the returned [`bat_building::visualiser::VisualiserHandle`] closes the window.
+fn toggle_visualiser_window(
+    existing: Option<bat_building::visualiser::VisualiserHandle>,
+    model: &Model<Training>,
+    output_size: (u32, u32, u32),
+) -> Option<bat_building::visualiser::VisualiserHandle> {
+    if existing.is_some() {
+        // Drop the handle → AtomicBool signals the window thread to exit.
+        return None;
+    }
+
+    let Some(output_buf) = model.last_output_buffer() else {
+        eprintln!("[visualiser] model has no output buffer yet");
+        return None;
+    };
+
+    let title = format!(
+        "Model Output  ({}×{}×{} channels)",
+        output_size.0, output_size.1, output_size.2
+    );
+
+    Some(bat_building::visualiser::spawn_window(
+        model.gpu_context(),
+        output_buf,
+        output_size.0,
+        output_size.1,
+        output_size.2,
+        title,
+    ))
+}
+
 fn apply_training_control_command(
     command: tui::TrainingControlCommand,
     model: &mut Model<Training>,
@@ -382,6 +435,8 @@ fn apply_training_control_command(
             model.set_learning_rate(*current_lr);
             model.set_batch_size(*current_batch_size);
         }
+        // ToggleWindow is handled in the training loop before this function is called.
+        tui::TrainingControlCommand::ToggleWindow => {}
     }
 }
 

@@ -656,8 +656,25 @@ impl<State> Model<State> {
         .expect("failed to read last output buffer")
     }
 
-    /// Best-effort estimate of GPU bytes currently held by model-related buffers.
-    /// Shared buffers are counted once.
+    /// Returns an `Arc` to the last layer's output buffer so that external
+    /// render pipelines (e.g. `the_window`) can bind it directly on the GPU
+    /// without copying data to the CPU.
+    ///
+    /// The buffer already carries `STORAGE | COPY_SRC | COPY_DST` usage flags.
+    /// Returns `None` if no layers have been built yet.
+    pub fn last_output_buffer(&self) -> Option<Arc<Buffer>> {
+        self.layers
+            .last()
+            .and_then(|l| l.buffers.forward.last())
+            .map(Arc::clone)
+    }
+
+    /// Returns the shared [`GpuContext`] so the caller can use the same
+    /// wgpu device/queue/instance for rendering without creating a second one.
+    pub fn gpu_context(&self) -> Arc<GpuContext> {
+        Arc::clone(&self.gpu)
+    }
+
     pub fn estimated_gpu_bytes(&self) -> u64 {
         fn add_unique(total: &mut u64, seen: &mut HashSet<usize>, buffer: &Arc<wgpu::Buffer>) {
             let key = Arc::as_ptr(buffer) as usize;
