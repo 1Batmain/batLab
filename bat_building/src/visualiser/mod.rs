@@ -6,7 +6,7 @@
 //! the fragment shader reads the live buffer contents on every frame.
 //!
 //! # Usage
-//! ```no_run
+//! ```ignore
 //! use std::sync::Arc;
 //! use bat_building::GpuContext;
 //! use bat_building::visualiser::spawn_window;
@@ -42,6 +42,7 @@ use winit::window::{Window, WindowId};
 /// Target frame interval for the visualiser (~30 fps).
 /// FIFO present mode provides additional vsync pacing on top of this.
 const FRAME_INTERVAL_MS: u64 = 33;
+const BYTES_PER_F32: u64 = std::mem::size_of::<f32>() as u64;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -101,10 +102,33 @@ pub fn spawn_window(
 ) -> VisualiserHandle {
     let close_flag = Arc::new(AtomicBool::new(false));
     let closed_flag = Arc::new(AtomicBool::new(false));
+    if let Err(err) = validate_output_layout(output_buf.size(), width, height, channels) {
+        eprintln!("[visualiser] invalid output layout: {err}");
+        close_flag.store(true, Ordering::Relaxed);
+        closed_flag.store(true, Ordering::Relaxed);
+        return VisualiserHandle {
+            _close_flag: close_flag,
+            closed_flag,
+        };
+    }
+
     let close_flag_clone = Arc::clone(&close_flag);
     let closed_flag_clone = Arc::clone(&closed_flag);
 
     std::thread::spawn(move || {
+        struct ClosedOnExit {
+            flag: Arc<AtomicBool>,
+        }
+
+        impl Drop for ClosedOnExit {
+            fn drop(&mut self) {
+                self.flag.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let _closed_guard = ClosedOnExit {
+            flag: Arc::clone(&closed_flag_clone),
+        };
         open_window(
             gpu,
             output_buf,
@@ -121,6 +145,39 @@ pub fn spawn_window(
         _close_flag: close_flag,
         closed_flag,
     }
+}
+
+fn validate_output_layout(
+    output_buf_size: u64,
+    width: u32,
+    height: u32,
+    channels: u32,
+) -> Result<(), String> {
+    if width == 0 || height == 0 || channels == 0 {
+        return Err(format!(
+            "width/height/channels must all be > 0 (got {width}x{height}x{channels})"
+        ));
+    }
+
+    let texel_count = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|v| v.checked_mul(u64::from(channels)))
+        .ok_or_else(|| {
+            format!(
+                "dimension overflow for {width}x{height}x{channels}; cannot compute texel count"
+            )
+        })?;
+    let required_bytes = texel_count.checked_mul(BYTES_PER_F32).ok_or_else(|| {
+        format!("size overflow for {texel_count} f32 values; cannot compute required bytes")
+    })?;
+
+    if output_buf_size < required_bytes {
+        return Err(format!(
+            "buffer too small: need {required_bytes} bytes, got {output_buf_size} bytes"
+        ));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +197,8 @@ struct RenderState {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    // Keep uniforms alive for the lifetime of the bind group/pipeline.
+    _uniform_buf: wgpu::Buffer,
 }
 
 impl RenderState {
@@ -251,6 +310,7 @@ impl RenderState {
             config,
             pipeline,
             bind_group,
+            _uniform_buf: uniform_buf,
         }
     }
 
@@ -262,28 +322,28 @@ impl RenderState {
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self) -> bool {
         let output = match self.surface.get_current_texture() {
             Ok(o) => o,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 // Swapchain invalidated (resize/minimise/etc.) – reconfigure and
                 // retry on the next frame.
                 self.surface.configure(self.gpu.device(), &self.config);
-                return;
+                return true;
             }
             Err(wgpu::SurfaceError::Timeout) => {
                 // The GPU is busy (e.g. training is running on the same
                 // device).  This is a transient stall – skip the frame and
                 // retry on the next tick rather than flooding stderr.
-                return;
+                return true;
             }
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 eprintln!("[visualiser] GPU out of memory");
-                return;
+                return false;
             }
             Err(e) => {
                 eprintln!("[visualiser] surface error: {e}");
-                return;
+                return false;
             }
         };
         let view = output
@@ -322,6 +382,7 @@ impl RenderState {
         // latest buffer state written by the last training pass.
         self.gpu.queue().submit(std::iter::once(encoder.finish()));
         output.present();
+        true
     }
 }
 
@@ -344,6 +405,13 @@ struct Viewer {
     state: Option<RenderState>,
 }
 
+impl Viewer {
+    fn exit(&self, event_loop: &ActiveEventLoop) {
+        self.closed_flag.store(true, Ordering::Relaxed);
+        event_loop.exit();
+    }
+}
+
 impl ApplicationHandler for Viewer {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
@@ -354,7 +422,7 @@ impl ApplicationHandler for Viewer {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 eprintln!("[visualiser] failed to create window: {e}");
-                event_loop.exit();
+                self.exit(event_loop);
                 return;
             }
         };
@@ -365,7 +433,7 @@ impl ApplicationHandler for Viewer {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[visualiser] failed to create surface: {e}");
-                event_loop.exit();
+                self.exit(event_loop);
                 return;
             }
         };
@@ -373,7 +441,7 @@ impl ApplicationHandler for Viewer {
         let caps = surface.get_capabilities(self.gpu.adapter());
         if caps.formats.is_empty() {
             eprintln!("[visualiser] training GPU adapter does not support surface presentation");
-            event_loop.exit();
+            self.exit(event_loop);
             return;
         }
 
@@ -422,8 +490,7 @@ impl ApplicationHandler for Viewer {
             WindowEvent::CloseRequested => {
                 // Signal the handle holder that the window closed on the user's
                 // initiative so they can clear their `Option<VisualiserHandle>`.
-                self.closed_flag.store(true, Ordering::Relaxed);
-                event_loop.exit();
+                self.exit(event_loop);
             }
             WindowEvent::Resized(size) => {
                 if let Some(state) = &mut self.state {
@@ -432,7 +499,9 @@ impl ApplicationHandler for Viewer {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(state) = &mut self.state {
-                    state.render();
+                    if !state.render() {
+                        self.exit(event_loop);
+                    }
                 }
             }
             _ => {}
@@ -442,8 +511,7 @@ impl ApplicationHandler for Viewer {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Close when the VisualiserHandle has been dropped.
         if self.close_flag.load(Ordering::Relaxed) {
-            self.closed_flag.store(true, Ordering::Relaxed);
-            event_loop.exit();
+            self.exit(event_loop);
             return;
         }
         // Throttle to ~30 fps so the visualiser does not burn CPU/GPU during
