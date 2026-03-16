@@ -2,6 +2,7 @@ pub mod gpu_context;
 pub mod model;
 pub mod training;
 pub mod tui;
+pub mod visualiser;
 
 pub use gpu_context::GpuContext;
 pub use model::Model;
