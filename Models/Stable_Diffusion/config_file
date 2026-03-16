@@ -183,7 +183,7 @@
     "mode": {
       "Train": {
         "lr": 0.01,
-        "batch_size": 10,
+        "batch_size": 100,
         "steps": 200,
         "dataset_path": "/home/bat/Documents/lab/batBuilder/master/datasets/cifar-10-batches-bin",
         "loss": "MeanSquared",
