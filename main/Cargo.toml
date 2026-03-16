@@ -9,5 +9,4 @@ image = "0.25.9"
 winit = "0.30.12"
 
 bat_building = { path = "../bat_building", default-features = false }
-the_window   = { path = "../the_window" }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }

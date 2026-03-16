@@ -1,4 +1,4 @@
-//! `the_window` – live GPU visualiser for model output buffers.
+//! Live GPU visualiser for model output buffers.
 //!
 //! Opens a native window that renders the model's actual GPU output buffer
 //! directly – no CPU readback, no snapshot, no extra copy.  The visualiser
@@ -9,7 +9,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use bat_building::GpuContext;
-//! use the_window::spawn_window;
+//! use bat_building::visualiser::spawn_window;
 //!
 //! // (during training, after model.build())
 //! let gpu: Arc<GpuContext> = model.gpu_context();
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use bat_building::GpuContext;
+use crate::GpuContext;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -51,8 +51,24 @@ const FRAME_INTERVAL_MS: u64 = 33;
 ///
 /// Dropping the handle sends a close signal to the window thread, which
 /// causes it to exit on the next event-loop iteration.
+///
+/// The handle also tracks whether the window was closed by the user (e.g.
+/// via the window's close button).  Poll [`VisualiserHandle::is_closed`] to
+/// check this and clear the handle on the caller's side.
 pub struct VisualiserHandle {
+    /// Caller → window: request the window to close.
     _close_flag: Arc<AtomicBool>,
+    /// Window → caller: window has exited (either via close button or flag).
+    closed_flag: Arc<AtomicBool>,
+}
+
+impl VisualiserHandle {
+    /// Returns `true` if the visualiser window has already been closed,
+    /// either because the user clicked the window's close button or because
+    /// the handle was previously dropped and the thread has since exited.
+    pub fn is_closed(&self) -> bool {
+        self.closed_flag.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for VisualiserHandle {
@@ -84,7 +100,9 @@ pub fn spawn_window(
     title: String,
 ) -> VisualiserHandle {
     let close_flag = Arc::new(AtomicBool::new(false));
+    let closed_flag = Arc::new(AtomicBool::new(false));
     let close_flag_clone = Arc::clone(&close_flag);
+    let closed_flag_clone = Arc::clone(&closed_flag);
 
     std::thread::spawn(move || {
         open_window(
@@ -95,11 +113,13 @@ pub fn spawn_window(
             channels,
             title,
             close_flag_clone,
+            closed_flag_clone,
         );
     });
 
     VisualiserHandle {
         _close_flag: close_flag,
+        closed_flag,
     }
 }
 
@@ -252,11 +272,11 @@ impl RenderState {
                 return;
             }
             Err(wgpu::SurfaceError::OutOfMemory) => {
-                eprintln!("[the_window] GPU out of memory");
+                eprintln!("[visualiser] GPU out of memory");
                 return;
             }
             Err(e) => {
-                eprintln!("[the_window] surface error: {e}");
+                eprintln!("[visualiser] surface error: {e}");
                 return;
             }
         };
@@ -311,6 +331,9 @@ struct Viewer {
     channels: u32,
     title: String,
     close_flag: Arc<AtomicBool>,
+    /// Set to `true` when the window exits so that the handle holder can
+    /// detect a user-initiated close.
+    closed_flag: Arc<AtomicBool>,
     window: Option<Arc<Window>>,
     state: Option<RenderState>,
 }
@@ -324,7 +347,7 @@ impl ApplicationHandler for Viewer {
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
-                eprintln!("[the_window] failed to create window: {e}");
+                eprintln!("[visualiser] failed to create window: {e}");
                 event_loop.exit();
                 return;
             }
@@ -335,7 +358,7 @@ impl ApplicationHandler for Viewer {
         let surface = match self.gpu.instance().create_surface(Arc::clone(&window)) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[the_window] failed to create surface: {e}");
+                eprintln!("[visualiser] failed to create surface: {e}");
                 event_loop.exit();
                 return;
             }
@@ -343,7 +366,7 @@ impl ApplicationHandler for Viewer {
 
         let caps = surface.get_capabilities(self.gpu.adapter());
         if caps.formats.is_empty() {
-            eprintln!("[the_window] training GPU adapter does not support surface presentation");
+            eprintln!("[visualiser] training GPU adapter does not support surface presentation");
             event_loop.exit();
             return;
         }
@@ -391,6 +414,9 @@ impl ApplicationHandler for Viewer {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                // Signal the handle holder that the window closed on the user's
+                // initiative so they can clear their `Option<VisualiserHandle>`.
+                self.closed_flag.store(true, Ordering::Relaxed);
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -410,6 +436,7 @@ impl ApplicationHandler for Viewer {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Close when the VisualiserHandle has been dropped.
         if self.close_flag.load(Ordering::Relaxed) {
+            self.closed_flag.store(true, Ordering::Relaxed);
             event_loop.exit();
             return;
         }
@@ -435,6 +462,7 @@ fn open_window(
     channels: u32,
     title: String,
     close_flag: Arc<AtomicBool>,
+    closed_flag: Arc<AtomicBool>,
 ) {
     // On Linux (Wayland and X11) winit requires `with_any_thread(true)` when
     // the event loop is created outside the main OS thread.  Both platform
@@ -446,7 +474,7 @@ fn open_window(
         match EventLoop::builder().with_any_thread(true).build() {
             Ok(el) => el,
             Err(e) => {
-                eprintln!("[the_window] failed to create event loop: {e}");
+                eprintln!("[visualiser] failed to create event loop: {e}");
                 return;
             }
         }
@@ -455,7 +483,7 @@ fn open_window(
     let event_loop = match EventLoop::new() {
         Ok(el) => el,
         Err(e) => {
-            eprintln!("[the_window] failed to create event loop: {e}");
+            eprintln!("[visualiser] failed to create event loop: {e}");
             return;
         }
     };
@@ -470,11 +498,12 @@ fn open_window(
         channels,
         title,
         close_flag,
+        closed_flag,
         window: None,
         state: None,
     };
 
     if let Err(e) = event_loop.run_app(&mut viewer) {
-        eprintln!("[the_window] event loop error: {e}");
+        eprintln!("[visualiser] event loop error: {e}");
     }
 }
