@@ -271,6 +271,12 @@ impl RenderState {
                 self.surface.configure(self.gpu.device(), &self.config);
                 return;
             }
+            Err(wgpu::SurfaceError::Timeout) => {
+                // The GPU is busy (e.g. training is running on the same
+                // device).  This is a transient stall – skip the frame and
+                // retry on the next tick rather than flooding stderr.
+                return;
+            }
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 eprintln!("[visualiser] GPU out of memory");
                 return;
