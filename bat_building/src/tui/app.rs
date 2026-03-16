@@ -630,6 +630,8 @@ pub enum TrainingControlCommand {
         batch_size: u32,
         total_steps: usize,
     },
+    /// Open (or toggle off) the live GPU visualiser window.
+    ToggleWindow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1746,6 +1748,14 @@ impl App {
         self.monitor
             .pending_control_commands
             .push(TrainingControlCommand::SetPaused(next));
+    }
+
+    /// Send a [`TrainingControlCommand::ToggleWindow`] to the training thread
+    /// to open or close the live GPU visualiser window.
+    pub fn toggle_visualise(&mut self) {
+        self.monitor
+            .pending_control_commands
+            .push(TrainingControlCommand::ToggleWindow);
     }
 
     pub fn open_training_control(&mut self) -> Result<(), String> {
