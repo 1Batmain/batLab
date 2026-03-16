@@ -202,10 +202,16 @@ async fn run_training(
 
     // Handle for the live-visualiser window.  `None` until the user presses
     // [v].  Dropping the handle closes the window.
-    let mut window_handle: Option<the_window::VisualiserHandle> = None;
+    let mut window_handle: Option<bat_building::visualiser::VisualiserHandle> = None;
 
     let mut step = 0usize;
     while step < total_steps {
+        // If the user closed the visualiser window via its close button, clear
+        // the stale handle so that pressing [v] opens a fresh window.
+        if window_handle.as_ref().is_some_and(|h| h.is_closed()) {
+            window_handle = None;
+        }
+
         while let Ok(command) = control_rx.try_recv() {
             if command == tui::TrainingControlCommand::ToggleWindow {
                 window_handle = toggle_visualiser_window(window_handle, &model, output_size);
@@ -338,12 +344,12 @@ async fn run_training(
 /// Open the visualiser window (or close it if it is already running).
 ///
 /// The window binds the model's GPU output buffer directly – no CPU readback.
-/// Dropping the returned [`the_window::VisualiserHandle`] closes the window.
+/// Dropping the returned [`bat_building::visualiser::VisualiserHandle`] closes the window.
 fn toggle_visualiser_window(
-    existing: Option<the_window::VisualiserHandle>,
+    existing: Option<bat_building::visualiser::VisualiserHandle>,
     model: &Model<Training>,
     output_size: (u32, u32, u32),
-) -> Option<the_window::VisualiserHandle> {
+) -> Option<bat_building::visualiser::VisualiserHandle> {
     if existing.is_some() {
         // Drop the handle → AtomicBool signals the window thread to exit.
         return None;
@@ -359,7 +365,7 @@ fn toggle_visualiser_window(
         output_size.0, output_size.1, output_size.2
     );
 
-    Some(the_window::spawn_window(
+    Some(bat_building::visualiser::spawn_window(
         model.gpu_context(),
         output_buf,
         output_size.0,
