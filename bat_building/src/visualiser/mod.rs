@@ -25,7 +25,9 @@
 //! ```
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::GpuContext;
@@ -43,6 +45,7 @@ use winit::window::{Window, WindowId};
 /// FIFO present mode provides additional vsync pacing on top of this.
 const FRAME_INTERVAL_MS: u64 = 33;
 const BYTES_PER_F32: u64 = std::mem::size_of::<f32>() as u64;
+static VISUALISER_CMD_TX: OnceLock<Sender<ManagerCommand>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -112,38 +115,145 @@ pub fn spawn_window(
         };
     }
 
-    let close_flag_clone = Arc::clone(&close_flag);
-    let closed_flag_clone = Arc::clone(&closed_flag);
+    let request = OpenRequest {
+        gpu,
+        output_buf,
+        width,
+        height,
+        channels,
+        title,
+        close_flag: Arc::clone(&close_flag),
+        closed_flag: Arc::clone(&closed_flag),
+    };
 
-    std::thread::spawn(move || {
-        struct ClosedOnExit {
-            flag: Arc<AtomicBool>,
-        }
-
-        impl Drop for ClosedOnExit {
-            fn drop(&mut self) {
-                self.flag.store(true, Ordering::Relaxed);
-            }
-        }
-
-        let _closed_guard = ClosedOnExit {
-            flag: Arc::clone(&closed_flag_clone),
-        };
-        open_window(
-            gpu,
-            output_buf,
-            width,
-            height,
-            channels,
-            title,
-            close_flag_clone,
-            closed_flag_clone,
-        );
-    });
+    let tx = visualiser_manager_tx();
+    if let Err(err) = tx.send(ManagerCommand::Open(request)) {
+        eprintln!("[visualiser] failed to enqueue open request: {err}");
+        close_flag.store(true, Ordering::Relaxed);
+        closed_flag.store(true, Ordering::Relaxed);
+    }
 
     VisualiserHandle {
         _close_flag: close_flag,
         closed_flag,
+    }
+}
+
+fn visualiser_manager_tx() -> &'static Sender<ManagerCommand> {
+    VISUALISER_CMD_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ManagerCommand>();
+        std::thread::spawn(move || {
+            open_window_manager(rx);
+        });
+        tx
+    })
+}
+
+enum ManagerCommand {
+    Open(OpenRequest),
+}
+
+struct OpenRequest {
+    gpu: Arc<GpuContext>,
+    output_buf: Arc<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    channels: u32,
+    title: String,
+    close_flag: Arc<AtomicBool>,
+    closed_flag: Arc<AtomicBool>,
+}
+
+struct ActiveVisualiser {
+    close_flag: Arc<AtomicBool>,
+    closed_flag: Arc<AtomicBool>,
+    window: Arc<Window>,
+    state: RenderState,
+}
+
+impl ActiveVisualiser {
+    fn from_open_request(event_loop: &ActiveEventLoop, req: OpenRequest) -> Option<Self> {
+        let attrs = Window::default_attributes()
+            .with_title(req.title.clone())
+            .with_inner_size(winit::dpi::LogicalSize::new(512u32, 512u32));
+
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                eprintln!("[visualiser] failed to create window: {e}");
+                req.closed_flag.store(true, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        // Create a surface using the SAME wgpu instance that the training
+        // device was created with, so they are compatible.
+        let surface = match req.gpu.instance().create_surface(Arc::clone(&window)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[visualiser] failed to create surface: {e}");
+                req.closed_flag.store(true, Ordering::Relaxed);
+                return None;
+            }
+        };
+
+        let size = window.inner_size();
+        if let Some(mut config) =
+            surface.get_default_config(req.gpu.adapter(), size.width.max(1), size.height.max(1))
+        {
+            let caps = surface.get_capabilities(req.gpu.adapter());
+            if !caps.formats.is_empty() {
+                let format = caps
+                    .formats
+                    .iter()
+                    .find(|f| f.is_srgb())
+                    .copied()
+                    .unwrap_or(caps.formats[0]);
+
+                config.format = format;
+                config.present_mode = caps
+                    .present_modes
+                    .iter()
+                    .find(|&&m| m == wgpu::PresentMode::Fifo)
+                    .copied()
+                    .unwrap_or(config.present_mode);
+                config.alpha_mode = caps
+                    .alpha_modes
+                    .first()
+                    .copied()
+                    .unwrap_or(config.alpha_mode);
+                config.desired_maximum_frame_latency = 2;
+
+                let configured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    surface.configure(req.gpu.device(), &config);
+                }));
+                if configured.is_ok() {
+                    let state = RenderState::new(
+                        Arc::clone(&req.gpu),
+                        surface,
+                        config,
+                        &req.output_buf,
+                        req.width,
+                        req.height,
+                        req.channels,
+                    );
+                    return Some(Self {
+                        close_flag: req.close_flag,
+                        closed_flag: req.closed_flag,
+                        window,
+                        state,
+                    });
+                }
+            }
+        }
+
+        let adapter_info = req.gpu.adapter().get_info();
+        eprintln!(
+            "[visualiser] failed to start shared-GPU visualiser (adapter='{}' backend={:?}); closing visualiser",
+            adapter_info.name, adapter_info.backend
+        );
+        req.closed_flag.store(true, Ordering::Relaxed);
+        None
     }
 }
 
@@ -202,6 +312,22 @@ struct RenderState {
 }
 
 impl RenderState {
+    fn configure_surface(&mut self, reason: &str) -> bool {
+        // On some Wayland setups, surface configuration failures are raised via
+        // wgpu's uncaptured-error panic path instead of a recoverable Result.
+        // Keep this contained to the visualiser thread.
+        let configured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.surface.configure(self.gpu.device(), &self.config);
+        }));
+        if configured.is_err() {
+            eprintln!(
+                "[visualiser] failed to configure surface ({reason}): invalid or incompatible surface"
+            );
+            return false;
+        }
+        true
+    }
+
     fn new(
         gpu: Arc<GpuContext>,
         surface: wgpu::Surface<'static>,
@@ -314,12 +440,13 @@ impl RenderState {
         }
     }
 
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) -> bool {
         if new_size.width > 0 && new_size.height > 0 {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
-            self.surface.configure(self.gpu.device(), &self.config);
+            return self.configure_surface("resize");
         }
+        true
     }
 
     fn render(&mut self) -> bool {
@@ -328,8 +455,7 @@ impl RenderState {
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 // Swapchain invalidated (resize/minimise/etc.) – reconfigure and
                 // retry on the next frame.
-                self.surface.configure(self.gpu.device(), &self.config);
-                return true;
+                return self.configure_surface("surface lost/outdated");
             }
             Err(wgpu::SurfaceError::Timeout) => {
                 // The GPU is busy (e.g. training is running on the same
@@ -390,118 +516,68 @@ impl RenderState {
 // Winit application
 // ---------------------------------------------------------------------------
 
-struct Viewer {
-    gpu: Arc<GpuContext>,
-    output_buf: Arc<wgpu::Buffer>,
-    width: u32,
-    height: u32,
-    channels: u32,
-    title: String,
-    close_flag: Arc<AtomicBool>,
-    /// Set to `true` when the window exits so that the handle holder can
-    /// detect a user-initiated close.
-    closed_flag: Arc<AtomicBool>,
-    window: Option<Arc<Window>>,
-    state: Option<RenderState>,
+struct VisualiserManagerApp {
+    rx: Receiver<ManagerCommand>,
+    active: Option<ActiveVisualiser>,
 }
 
-impl Viewer {
-    fn exit(&self, event_loop: &ActiveEventLoop) {
-        self.closed_flag.store(true, Ordering::Relaxed);
-        event_loop.exit();
+impl VisualiserManagerApp {
+    fn close_active(&mut self) {
+        if let Some(active) = self.active.take() {
+            active.closed_flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn drain_commands(&mut self, event_loop: &ActiveEventLoop) {
+        let mut pending_open: Option<OpenRequest> = None;
+        while let Ok(cmd) = self.rx.try_recv() {
+            match cmd {
+                ManagerCommand::Open(req) => {
+                    if let Some(previous) = pending_open.replace(req) {
+                        previous.closed_flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        if let Some(open) = pending_open {
+            self.close_active();
+            self.active = ActiveVisualiser::from_open_request(event_loop, open);
+        }
     }
 }
 
-impl ApplicationHandler for Viewer {
+impl ApplicationHandler for VisualiserManagerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes()
-            .with_title(self.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(512u32, 512u32));
+        self.drain_commands(event_loop);
+    }
 
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => {
-                eprintln!("[visualiser] failed to create window: {e}");
-                self.exit(event_loop);
-                return;
-            }
-        };
-
-        // Create a surface using the SAME wgpu instance that the training
-        // device was created with, so they are compatible.
-        let surface = match self.gpu.instance().create_surface(Arc::clone(&window)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[visualiser] failed to create surface: {e}");
-                self.exit(event_loop);
-                return;
-            }
-        };
-
-        let caps = surface.get_capabilities(self.gpu.adapter());
-        if caps.formats.is_empty() {
-            eprintln!("[visualiser] training GPU adapter does not support surface presentation");
-            self.exit(event_loop);
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let is_active_window = self.active.as_ref().is_some_and(|a| a.window.id() == id);
+        if !is_active_window {
             return;
         }
 
-        let format = caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(caps.formats[0]);
-
-        let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            // Prefer FIFO (vsync) to avoid burning CPU/GPU during training.
-            present_mode: caps
-                .present_modes
-                .iter()
-                .find(|&&m| m == wgpu::PresentMode::Fifo)
-                .copied()
-                .unwrap_or(caps.present_modes[0]),
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(self.gpu.device(), &config);
-
-        let state = RenderState::new(
-            Arc::clone(&self.gpu),
-            surface,
-            config,
-            &self.output_buf,
-            self.width,
-            self.height,
-            self.channels,
-        );
-
-        self.window = Some(window);
-        self.state = Some(state);
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                // Signal the handle holder that the window closed on the user's
-                // initiative so they can clear their `Option<VisualiserHandle>`.
-                self.exit(event_loop);
+                self.close_active();
             }
             WindowEvent::Resized(size) => {
-                if let Some(state) = &mut self.state {
-                    state.resize(size);
+                let should_close = self
+                    .active
+                    .as_mut()
+                    .is_some_and(|active| !active.state.resize(size));
+                if should_close {
+                    self.close_active();
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(state) = &mut self.state {
-                    if !state.render() {
-                        self.exit(event_loop);
-                    }
+                let should_close = self
+                    .active
+                    .as_mut()
+                    .is_some_and(|active| !active.state.render());
+                if should_close {
+                    self.close_active();
                 }
             }
             _ => {}
@@ -509,17 +585,21 @@ impl ApplicationHandler for Viewer {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Close when the VisualiserHandle has been dropped.
-        if self.close_flag.load(Ordering::Relaxed) {
-            self.exit(event_loop);
-            return;
+        let should_close = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.close_flag.load(Ordering::Relaxed));
+        if should_close {
+            self.close_active();
         }
+        self.drain_commands(event_loop);
+
         // Throttle to ~30 fps so the visualiser does not burn CPU/GPU during
         // training.  FIFO present mode provides additional vsync pacing.
         let next = Instant::now() + Duration::from_millis(FRAME_INTERVAL_MS);
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
-        if let Some(win) = &self.window {
-            win.request_redraw();
+        if let Some(active) = &self.active {
+            active.window.request_redraw();
         }
     }
 }
@@ -528,28 +608,78 @@ impl ApplicationHandler for Viewer {
 // Internal entry point
 // ---------------------------------------------------------------------------
 
-fn open_window(
-    gpu: Arc<GpuContext>,
-    output_buf: Arc<wgpu::Buffer>,
-    width: u32,
-    height: u32,
-    channels: u32,
-    title: String,
-    close_flag: Arc<AtomicBool>,
-    closed_flag: Arc<AtomicBool>,
-) {
+fn open_window_manager(rx: Receiver<ManagerCommand>) {
     // On Linux (Wayland and X11) winit requires `with_any_thread(true)` when
     // the event loop is created outside the main OS thread.  Both platform
     // extensions write to the same underlying `any_thread` flag, so importing
     // either one is sufficient.
     #[cfg(target_os = "linux")]
     let event_loop = {
-        use winit::platform::wayland::EventLoopBuilderExtWayland as _;
-        match EventLoop::builder().with_any_thread(true).build() {
+        let mut try_x11_first = false;
+        if std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland")
+            && std::env::var_os("DISPLAY").is_some()
+        {
+            // On some NVIDIA+Wayland setups, forcing X11/XWayland is more
+            // reliable for swapchain configuration than native Wayland.
+            try_x11_first = true;
+        }
+
+        let try_build_x11 = || {
+            let mut builder = EventLoop::builder();
+            winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
+            winit::platform::x11::EventLoopBuilderExtX11::with_x11(&mut builder);
+            builder.build()
+        };
+
+        let try_build_wayland = || {
+            let mut builder = EventLoop::builder();
+            winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
+                &mut builder,
+                true,
+            );
+            winit::platform::wayland::EventLoopBuilderExtWayland::with_wayland(&mut builder);
+            builder.build()
+        };
+
+        let event_loop = if try_x11_first {
+            match try_build_x11() {
+                Ok(el) => {
+                    eprintln!("[visualiser] using X11 backend on Wayland session");
+                    Ok(el)
+                }
+                Err(x11_err) => {
+                    eprintln!(
+                        "[visualiser] failed to init X11 backend ({x11_err}); retrying Wayland backend"
+                    );
+                    try_build_wayland()
+                }
+            }
+        } else {
+            try_build_wayland()
+        };
+
+        match event_loop {
             Ok(el) => el,
-            Err(e) => {
-                eprintln!("[visualiser] failed to create event loop: {e}");
-                return;
+            Err(wayland_err) => {
+                if !try_x11_first {
+                    match try_build_x11() {
+                        Ok(el) => {
+                            eprintln!(
+                                "[visualiser] failed to init Wayland backend ({wayland_err}); using X11 backend"
+                            );
+                            el
+                        }
+                        Err(x11_err) => {
+                            eprintln!(
+                                "[visualiser] failed to create event loop: Wayland={wayland_err}; X11={x11_err}"
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    eprintln!("[visualiser] failed to create event loop: {wayland_err}");
+                    return;
+                }
             }
         }
     };
@@ -562,22 +692,9 @@ fn open_window(
         }
     };
 
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = VisualiserManagerApp { rx, active: None };
 
-    let mut viewer = Viewer {
-        gpu,
-        output_buf,
-        width,
-        height,
-        channels,
-        title,
-        close_flag,
-        closed_flag,
-        window: None,
-        state: None,
-    };
-
-    if let Err(e) = event_loop.run_app(&mut viewer) {
+    if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("[visualiser] event loop error: {e}");
     }
 }

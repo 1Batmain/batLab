@@ -117,11 +117,8 @@ impl DiffusionTask {
         step: usize,
         batch_size: usize,
         seed: u64,
-    ) -> Result<f32, TrainingTaskError> {
-        self.train_step_batch_inner(model, dataset, step, batch_size, seed, true)?
-            .ok_or_else(|| TrainingTaskError::DatasetError {
-                message: "loss report was not produced".to_string(),
-            })
+    ) -> Result<Option<f32>, TrainingTaskError> {
+        self.train_step_batch_inner(model, dataset, step, batch_size, seed, true)
     }
 
     pub fn train_step_batch(
@@ -187,10 +184,10 @@ impl DiffusionTask {
 
             let is_last = batch_offset + 1 == batch_size;
             if is_last && report_last_loss {
-                last_loss = Some(model.train_step_report_with_prepass_no_opt(|encoder| {
+                last_loss = model.train_step_report_with_prepass_no_opt(|encoder| {
                     pass.encode_with_dataset(encoder, gpu.as_ref(), dataset, sample_index)
                         .expect("diffusion dataset sample copy should be valid");
-                }));
+                });
             } else {
                 model.train_step_with_prepass_no_opt(|encoder| {
                     pass.encode_with_dataset(encoder, gpu.as_ref(), dataset, sample_index)
@@ -524,7 +521,8 @@ mod tests {
             let loss = task
                 .train_step_report_batch(&mut model, &mut dataset, 0, 1, 42)
                 .unwrap();
-            assert!(loss.is_finite());
+            assert!(loss.is_some());
+            assert!(loss.unwrap().is_finite());
         });
     }
 }

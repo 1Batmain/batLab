@@ -267,18 +267,16 @@ async fn run_training(
 
         let should_report_loss = step % LOSS_REPORT_INTERVAL_STEPS == 0 || step + 1 == total_steps;
         let loss = if should_report_loss {
-            Some(
-                trainer
-                    .task_mut()
-                    .train_step_report_batch(
-                        &mut model,
-                        &mut gpu_dataset,
-                        step,
-                        current_batch_size as usize,
-                        (step as u64) << 32,
-                    )
-                    .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?,
-            )
+            trainer
+                .task_mut()
+                .train_step_report_batch(
+                    &mut model,
+                    &mut gpu_dataset,
+                    step,
+                    current_batch_size as usize,
+                    (step as u64) << 32,
+                )
+                .map_err(|err| format!("failed diffusion GPU batch step: {err}"))?
         } else {
             trainer
                 .task_mut()
