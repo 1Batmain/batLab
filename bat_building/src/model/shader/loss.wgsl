@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing loss operations for model forward/backward or optimizer passes.
+
 // Bindings match LossType::get_buffers_specs():
 //   [0] model_result — the model's forward output  (read)
 //   [1] target       — ground-truth labels          (read, CPU writes each step)

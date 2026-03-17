@@ -1,3 +1,5 @@
+//! File purpose: Manages the visualiser window lifecycle and GPU-backed frame presentation of model outputs.
+
 //! Live GPU visualiser for model output buffers.
 //!
 //! Opens a native window that renders the model's actual GPU output buffer

@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing back concat operations for model forward/backward or optimizer passes.
+
 // Bindings match ConcatType::get_back_buffers_specs():
 //   [0] grad_output — incoming gradient for concatenated output
 //   [1] specs       — concat dimensions

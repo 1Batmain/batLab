@@ -1,3 +1,5 @@
+//! File purpose: Module entry point for layer types; wires submodules and shared exports.
+
 use crate::model::error::ModelError;
 use crate::model::types::{BufferSpec, Dim3};
 use enum_dispatch::enum_dispatch;

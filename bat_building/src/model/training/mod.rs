@@ -1,3 +1,5 @@
+//! File purpose: Module entry point for training; wires submodules and shared exports.
+
 pub mod dataset;
 pub mod diffusion;
 pub mod schedule;

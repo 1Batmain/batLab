@@ -1,3 +1,5 @@
+# File purpose: Cargo manifest for the bat_building crate and its build/dependency settings.
+
 [package]
 name = "bat_building"
 version = "0.1.0"

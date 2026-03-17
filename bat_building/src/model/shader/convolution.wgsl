@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing convolution operations for model forward/backward or optimizer passes.
+
 // Bindings match ConvolutionType::get_buffers_specs():
 //   [0] input   — HWC layout: index = iy*W*C + ix*C + iz
 //   [1] weights — KHKWKC layout: index = k*KH*KW*KC + ky*KW*KC + kx*KC + kz

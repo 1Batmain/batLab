@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing concat operations for model forward/backward or optimizer passes.
+
 // Bindings match ConcatType::get_buffers_specs():
 //   [0] input      — current sequential tensor (HWC)
 //   [1] skip_input — saved skip tensor (HWC)

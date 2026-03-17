@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing upsample conv operations for model forward/backward or optimizer passes.
+
 // Bindings match UpsampleConvType::get_buffers_specs():
 //   [0] input   — original input tensor (HWC)
 //   [1] weights — output-major convolution weights (KHKWKC)

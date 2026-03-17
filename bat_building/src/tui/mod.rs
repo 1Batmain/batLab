@@ -1,3 +1,5 @@
+//! File purpose: Module entry point for tui; wires submodules and shared exports.
+
 pub mod app;
 pub mod events;
 pub mod storage;

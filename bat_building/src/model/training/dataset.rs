@@ -1,8 +1,12 @@
+//! File purpose: Implements dataset logic used by the training pipeline.
+
 use crate::gpu_context::GpuContext;
 use std::error::Error;
 use std::fmt;
 
 const DEFAULT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DYNAMIC_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+const GPU_MEMORY_CHUNK_FRACTION: u64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct GpuDataset {
@@ -75,6 +79,23 @@ impl fmt::Display for GpuDatasetError {
 impl Error for GpuDatasetError {}
 
 impl GpuDataset {
+    fn select_max_chunk_bytes(gpu: &GpuContext, dataset_total_bytes: usize) -> usize {
+        let limits = gpu.device.limits();
+        let binding_cap = limits.max_storage_buffer_binding_size as u64;
+        let buffer_cap = limits.max_buffer_size;
+        let gpu_cap = gpu.specs().memory_size();
+        let hard_cap = buffer_cap
+            .min(binding_cap)
+            .min(gpu_cap)
+            .min(MAX_DYNAMIC_CHUNK_BYTES as u64) as usize;
+
+        let target_from_gpu = (gpu_cap / GPU_MEMORY_CHUNK_FRACTION) as usize;
+        let target = target_from_gpu
+            .max(DEFAULT_CHUNK_BYTES)
+            .min(hard_cap.max(1));
+        target.min(dataset_total_bytes.max(1))
+    }
+
     pub fn from_samples(
         gpu: &GpuContext,
         samples: Vec<Vec<f32>>,
@@ -100,8 +121,8 @@ impl GpuDataset {
         }
         let sample_count = samples.len();
         let sample_bytes = sample_len * std::mem::size_of::<f32>();
-        let max_chunk_bytes =
-            (gpu.device.limits().max_buffer_size as usize).min(DEFAULT_CHUNK_BYTES);
+        let dataset_total_bytes = sample_count.saturating_mul(sample_bytes);
+        let max_chunk_bytes = Self::select_max_chunk_bytes(gpu, dataset_total_bytes);
         if sample_bytes > max_chunk_bytes {
             return Err(GpuDatasetError::SampleTooLarge {
                 sample_len,

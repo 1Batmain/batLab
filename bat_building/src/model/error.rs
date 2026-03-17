@@ -1,3 +1,5 @@
+//! File purpose: Implements error functionality for model execution, state, or diagnostics.
+
 use crate::model::types::{Dim3, PaddingMode};
 use std::error::Error;
 use std::fmt::{Display, Formatter};

@@ -1,9 +1,38 @@
+//! File purpose: Creates and configures the shared headless WGPU context used by training and rendering paths.
+
+#[derive(Debug)]
+pub struct GpuSpecs {
+    pub(crate) device_name: String,
+    pub(crate) memory_size: u64,
+}
+impl GpuSpecs {
+    pub fn new(adapter: &wgpu::Adapter) -> Self {
+        let info = adapter.get_info();
+        let limits = adapter.limits();
+        Self {
+            device_name: info.name,
+            // For now we expose the adapter's max single-buffer allocation size as
+            // the project-level memory capacity metric.
+            memory_size: limits.max_buffer_size,
+        }
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn memory_size(&self) -> u64 {
+        self.memory_size
+    }
+}
+
 #[derive(Debug)]
 pub struct GpuContext {
     pub(crate) _instance: wgpu::Instance,
     pub(crate) _adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+    pub(crate) gpu_specs: GpuSpecs,
 }
 
 impl GpuContext {
@@ -40,12 +69,14 @@ impl GpuContext {
         device.on_uncaptured_error(std::sync::Arc::new(|err| {
             eprintln!("[gpu] uncaptured wgpu error: {err}");
         }));
+        let gpu_specs = GpuSpecs::new(&adapter);
 
         Self {
             _instance: instance,
             _adapter: adapter,
             device,
             queue,
+            gpu_specs,
         }
     }
 
@@ -70,5 +101,10 @@ impl GpuContext {
     /// Provides access to the wgpu instance for surface creation.
     pub fn instance(&self) -> &wgpu::Instance {
         &self._instance
+    }
+
+    /// Provides access to cached GPU specification details used by the app.
+    pub fn specs(&self) -> &GpuSpecs {
+        &self.gpu_specs
     }
 }

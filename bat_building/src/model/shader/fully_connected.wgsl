@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing fully connected operations for model forward/backward or optimizer passes.
+
 // Bindings match FullyConnectedType::get_buffers_specs():
 //   [0] input   — flattened input vector
 //   [1] weights — output-major matrix: neuron_idx * input_len + in_idx

@@ -1,3 +1,5 @@
+//! File purpose: Implements layer functionality for model execution, state, or diagnostics.
+
 use crate::gpu_context::GpuContext;
 use crate::model::error::ModelError;
 use crate::model::layer_types::{

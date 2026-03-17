@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing diffusion prepare preprocessing for diffusion training inputs.
+
 @group(0) @binding(0) var<storage, read>       clean_target: array<f32>;
 @group(0) @binding(1) var<uniform>             specs: DiffusionPrepareSpec;
 @group(0) @binding(2) var<storage, read_write> model_input:  array<f32>;

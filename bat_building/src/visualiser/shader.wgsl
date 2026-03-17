@@ -1,3 +1,5 @@
+// File purpose: WGSL shader used by the visualiser to render model output frames to the swapchain.
+
 // Model-output visualiser shaders
 //
 // The data buffer holds the flat f32 model-output tensor in row-major,

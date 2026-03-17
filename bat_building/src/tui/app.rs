@@ -1,3 +1,5 @@
+//! File purpose: Implements app behavior for the terminal user interface flow.
+
 use super::storage::{self, SavedModelEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
