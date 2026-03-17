@@ -1,3 +1,5 @@
+//! File purpose: Implements schedule logic used by the training pipeline.
+
 #[derive(Debug, Clone)]
 pub struct LinearNoiseSchedule {
     betas: Vec<f32>,

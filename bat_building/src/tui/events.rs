@@ -1,3 +1,5 @@
+//! File purpose: Implements events behavior for the terminal user interface flow.
+
 use super::app::{App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen};
 use crossterm::event::KeyCode;
 

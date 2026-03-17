@@ -1,3 +1,5 @@
+# File purpose: Cargo manifest for the main crate and its build/dependency settings.
+
 [package]
 name = "main"
 version = "0.1.0"

@@ -1,3 +1,5 @@
+//! File purpose: Implements ui behavior for the terminal user interface flow.
+
 use super::app::{
     App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, MonitorImage, RunMode, Screen,
     TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,

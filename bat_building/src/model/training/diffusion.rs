@@ -1,3 +1,5 @@
+//! File purpose: Implements diffusion logic used by the training pipeline.
+
 use super::{
     GpuDataset, LinearNoiseSchedule, TaskPassSpec, TrainingTask, TrainingTaskError, Workgroups,
 };

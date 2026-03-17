@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing optimizer operations for model forward/backward or optimizer passes.
+
 @group(0) @binding(0) var<storage, read> result: array<f32>;
 @group(0) @binding(1) var<storage, read> expected: array<f32>;
 @group(0) @binding(2) var<storage, read_write> grad_output: array<f32>;

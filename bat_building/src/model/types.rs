@@ -1,3 +1,5 @@
+//! File purpose: Implements types functionality for model execution, state, or diagnostics.
+
 use encase::ShaderType;
 use serde::{Deserialize, Serialize};
 

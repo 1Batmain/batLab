@@ -1,3 +1,5 @@
+//! File purpose: Implements debug functionality for model execution, state, or diagnostics.
+
 use std::fmt;
 
 use crate::gpu_context::GpuContext;

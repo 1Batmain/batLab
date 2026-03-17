@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing back activation operations for model forward/backward or optimizer passes.
+
 // Bindings match back_buffers_specs for ActivationType:
 //   [0] fwd_input  — the activation input that was used in the forward pass
 //   [1] specs      — shared LayerSpec uniform from forward

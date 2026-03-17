@@ -1,3 +1,5 @@
+//! File purpose: Defines the loss layer type, shapes, and GPU bindings used by the model graph.
+
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
     BufferInit, ForwardBufferBinding, ForwardBufferSource, LayerType, ShaderDescriptor,

@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing group norm operations for model forward/backward or optimizer passes.
+
 @group(0) @binding(0) var<storage, read>       input:  array<f32>;
 @group(0) @binding(1) var<storage, read>       gamma:  array<f32>;
 @group(0) @binding(2) var<storage, read>       beta:   array<f32>;

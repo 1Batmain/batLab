@@ -1,3 +1,5 @@
+//! File purpose: Application entry point that orchestrates training, inference, and TUI workflows.
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};

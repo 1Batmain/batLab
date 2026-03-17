@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing sgd operations for model forward/backward or optimizer passes.
+
 // SGD weight update.
 // Bindings match create_opt_pass() in layer.rs:
 //   [0] weights      — trainable weights (read_write, updated in-place)

@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing back upsample conv operations for model forward/backward or optimizer passes.
+
 // Bindings match UpsampleConvType::get_back_buffers_specs():
 //   [0] fwd_input    — original forward input (HWC)
 //   [1] weights      — forward weights (KHKWKC)

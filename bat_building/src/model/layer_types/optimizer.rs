@@ -1,3 +1,5 @@
+//! File purpose: Defines the optimizer layer type, shapes, and GPU bindings used by the model graph.
+
 use crate::model::error::ModelError;
 use crate::model::layer_types::LayerType;
 use crate::model::types::{BufferSpec, Dim3};

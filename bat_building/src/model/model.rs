@@ -1,3 +1,5 @@
+//! File purpose: Implements model functionality for model execution, state, or diagnostics.
+
 use crate::gpu_context::GpuContext;
 use crate::model::debug::{LayerDebugView, read_back_f32};
 use crate::model::error::ModelError;

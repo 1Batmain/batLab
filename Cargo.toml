@@ -1,3 +1,5 @@
+# File purpose: Workspace Cargo manifest defining member crates and shared dependency configuration.
+
 [package]
 name = "batBuilder"
 version = "0.1.0"

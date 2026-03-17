@@ -1,3 +1,5 @@
+//! File purpose: Implements storage behavior for the terminal user interface flow.
+
 use super::app::ModelConfig;
 use std::fs;
 use std::io;

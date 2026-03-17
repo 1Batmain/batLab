@@ -1,3 +1,5 @@
+// File purpose: WGSL compute shader implementing back fully connected operations for model forward/backward or optimizer passes.
+
 // Bindings match FullyConnectedType::get_back_buffers_specs():
 //   [0] fwd_input    — flattened input vector used during forward
 //   [1] weights      — forward weights
