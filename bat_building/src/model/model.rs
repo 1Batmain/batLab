@@ -50,6 +50,8 @@ pub struct Model<State = Infer> {
     pub(crate) state: ModelState,
     pub(crate) saved_outputs: HashMap<String, usize>,
     pending_loss_readback: Option<PendingLossReadback>,
+    last_reported_loss: Option<f32>,
+    loss_readback_disabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,8 @@ impl Model<Training> {
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
             pending_loss_readback: None,
+            last_reported_loss: None,
+            loss_readback_disabled: false,
         }
     }
 
@@ -236,7 +240,7 @@ impl Model<Training> {
         self.read_last_loss()
     }
 
-    pub(crate) fn train_step_report_with_prepass_no_opt<F>(&mut self, prepass: F) -> f32
+    pub(crate) fn train_step_report_with_prepass_no_opt<F>(&mut self, prepass: F) -> Option<f32>
     where
         F: FnOnce(&mut wgpu::CommandEncoder),
     {
@@ -245,7 +249,7 @@ impl Model<Training> {
         prepass(&mut encoder);
         self.encode_train_graph_without_opt(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
-        self.read_last_loss()
+        self.read_last_loss_optional()
     }
 
     pub(crate) fn train_step_with_prepass_no_opt<F>(&mut self, prepass: F)
@@ -364,6 +368,8 @@ impl<State> Model<State> {
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
             pending_loss_readback: None,
+            last_reported_loss: None,
+            loss_readback_disabled: false,
         }
     }
 
@@ -374,6 +380,8 @@ impl<State> Model<State> {
         self.state.is_build = false;
         self.saved_outputs.clear();
         self.pending_loss_readback = None;
+        self.last_reported_loss = None;
+        self.loss_readback_disabled = false;
     }
 
     pub fn training_mode(&mut self, training: Option<State>) {
@@ -716,17 +724,7 @@ impl<State> Model<State> {
         total
     }
 
-    pub fn read_last_loss(&self) -> f32 {
-        let loss_layer = self
-            .loss_layer
-            .as_ref()
-            .expect("loss layer is only available in training mode");
-        let loss_terms = read_back_f32(
-            self.gpu.as_ref(),
-            &loss_layer.buffers.forward[2],
-            loss_layer.ty.get_dim_output().bytes_size() as u64,
-        )
-        .expect("failed to read loss buffer");
+    fn average_loss_terms(loss_terms: &[f32]) -> f32 {
         if loss_terms.is_empty() {
             0.0
         } else {
@@ -734,9 +732,46 @@ impl<State> Model<State> {
         }
     }
 
+    fn disable_loss_readback(&mut self, reason: &str) {
+        if !self.loss_readback_disabled {
+            eprintln!("[training] {reason}; disabling loss readback for this run");
+            self.loss_readback_disabled = true;
+            self.pending_loss_readback = None;
+        }
+    }
+
+    pub fn read_last_loss_optional(&mut self) -> Option<f32> {
+        if self.loss_readback_disabled {
+            return self.last_reported_loss;
+        }
+
+        let loss_layer = self
+            .loss_layer
+            .as_ref()
+            .expect("loss layer is only available in training mode");
+        let Some(loss_terms) = read_back_f32(
+            self.gpu.as_ref(),
+            &loss_layer.buffers.forward[2],
+            loss_layer.ty.get_dim_output().bytes_size() as u64,
+        ) else {
+            self.disable_loss_readback("failed to read loss buffer");
+            return self.last_reported_loss;
+        };
+        let loss = Self::average_loss_terms(&loss_terms);
+        self.last_reported_loss = Some(loss);
+        Some(loss)
+    }
+
+    pub fn read_last_loss(&mut self) -> f32 {
+        self.read_last_loss_optional().unwrap_or(0.0)
+    }
+
     /// Schedule a non-blocking loss readback from GPU.
     /// Returns false when no loss buffer is available or a prior request is still pending.
     pub fn request_loss_readback(&mut self) -> bool {
+        if self.loss_readback_disabled {
+            return false;
+        }
         if self.pending_loss_readback.is_some() {
             return false;
         }
@@ -794,13 +829,14 @@ impl<State> Model<State> {
                     bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
                 };
                 pending.staging.unmap();
-                if loss_terms.is_empty() {
-                    Some(0.0)
-                } else {
-                    Some(loss_terms.iter().sum::<f32>() / loss_terms.len() as f32)
-                }
+                let loss = Self::average_loss_terms(&loss_terms);
+                self.last_reported_loss = Some(loss);
+                Some(loss)
             }
-            Ok(Some(Err(_))) | Err(_) => None,
+            Ok(Some(Err(_))) | Err(_) => {
+                self.disable_loss_readback("non-blocking loss readback failed");
+                None
+            }
         }
     }
 }

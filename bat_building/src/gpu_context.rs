@@ -37,6 +37,9 @@ impl GpuContext {
             .request_device(&Default::default())
             .await
             .expect("failed to request a wgpu device");
+        device.on_uncaptured_error(std::sync::Arc::new(|err| {
+            eprintln!("[gpu] uncaptured wgpu error: {err}");
+        }));
 
         Self {
             _instance: instance,

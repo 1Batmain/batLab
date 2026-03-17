@@ -180,16 +180,6 @@
     }
   ],
   "run": {
-    "mode": {
-      "Train": {
-        "lr": 0.001,
-        "batch_size": 200,
-        "steps": 2000,
-        "dataset_path": "/goinfre/bduval/batlab/datasets/cifar-10-batches-bin",
-        "loss": "MeanSquared",
-        "checkpoint_path": "/goinfre/bduval/batlab/Models/Stable_Diffusion/pretrained_weights/latest.ckpt",
-        "load_checkpoint": true
-      }
-    }
+    "mode": "Infer"
   }
 }
