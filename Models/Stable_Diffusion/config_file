@@ -188,12 +188,12 @@
   "run": {
     "mode": {
       "Train": {
-        "lr": 0.001,
-        "batch_size": 32,
+        "lr": 0.0001,
+        "batch_size": 128,
         "steps": 20000,
-        "dataset_path": "/home/bat/Documents/lab/batBuilder/master/datasets/cifar-10-batches-bin",
+        "dataset_path": "/goinfre/bduval/batBuilder/datasets/cifar-10-batches-bin",
         "loss": "MeanSquared",
-        "checkpoint_path": "/home/bat/Documents/lab/batBuilder/master/Models/Stable_Diffusion/pretrained_weights/latest.ckpt",
+        "checkpoint_path": "/goinfre/bduval/batBuilder/Models/Stable_Diffusion/pretrained_weights/latest.ckpt",
         "load_checkpoint": true
       }
     }
