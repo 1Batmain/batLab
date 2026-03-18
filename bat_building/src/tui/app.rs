@@ -613,6 +613,43 @@ pub struct TrainingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceConfig {
+    #[serde(default = "InferenceConfig::default_random_seed")]
+    pub random_seed: bool,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default = "InferenceConfig::default_denoising_paths")]
+    pub denoising_paths: usize,
+    #[serde(default = "InferenceConfig::default_denoise_magnitude")]
+    pub denoise_magnitude: f32,
+}
+
+impl InferenceConfig {
+    const fn default_random_seed() -> bool {
+        true
+    }
+
+    const fn default_denoising_paths() -> usize {
+        1
+    }
+
+    const fn default_denoise_magnitude() -> f32 {
+        1.0
+    }
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            random_seed: Self::default_random_seed(),
+            seed: None,
+            denoising_paths: Self::default_denoising_paths(),
+            denoise_magnitude: Self::default_denoise_magnitude(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunMode {
     Infer,
     Train(TrainingConfig),
@@ -632,8 +669,6 @@ pub enum TrainingControlCommand {
         batch_size: u32,
         total_steps: usize,
     },
-    /// Open (or toggle off) the live GPU visualiser window.
-    ToggleWindow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -642,6 +677,8 @@ pub struct ModelConfig {
     pub model_name: Option<String>,
     pub input_size: (u32, u32, u32),
     pub layers: Vec<LayerDraft>,
+    #[serde(default)]
+    pub inference: InferenceConfig,
     pub run: RunConfig,
 }
 
@@ -669,6 +706,7 @@ pub enum Screen {
     InputSize,
     LayerBuilder,
     ModeSelector,
+    InferenceParams,
     TrainingParams,
     DatasetSelector,
     Monitor,
@@ -744,6 +782,16 @@ pub struct TrainingParamsState {
 
 pub const TRAINING_PARAM_FIELD_NAMES: [&str; 3] = ["Learning Rate", "Batch Size", "Steps"];
 
+pub struct InferenceParamsState {
+    pub random_seed: bool,
+    pub fields: Vec<String>, // [seed, denoising_paths, denoise_magnitude]
+    pub field_idx: usize,    // 0=random toggle, 1=seed, 2=paths, 3=magnitude
+    pub error: Option<String>,
+}
+
+pub const INFERENCE_PARAM_FIELD_NAMES: [&str; 4] =
+    ["Random Seed", "Seed", "Denoising Paths", "Magnitude"];
+
 pub struct TrainingControlState {
     pub fields: Vec<String>, // [lr, batch_size, total_steps]
     pub field_idx: usize,
@@ -758,6 +806,13 @@ pub struct MonitorImage {
     pub height: u32,
     pub channels: u32,
     pub pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadingProgress {
+    pub label: String,
+    pub current: usize,
+    pub total: usize,
 }
 
 #[derive(Default)]
@@ -786,6 +841,8 @@ pub struct MonitorState {
     pub inference_checkpoint_path: Option<String>,
     /// Seed used for the latest inference sample.
     pub inference_seed: Option<u64>,
+    /// Generic loading/progress state for long-running GPU preparation/sampling.
+    pub loading_progress: Option<LoadingProgress>,
     /// Whether the training worker is currently paused.
     pub is_training_paused: bool,
     /// Current runtime learning rate (may differ from initial config).
@@ -808,6 +865,7 @@ pub struct App {
     pub input_size: InputSizeState,
     pub layer_builder: LayerBuilderState,
     pub mode_selector: ModeSelectorState,
+    pub inference_params: InferenceParamsState,
     pub training_params: TrainingParamsState,
     pub training_control: TrainingControlState,
     pub monitor: MonitorState,
@@ -966,6 +1024,12 @@ impl App {
                 browse_selected: 0,
             },
             mode_selector: ModeSelectorState { selected: 1 },
+            inference_params: InferenceParamsState {
+                random_seed: true,
+                fields: vec!["0".into(), "1".into(), "1.0".into()],
+                field_idx: 0,
+                error: None,
+            },
             training_params: TrainingParamsState {
                 fields: vec![
                     default_lr.to_string(),
@@ -999,6 +1063,7 @@ impl App {
                 inference_image: None,
                 inference_checkpoint_path: None,
                 inference_seed: None,
+                loading_progress: None,
                 is_training_paused: false,
                 current_lr: None,
                 current_batch_size: None,
@@ -1012,6 +1077,7 @@ impl App {
         };
         app.refresh_templates();
         app.sync_selected_dataset_from_field();
+        app.sync_inference_params_from_config(&InferenceConfig::default());
         app.reset_layer_form();
         app
     }
@@ -1114,6 +1180,7 @@ impl App {
             model_name: Some(template.key.clone()),
             input_size: template.input_size,
             layers: template.layers.clone(),
+            inference: InferenceConfig::default(),
             run: RunConfig {
                 mode: RunMode::Infer,
             },
@@ -1138,6 +1205,7 @@ impl App {
         self.layer_builder.error = None;
         self.input_size.error = None;
         self.refresh_datasets();
+        self.sync_inference_params_from_config(&config.inference);
 
         match config.run.mode {
             RunMode::Infer => {
@@ -1160,6 +1228,15 @@ impl App {
         }
 
         self.screen = Screen::ModeSelector;
+    }
+
+    fn sync_inference_params_from_config(&mut self, inference: &InferenceConfig) {
+        self.inference_params.random_seed = inference.random_seed;
+        self.inference_params.fields[0] = inference.seed.unwrap_or(0).to_string();
+        self.inference_params.fields[1] = inference.denoising_paths.max(1).to_string();
+        self.inference_params.fields[2] = inference.denoise_magnitude.to_string();
+        self.inference_params.field_idx = 0;
+        self.inference_params.error = None;
     }
 
     pub fn cycle_dataset_forward(&mut self) {
@@ -1752,12 +1829,10 @@ impl App {
             .push(TrainingControlCommand::SetPaused(next));
     }
 
-    /// Send a [`TrainingControlCommand::ToggleWindow`] to the training thread
-    /// to open or close the live GPU visualiser window.
     pub fn toggle_visualise(&mut self) {
-        self.monitor
-            .pending_control_commands
-            .push(TrainingControlCommand::ToggleWindow);
+        if let Err(err) = super::visualiser_control::toggle_visualiser() {
+            self.monitor.error = Some(err);
+        }
     }
 
     pub fn open_training_control(&mut self) -> Result<(), String> {
@@ -2012,9 +2087,9 @@ impl App {
     pub fn finish_mode_selector(&mut self) {
         match self.mode_selector.selected {
             0 => {
-                self.run_config = Some(RunConfig {
-                    mode: RunMode::Infer,
-                })
+                self.inference_params.error = None;
+                self.inference_params.field_idx = 0;
+                self.screen = Screen::InferenceParams;
             }
             _ => {
                 self.training_params.error = None;
@@ -2022,6 +2097,52 @@ impl App {
                 self.screen = Screen::TrainingParams;
             }
         }
+    }
+
+    pub fn toggle_inference_seed_mode(&mut self) {
+        self.inference_params.random_seed = !self.inference_params.random_seed;
+        self.inference_params.error = None;
+    }
+
+    pub fn finish_inference_params(&mut self) -> Result<(), String> {
+        let seed = if self.inference_params.random_seed {
+            None
+        } else {
+            let parsed = self.inference_params.fields[0]
+                .parse::<u64>()
+                .map_err(|_| "Seed must be an unsigned integer".to_string())?;
+            Some(parsed)
+        };
+        let denoising_paths = self.inference_params.fields[1]
+            .parse::<usize>()
+            .map_err(|_| "Denoising paths must be a positive integer".to_string())?;
+        if denoising_paths == 0 {
+            return Err("Denoising paths must be > 0".to_string());
+        }
+        let denoise_magnitude = self.inference_params.fields[2]
+            .parse::<f32>()
+            .map_err(|_| "Denoise magnitude must be a number".to_string())?;
+        if denoise_magnitude <= 0.0 {
+            return Err("Denoise magnitude must be > 0".to_string());
+        }
+
+        let inference = InferenceConfig {
+            random_seed: self.inference_params.random_seed,
+            seed,
+            denoising_paths,
+            denoise_magnitude,
+        };
+
+        self.inference_params.error = None;
+        self.run_config = Some(RunConfig {
+            mode: RunMode::Infer,
+        });
+        if let Some(config) = self.monitor.model_config.as_mut() {
+            config.inference = inference.clone();
+        }
+        self.inference_params.fields[1] = denoising_paths.to_string();
+        self.inference_params.fields[2] = denoise_magnitude.to_string();
+        Ok(())
     }
 
     pub fn enter_layer_builder_from_mode(&mut self) {
@@ -2145,6 +2266,27 @@ impl App {
         self.training_params.fields[idx].pop();
     }
 
+    pub fn handle_char_inference(&mut self, c: char) {
+        let idx = self.inference_params.field_idx;
+        let accepted = match idx {
+            1 => c.is_ascii_digit(),
+            2 => c.is_ascii_digit(),
+            3 => c.is_ascii_digit() || c == '.',
+            _ => false,
+        };
+        if accepted {
+            self.inference_params.fields[idx - 1].push(c);
+            self.inference_params.error = None;
+        }
+    }
+
+    pub fn handle_backspace_inference(&mut self) {
+        let idx = self.inference_params.field_idx;
+        if (1..=3).contains(&idx) {
+            self.inference_params.fields[idx - 1].pop();
+        }
+    }
+
     pub fn handle_char_training_control(&mut self, c: char) {
         let idx = self.training_control.field_idx;
         let accepted = match idx {
@@ -2167,8 +2309,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, LayerKind, LossMethod, ModelConfig, RunConfig, RunMode, Screen, TrainingConfig,
-        TrainingControlCommand,
+        App, InferenceConfig, LayerKind, LossMethod, ModelConfig, RunConfig, RunMode, Screen,
+        TrainingConfig, TrainingControlCommand,
     };
 
     #[test]
@@ -2221,6 +2363,14 @@ mod tests {
         app.mode_selector.selected = 0;
 
         app.finish_mode_selector();
+        assert!(matches!(app.screen, Screen::InferenceParams));
+
+        app.inference_params.random_seed = false;
+        app.inference_params.fields[0] = "123".to_string();
+        app.inference_params.fields[1] = "2".to_string();
+        app.inference_params.fields[2] = "0.8".to_string();
+        app.finish_inference_params()
+            .expect("inference params should be accepted");
 
         let Some(run) = app.run_config.as_ref() else {
             panic!("run config should be set");
@@ -2321,6 +2471,7 @@ mod tests {
             model_name: Some("unit-test-model".to_string()),
             input_size: (32, 32, 3),
             layers: Vec::new(),
+            inference: InferenceConfig::default(),
             run: RunConfig {
                 mode: RunMode::Train(TrainingConfig {
                     lr: 0.01,

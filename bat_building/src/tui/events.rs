@@ -23,6 +23,11 @@ pub enum TrainingEvent {
         checkpoint_path: String,
         seed: u64,
     },
+    InferenceProgress {
+        label: String,
+        current: usize,
+        total: usize,
+    },
     TrainingState {
         paused: bool,
         lr: f32,
@@ -48,6 +53,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::InputSize => handle_input_size(app, code),
         Screen::LayerBuilder => handle_layer_builder(app, code),
         Screen::ModeSelector => handle_mode_selector(app, code),
+        Screen::InferenceParams => handle_inference_params(app, code),
         Screen::TrainingParams => handle_training_params(app, code),
         Screen::DatasetSelector => handle_dataset_selector(app, code),
         Screen::Monitor => handle_monitor(app, code),
@@ -268,6 +274,38 @@ fn handle_dataset_selector(app: &mut App, code: KeyCode) {
                 app.training_params.error = Some(e);
             }
         }
+        _ => {}
+    }
+}
+
+fn handle_inference_params(app: &mut App, code: KeyCode) {
+    let max_field = 3;
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => {
+            if app.inference_params.field_idx > 0 {
+                app.inference_params.field_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.inference_params.field_idx < max_field {
+                app.inference_params.field_idx += 1;
+            }
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if app.inference_params.field_idx == 0 =>
+        {
+            app.toggle_inference_seed_mode();
+        }
+        KeyCode::Backspace => app.handle_backspace_inference(),
+        KeyCode::Enter => {
+            if app.inference_params.field_idx < max_field {
+                app.inference_params.field_idx += 1;
+            } else if let Err(e) = app.finish_inference_params() {
+                app.inference_params.error = Some(e);
+            }
+        }
+        KeyCode::Char(c) => app.handle_char_inference(c),
         _ => {}
     }
 }
