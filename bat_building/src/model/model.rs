@@ -826,11 +826,25 @@ impl<State> Model<State> {
                 None
             }
             Ok(Some(Ok(()))) => {
-                let loss_terms = {
-                    let bytes = pending.staging.slice(..).get_mapped_range();
-                    bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
-                };
-                pending.staging.unmap();
+                let loss_terms =
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let bytes = pending.staging.slice(..).get_mapped_range();
+                        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+                    })) {
+                        Ok(loss_terms) => loss_terms,
+                        Err(_) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                pending.staging.unmap();
+                            }));
+                            self.disable_loss_readback(
+                                "non-blocking loss readback mapped range became invalid",
+                            );
+                            return None;
+                        }
+                    };
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pending.staging.unmap();
+                }));
                 let loss = Self::average_loss_terms(&loss_terms);
                 self.last_reported_loss = Some(loss);
                 Some(loss)

@@ -46,7 +46,8 @@ use winit::window::{Window, WindowId};
 /// Target frame interval for the visualiser (~30 fps).
 /// FIFO present mode provides additional vsync pacing on top of this.
 const FRAME_INTERVAL_MS: u64 = 33;
-const BYTES_PER_F32: u64 = std::mem::size_of::<f32>() as u64;
+/// Poll interval when no visible visualiser is active.
+const IDLE_INTERVAL_MS: u64 = 100;
 static VISUALISER_CMD_TX: OnceLock<Sender<ManagerCommand>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -64,6 +65,8 @@ static VISUALISER_CMD_TX: OnceLock<Sender<ManagerCommand>> = OnceLock::new();
 pub struct VisualiserHandle {
     /// Caller → window: request the window to close.
     _close_flag: Arc<AtomicBool>,
+    /// Caller → window: request the window to show/hide.
+    visible_flag: Arc<AtomicBool>,
     /// Window → caller: window has exited (either via close button or flag).
     closed_flag: Arc<AtomicBool>,
 }
@@ -74,6 +77,11 @@ impl VisualiserHandle {
     /// the handle was previously dropped and the thread has since exited.
     pub fn is_closed(&self) -> bool {
         self.closed_flag.load(Ordering::Relaxed)
+    }
+
+    /// Set whether the visualiser window should be visible.
+    pub fn set_visible(&self, visible: bool) {
+        self.visible_flag.store(visible, Ordering::Relaxed);
     }
 }
 
@@ -105,17 +113,22 @@ pub fn spawn_window(
     channels: u32,
     title: String,
 ) -> VisualiserHandle {
+    spawn_window_with_visibility(gpu, output_buf, width, height, channels, title, true)
+}
+
+/// Spawn a visualiser window with an explicit initial visibility.
+pub fn spawn_window_with_visibility(
+    gpu: Arc<GpuContext>,
+    output_buf: Arc<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+    channels: u32,
+    title: String,
+    initial_visible: bool,
+) -> VisualiserHandle {
     let close_flag = Arc::new(AtomicBool::new(false));
+    let visible_flag = Arc::new(AtomicBool::new(initial_visible));
     let closed_flag = Arc::new(AtomicBool::new(false));
-    if let Err(err) = validate_output_layout(output_buf.size(), width, height, channels) {
-        eprintln!("[visualiser] invalid output layout: {err}");
-        close_flag.store(true, Ordering::Relaxed);
-        closed_flag.store(true, Ordering::Relaxed);
-        return VisualiserHandle {
-            _close_flag: close_flag,
-            closed_flag,
-        };
-    }
 
     let request = OpenRequest {
         gpu,
@@ -125,7 +138,9 @@ pub fn spawn_window(
         channels,
         title,
         close_flag: Arc::clone(&close_flag),
+        visible_flag: Arc::clone(&visible_flag),
         closed_flag: Arc::clone(&closed_flag),
+        initial_visible,
     };
 
     let tx = visualiser_manager_tx();
@@ -137,8 +152,14 @@ pub fn spawn_window(
 
     VisualiserHandle {
         _close_flag: close_flag,
+        visible_flag,
         closed_flag,
     }
+}
+
+/// Ensure the background visualiser manager thread/event loop is running.
+pub fn warmup_manager() {
+    let _ = visualiser_manager_tx();
 }
 
 fn visualiser_manager_tx() -> &'static Sender<ManagerCommand> {
@@ -163,13 +184,18 @@ struct OpenRequest {
     channels: u32,
     title: String,
     close_flag: Arc<AtomicBool>,
+    visible_flag: Arc<AtomicBool>,
     closed_flag: Arc<AtomicBool>,
+    initial_visible: bool,
 }
 
 struct ActiveVisualiser {
     close_flag: Arc<AtomicBool>,
+    visible_flag: Arc<AtomicBool>,
     closed_flag: Arc<AtomicBool>,
     window: Arc<Window>,
+    is_visible: bool,
+    is_occluded: bool,
     state: RenderState,
 }
 
@@ -177,7 +203,8 @@ impl ActiveVisualiser {
     fn from_open_request(event_loop: &ActiveEventLoop, req: OpenRequest) -> Option<Self> {
         let attrs = Window::default_attributes()
             .with_title(req.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(512u32, 512u32));
+            .with_inner_size(winit::dpi::LogicalSize::new(512u32, 512u32))
+            .with_visible(req.initial_visible);
 
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -241,8 +268,11 @@ impl ActiveVisualiser {
                     );
                     return Some(Self {
                         close_flag: req.close_flag,
+                        visible_flag: req.visible_flag,
                         closed_flag: req.closed_flag,
                         window,
+                        is_visible: req.initial_visible,
+                        is_occluded: false,
                         state,
                     });
                 }
@@ -257,39 +287,6 @@ impl ActiveVisualiser {
         req.closed_flag.store(true, Ordering::Relaxed);
         None
     }
-}
-
-fn validate_output_layout(
-    output_buf_size: u64,
-    width: u32,
-    height: u32,
-    channels: u32,
-) -> Result<(), String> {
-    if width == 0 || height == 0 || channels == 0 {
-        return Err(format!(
-            "width/height/channels must all be > 0 (got {width}x{height}x{channels})"
-        ));
-    }
-
-    let texel_count = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|v| v.checked_mul(u64::from(channels)))
-        .ok_or_else(|| {
-            format!(
-                "dimension overflow for {width}x{height}x{channels}; cannot compute texel count"
-            )
-        })?;
-    let required_bytes = texel_count.checked_mul(BYTES_PER_F32).ok_or_else(|| {
-        format!("size overflow for {texel_count} f32 values; cannot compute required bytes")
-    })?;
-
-    if output_buf_size < required_bytes {
-        return Err(format!(
-            "buffer too small: need {required_bytes} bytes, got {output_buf_size} bytes"
-        ));
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +538,6 @@ impl VisualiserManagerApp {
                 }
             }
         }
-
         if let Some(open) = pending_open {
             self.close_active();
             self.active = ActiveVisualiser::from_open_request(event_loop, open);
@@ -564,6 +560,11 @@ impl ApplicationHandler for VisualiserManagerApp {
             WindowEvent::CloseRequested => {
                 self.close_active();
             }
+            WindowEvent::Occluded(occluded) => {
+                if let Some(active) = self.active.as_mut() {
+                    active.is_occluded = occluded;
+                }
+            }
             WindowEvent::Resized(size) => {
                 let should_close = self
                     .active
@@ -577,7 +578,7 @@ impl ApplicationHandler for VisualiserManagerApp {
                 let should_close = self
                     .active
                     .as_mut()
-                    .is_some_and(|active| !active.state.render());
+                    .is_some_and(|active| !active.is_occluded && !active.state.render());
                 if should_close {
                     self.close_active();
                 }
@@ -596,12 +597,29 @@ impl ApplicationHandler for VisualiserManagerApp {
         }
         self.drain_commands(event_loop);
 
-        // Throttle to ~30 fps so the visualiser does not burn CPU/GPU during
-        // training.  FIFO present mode provides additional vsync pacing.
-        let next = Instant::now() + Duration::from_millis(FRAME_INTERVAL_MS);
+        if let Some(active) = self.active.as_mut() {
+            let desired_visible = active.visible_flag.load(Ordering::Relaxed);
+            if desired_visible != active.is_visible {
+                active.window.set_visible(desired_visible);
+                active.is_visible = desired_visible;
+            }
+        }
+
+        let interval_ms = if self
+            .active
+            .as_ref()
+            .is_some_and(|a| a.is_visible && !a.is_occluded)
+        {
+            FRAME_INTERVAL_MS
+        } else {
+            IDLE_INTERVAL_MS
+        };
+        let next = Instant::now() + Duration::from_millis(interval_ms);
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
         if let Some(active) = &self.active {
-            active.window.request_redraw();
+            if active.is_visible && !active.is_occluded {
+                active.window.request_redraw();
+            }
         }
     }
 }
@@ -618,11 +636,12 @@ fn open_window_manager(rx: Receiver<ManagerCommand>) {
     #[cfg(target_os = "linux")]
     let event_loop = {
         let mut try_x11_first = false;
+
+        // On some NVIDIA+Wayland setups, forcing X11/XWayland is more
+        // reliable for swapchain configuration than native Wayland.
         if std::env::var("XDG_SESSION_TYPE").ok().as_deref() == Some("wayland")
             && std::env::var_os("DISPLAY").is_some()
         {
-            // On some NVIDIA+Wayland setups, forcing X11/XWayland is more
-            // reliable for swapchain configuration than native Wayland.
             try_x11_first = true;
         }
 
@@ -645,13 +664,10 @@ fn open_window_manager(rx: Receiver<ManagerCommand>) {
 
         let event_loop = if try_x11_first {
             match try_build_x11() {
-                Ok(el) => {
-                    eprintln!("[visualiser] using X11 backend on Wayland session");
-                    Ok(el)
-                }
+                Ok(el) => Ok(el),
                 Err(x11_err) => {
                     eprintln!(
-                        "[visualiser] failed to init X11 backend ({x11_err}); retrying Wayland backend"
+                        "[visualiser] failed to init with X11 backend ({x11_err}); retrying Wayland backend"
                     );
                     try_build_wayland()
                 }

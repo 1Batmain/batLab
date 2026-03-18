@@ -118,6 +118,17 @@ impl LinearNoiseSchedule {
         step: usize,
         seed: u64,
     ) -> Vec<f32> {
+        self.denoise_step_with_magnitude(latent, predicted_noise, step, seed, 1.0)
+    }
+
+    pub fn denoise_step_with_magnitude(
+        &self,
+        latent: &[f32],
+        predicted_noise: &[f32],
+        step: usize,
+        seed: u64,
+        denoise_magnitude: f32,
+    ) -> Vec<f32> {
         assert_eq!(
             latent.len(),
             predicted_noise.len(),
@@ -129,7 +140,12 @@ impl LinearNoiseSchedule {
         let alpha_bar = self.alpha_bar(step);
         let coeff = beta / (1.0 - alpha_bar).sqrt();
         let mean_scale = 1.0 / alpha.sqrt();
-        let sigma = if step == 0 { 0.0 } else { beta.sqrt() };
+        let magnitude = denoise_magnitude.max(0.0);
+        let sigma = if step == 0 {
+            0.0
+        } else {
+            beta.sqrt() * magnitude
+        };
 
         latent
             .iter()

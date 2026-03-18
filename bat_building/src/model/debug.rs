@@ -52,11 +52,17 @@ pub(crate) fn read_back_f32(
         _ => return None,
     }
 
-    let values = {
+    let values = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let bytes = slice.get_mapped_range();
         bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+    })) {
+        Ok(values) => values,
+        Err(_) => {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| staging.unmap()));
+            return None;
+        }
     };
-    staging.unmap();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| staging.unmap()));
     Some(values)
 }
 

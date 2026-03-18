@@ -1,8 +1,8 @@
 //! File purpose: Implements ui behavior for the terminal user interface flow.
 
 use super::app::{
-    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind, MonitorImage, RunMode, Screen,
-    TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
+    App, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind,
+    MonitorImage, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -15,6 +15,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::InputSize => draw_input_size(f, app),
         Screen::LayerBuilder => draw_layer_builder(f, app),
         Screen::ModeSelector => draw_mode_selector(f, app),
+        Screen::InferenceParams => draw_inference_params(f, app),
         Screen::TrainingParams => draw_training_params(f, app),
         Screen::DatasetSelector => draw_dataset_selector(f, app),
         Screen::Monitor => draw_monitor(f, app),
@@ -305,7 +306,9 @@ fn draw_weight_selector(f: &mut Frame, app: &App) {
         .title(format!(" {model_name} — Weights "))
         .title_alignment(Alignment::Center);
     let inner = block.inner(popup);
-    f.render_widget(block, popup);
+    f.render_widget(block, popup)cd bitnet_kernels
+    bash compile.sh
+    cd ..;
 
     let mut lines = vec![Line::from("")];
     let random_selected = app.weight_selector.selected == 0;
@@ -604,7 +607,7 @@ fn draw_mode_selector(f: &mut Frame, app: &App) {
         "Run Mode",
         &["Inference", "Training"],
         app.mode_selector.selected,
-        "[arrow] select  [Enter] confirm  [e] edit layers  [q] quit",
+        "[arrow] select  [Enter] configure/run  [e] edit layers  [q] quit",
     );
 }
 
@@ -622,6 +625,29 @@ fn draw_training_params(f: &mut Frame, app: &App) {
         app.training_params.field_idx,
         app.training_params.error.as_deref(),
         "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] quit",
+    );
+}
+
+fn draw_inference_params(f: &mut Frame, app: &App) {
+    let seed_mode = if app.inference_params.random_seed {
+        "Random"
+    } else {
+        "Manual"
+    };
+    let values = vec![
+        seed_mode.to_string(),
+        app.inference_params.fields[0].clone(),
+        app.inference_params.fields[1].clone(),
+        app.inference_params.fields[2].clone(),
+    ];
+    draw_form_screen(
+        f,
+        "Inference Parameters",
+        &INFERENCE_PARAM_FIELD_NAMES,
+        &values,
+        app.inference_params.field_idx,
+        app.inference_params.error.as_deref(),
+        "[up/down] field  [left/right/space] toggle random seed  [type] edit  [Enter] next/run",
     );
 }
 
@@ -747,6 +773,15 @@ fn draw_monitor(f: &mut Frame, app: &App) {
         format!(" error: {error} | [s] save  [q] quit")
     } else if app.monitor.done {
         " [r] new run  [s] save config  [q] quit".to_string()
+    } else if is_inference_mode(app) {
+        if let Some(progress) = app.monitor.loading_progress.as_ref() {
+            format!(
+                " inference: {} ({}/{}) | [s] save  [q] quit",
+                progress.label, progress.current, progress.total
+            )
+        } else {
+            " inference: running | [s] save  [q] quit".to_string()
+        }
     } else if is_training_mode(app) {
         let status = if app.monitor.is_training_paused {
             "paused"
@@ -819,8 +854,40 @@ fn draw_inference_image(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let Some(image) = app.monitor.inference_image.as_ref() else {
-        let placeholder = Paragraph::new("  Waiting for inference output...");
-        f.render_widget(placeholder, inner);
+        if let Some(progress) = app.monitor.loading_progress.as_ref() {
+            let sections = Layout::vertical([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+            let status = Paragraph::new(format!(
+                "  {} ({}/{})",
+                progress.label, progress.current, progress.total
+            ));
+            f.render_widget(status, sections[0]);
+            let ratio = if progress.total == 0 {
+                0.0
+            } else {
+                (progress.current as f64 / progress.total as f64).clamp(0.0, 1.0)
+            };
+            let gauge = Gauge::default()
+                .block(Block::default().borders(Borders::ALL).title(" Loading "))
+                .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Black))
+                .ratio(ratio)
+                .label(format!(
+                    "{:.0}%",
+                    if progress.total == 0 {
+                        0.0
+                    } else {
+                        (progress.current as f64 / progress.total as f64) * 100.0
+                    }
+                ));
+            f.render_widget(gauge, sections[1]);
+        } else {
+            let placeholder = Paragraph::new("  Waiting for inference output...");
+            f.render_widget(placeholder, inner);
+        }
         return;
     };
     if inner.width == 0 || inner.height == 0 || image.width == 0 || image.height == 0 {
@@ -1008,26 +1075,34 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
         })
         .unwrap_or_else(|| "—".to_string());
 
-    let step_str = if app.monitor.total_steps > 0 {
-        format!("{}/{}", app.monitor.step + 1, app.monitor.total_steps)
-    } else {
-        format!("{}", app.monitor.step + 1)
-    };
-
-    let progress_str = if app.monitor.total_steps > 0 {
-        let pct = ((app.monitor.step + 1) * 100)
-            .checked_div(app.monitor.total_steps)
-            .unwrap_or(0)
-            .min(100);
-        // Progress bar width in character cells.
+    let (step_str, progress_str) = if let Some(progress) = app.monitor.loading_progress.as_ref() {
+        let total = progress.total.max(1);
+        let current = progress.current.min(total);
+        let pct = (current * 100 / total).min(100);
         const BAR_WIDTH: usize = 10;
         let filled = pct * BAR_WIDTH / 100;
         let bar: String = (0..BAR_WIDTH)
             .map(|i| if i < filled { '\u{2588}' } else { '\u{2591}' })
             .collect();
-        format!("{bar} {pct}%")
+        (format!("{current}/{total}"), format!("{bar} {pct}%"))
+    } else if app.monitor.total_steps > 0 {
+        (
+            format!("{}/{}", app.monitor.step + 1, app.monitor.total_steps),
+            {
+                let pct = ((app.monitor.step + 1) * 100)
+                    .checked_div(app.monitor.total_steps)
+                    .unwrap_or(0)
+                    .min(100);
+                const BAR_WIDTH: usize = 10;
+                let filled = pct * BAR_WIDTH / 100;
+                let bar: String = (0..BAR_WIDTH)
+                    .map(|i| if i < filled { '\u{2588}' } else { '\u{2591}' })
+                    .collect();
+                format!("{bar} {pct}%")
+            },
+        )
     } else {
-        "—".to_string()
+        (format!("{}", app.monitor.step + 1), "—".to_string())
     };
 
     let format_loss = |v: Option<f64>| v.map_or_else(|| "—".to_string(), |x| format!("{:.6}", x));
@@ -1049,6 +1124,8 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| "—".to_string());
     let status_str = if app.monitor.done {
         "Done".to_string()
+    } else if is_inference_mode(app) && app.monitor.loading_progress.is_some() {
+        "Loading".to_string()
     } else if is_training_mode(app) {
         if app.monitor.is_training_paused {
             "Paused".to_string()

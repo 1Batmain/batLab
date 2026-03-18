@@ -15,7 +15,7 @@ use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
     FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
     LossMethod as PLoss, Model, PaddingMode as PPadding, Trainer, UpsampleConvType,
-    model::{Infer, Training},
+    model::Training,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -24,6 +24,8 @@ const DIFFUSION_SCHEDULE_STEPS: usize = 256;
 const DIFFUSION_BETA_START: f32 = 1e-4;
 const DIFFUSION_BETA_END: f32 = 2e-2;
 const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
+const INFERENCE_RUNTIME_LR: f32 = 0.01;
+const INFERENCE_RUNTIME_BATCH_SIZE: u32 = 1;
 
 #[derive(Debug, Clone)]
 struct ImageSample {
@@ -108,25 +110,28 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<(), St
     Ok(())
 }
 
+async fn build_execution_model(
+    config: &ModelConfig,
+    lr: f32,
+    batch_size: u32,
+) -> Result<(Arc<GpuContext>, Model<Training>), String> {
+    let gpu = Arc::new(GpuContext::new_headless().await);
+    let mut model = Model::new_training(gpu.clone(), lr, batch_size, PLoss::MeanSquared).await;
+    for draft in &config.layers {
+        append_layer(&mut model, draft).map_err(|err| err.to_string())?;
+    }
+    model.build().map_err(|err| err.to_string())?;
+    Ok((gpu, model))
+}
+
 async fn run_training(
     config: ModelConfig,
     train_cfg: TrainingConfig,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
     control_rx: Receiver<tui::TrainingControlCommand>,
 ) -> Result<(), String> {
-    let gpu = Arc::new(GpuContext::new_headless().await);
-    let mut model = Model::new_training(
-        gpu.clone(),
-        train_cfg.lr,
-        train_cfg.batch_size,
-        PLoss::MeanSquared,
-    )
-    .await;
-
-    for draft in &config.layers {
-        append_layer(&mut model, draft).map_err(|err| err.to_string())?;
-    }
-    model.build().map_err(|err| err.to_string())?;
+    let (gpu, mut model) =
+        build_execution_model(&config, train_cfg.lr, train_cfg.batch_size).await?;
     let checkpoint_path = match train_cfg.checkpoint_path.as_deref() {
         Some(path) => Some(PathBuf::from(path)),
         None => config
@@ -202,64 +207,56 @@ async fn run_training(
         total_steps,
     });
 
-    // Handle for the live-visualiser window.  `None` until the user presses
-    // [v].  Dropping the handle closes the window.
-    let mut window_handle: Option<bat_building::visualiser::VisualiserHandle> = None;
+    if let Some(output_buf) = model.last_output_buffer() {
+        let title = format!(
+            "Model Output  ({}×{}×{} channels)",
+            output_size.0, output_size.1, output_size.2
+        );
+        tui::register_visualiser_source(
+            model.gpu_context(),
+            output_buf,
+            output_size.0,
+            output_size.1,
+            output_size.2,
+            title,
+        );
+    } else {
+        eprintln!("[visualiser] model has no output buffer yet");
+    }
 
     let mut step = 0usize;
     while step < total_steps {
-        // If the user closed the visualiser window via its close button, clear
-        // the stale handle so that pressing [v] opens a fresh window.
-        if window_handle.as_ref().is_some_and(|h| h.is_closed()) {
-            window_handle = None;
-        }
-
         while let Ok(command) = control_rx.try_recv() {
-            if command == tui::TrainingControlCommand::ToggleWindow {
-                window_handle = toggle_visualiser_window(window_handle, &model, output_size);
-            } else {
-                apply_training_control_command(
-                    command,
-                    &mut model,
-                    &mut paused,
-                    &mut current_lr,
-                    &mut current_batch_size,
-                    &mut total_steps,
-                    checkpoint_path.as_deref(),
-                    tx,
-                );
+            let channel_open = apply_and_publish_training_state(
+                command,
+                &mut model,
+                &mut paused,
+                &mut current_lr,
+                &mut current_batch_size,
+                &mut total_steps,
+                checkpoint_path.as_deref(),
+                tx,
+            );
+            if !channel_open {
+                return Ok(());
             }
-            let _ = tx.send(tui::TrainingEvent::TrainingState {
-                paused,
-                lr: current_lr,
-                batch_size: current_batch_size,
-                total_steps,
-            });
         }
         if paused {
             match control_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(command) => {
-                    if command == tui::TrainingControlCommand::ToggleWindow {
-                        window_handle =
-                            toggle_visualiser_window(window_handle, &model, output_size);
-                    } else {
-                        apply_training_control_command(
-                            command,
-                            &mut model,
-                            &mut paused,
-                            &mut current_lr,
-                            &mut current_batch_size,
-                            &mut total_steps,
-                            checkpoint_path.as_deref(),
-                            tx,
-                        );
+                    let channel_open = apply_and_publish_training_state(
+                        command,
+                        &mut model,
+                        &mut paused,
+                        &mut current_lr,
+                        &mut current_batch_size,
+                        &mut total_steps,
+                        checkpoint_path.as_deref(),
+                        tx,
+                    );
+                    if !channel_open {
+                        return Ok(());
                     }
-                    let _ = tx.send(tui::TrainingEvent::TrainingState {
-                        paused,
-                        lr: current_lr,
-                        batch_size: current_batch_size,
-                        total_steps,
-                    });
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -341,38 +338,33 @@ async fn run_training(
     Ok(())
 }
 
-/// Open the visualiser window (or close it if it is already running).
-///
-/// The window binds the model's GPU output buffer directly – no CPU readback.
-/// Dropping the returned [`bat_building::visualiser::VisualiserHandle`] closes the window.
-fn toggle_visualiser_window(
-    existing: Option<bat_building::visualiser::VisualiserHandle>,
-    model: &Model<Training>,
-    output_size: (u32, u32, u32),
-) -> Option<bat_building::visualiser::VisualiserHandle> {
-    if existing.is_some() {
-        // Drop the handle → AtomicBool signals the window thread to exit.
-        return None;
-    }
-
-    let Some(output_buf) = model.last_output_buffer() else {
-        eprintln!("[visualiser] model has no output buffer yet");
-        return None;
-    };
-
-    let title = format!(
-        "Model Output  ({}×{}×{} channels)",
-        output_size.0, output_size.1, output_size.2
+fn apply_and_publish_training_state(
+    command: tui::TrainingControlCommand,
+    model: &mut Model<Training>,
+    paused: &mut bool,
+    current_lr: &mut f32,
+    current_batch_size: &mut u32,
+    total_steps: &mut usize,
+    checkpoint_path: Option<&Path>,
+    tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+) -> bool {
+    apply_training_control_command(
+        command,
+        model,
+        paused,
+        current_lr,
+        current_batch_size,
+        total_steps,
+        checkpoint_path,
+        tx,
     );
-
-    Some(bat_building::visualiser::spawn_window(
-        model.gpu_context(),
-        output_buf,
-        output_size.0,
-        output_size.1,
-        output_size.2,
-        title,
-    ))
+    tx.send(tui::TrainingEvent::TrainingState {
+        paused: *paused,
+        lr: *current_lr,
+        batch_size: *current_batch_size,
+        total_steps: *total_steps,
+    })
+    .is_ok()
 }
 
 fn apply_training_control_command(
@@ -435,8 +427,6 @@ fn apply_training_control_command(
             model.set_learning_rate(*current_lr);
             model.set_batch_size(*current_batch_size);
         }
-        // ToggleWindow is handled in the training loop before this function is called.
-        tui::TrainingControlCommand::ToggleWindow => {}
     }
 }
 
@@ -444,13 +434,8 @@ async fn run_inference(
     config: ModelConfig,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
 ) -> Result<(), String> {
-    let gpu = Arc::new(GpuContext::new_headless().await);
-    let mut model = Model::<Infer>::new(gpu.clone()).await;
-
-    for draft in &config.layers {
-        append_layer(&mut model, draft).map_err(|err| err.to_string())?;
-    }
-    model.build_model().map_err(|err| err.to_string())?;
+    let (gpu, mut model) =
+        build_execution_model(&config, INFERENCE_RUNTIME_LR, INFERENCE_RUNTIME_BATCH_SIZE).await?;
 
     let checkpoint_path = resolve_inference_checkpoint_path(&config)?;
     model.load_checkpoint(&checkpoint_path).map_err(|err| {
@@ -481,8 +466,38 @@ async fn run_inference(
         DIFFUSION_BETA_END,
     );
 
-    let seed = 0;
-    let output = sample_diffusion_image(&mut model, input_size, output_size, &diffusion, seed);
+    let inference = &config.inference;
+    let seed = if inference.random_seed {
+        random_seed()
+    } else {
+        inference.seed.unwrap_or(0)
+    };
+
+    let total_steps = diffusion
+        .len()
+        .saturating_mul(inference.denoising_paths.max(1));
+    let _ = tx.send(tui::TrainingEvent::InferenceProgress {
+        label: "Preparing inference path".to_string(),
+        current: 0,
+        total: total_steps.max(1),
+    });
+
+    let output = sample_diffusion_image_with_controls(
+        &mut model,
+        input_size,
+        output_size,
+        &diffusion,
+        seed,
+        inference.denoising_paths,
+        inference.denoise_magnitude,
+        |current, total| {
+            let _ = tx.send(tui::TrainingEvent::InferenceProgress {
+                label: "Running denoising paths".to_string(),
+                current,
+                total,
+            });
+        },
+    );
     let pixels = tensor_to_rgb_pixels(&output, output_size)?;
 
     if tx
@@ -783,26 +798,77 @@ fn sample_diffusion_image<State>(
     schedule: &LinearNoiseSchedule,
     seed: u64,
 ) -> Vec<f32> {
-    let output_len = (output_dims.0 * output_dims.1 * output_dims.2) as usize;
-    let mut latent = schedule.sample_noise(output_len, seed ^ 0xa5a5_5a5a_0123_4567);
+    sample_diffusion_image_with_controls(
+        model,
+        input_dims,
+        output_dims,
+        schedule,
+        seed,
+        1,
+        1.0,
+        |_, _| {},
+    )
+}
 
-    for diffusion_step in (0..schedule.len()).rev() {
-        let timestep_features = schedule.timestep_embedding(
-            diffusion_step,
-            input_dims.2.saturating_sub(output_dims.2) as usize,
-        );
-        let model_input =
-            compose_diffusion_input(&latent, input_dims, output_dims, &timestep_features);
-        let predicted_noise = model.predict(&model_input);
-        latent = schedule.denoise_step(
-            &latent,
-            &predicted_noise,
-            diffusion_step,
-            seed ^ diffusion_step as u64,
-        );
+fn sample_diffusion_image_with_controls<State, F>(
+    model: &mut Model<State>,
+    input_dims: (u32, u32, u32),
+    output_dims: (u32, u32, u32),
+    schedule: &LinearNoiseSchedule,
+    seed: u64,
+    denoising_paths: usize,
+    denoise_magnitude: f32,
+    mut progress: F,
+) -> Vec<f32>
+where
+    F: FnMut(usize, usize),
+{
+    let output_len = (output_dims.0 * output_dims.1 * output_dims.2) as usize;
+    let path_count = denoising_paths.max(1);
+    let steps = schedule.len().max(1);
+    let total_work = path_count.saturating_mul(steps);
+    let mut accumulated = vec![0.0f32; output_len];
+
+    for path_idx in 0..path_count {
+        let path_seed = seed ^ ((path_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut latent = schedule.sample_noise(output_len, path_seed ^ 0xa5a5_5a5a_0123_4567);
+
+        for (step_idx, diffusion_step) in (0..schedule.len()).rev().enumerate() {
+            let timestep_features = schedule.timestep_embedding(
+                diffusion_step,
+                input_dims.2.saturating_sub(output_dims.2) as usize,
+            );
+            let model_input =
+                compose_diffusion_input(&latent, input_dims, output_dims, &timestep_features);
+            let predicted_noise = model.predict(&model_input);
+            latent = schedule.denoise_step_with_magnitude(
+                &latent,
+                &predicted_noise,
+                diffusion_step,
+                path_seed ^ diffusion_step as u64,
+                denoise_magnitude,
+            );
+            progress(path_idx * steps + step_idx + 1, total_work);
+        }
+
+        for (acc, value) in accumulated.iter_mut().zip(latent.iter()) {
+            *acc += *value;
+        }
     }
 
-    latent
+    for value in &mut accumulated {
+        *value /= path_count as f32;
+    }
+    accumulated
+}
+
+fn random_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x5eed_u64);
+    nanos ^ (nanos.rotate_left(17)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 fn prepare_sample_dir(dataset_path: &str) -> Result<PathBuf, String> {
