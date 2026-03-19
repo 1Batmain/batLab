@@ -306,10 +306,7 @@ fn draw_weight_selector(f: &mut Frame, app: &App) {
         .title(format!(" {model_name} — Weights "))
         .title_alignment(Alignment::Center);
     let inner = block.inner(popup);
-    f.render_widget(block, popup)cd bitnet_kernels
-    bash compile.sh
-    cd ..;
-
+    f.render_widget(block, popup);
     let mut lines = vec![Line::from("")];
     let random_selected = app.weight_selector.selected == 0;
     lines.push(Line::from(Span::styled(
