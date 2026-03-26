@@ -186,6 +186,16 @@
     "denoise_magnitude": 1.0
   },
   "run": {
-    "mode": "Infer"
+    "mode": {
+      "Train": {
+        "lr": 0.001,
+        "batch_size": 32,
+        "steps": 20000,
+        "dataset_path": "/home/bat/Documents/lab/batBuilder/master/datasets/cifar-10-batches-bin",
+        "loss": "MeanSquared",
+        "checkpoint_path": "/home/bat/Documents/lab/batBuilder/master/Models/Stable_Diffusion/pretrained_weights/latest.ckpt",
+        "load_checkpoint": true
+      }
+    }
   }
 }
