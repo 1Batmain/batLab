@@ -170,7 +170,7 @@ impl DiffusionTask {
         model.begin_batch_accumulation();
         for batch_offset in 0..batch_size {
             let sample_index = (step * batch_size + batch_offset) % sample_count;
-            let diffusion_step = diffusion_step_for(step, sample_index, schedule_len);
+            let diffusion_step = diffusion_step_for(step, batch_size, batch_offset, schedule_len);
             let alpha_bar = schedule.alpha_bar(diffusion_step);
             let step_seed = seed ^ ((batch_offset as u64) << 32) ^ sample_index as u64;
             let specs_bytes = Self::encode_prepare_uniform(DiffusionPrepareUniform {
@@ -451,11 +451,16 @@ fn fold_seed(seed: u64) -> u32 {
         .wrapping_add(1013904223)
 }
 
-fn diffusion_step_for(step: usize, sample_index: usize, schedule_len: usize) -> usize {
+fn diffusion_step_for(
+    step: usize,
+    batch_size: usize,
+    batch_offset: usize,
+    schedule_len: usize,
+) -> usize {
     if schedule_len == 0 {
         0
     } else {
-        (step + sample_index) % schedule_len
+        step.wrapping_mul(batch_size).wrapping_add(batch_offset) % schedule_len
     }
 }
 
@@ -526,5 +531,13 @@ mod tests {
             assert!(loss.is_some());
             assert!(loss.unwrap().is_finite());
         });
+    }
+
+    #[test]
+    fn diffusion_step_progression_does_not_alias_single_batch() {
+        let steps: Vec<usize> = (0..8)
+            .map(|step| super::diffusion_step_for(step, 1, 0, 8))
+            .collect();
+        assert_eq!(steps, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     }
 }
