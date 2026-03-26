@@ -460,7 +460,7 @@ fn diffusion_step_for(
     if schedule_len == 0 {
         0
     } else {
-        step.saturating_mul(batch_size).saturating_add(batch_offset) % schedule_len
+        step.wrapping_mul(batch_size).wrapping_add(batch_offset) % schedule_len
     }
 }
 
