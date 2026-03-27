@@ -591,8 +591,99 @@ fn diffusion_template() -> ModelTemplate {
     }
 }
 
+fn greyscale_diffusion_template() -> ModelTemplate {
+    ModelTemplate {
+        key: "Greyscale_Diffusion".to_string(),
+        name: "Greyscale Diffusion".to_string(),
+        description: "Greyscale diffusion backbone (32x32x1) — same U-Net structure as RGB, single channel in/out."
+            .to_string(),
+        input_size: (32, 32, 1),
+        layers: vec![
+            LayerDraft::Convolution {
+                dim_input: (32, 32, 1),
+                nb_kernel: 16,
+                dim_kernel: (3, 3, 1),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: Some("enc1".to_string()),
+            },
+            LayerDraft::GroupNorm {
+                dim_input: (32, 32, 16),
+                num_groups: 4,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (32, 32, 16),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (32, 32, 16),
+                nb_kernel: 32,
+                dim_kernel: (3, 3, 16),
+                stride: 2,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::GroupNorm {
+                dim_input: (16, 16, 32),
+                num_groups: 8,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (16, 16, 32),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (16, 16, 32),
+                nb_kernel: 32,
+                dim_kernel: (3, 3, 32),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::UpsampleConv {
+                dim_input: (16, 16, 32),
+                scale_factor: 2,
+                nb_kernel: 16,
+                dim_kernel: (3, 3, 32),
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::Concat {
+                dim_input: (32, 32, 16),
+                dim_skip: (32, 32, 16),
+                skip_key: "enc1".to_string(),
+                save_key: None,
+            },
+            LayerDraft::GroupNorm {
+                dim_input: (32, 32, 32),
+                num_groups: 8,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (32, 32, 32),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (32, 32, 32),
+                nb_kernel: 1,
+                dim_kernel: (3, 3, 32),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+        ],
+        default_lr: 0.01,
+        default_batch_size: 1,
+        default_steps: 200,
+    }
+}
+
 fn built_in_templates() -> Vec<ModelTemplate> {
-    vec![diffusion_template()]
+    vec![diffusion_template(), greyscale_diffusion_template()]
 }
 
 // ---------------------------------------------------------------------------
