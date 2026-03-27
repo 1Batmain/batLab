@@ -20,6 +20,10 @@ use bat_building::{
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
+/// Magic header for the raw binary dataset format produced by the pre-processing scripts.
+/// Format: magic(8) | count(u32le) | width(u32le) | height(u32le) | channels(u32le) | f32 data…
+const RAW_DATASET_MAGIC: &[u8; 8] = b"BATRAW1\0";
+
 const DIFFUSION_SCHEDULE_STEPS: usize = 256;
 const DIFFUSION_BETA_START: f32 = 1e-4;
 const DIFFUSION_BETA_END: f32 = 2e-2;
@@ -543,6 +547,10 @@ fn load_dataset(
         .canonicalize()
         .map_err(|err| format!("failed to resolve dataset path '{}': {err}", dataset_path))?;
 
+    if let Some(dataset) = try_load_raw_dataset(&canonical_path, output_size)? {
+        return Ok(dataset);
+    }
+
     if let Some(dataset) = try_load_cifar_dataset(&canonical_path, output_size)? {
         return Ok(dataset);
     }
@@ -566,6 +574,164 @@ fn load_dataset(
             })
         })
         .collect()
+}
+
+/// Tries to load a dataset from a raw binary file (`*.batraw`) or a directory that contains such
+/// files.  Returns `Ok(None)` when the path does not look like a raw-binary dataset so the caller
+/// can fall back to other loaders.
+///
+/// # Binary format (produced by the Python pre-processing scripts)
+/// ```text
+/// [0..8]   magic: b"BATRAW1\0"
+/// [8..12]  count:    u32 LE – number of samples
+/// [12..16] width:    u32 LE – image width in pixels
+/// [16..20] height:   u32 LE – image height in pixels
+/// [20..24] channels: u32 LE – number of channels per pixel
+/// [24..]   data:     count * width * height * channels × f32 LE values, normalised [0, 1]
+/// ```
+fn try_load_raw_dataset(
+    dataset_path: &Path,
+    output_size: (u32, u32, u32),
+) -> Result<Option<Vec<ImageSample>>, String> {
+    // Collect candidate .batraw files.
+    let mut raw_files: Vec<PathBuf> = Vec::new();
+
+    if dataset_path.is_file() {
+        if dataset_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("batraw"))
+        {
+            raw_files.push(dataset_path.to_path_buf());
+        } else {
+            return Ok(None);
+        }
+    } else if dataset_path.is_dir() {
+        for entry in fs::read_dir(dataset_path)
+            .map_err(|err| format!("failed to read directory {}: {err}", dataset_path.display()))?
+        {
+            let path = entry
+                .map_err(|err| {
+                    format!(
+                        "failed to read directory entry in {}: {err}",
+                        dataset_path.display()
+                    )
+                })?
+                .path();
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("batraw"))
+            {
+                raw_files.push(path);
+            }
+        }
+        if raw_files.is_empty() {
+            return Ok(None);
+        }
+        raw_files.sort();
+    } else {
+        return Ok(None);
+    }
+
+    let mut dataset: Vec<ImageSample> = Vec::new();
+    for raw_file in &raw_files {
+        let bytes = fs::read(raw_file)
+            .map_err(|err| format!("failed to read {}: {err}", raw_file.display()))?;
+
+        if bytes.len() < RAW_DATASET_MAGIC.len() + 16 {
+            return Err(format!(
+                "raw dataset file too short to contain a valid header: {}",
+                raw_file.display()
+            ));
+        }
+        if &bytes[..RAW_DATASET_MAGIC.len()] != RAW_DATASET_MAGIC {
+            return Err(format!(
+                "invalid magic in raw dataset file: {}",
+                raw_file.display()
+            ));
+        }
+
+        let mut offset = RAW_DATASET_MAGIC.len();
+        // count is a u32 value from a validated header produced by our own tooling, so it
+        // safely fits in usize on all supported 32- and 64-bit targets.
+        let count = read_u32_le_bytes(&bytes, &mut offset)? as usize;
+        let width = read_u32_le_bytes(&bytes, &mut offset)?;
+        let height = read_u32_le_bytes(&bytes, &mut offset)?;
+        let channels = read_u32_le_bytes(&bytes, &mut offset)?;
+
+        let sample_floats = (width * height * channels) as usize;
+        let expected_bytes = offset + count * sample_floats * 4;
+        if bytes.len() != expected_bytes {
+            return Err(format!(
+                "raw dataset file size mismatch in {}: expected {expected_bytes} bytes, got {}",
+                raw_file.display(),
+                bytes.len()
+            ));
+        }
+
+        for _ in 0..count {
+            let raw: Vec<f32> = bytes[offset..offset + sample_floats * 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            offset += sample_floats * 4;
+
+            // Rescale to the model's output dimensions if they differ.
+            let target = if (width, height, channels) == output_size {
+                raw
+            } else {
+                let image = raw_floats_to_dynamic_image(&raw, width, height, channels)?;
+                image_to_tensor(&image, output_size)
+            };
+            dataset.push(ImageSample { target });
+        }
+    }
+
+    Ok(Some(dataset))
+}
+
+/// Decode a flat `[0, 1]` f32 slice back into a [`DynamicImage`] for rescaling.
+fn raw_floats_to_dynamic_image(
+    data: &[f32],
+    width: u32,
+    height: u32,
+    channels: u32,
+) -> Result<DynamicImage, String> {
+    let pixels: Vec<u8> = data.iter().map(|v| to_u8(*v)).collect();
+    match channels {
+        1 => {
+            let img = GrayImage::from_raw(width, height, pixels)
+                .ok_or_else(|| "failed to reconstruct greyscale image from raw data".to_string())?;
+            Ok(DynamicImage::ImageLuma8(img))
+        }
+        3 => {
+            let img = RgbImage::from_raw(width, height, pixels)
+                .ok_or_else(|| "failed to reconstruct RGB image from raw data".to_string())?;
+            Ok(DynamicImage::ImageRgb8(img))
+        }
+        c => Err(format!(
+            "unsupported channel count {c} in raw dataset (expected 1 or 3)"
+        )),
+    }
+}
+
+/// Read a little-endian `u32` from `bytes` at `*offset`, advancing the offset by 4.
+fn read_u32_le_bytes(bytes: &[u8], offset: &mut usize) -> Result<u32, String> {
+    let end = *offset + 4;
+    if end > bytes.len() {
+        return Err(format!(
+            "unexpected end of data reading u32 at offset {offset}"
+        ));
+    }
+    let value = u32::from_le_bytes([
+        bytes[*offset],
+        bytes[*offset + 1],
+        bytes[*offset + 2],
+        bytes[*offset + 3],
+    ]);
+    *offset = end;
+    Ok(value)
 }
 
 fn try_load_cifar_dataset(
@@ -1068,5 +1234,101 @@ fn convert_activation(a: &ActivationMethod) -> PActivation {
         ActivationMethod::Relu => PActivation::Relu,
         ActivationMethod::Silu => PActivation::Silu,
         ActivationMethod::Linear => PActivation::Linear,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_batraw(
+        path: &std::path::Path,
+        count: u32,
+        width: u32,
+        height: u32,
+        channels: u32,
+        samples: &[Vec<f32>],
+    ) {
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(RAW_DATASET_MAGIC).unwrap();
+        for v in [count, width, height, channels] {
+            file.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for sample in samples {
+            for &v in sample {
+                file.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+    }
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("batlab_test_{name}"));
+        dir
+    }
+
+    #[test]
+    fn raw_dataset_greyscale_round_trip() {
+        let out = tmp_path("grey.batraw");
+        // One 2×2 greyscale sample.
+        let sample = vec![0.0_f32, 0.25, 0.5, 1.0];
+        write_batraw(&out, 1, 2, 2, 1, &[sample.clone()]);
+
+        let dataset = try_load_raw_dataset(&out, (2, 2, 1))
+            .expect("load should succeed")
+            .expect("should detect .batraw file");
+
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(dataset.len(), 1);
+        for (a, b) in dataset[0].target.iter().zip(sample.iter()) {
+            assert!((a - b).abs() < 1e-6, "value mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn raw_dataset_rgb_round_trip() {
+        let out = tmp_path("rgb.batraw");
+        // One 2×2 RGB sample (4 pixels × 3 channels).
+        let sample: Vec<f32> = (0..12).map(|i| i as f32 / 11.0).collect();
+        write_batraw(&out, 1, 2, 2, 3, &[sample.clone()]);
+
+        let dataset = try_load_raw_dataset(&out, (2, 2, 3))
+            .expect("load should succeed")
+            .expect("should detect .batraw file");
+
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(dataset.len(), 1);
+        for (a, b) in dataset[0].target.iter().zip(sample.iter()) {
+            assert!((a - b).abs() < 1e-6, "value mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn raw_dataset_non_batraw_file_returns_none() {
+        let out = tmp_path("image.png");
+        std::fs::write(&out, b"notabatraw").unwrap();
+
+        let result = try_load_raw_dataset(&out, (32, 32, 1)).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert!(result.is_none(), "non-.batraw file should return None");
+    }
+
+    #[test]
+    fn raw_dataset_wrong_magic_returns_error() {
+        let out = tmp_path("bad.batraw");
+        // Header with correct structure but wrong magic.
+        let mut data = b"WRONGMAG".to_vec();
+        for v in [1u32, 2, 2, 1] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        for _ in 0..4u32 {
+            data.extend_from_slice(&0.5f32.to_le_bytes());
+        }
+        std::fs::write(&out, &data).unwrap();
+
+        let result = try_load_raw_dataset(&out, (2, 2, 1));
+        let _ = std::fs::remove_file(&out);
+        assert!(result.is_err(), "wrong magic should return an error");
     }
 }
