@@ -994,10 +994,12 @@ where
     let steps = schedule.len().max(1);
     let total_work = path_count.saturating_mul(steps);
     let mut accumulated = vec![0.0f32; output_len];
+    let base_noise_seed = seed ^ 0xa5a5_5a5a_0123_4567;
+    let base_latent = schedule.sample_noise(output_len, base_noise_seed);
 
     for path_idx in 0..path_count {
         let path_seed = seed ^ ((path_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let mut latent = schedule.sample_noise(output_len, path_seed ^ 0xa5a5_5a5a_0123_4567);
+        let mut latent = base_latent.clone();
 
         for (step_idx, diffusion_step) in (0..schedule.len()).rev().enumerate() {
             let timestep_features = schedule.timestep_embedding(
