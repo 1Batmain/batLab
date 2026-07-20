@@ -32,10 +32,28 @@ struct ConvSpec {
     dim_output:   vec3<u32>,
 }
 
+// Must mirror convolution.wgsl exactly: the forward maps
+// (oy,ox,ky,kx) -> iy = oy*s + ky - pad_y, ix = ox*s + kx - pad_x,
+// with out-of-bounds taps contributing zero.
+fn pad_y() -> i32 {
+    if layer_spec.padding_mode == 1u {
+        return i32(layer_spec.dim_kernel.x / 2u);
+    }
+    return 0;
+}
+
+fn pad_x() -> i32 {
+    if layer_spec.padding_mode == 1u {
+        return i32(layer_spec.dim_kernel.y / 2u);
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Pass 1 — grad_input
 //   grad_input[iy][ix][iz] = Σ_{k,ky,kx} grad_output[oy][ox][k] * weights[k][ky][kx][iz]
-//   where oy=(iy-ky)/s, ox=(ix-kx)/s  (only valid integer positions)
+//   inverting the forward map: oy = (iy + pad_y - ky)/s, ox = (ix + pad_x - kx)/s
+//   (only non-negative, divisible, in-range positions contribute)
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
 fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -60,9 +78,11 @@ fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var k: u32 = 0u; k < K; k++) {
         for (var ky: u32 = 0u; ky < KH; ky++) {
             for (var kx: u32 = 0u; kx < KW; kx++) {
-                if iy < ky || ix < kx { continue; }
-                let dy = iy - ky;
-                let dx = ix - kx;
+                let sy = i32(iy) + pad_y() - i32(ky);
+                let sx = i32(ix) + pad_x() - i32(kx);
+                if sy < 0 || sx < 0 { continue; }
+                let dy = u32(sy);
+                let dx = u32(sx);
                 if dy % s != 0u || dx % s != 0u { continue; }
                 let oy = dy / s;
                 let ox = dx / s;
@@ -96,15 +116,19 @@ fn conv_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
+    let IH = layer_spec.dim_input.x;
     let IW = layer_spec.dim_input.y;
     let s  = layer_spec.stride;
 
     var g: f32 = 0.0;
     for (var oy: u32 = 0u; oy < OH; oy++) {
         for (var ox: u32 = 0u; ox < OW; ox++) {
-            let iy     = oy * s + ky;
-            let ix     = ox * s + kx;
-            let in_i   = iy * IW * IC + ix * IC + kz;
+            let sy = i32(oy * s) + i32(ky) - pad_y();
+            let sx = i32(ox * s) + i32(kx) - pad_x();
+            if sy < 0 || sy >= i32(IH) || sx < 0 || sx >= i32(IW) {
+                continue; // padded position — contributes zero to the gradient
+            }
+            let in_i   = u32(sy) * IW * IC + u32(sx) * IC + kz;
             let go_i   = oy * OW * K + ox * K + k;
             g += grad_output[go_i] * fwd_input[in_i];
         }
