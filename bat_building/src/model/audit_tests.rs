@@ -100,52 +100,63 @@ fn same_padding_conv_is_centered_and_zero_padded() {
 // of the `schedule_len` timesteps, for the entire run. DDPM requires
 // t ~ U{0, T-1} drawn INDEPENDENTLY of x_0.
 // ---------------------------------------------------------------------------
+//
+// NOTE (fix pass): as originally written this test replicated the buggy
+// pairing INLINE and asserted that sample #0 sees all 256 timesteps over 20
+// epochs. That assertion is unsatisfiable by construction — sample #0 is drawn
+// exactly once per epoch, so 20 epochs yield at most 20 distinct timesteps, no
+// matter how the timestep is drawn. It also never called production code, so no
+// fix could have made it pass. It is rewritten below to exercise the real
+// `diffusion_step_for` / `SampleShuffle` and to assert the property the finding
+// is actually about: the timestep a sample is paired with must not be confined
+// to the `gcd(sample_count, schedule_len)` lattice.
 #[test]
 fn diffusion_timestep_is_decorrelated_from_sample_index() {
+    use crate::model::training::diffusion::{SampleShuffle, diffusion_step_for};
     use std::collections::HashSet;
 
-    // CIFAR-10-like dataset against the project's 256-step schedule.
     let sample_count = 50_000usize;
     let schedule_len = 256usize;
     let batch_size = 16usize;
+    let epochs = 40usize;
 
-    // Replicates diffusion.rs::train_step_batch_inner exactly.
-    let pair_for = |n: usize| {
-        let step = n / batch_size;
-        let batch_offset = n % batch_size;
-        let sample_index = (step * batch_size + batch_offset) % sample_count;
-        let diffusion_step = (step * batch_size + batch_offset) % schedule_len;
-        (sample_index, diffusion_step)
-    };
-
-    // Walk 20 full epochs and collect every timestep sample #0 is ever paired with.
+    let mut shuffle = SampleShuffle::default();
     let mut seen: HashSet<usize> = HashSet::new();
-    for n in 0..(sample_count * 20) {
-        let (sample_index, diffusion_step) = pair_for(n);
+    let mut draws = 0usize;
+
+    for counter in 0..(sample_count * epochs) {
+        let epoch = (counter / sample_count) as u64;
+        let position = counter % sample_count;
+        let sample_index = shuffle.sample_index(position, epoch, sample_count);
         if sample_index == 0 {
-            seen.insert(diffusion_step);
+            let seed = ((counter / batch_size) as u64) << 32; // what main.rs passes
+            seen.insert(diffusion_step_for(counter, schedule_len, seed));
+            draws += 1;
         }
     }
 
-    assert_eq!(
-        seen.len(),
-        schedule_len,
-        "\nSample #0 only ever sees {} of the {schedule_len} timesteps, over 20 epochs.\n\
-         Observed set: {:?}\n\
-         The timestep is fully determined by the sample index: both are\n\
-         `(step*batch_size + batch_offset) % _`. Coverage is capped at\n\
-         gcd(sample_count, schedule_len) = {}.\n",
+    // Coverage is bounded above by the number of draws (one per epoch). The
+    // coupled pairing capped it at gcd(50000, 256) = 16 regardless of epochs;
+    // a uniform draw should land close to the bound.
+    let lattice = {
+        fn gcd(a: usize, b: usize) -> usize {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        gcd(sample_count, schedule_len)
+    };
+    let expected_unique = draws * 3 / 4;
+
+    assert!(
+        seen.len() > lattice && seen.len() >= expected_unique,
+        "\nSample #0 saw {} distinct timesteps over {draws} draws ({epochs} epochs).\n\
+         Expected > {lattice} (the gcd lattice the coupled pairing was pinned to)\n\
+         and >= {expected_unique} (near the one-draw-per-epoch bound).\n\
+         Observed set: {:?}\n",
         seen.len(),
         {
             let mut v: Vec<_> = seen.iter().copied().collect();
             v.sort_unstable();
             v
-        },
-        {
-            fn gcd(a: usize, b: usize) -> usize {
-                if b == 0 { a } else { gcd(b, a % b) }
-            }
-            gcd(sample_count, schedule_len)
         }
     );
 }

@@ -15,6 +15,60 @@ pub struct DiffusionTask {
     configured_input: Option<Dim3>,
     configured_output: Option<Dim3>,
     prepare_pass: Option<DiffusionPreparePass>,
+    shuffle: SampleShuffle,
+}
+
+/// Per-epoch permutation of the dataset.
+///
+/// The sample index used to be `(step*batch_size + batch_offset) % sample_count`,
+/// i.e. strictly sequential: the presentation order was identical at every
+/// epoch. The permutation is regenerated whenever the epoch changes and is
+/// derived from the epoch number alone, so runs stay reproducible.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SampleShuffle {
+    order: Vec<usize>,
+    epoch: Option<u64>,
+}
+
+impl SampleShuffle {
+    pub(crate) fn sample_index(
+        &mut self,
+        position: usize,
+        epoch: u64,
+        sample_count: usize,
+    ) -> usize {
+        if sample_count == 0 {
+            return 0;
+        }
+        if self.epoch != Some(epoch) || self.order.len() != sample_count {
+            self.order = (0..sample_count).collect();
+            let mut rng = SplitMix64::new(epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5DEE_CE66);
+            for i in (1..sample_count).rev() {
+                let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+                self.order.swap(i, j);
+            }
+            self.epoch = Some(epoch);
+        }
+        self.order[position % sample_count]
+    }
+}
+
+/// Minimal SplitMix64 — enough to shuffle indices and draw timesteps, with no
+/// external RNG dependency.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +103,7 @@ impl DiffusionTask {
             configured_input: None,
             configured_output: None,
             prepare_pass: None,
+            shuffle: SampleShuffle::default(),
         }
     }
 
@@ -156,6 +211,25 @@ impl DiffusionTask {
         let schedule_len = schedule.len();
         let timestep_channels = self.timestep_channels as u32;
 
+        // Resolved up front: the shuffle borrows `self`, while `pass` below
+        // borrows it mutably for the rest of the function.
+        let sample_count = dataset.sample_count();
+        let batch_plan: Vec<(usize, usize)> = (0..batch_size)
+            .map(|batch_offset| {
+                let counter = step.wrapping_mul(batch_size).wrapping_add(batch_offset);
+                let (epoch, position) = if sample_count == 0 {
+                    (0, 0)
+                } else {
+                    ((counter / sample_count) as u64, counter % sample_count)
+                };
+                let sample_index = self.shuffle.sample_index(position, epoch, sample_count);
+                (
+                    sample_index,
+                    diffusion_step_for(counter, schedule_len, seed),
+                )
+            })
+            .collect();
+
         let pass = self.ensure_prepare_pass(model, input, output)?;
         if dataset.sample_len() != pass.expected_target_len {
             return Err(TrainingTaskError::TargetLengthMismatch {
@@ -166,11 +240,8 @@ impl DiffusionTask {
         let gpu = model.gpu.clone();
 
         let mut last_loss = None;
-        let sample_count = dataset.sample_count();
         model.begin_batch_accumulation();
-        for batch_offset in 0..batch_size {
-            let sample_index = (step * batch_size + batch_offset) % sample_count;
-            let diffusion_step = diffusion_step_for(step, batch_size, batch_offset, schedule_len);
+        for (batch_offset, &(sample_index, diffusion_step)) in batch_plan.iter().enumerate() {
             let alpha_bar = schedule.alpha_bar(diffusion_step);
             let step_seed = seed ^ ((batch_offset as u64) << 32) ^ sample_index as u64;
             let specs_bytes = Self::encode_prepare_uniform(DiffusionPrepareUniform {
@@ -451,17 +522,20 @@ fn fold_seed(seed: u64) -> u32 {
         .wrapping_add(1013904223)
 }
 
-fn diffusion_step_for(
-    step: usize,
-    batch_size: usize,
-    batch_offset: usize,
-    schedule_len: usize,
-) -> usize {
+/// Draws t ~ U{0, schedule_len-1}, independently of which sample is paired with
+/// it.
+///
+/// The timestep used to be `counter % schedule_len` while the sample index was
+/// `counter % sample_count` — both derived from the same linear counter, so the
+/// timestep was a deterministic function of the image. A given sample only ever
+/// saw `gcd(sample_count, schedule_len)` distinct timesteps (16 of 256 for
+/// CIFAR-10), whereas DDPM requires t drawn independently of x_0.
+pub(crate) fn diffusion_step_for(counter: usize, schedule_len: usize, seed: u64) -> usize {
     if schedule_len == 0 {
-        0
-    } else {
-        step.wrapping_mul(batch_size).wrapping_add(batch_offset) % schedule_len
+        return 0;
     }
+    let mut rng = SplitMix64::new(seed ^ (counter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    (rng.next_u64() % schedule_len as u64) as usize
 }
 
 fn same_dims(saved: Option<Dim3>, target: Dim3) -> bool {
@@ -533,11 +607,90 @@ mod tests {
         });
     }
 
+    /// Kept from PR #6: consecutive draws within a batch must not collapse onto
+    /// a single timestep. Strengthened — the draw is now random, so the property
+    /// is "spread across the schedule", not "the identity sequence".
     #[test]
     fn diffusion_step_progression_does_not_alias_single_batch() {
-        let steps: Vec<usize> = (0..8)
-            .map(|step| super::diffusion_step_for(step, 1, 0, 8))
+        use std::collections::HashSet;
+        let steps: HashSet<usize> = (0..8)
+            .map(|counter| super::diffusion_step_for(counter, 8, 0))
             .collect();
-        assert_eq!(steps, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert!(
+            steps.len() >= 4,
+            "8 consecutive draws over 8 timesteps collapsed to {steps:?}"
+        );
+    }
+
+    /// Finding #2 — the timestep must be independent of the sample it is paired
+    /// with. Walks the same (sample, timestep) pairing the training loop builds
+    /// and checks that one given sample eventually sees the whole schedule.
+    #[test]
+    fn timestep_is_decorrelated_from_sample_index() {
+        use std::collections::HashSet;
+
+        let sample_count = 1_024usize;
+        let schedule_len = 256usize;
+        let batch_size = 16usize;
+        // Sample #0 is drawn once per epoch, so coverage is bounded by the epoch
+        // count. 2000 epochs makes full coverage of a 256-step schedule the
+        // overwhelmingly likely outcome for a uniform draw (expected number of
+        // never-hit timesteps: 256 * e^-7.8 < 0.2), while the old lattice
+        // pairing would stay pinned at gcd(sample_count, schedule_len).
+        let epochs = 2_000usize;
+        let mut shuffle = super::SampleShuffle::default();
+
+        let mut seen: HashSet<usize> = HashSet::new();
+        for counter in 0..(sample_count * epochs) {
+            let step = counter / batch_size;
+            let seed = (step as u64) << 32; // what main.rs passes per step
+            let epoch = (counter / sample_count) as u64;
+            let position = counter % sample_count;
+            let sample_index = shuffle.sample_index(position, epoch, sample_count);
+            if sample_index == 0 {
+                seen.insert(super::diffusion_step_for(counter, schedule_len, seed));
+            }
+        }
+
+        let lattice = gcd(sample_count, schedule_len);
+        assert_eq!(
+            seen.len(),
+            schedule_len,
+            "sample #0 saw {} of the {schedule_len} timesteps over {epochs} epochs \
+             (the coupled pairing would cap it at gcd = {lattice})",
+            seen.len()
+        );
+    }
+
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+
+    /// The dataset presentation order must differ between epochs.
+    #[test]
+    fn sample_order_is_shuffled_between_epochs() {
+        let sample_count = 512usize;
+        let mut shuffle = super::SampleShuffle::default();
+
+        let order_of = |shuffle: &mut super::SampleShuffle, epoch: u64| -> Vec<usize> {
+            (0..sample_count)
+                .map(|position| shuffle.sample_index(position, epoch, sample_count))
+                .collect()
+        };
+
+        let epoch0 = order_of(&mut shuffle, 0);
+        let epoch1 = order_of(&mut shuffle, 1);
+
+        assert_ne!(
+            epoch0, epoch1,
+            "presentation order is identical across epochs"
+        );
+
+        // Each epoch must still be a permutation — every sample seen exactly once.
+        for order in [&epoch0, &epoch1] {
+            let mut sorted = (*order).clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..sample_count).collect::<Vec<_>>());
+        }
     }
 }
