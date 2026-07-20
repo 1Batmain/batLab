@@ -41,12 +41,131 @@ struct ImageSample {
 }
 
 fn main() {
+    // ---------------------------------------------------------------------
+    // DEV/CI ONLY — headless training entry point.
+    //
+    // The normal entry point is the interactive TUI below. This branch exists
+    // so a training run can be driven from a script (validating pipeline fixes,
+    // regression runs) without a terminal. It reuses `run_training` unchanged,
+    // so it exercises exactly the production path and cannot drift from it.
+    //
+    //   cargo run --release -- --headless-train <model> --steps N \
+    //       --dataset <path> [--lr F] [--batch N] [--out <ckpt path>]
+    //
+    // It never writes back to the model's config_file and defaults its
+    // checkpoint to a scratch path, so it cannot clobber saved weights.
+    // ---------------------------------------------------------------------
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--headless-train") {
+        if let Err(err) = run_headless_train(&args) {
+            eprintln!("headless training failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config = match tui::run() {
         Ok(c) => c,
         Err(_) => return,
     };
 
     run_execution_loop(config);
+}
+
+/// See the DEV/CI note in `main`. Not reachable from the TUI.
+fn run_headless_train(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let parse = |name: &str, fallback: f32| -> Result<f32, String> {
+        match flag(name) {
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("invalid value for {name}: {v}")),
+            None => Ok(fallback),
+        }
+    };
+
+    let model_name = flag("--headless-train")
+        .ok_or_else(|| "--headless-train requires a model name".to_string())?;
+    let steps = parse("--steps", 500.0)? as usize;
+    let lr = parse("--lr", 1e-3)?;
+    let batch_size = parse("--batch", 16.0)? as u32;
+
+    let config_path = tui::storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let mut config = tui::storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    let dataset_path = flag("--dataset")
+        .ok_or_else(|| "--dataset <path to .batraw or image dir> is required".to_string())?;
+    let checkpoint_path = flag("--out").unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join(format!("{model_name}_headless.ckpt"))
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let train_cfg = TrainingConfig {
+        lr,
+        batch_size,
+        steps,
+        dataset_path,
+        loss: match &config.run.mode {
+            RunMode::Train(existing) => existing.loss.clone(),
+            RunMode::Infer => tui::LossMethod::MeanSquared,
+        },
+        checkpoint_path: Some(checkpoint_path),
+        // Fixes #1 and #4 changed the convolution operator and the data range,
+        // so any pre-existing checkpoint is meaningless. Always start fresh.
+        load_checkpoint: false,
+    };
+    config.run.mode = RunMode::Train(train_cfg.clone());
+
+    println!(
+        "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
+         dataset={}",
+        train_cfg.dataset_path
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
+    let worker = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            if let Err(message) =
+                run_training(config, train_cfg, &tx, std::sync::mpsc::channel().1).await
+            {
+                let _ = tx.send(tui::TrainingEvent::Error { message });
+            }
+            let _ = tx.send(tui::TrainingEvent::Done);
+        });
+    });
+
+    let mut failure = None;
+    while let Ok(event) = rx.recv() {
+        match event {
+            tui::TrainingEvent::Step {
+                step,
+                loss: Some(loss),
+                ..
+            } => println!("step {step}\tloss {loss:.6}"),
+            tui::TrainingEvent::Error { message } => {
+                eprintln!("error: {message}");
+                failure = Some(message);
+            }
+            tui::TrainingEvent::Done => break,
+            _ => {}
+        }
+    }
+    let _ = worker.join();
+
+    match failure {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 fn run_execution_loop(mut config: ModelConfig) {
