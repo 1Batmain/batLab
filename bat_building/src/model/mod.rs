@@ -16,3 +16,6 @@ pub use layer_types::{
 };
 pub use model::{Infer, Model, Training};
 pub use types::{Dim3, PaddingMode};
+
+#[cfg(test)]
+mod audit_tests;
