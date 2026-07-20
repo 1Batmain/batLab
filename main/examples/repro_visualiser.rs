@@ -1,12 +1,19 @@
-//! Minimal reproduction of the visualiser crash: spawn a window from a non-main
-//! thread exactly the way the TUI does, then observe what happens.
+//! Regression check for the macOS visualiser crash.
+//!
+//! Before the fix this panicked with "on macOS, `EventLoop` must be created on
+//! the main thread!" as soon as a window was requested. It now opens a real
+//! window from a worker thread, exactly the way the TUI does.
 
 use bat_building::GpuContext;
-use bat_building::visualiser::spawn_window;
+use bat_building::visualiser::{run_on_main_thread, spawn_window};
 use std::sync::Arc;
 use std::time::Duration;
 
 fn main() {
+    run_on_main_thread(worker);
+}
+
+fn worker() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let gpu = Arc::new(rt.block_on(GpuContext::new_headless()));
     eprintln!("[repro] gpu ready: {}", gpu.adapter().get_info().name);

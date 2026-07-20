@@ -37,12 +37,17 @@ struct ImageSample {
 }
 
 fn main() {
-    let config = match tui::run() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    // winit's event loop must own the process main thread (a hard AppKit
+    // requirement on macOS), so the TUI and the training/inference loop run on a
+    // worker thread instead. `run_on_main_thread` returns once that worker does.
+    bat_building::visualiser::run_on_main_thread(|| {
+        let config = match tui::run() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
-    run_execution_loop(config);
+        run_execution_loop(config);
+    });
 }
 
 fn run_execution_loop(mut config: ModelConfig) {
