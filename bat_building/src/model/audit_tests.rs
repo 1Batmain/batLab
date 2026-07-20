@@ -84,3 +84,86 @@ fn same_padding_conv_is_centered_and_zero_padded() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Finding #2 — the diffusion timestep is a deterministic function of the
+// sample index, because both derive from the same linear counter
+// `step * batch_size + batch_offset` (diffusion.rs:172-173).
+//
+// Consequence: a given image only ever sees `gcd(sample_count, schedule_len)`
+// of the `schedule_len` timesteps, for the entire run. DDPM requires
+// t ~ U{0, T-1} drawn INDEPENDENTLY of x_0.
+// ---------------------------------------------------------------------------
+#[test]
+fn diffusion_timestep_is_decorrelated_from_sample_index() {
+    use std::collections::HashSet;
+
+    // CIFAR-10-like dataset against the project's 256-step schedule.
+    let sample_count = 50_000usize;
+    let schedule_len = 256usize;
+    let batch_size = 16usize;
+
+    // Replicates diffusion.rs::train_step_batch_inner exactly.
+    let pair_for = |n: usize| {
+        let step = n / batch_size;
+        let batch_offset = n % batch_size;
+        let sample_index = (step * batch_size + batch_offset) % sample_count;
+        let diffusion_step = (step * batch_size + batch_offset) % schedule_len;
+        (sample_index, diffusion_step)
+    };
+
+    // Walk 20 full epochs and collect every timestep sample #0 is ever paired with.
+    let mut seen: HashSet<usize> = HashSet::new();
+    for n in 0..(sample_count * 20) {
+        let (sample_index, diffusion_step) = pair_for(n);
+        if sample_index == 0 {
+            seen.insert(diffusion_step);
+        }
+    }
+
+    assert_eq!(
+        seen.len(),
+        schedule_len,
+        "\nSample #0 only ever sees {} of the {schedule_len} timesteps, over 20 epochs.\n\
+         Observed set: {:?}\n\
+         The timestep is fully determined by the sample index: both are\n\
+         `(step*batch_size + batch_offset) % _`. Coverage is capped at\n\
+         gcd(sample_count, schedule_len) = {}.\n",
+        seen.len(),
+        {
+            let mut v: Vec<_> = seen.iter().copied().collect();
+            v.sort_unstable();
+            v
+        },
+        {
+            fn gcd(a: usize, b: usize) -> usize {
+                if b == 0 { a } else { gcd(b, a % b) }
+            }
+            gcd(sample_count, schedule_len)
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finding #3 — the linear schedule uses the DDPM betas (1e-4 .. 0.02), which
+// are calibrated for T = 1000, at T = 256. The forward process therefore never
+// reaches (approximately) pure noise, so q(x_T) != N(0, I) while the sampler
+// starts from N(0, I).
+// ---------------------------------------------------------------------------
+#[test]
+fn schedule_reaches_approximately_pure_noise_at_final_step() {
+    use crate::training::LinearNoiseSchedule;
+
+    let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+    let terminal = schedule.alpha_bar(schedule.len() - 1);
+    let residual_signal = terminal.sqrt();
+
+    assert!(
+        terminal < 1e-3,
+        "\nalpha_bar(T-1) = {terminal:.6} (sqrt = {residual_signal:.4}).\n\
+         x_T still retains {:.1}% of the original signal, so q(x_T) is far from\n\
+         N(0, I) — yet sampling starts from pure Gaussian noise.\n\
+         Reference: DDPM at T=1000 with these betas gives alpha_bar_T = 4.0e-5.\n",
+        residual_signal * 100.0
+    );
+}
