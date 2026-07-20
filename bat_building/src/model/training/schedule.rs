@@ -7,13 +7,34 @@ pub struct LinearNoiseSchedule {
     alpha_bars: Vec<f32>,
 }
 
+/// Step count the reference DDPM betas (1e-4 .. 0.02) are calibrated for.
+const BETA_REFERENCE_STEPS: f32 = 1000.0;
+/// Upper bound on a single beta. Keeps alpha strictly positive so alpha_bar
+/// stays strictly decreasing even after rescaling for a short schedule.
+const MAX_BETA: f32 = 0.999;
+/// Residual signal budget at the terminal step: alpha_bar(T-1) must fall below
+/// this for q(x_T) to be approximately N(0, I).
+const TERMINAL_ALPHA_BAR_LIMIT: f32 = 1e-3;
+
 impl LinearNoiseSchedule {
+    /// Builds a linear beta schedule.
+    ///
+    /// `beta_start`/`beta_end` are interpreted as calibrated for
+    /// `BETA_REFERENCE_STEPS` (the DDPM paper's T = 1000) and are rescaled by
+    /// `BETA_REFERENCE_STEPS / num_steps`, so the total injected noise is
+    /// preserved at any T. Without this, reusing the paper's betas at T = 256
+    /// left alpha_bar(T-1) = 0.075 — i.e. 27% of the original signal still
+    /// present in x_T, while sampling starts from pure Gaussian noise.
     pub fn new_linear(num_steps: usize, beta_start: f32, beta_end: f32) -> Self {
         assert!(num_steps > 0, "noise schedule requires at least one step");
         assert!(
             beta_start > 0.0 && beta_end > 0.0 && beta_start <= beta_end && beta_end < 1.0,
             "noise schedule betas must be in (0, 1) and ordered"
         );
+
+        let scale = BETA_REFERENCE_STEPS / num_steps as f32;
+        let scaled_start = (beta_start * scale).min(MAX_BETA);
+        let scaled_end = (beta_end * scale).min(MAX_BETA);
 
         let mut betas = Vec::with_capacity(num_steps);
         let mut alphas = Vec::with_capacity(num_steps);
@@ -23,13 +44,24 @@ impl LinearNoiseSchedule {
 
         for step in 0..num_steps {
             let t = step as f32 / denom;
-            let beta = beta_start + (beta_end - beta_start) * t;
+            let beta = (scaled_start + (scaled_end - scaled_start) * t).min(MAX_BETA);
             let alpha = 1.0 - beta;
             running_alpha_bar *= alpha;
             betas.push(beta);
             alphas.push(alpha);
             alpha_bars.push(running_alpha_bar);
         }
+
+        let terminal = *alpha_bars.last().expect("schedule has at least one step");
+        assert!(
+            terminal < TERMINAL_ALPHA_BAR_LIMIT,
+            "noise schedule never reaches pure noise: alpha_bar({}) = {terminal:.3e} \
+             (sqrt = {:.4}, i.e. {:.1}% residual signal in x_T). \
+             q(x_T) must be approximately N(0, I) since sampling starts there.",
+            num_steps - 1,
+            terminal.sqrt(),
+            terminal.sqrt() * 100.0
+        );
 
         Self {
             betas,
@@ -190,6 +222,34 @@ mod tests {
             assert!(schedule.alpha_bar(step) < schedule.alpha_bar(step - 1));
             assert!(schedule.beta(step) >= schedule.beta(step - 1));
             assert!(schedule.alpha(step) <= schedule.alpha(step - 1));
+        }
+    }
+
+    /// Finding #3 — the betas are calibrated for T = 1000 and must be rescaled
+    /// for the T = 256 schedule the project actually runs, so that x_T is
+    /// (approximately) pure noise.
+    #[test]
+    fn production_schedule_reaches_pure_noise() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let terminal = schedule.alpha_bar(schedule.len() - 1);
+        assert!(
+            terminal < 1e-3,
+            "alpha_bar(T-1) = {terminal:.3e}, residual signal {:.2}%",
+            terminal.sqrt() * 100.0
+        );
+    }
+
+    /// Rescaling must preserve the total injected noise across step counts:
+    /// the same betas at different T land in the same ballpark at the end.
+    #[test]
+    fn rescaling_keeps_terminal_alpha_bar_comparable_across_step_counts() {
+        for steps in [128usize, 256, 512, 1000] {
+            let schedule = LinearNoiseSchedule::new_linear(steps, 1e-4, 0.02);
+            let terminal = schedule.alpha_bar(schedule.len() - 1);
+            assert!(
+                terminal < 1e-3,
+                "T={steps}: alpha_bar(T-1) = {terminal:.3e} does not reach pure noise"
+            );
         }
     }
 
