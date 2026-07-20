@@ -1378,6 +1378,7 @@ dependencies = [
  "bat_building",
  "image",
  "tokio",
+ "wgpu",
  "winit",
 ]
 

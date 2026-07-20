@@ -143,11 +143,22 @@ pub fn spawn_window_with_visibility(
         initial_visible,
     };
 
-    let tx = visualiser_manager_tx();
-    if let Err(err) = tx.send(ManagerCommand::Open(request)) {
-        eprintln!("[visualiser] failed to enqueue open request: {err}");
-        close_flag.store(true, Ordering::Relaxed);
-        closed_flag.store(true, Ordering::Relaxed);
+    match visualiser_manager_tx() {
+        Some(tx) => {
+            if let Err(err) = tx.send(ManagerCommand::Open(request)) {
+                eprintln!("[visualiser] failed to enqueue open request: {err}");
+                close_flag.store(true, Ordering::Relaxed);
+                closed_flag.store(true, Ordering::Relaxed);
+            }
+        }
+        None => {
+            eprintln!(
+                "[visualiser] no manager running; the process must be started via \
+                 visualiser::run_on_main_thread"
+            );
+            close_flag.store(true, Ordering::Relaxed);
+            closed_flag.store(true, Ordering::Relaxed);
+        }
     }
 
     VisualiserHandle {
@@ -157,23 +168,86 @@ pub fn spawn_window_with_visibility(
     }
 }
 
-/// Ensure the background visualiser manager thread/event loop is running.
+/// No-op kept for API compatibility.
+///
+/// The manager event loop is now started by [`run_on_main_thread`] before any
+/// application code runs, so there is nothing left to warm up.
 pub fn warmup_manager() {
-    let _ = visualiser_manager_tx();
+    if visualiser_manager_tx().is_none() {
+        eprintln!(
+            "[visualiser] manager not running; visualiser windows will be unavailable \
+             (start the process via visualiser::run_on_main_thread)"
+        );
+    }
 }
 
-fn visualiser_manager_tx() -> &'static Sender<ManagerCommand> {
-    VISUALISER_CMD_TX.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<ManagerCommand>();
-        std::thread::spawn(move || {
-            open_window_manager(rx);
-        });
-        tx
-    })
+fn visualiser_manager_tx() -> Option<&'static Sender<ManagerCommand>> {
+    VISUALISER_CMD_TX.get()
+}
+
+/// Run `worker` on a background thread while the visualiser's winit event loop
+/// owns the calling thread.
+///
+/// This **must** be called from the process main thread: on macOS AppKit
+/// requires `NSApplication` (and therefore winit's event loop) to live on the
+/// main thread, and winit panics outright otherwise. Windows and Linux have the
+/// same expectation, merely less strictly enforced.
+///
+/// `worker` receives the whole application (TUI, training, inference); the event
+/// loop exits once it returns, so this function returns when the application is
+/// done.
+pub fn run_on_main_thread<F>(worker: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel::<ManagerCommand>();
+    if VISUALISER_CMD_TX.set(tx).is_err() {
+        eprintln!("[visualiser] manager already running; refusing to start a second event loop");
+        worker();
+        return;
+    }
+    let shutdown_tx = visualiser_manager_tx()
+        .expect("manager sender was just installed")
+        .clone();
+
+    // Sending `Shutdown` from a drop guard means a panicking worker still
+    // releases the event loop instead of hanging the process.
+    let worker_thread = std::thread::spawn(move || {
+        let _guard = ShutdownOnDrop(shutdown_tx);
+        worker();
+    });
+
+    let Some(event_loop) = build_event_loop() else {
+        // No GUI backend: drop the receiver so later `spawn_window` calls fail
+        // fast, and simply let the application run to completion.
+        drop(rx);
+        let _ = worker_thread.join();
+        return;
+    };
+
+    let mut app = VisualiserManagerApp {
+        rx,
+        active: None,
+        shutdown: false,
+    };
+    if let Err(e) = event_loop.run_app(&mut app) {
+        eprintln!("[visualiser] event loop error: {e}");
+    }
+
+    let _ = worker_thread.join();
+}
+
+struct ShutdownOnDrop(Sender<ManagerCommand>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(ManagerCommand::Shutdown);
+    }
 }
 
 enum ManagerCommand {
     Open(OpenRequest),
+    Shutdown,
 }
 
 struct OpenRequest {
@@ -518,6 +592,8 @@ impl RenderState {
 struct VisualiserManagerApp {
     rx: Receiver<ManagerCommand>,
     active: Option<ActiveVisualiser>,
+    /// Set once the application worker has finished; the loop then exits.
+    shutdown: bool,
 }
 
 impl VisualiserManagerApp {
@@ -536,7 +612,18 @@ impl VisualiserManagerApp {
                         previous.closed_flag.store(true, Ordering::Relaxed);
                     }
                 }
+                ManagerCommand::Shutdown => {
+                    self.shutdown = true;
+                    if let Some(req) = pending_open.take() {
+                        req.closed_flag.store(true, Ordering::Relaxed);
+                    }
+                }
             }
+        }
+        if self.shutdown {
+            self.close_active();
+            event_loop.exit();
+            return;
         }
         if let Some(open) = pending_open {
             self.close_active();
@@ -596,6 +683,9 @@ impl ApplicationHandler for VisualiserManagerApp {
             self.close_active();
         }
         self.drain_commands(event_loop);
+        if self.shutdown {
+            return;
+        }
 
         if let Some(active) = self.active.as_mut() {
             let desired_visible = active.visible_flag.load(Ordering::Relaxed);
@@ -628,11 +718,11 @@ impl ApplicationHandler for VisualiserManagerApp {
 // Internal entry point
 // ---------------------------------------------------------------------------
 
-fn open_window_manager(rx: Receiver<ManagerCommand>) {
-    // On Linux (Wayland and X11) winit requires `with_any_thread(true)` when
-    // the event loop is created outside the main OS thread.  Both platform
-    // extensions write to the same underlying `any_thread` flag, so importing
-    // either one is sufficient.
+/// Build the winit event loop for the calling (main) thread.
+///
+/// Returns `None` when no usable windowing backend is available; the caller then
+/// runs the application without a visualiser instead of failing outright.
+fn build_event_loop() -> Option<EventLoop<()>> {
     #[cfg(target_os = "linux")]
     let event_loop = {
         let mut try_x11_first = false;
@@ -645,19 +735,16 @@ fn open_window_manager(rx: Receiver<ManagerCommand>) {
             try_x11_first = true;
         }
 
+        // `with_any_thread` is deliberately absent: the loop now runs on the
+        // main thread, which every winit backend expects.
         let try_build_x11 = || {
             let mut builder = EventLoop::builder();
-            winit::platform::x11::EventLoopBuilderExtX11::with_any_thread(&mut builder, true);
             winit::platform::x11::EventLoopBuilderExtX11::with_x11(&mut builder);
             builder.build()
         };
 
         let try_build_wayland = || {
             let mut builder = EventLoop::builder();
-            winit::platform::wayland::EventLoopBuilderExtWayland::with_any_thread(
-                &mut builder,
-                true,
-            );
             winit::platform::wayland::EventLoopBuilderExtWayland::with_wayland(&mut builder);
             builder.build()
         };
@@ -691,28 +778,42 @@ fn open_window_manager(rx: Receiver<ManagerCommand>) {
                             eprintln!(
                                 "[visualiser] failed to create event loop: Wayland={wayland_err}; X11={x11_err}"
                             );
-                            return;
+                            return None;
                         }
                     }
                 } else {
                     eprintln!("[visualiser] failed to create event loop: {wayland_err}");
-                    return;
+                    return None;
                 }
             }
         }
     };
-    #[cfg(not(target_os = "linux"))]
+
+    // The TUI owns the terminal and stays the primary interface, so the
+    // visualiser registers as an accessory: it shows its window without adding
+    // a dock icon or stealing focus from the terminal at startup.
+    #[cfg(target_os = "macos")]
+    let event_loop = {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        let mut builder = EventLoop::builder();
+        builder.with_activation_policy(ActivationPolicy::Accessory);
+        match builder.build() {
+            Ok(el) => el,
+            Err(e) => {
+                eprintln!("[visualiser] failed to create event loop: {e}");
+                return None;
+            }
+        }
+    };
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let event_loop = match EventLoop::new() {
         Ok(el) => el,
         Err(e) => {
             eprintln!("[visualiser] failed to create event loop: {e}");
-            return;
+            return None;
         }
     };
 
-    let mut app = VisualiserManagerApp { rx, active: None };
-
-    if let Err(e) = event_loop.run_app(&mut app) {
-        eprintln!("[visualiser] event loop error: {e}");
-    }
+    Some(event_loop)
 }
