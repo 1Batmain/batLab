@@ -20,9 +20,13 @@ use bat_building::{
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
-/// Magic header for the raw binary dataset format produced by the pre-processing scripts.
-/// Format: magic(8) | count(u32le) | width(u32le) | height(u32le) | channels(u32le) | f32 data…
-const RAW_DATASET_MAGIC: &[u8; 8] = b"BATRAW1\0";
+// Magic headers for the raw binary dataset format produced by the pre-processing
+// scripts. Format: magic(8) | count | width | height | channels | f32 data…
+/// Legacy raw-dataset magic — payload stored in `[0, 1]`. Converted to the
+/// model's `[-1, 1]` convention at load time.
+const RAW_DATASET_MAGIC_UNIT: &[u8; 8] = b"BATRAW1\0";
+/// Current raw-dataset magic — payload already stored in `[-1, 1]`.
+const RAW_DATASET_MAGIC_SIGNED: &[u8; 8] = b"BATRAW2\0";
 
 const DIFFUSION_SCHEDULE_STEPS: usize = 256;
 const DIFFUSION_BETA_START: f32 = 1e-4;
@@ -582,13 +586,17 @@ fn load_dataset(
 ///
 /// # Binary format (produced by the Python pre-processing scripts)
 /// ```text
-/// [0..8]   magic: b"BATRAW1\0"
+/// [0..8]   magic: b"BATRAW2\0" (or legacy b"BATRAW1\0")
 /// [8..12]  count:    u32 LE – number of samples
 /// [12..16] width:    u32 LE – image width in pixels
 /// [16..20] height:   u32 LE – image height in pixels
 /// [20..24] channels: u32 LE – number of channels per pixel
-/// [24..]   data:     count * width * height * channels × f32 LE values, normalised [0, 1]
+/// [24..]   data:     count * width * height * channels × f32 LE values
 /// ```
+///
+/// `BATRAW2` stores values already normalised in `[-1, 1]` — the convention the
+/// diffusion pipeline expects. `BATRAW1` files store `[0, 1]` and are rescaled
+/// on the fly, so pre-existing datasets keep loading unchanged.
 fn try_load_raw_dataset(
     dataset_path: &Path,
     output_size: (u32, u32, u32),
@@ -639,20 +647,26 @@ fn try_load_raw_dataset(
         let bytes = fs::read(raw_file)
             .map_err(|err| format!("failed to read {}: {err}", raw_file.display()))?;
 
-        if bytes.len() < RAW_DATASET_MAGIC.len() + 16 {
+        if bytes.len() < RAW_DATASET_MAGIC_SIGNED.len() + 16 {
             return Err(format!(
                 "raw dataset file too short to contain a valid header: {}",
                 raw_file.display()
             ));
         }
-        if &bytes[..RAW_DATASET_MAGIC.len()] != RAW_DATASET_MAGIC {
+        let magic = &bytes[..RAW_DATASET_MAGIC_SIGNED.len()];
+        // BATRAW1 payloads predate the [-1, 1] convention and are rescaled below.
+        let needs_unit_rescale = if magic == RAW_DATASET_MAGIC_SIGNED {
+            false
+        } else if magic == RAW_DATASET_MAGIC_UNIT {
+            true
+        } else {
             return Err(format!(
                 "invalid magic in raw dataset file: {}",
                 raw_file.display()
             ));
-        }
+        };
 
-        let mut offset = RAW_DATASET_MAGIC.len();
+        let mut offset = RAW_DATASET_MAGIC_SIGNED.len();
         // count is a u32 value from a validated header produced by our own tooling, so it
         // safely fits in usize on all supported 32- and 64-bit targets.
         let count = read_u32_le_bytes(&bytes, &mut offset)? as usize;
@@ -673,7 +687,14 @@ fn try_load_raw_dataset(
         for _ in 0..count {
             let raw: Vec<f32> = bytes[offset..offset + sample_floats * 4]
                 .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .map(|b| {
+                    let value = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    if needs_unit_rescale {
+                        value * 2.0 - 1.0
+                    } else {
+                        value
+                    }
+                })
                 .collect();
             offset += sample_floats * 4;
 
@@ -691,7 +712,7 @@ fn try_load_raw_dataset(
     Ok(Some(dataset))
 }
 
-/// Decode a flat `[0, 1]` f32 slice back into a [`DynamicImage`] for rescaling.
+/// Decode a flat `[-1, 1]` f32 slice back into a [`DynamicImage`] for rescaling.
 fn raw_floats_to_dynamic_image(
     data: &[f32],
     width: u32,
@@ -905,7 +926,7 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
             .resize_exact(width, height, FilterType::Triangle)
             .to_luma8()
             .pixels()
-            .map(|pixel| pixel.0[0] as f32 / 255.0)
+            .map(|pixel| from_u8(pixel.0[0]))
             .collect();
     }
 
@@ -922,7 +943,7 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
                 2 => rgb[2],
                 _ => rgb[2],
             };
-            tensor.push(value as f32 / 255.0);
+            tensor.push(from_u8(value));
         }
     }
     tensor
@@ -1094,8 +1115,18 @@ fn save_tensor_as_image(
     Ok(path)
 }
 
+/// Encode an 8-bit sample into the model's `[-1, 1]` convention.
+///
+/// Diffusion's forward process `x_t = sqrt(a_bar)*x_0 + sqrt(1-a_bar)*eps`
+/// assumes a zero-centered `x_0`; a `[0, 1]` encoding leaves a mean bias of
+/// `0.5*sqrt(a_bar)` at every timestep while the sampler starts from N(0, 1).
+fn from_u8(value: u8) -> f32 {
+    value as f32 / 127.5 - 1.0
+}
+
+/// Inverse of [`from_u8`].
 fn to_u8(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    ((value.clamp(-1.0, 1.0) + 1.0) * 127.5).round() as u8
 }
 
 fn tensor_to_rgb_pixels(tensor: &[f32], dims: (u32, u32, u32)) -> Result<Vec<u8>, String> {
@@ -1252,8 +1283,28 @@ mod tests {
         channels: u32,
         samples: &[Vec<f32>],
     ) {
+        write_batraw_with_magic(
+            path,
+            RAW_DATASET_MAGIC_SIGNED,
+            count,
+            width,
+            height,
+            channels,
+            samples,
+        )
+    }
+
+    fn write_batraw_with_magic(
+        path: &std::path::Path,
+        magic: &[u8; 8],
+        count: u32,
+        width: u32,
+        height: u32,
+        channels: u32,
+        samples: &[Vec<f32>],
+    ) {
         let mut file = std::fs::File::create(path).unwrap();
-        file.write_all(RAW_DATASET_MAGIC).unwrap();
+        file.write_all(magic).unwrap();
         for v in [count, width, height, channels] {
             file.write_all(&v.to_le_bytes()).unwrap();
         }
@@ -1273,8 +1324,8 @@ mod tests {
     #[test]
     fn raw_dataset_greyscale_round_trip() {
         let out = tmp_path("grey.batraw");
-        // One 2×2 greyscale sample.
-        let sample = vec![0.0_f32, 0.25, 0.5, 1.0];
+        // One 2×2 greyscale sample, in the [-1, 1] convention.
+        let sample = vec![-1.0_f32, -0.5, 0.0, 1.0];
         write_batraw(&out, 1, 2, 2, 1, &[sample.clone()]);
 
         let dataset = try_load_raw_dataset(&out, (2, 2, 1))
@@ -1291,8 +1342,8 @@ mod tests {
     #[test]
     fn raw_dataset_rgb_round_trip() {
         let out = tmp_path("rgb.batraw");
-        // One 2×2 RGB sample (4 pixels × 3 channels).
-        let sample: Vec<f32> = (0..12).map(|i| i as f32 / 11.0).collect();
+        // One 2×2 RGB sample (4 pixels × 3 channels), in the [-1, 1] convention.
+        let sample: Vec<f32> = (0..12).map(|i| i as f32 / 11.0 * 2.0 - 1.0).collect();
         write_batraw(&out, 1, 2, 2, 3, &[sample.clone()]);
 
         let dataset = try_load_raw_dataset(&out, (2, 2, 3))
@@ -1304,6 +1355,39 @@ mod tests {
         for (a, b) in dataset[0].target.iter().zip(sample.iter()) {
             assert!((a - b).abs() < 1e-6, "value mismatch: {a} vs {b}");
         }
+    }
+
+    /// Finding #4 — legacy BATRAW1 payloads are stored in [0, 1] and must be
+    /// rescaled to the [-1, 1] convention the diffusion pipeline expects.
+    #[test]
+    fn raw_dataset_legacy_unit_payload_is_rescaled_to_signed_range() {
+        let out = tmp_path("legacy.batraw");
+        let stored = vec![0.0_f32, 0.25, 0.5, 1.0];
+        let expected = [-1.0_f32, -0.5, 0.0, 1.0];
+        write_batraw_with_magic(&out, RAW_DATASET_MAGIC_UNIT, 1, 2, 2, 1, &[stored]);
+
+        let dataset = try_load_raw_dataset(&out, (2, 2, 1))
+            .expect("load should succeed")
+            .expect("should detect .batraw file");
+
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(dataset.len(), 1);
+        for (got, want) in dataset[0].target.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-6, "value mismatch: {got} vs {want}");
+        }
+    }
+
+    /// Finding #4 — the encode/decode pair must be symmetric, so a sample that
+    /// round-trips through an image file comes back unchanged.
+    #[test]
+    fn u8_encoding_round_trips_through_signed_range() {
+        for byte in 0..=255u8 {
+            assert_eq!(to_u8(from_u8(byte)), byte, "round trip failed for {byte}");
+        }
+        assert!((from_u8(0)).abs() - 1.0 < 1e-6);
+        assert!((from_u8(255) - 1.0).abs() < 1e-6);
+        // Mid-grey must land near zero — that is the whole point of the change.
+        assert!(from_u8(128).abs() < 0.01);
     }
 
     #[test]
