@@ -618,3 +618,158 @@ fn input_gradients_match_finite_differences() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// Isolated-layer benchmark
+// ---------------------------------------------------------------------------
+
+/// Times the group_norm kernels on their own, old against new, in the same
+/// process and on the same buffers. Ignored by default (it is a measurement,
+/// not an assertion):
+///
+///   cargo test --release -p bat_building --lib bench_group_norm_isolated \
+///       -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_group_norm_isolated() {
+    use std::time::Instant;
+
+    /// Encode `iters` back-to-back dispatches, submit, and block until the GPU
+    /// has drained. Returns the wall time for the whole batch.
+    fn time_dispatches(
+        gpu: &GpuContext,
+        passes: &[(&wgpu::ComputePipeline, u32)],
+        bind_group: &wgpu::BindGroup,
+        iters: u32,
+    ) -> std::time::Duration {
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        for _ in 0..iters {
+            for (pipeline, workgroups) in passes {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(*workgroups, 1, 1);
+            }
+        }
+        let start = Instant::now();
+        gpu.queue.submit([encoder.finish()]);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll failed");
+        start.elapsed()
+    }
+
+    fn legacy_pipeline(
+        gpu: &GpuContext,
+        source: &str,
+        entry_point: &str,
+        bgl: &wgpu::BindGroupLayout,
+    ) -> wgpu::ComputePipeline {
+        let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("legacy_bench"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+        });
+        let pl = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("legacy_bench_pl"),
+                bind_group_layouts: &[bgl],
+                immediate_size: 0,
+            });
+        gpu.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("legacy_bench_pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(entry_point),
+                compilation_options: Default::default(),
+                cache: Default::default(),
+            })
+    }
+
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        // The three GroupNorm layers of Greyscale_Diffusion.
+        let layers = [((32, 32, 16), 4u32), ((16, 16, 32), 8), ((32, 32, 32), 8)];
+        let iters = 200u32;
+
+        println!(
+            "\n{:<16} {:>10} {:>12} {:>12} {:>9}",
+            "layer", "pass", "naive (ms)", "new (ms)", "speedup"
+        );
+        let mut total_old = 0.0f64;
+        let mut total_new = 0.0f64;
+
+        for (dims, num_groups) in layers {
+            let dim = Dim3::new(dims);
+            let (model, _, _) = trained_group_norm(gpu.clone(), dim, num_groups).await;
+            let layer = model.layers.first().unwrap();
+
+            // --- forward
+            let fwd_pipeline = layer.pipeline.forward.as_ref().unwrap();
+            let fwd_bgl = fwd_pipeline.get_bind_group_layout(0);
+            let fwd_bg = layer.bind_group.forward.as_ref().unwrap();
+            let fwd_legacy = legacy_pipeline(gpu.as_ref(), LEGACY_FORWARD, "group_norm", &fwd_bgl);
+
+            let new_fwd = [(fwd_pipeline, num_groups)];
+            let old_fwd = [(&fwd_legacy, dim.length().div_ceil(64))];
+            time_dispatches(gpu.as_ref(), &new_fwd, fwd_bg, 4); // warm-up
+            time_dispatches(gpu.as_ref(), &old_fwd, fwd_bg, 4);
+            let new_fwd_t = time_dispatches(gpu.as_ref(), &new_fwd, fwd_bg, iters);
+            let old_fwd_t = time_dispatches(gpu.as_ref(), &old_fwd, fwd_bg, iters);
+
+            // --- backward (the full sequence each implementation needs)
+            let back_bgl = layer.pipeline.backward[0].0.get_bind_group_layout(0);
+            let back_bg = layer.bind_group.backward.as_ref().unwrap();
+            let new_back: Vec<(&wgpu::ComputePipeline, u32)> = layer
+                .pipeline
+                .backward
+                .iter()
+                .map(|(p, wg)| (p, *wg))
+                .collect();
+            let legacy_back: Vec<wgpu::ComputePipeline> = [
+                "group_norm_back_input",
+                "group_norm_back_gamma",
+                "group_norm_back_beta",
+            ]
+            .iter()
+            .map(|ep| legacy_pipeline(gpu.as_ref(), LEGACY_BACKWARD, ep, &back_bgl))
+            .collect();
+            let old_back: Vec<(&wgpu::ComputePipeline, u32)> = vec![
+                (&legacy_back[0], dim.length().div_ceil(64)),
+                (&legacy_back[1], dim.z.div_ceil(64)),
+                (&legacy_back[2], dim.z.div_ceil(64)),
+            ];
+
+            time_dispatches(gpu.as_ref(), &new_back, back_bg, 4); // warm-up
+            time_dispatches(gpu.as_ref(), &old_back, back_bg, 4);
+            let new_back_t = time_dispatches(gpu.as_ref(), &new_back, back_bg, iters);
+            let old_back_t = time_dispatches(gpu.as_ref(), &old_back, back_bg, iters);
+
+            let label = format!("{}x{}x{}/{}", dims.0, dims.1, dims.2, num_groups);
+            for (name, old, new) in [
+                ("forward", old_fwd_t, new_fwd_t),
+                ("backward", old_back_t, new_back_t),
+            ] {
+                let old_ms = old.as_secs_f64() * 1e3 / iters as f64;
+                let new_ms = new.as_secs_f64() * 1e3 / iters as f64;
+                total_old += old_ms;
+                total_new += new_ms;
+                println!(
+                    "{:<16} {:>10} {:>12.4} {:>12.4} {:>8.1}x",
+                    label,
+                    name,
+                    old_ms,
+                    new_ms,
+                    old_ms / new_ms
+                );
+            }
+        }
+
+        println!(
+            "\nAll three layers, forward + backward, per sample: \
+             {total_old:.4} ms -> {total_new:.4} ms ({:.1}x)\n",
+            total_old / total_new
+        );
+    });
+}
