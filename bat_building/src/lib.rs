@@ -11,8 +11,8 @@ pub use model::training;
 pub use model::training::{
     BucketStat, DenoiseStepStat, DiffusionTask, GpuDataset, GpuDatasetError, LinearNoiseSchedule,
     MetricsLogger, ProbeConfig, Stats, TaskPassSpec, Trainer, TrainingTask, TrainingTaskError,
-    Workgroups, compose_diffusion_input, log_probe, log_trajectory, probe_diffusion,
-    sample_diffusion,
+    Workgroups, compose_diffusion_input, log_probe, log_train_loss, log_trajectory,
+    probe_diffusion, sample_diffusion,
 };
 pub use model::{
     ActivationMethod, ActivationType, ConcatType, ConvolutionType, Dim3, FullyConnectedType,

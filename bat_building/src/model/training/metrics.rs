@@ -275,6 +275,23 @@ pub fn log_probe(logger: &mut MetricsLogger, step: usize, buckets: &[BucketStat]
     }));
 }
 
+/// Emits one `train_loss` record (the batch loss reported by the GPU step).
+pub fn log_train_loss(
+    logger: &mut MetricsLogger,
+    step: usize,
+    loss: f32,
+    lr: f32,
+    batch_size: u32,
+) {
+    logger.write(&serde_json::json!({
+        "kind": "train_loss",
+        "step": step,
+        "loss": loss,
+        "lr": lr,
+        "batch_size": batch_size,
+    }));
+}
+
 /// Latent (and ε̂) statistics captured at one denoising step of a sampling run.
 #[derive(Debug, Clone, Copy)]
 pub struct DenoiseStepStat {
