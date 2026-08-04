@@ -3,7 +3,7 @@
   "input_size": [
     32,
     32,
-    1
+    3
   ],
   "layers": [
     {
@@ -11,13 +11,13 @@
         "dim_input": [
           32,
           32,
-          1
+          3
         ],
         "nb_kernel": 16,
         "dim_kernel": [
           3,
           3,
-          1
+          3
         ],
         "stride": 1,
         "padding": "Same",

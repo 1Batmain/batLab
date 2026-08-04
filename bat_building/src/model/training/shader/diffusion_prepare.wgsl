@@ -13,6 +13,7 @@ struct DiffusionPrepareSpec {
     signal_channels:   u32,
     timestep_channels: u32,
     pixel_count:       u32,
+    total_steps:       u32,
 }
 
 fn hash_u32(value_in: u32) -> u32 {
@@ -38,16 +39,19 @@ fn gaussian_from_seed(seed: u32) -> f32 {
     return sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
 }
 
+// Smooth multi-resolution timestep embedding. MUST stay byte-for-byte identical
+// to `LinearNoiseSchedule::timestep_embedding` (schedule.rs): the network is
+// trained with this GPU-side embedding and sampled with the CPU one, so any
+// divergence conditions it on a signal it was never trained on.
 fn timestep_value(offset: u32) -> f32 {
     if specs.timestep_channels == 0u {
         return 0.0;
     }
-    let half = (specs.timestep_channels + 1u) / 2u;
+    let steps = max(specs.total_steps, 1u);
+    let denom = f32(max(steps - 1u, 1u));
+    let tau = f32(min(specs.step, steps - 1u)) / denom;
     let pair_idx = offset / 2u;
-    let denom = max(half, 2u) - 1u;
-    let exponent = f32(pair_idx) / f32(denom);
-    let frequency = 1.0 / pow(10000.0, exponent);
-    let phase = f32(specs.step) * frequency;
+    let phase = tau * 3.14159265358979 * pow(2.0, f32(pair_idx));
     if (offset & 1u) == 0u {
         return sin(phase);
     }
