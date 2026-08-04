@@ -528,14 +528,29 @@ fn forward_matches_naive_implementation() {
             );
             let naive = read_layer_buffer(gpu.as_ref(), layer.buffers.forward[4].as_ref());
 
-            let worst = worst_relative_diff(&optimised, &naive);
-            assert!(
-                worst < 1e-5,
-                "\n{} forward disagrees with the naive implementation.\n\
-                 worst relative difference: {worst:e}\n\
+            // The forward optimisation only hoists integer address arithmetic
+            // out of the loops: every tap is visited in the same order, from
+            // the same bias, so the agreement must be EXACT, not merely within
+            // a tolerance. Asserting bitwise equality is what makes this test
+            // able to catch a reordering — a 1e-5 threshold would not.
+            let differing = optimised
+                .iter()
+                .zip(&naive)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing,
+                0,
+                "\n{} forward is not bit-identical to the naive implementation \
+                 ({differing}/{} elements differ).\n\
+                 The optimisation only reassociates *integer* index arithmetic, \
+                 so any float difference means the tap order changed.\n\
+                 worst relative difference: {:e}\n\
                  optimised[..8]: {:?}\n\
                  naive[..8]:     {:?}\n",
                 shape.label,
+                optimised.len(),
+                worst_relative_diff(&optimised, &naive),
                 &optimised[..optimised.len().min(8)],
                 &naive[..naive.len().min(8)],
             );
