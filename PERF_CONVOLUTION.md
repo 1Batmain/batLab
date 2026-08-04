@@ -4,19 +4,28 @@ Branche `perf-convolution`. Fait suite à `PERF_GROUP_NORM.md`, qui avait
 déplacé le goulot du pas d'entraînement de `group_norm` vers la convolution.
 
 **Résumé** : les quatre convolutions de `Greyscale_Diffusion` passent de
-**2,57 ms à 0,69 ms par échantillon** (couches isolées, forward + backward,
-mesure appariée) — **3,7×**. Les maths sont inchangées : sur 600 pas
-d'entraînement réel, la trajectoire de loss est identique à toutes les
-décimales affichées, l'écart relatif max sur `train_loss` est de **5,6e-7** et
-l'écart absolu max sur les 821 enregistrements JSONL de **2,1e-6**.
+**2,30 ms à 0,62 ms par échantillon** (couches isolées, forward + backward,
+mesure appariée, minimum sur 36 rondes) — **3,7×**. Les maths sont inchangées :
+sur 600 pas d'entraînement réel, la trajectoire de loss est identique à toutes
+les décimales affichées, l'écart relatif max sur `train_loss` est de **5,6e-7**
+et l'écart absolu max sur les 821 enregistrements JSONL de **2,1e-6**.
 
-Deux résultats méritent d'être lus avant le reste :
+**Mais le pas d'entraînement complet, lui, ne bouge pas** — la seule mesure
+bout-en-bout exploitable dont on dispose le donne même **~1 % plus lent**
+(§5.3). C'est le résultat le plus important du rapport, et il est **inexpliqué**.
+Le §5.4 pose l'hypothèse, dit franchement pourquoi elle n'est pas démontrée, et
+donne le test qui trancherait. Contrairement à `group_norm`, où le banc isolé
+était un *minorant* du gain réel, la convolution ne transmet pas son gain au pas.
+
+Trois autres résultats méritent d'être lus avant le reste :
 
 - Le coût était à **90 % dans le backward**, pas dans le forward. C'est le
   profilage qui l'a établi, contre l'intuition de départ.
 - L'approche attendue par la mission — **tuiles / réutilisation par thread** —
   a été implémentée, mesurée, et **rejetée** : elle est plus lente sur les
   quatre couches. Le §3.3 explique pourquoi, chiffres à l'appui.
+- Un **retuning** du nombre de lanes, motivé par le résultat bout-en-bout, a été
+  écrit puis **retiré faute de mesure reproductible** (§5.4).
 
 ---
 
@@ -302,11 +311,152 @@ Protocole retenu :
 
 ### 5.2 Couches isolées
 
-TABLE_ISOLATED
+Quatre balayages complets de `bench_convolution_isolated` (9 rondes chacun,
+200 dispatches par point), tous sur la configuration livrée. Le tableau donne le
+**minimum par cellule sur les 36 rondes** : la contention ne pouvant qu'ajouter
+du temps, c'est la meilleure estimation du coût propre de chaque kernel.
+
+| couche | passe | naïf (ms) | nouveau (ms) | speedup |
+|---|---|---:|---:|---:|
+| conv1 32×32×3 → 16, s1 | `forward` | 0,0198 | 0,0281 | 0,70× |
+| conv1 32×32×3 → 16, s1 | `back_input` | 0,0572 | 0,0271 | **2,11×** |
+| conv1 32×32×3 → 16, s1 | `back_weights` | 0,3820 | 0,0313 | **12,20×** |
+| conv1 32×32×3 → 16, s1 | `back_bias` | 0,2460 | 0,0302 | **8,15×** |
+| conv2 32×32×16 → 32, s2 | `forward` | 0,0289 | 0,0289 | 1,00× |
+| conv2 32×32×16 → 32, s2 | `back_input` | 0,4456 | 0,0533 | **8,36×** |
+| conv2 32×32×16 → 32, s2 | `back_weights` | 0,0719 | 0,0604 | 1,19× |
+| conv2 32×32×16 → 32, s2 | `back_bias` | 0,0725 | 0,0218 | **3,33×** |
+| conv3 16×16×32 → 32, s1 | `forward` | 0,0449 | 0,0456 | 0,98× |
+| conv3 16×16×32 → 32, s1 | `back_input` | 0,3510 | 0,0579 | **6,06×** |
+| conv3 16×16×32 → 32, s1 | `back_weights` | 0,0821 | 0,0983 | 0,84× |
+| conv3 16×16×32 → 32, s1 | `back_bias` | 0,0721 | 0,0217 | **3,32×** |
+| conv4 32×32×32 → 1, s1 | `forward` | 0,0362 | 0,0368 | 0,98× |
+| conv4 32×32×32 → 1, s1 | `back_input` | 0,0231 | 0,0292 | 0,79× |
+| conv4 32×32×32 → 1, s1 | `back_weights` | 0,2671 | 0,0235 | **11,37×** |
+| conv4 32×32×32 → 1, s1 | `back_bias` | 0,0973 | 0,0222 | **4,38×** |
+| **total / échantillon** | | **2,2977** | **0,6163** | **3,73×** |
+
+**Comment lire les lignes proches de 1,00×.** Le forward est **bit à bit
+identique** au legacy (§4.1) : il ne change que de l'arithmétique entière
+d'indices. Ses quatre lignes ne mesurent donc **que le bruit de l'instrument**,
+et le fait qu'elles s'étalent de 0,70× à 1,00× donne l'ordre de grandeur de ce
+bruit sur les passes courtes. Le gain réel du forward, mesuré au moment du
+commit `b5465b7` par un banc dédié moins bruité, va de 1,00× à 1,23× selon la
+couche. Même lecture pour `conv3 back_weights` (0,84×) et `conv4 back_input`
+(0,79×) : sous le bruit, et cohérent avec les contreparties déjà assumées aux
+§2.3 et §2.2.
+
+Ce qui **est** au-dessus du bruit, d'un facteur 3 à 12, ce sont exactement les
+trois passes que la mission visait : `back_weights`, `back_bias` et le
+`back_input` de conv2/conv3.
+
+Totaux des quatre balayages pris séparément : **3,88× / 3,72× / 3,57× / 3,36×**.
+Le côté « nouveau » est très stable (0,6909 à 0,7011 ms, ±0,7 %) ; c'est le côté
+naïf qui bouge (2,36 à 2,71 ms, ±7 %), ses kernels étant assez longs pour
+absorber les rafales du voisin. Fourchette honnête : **3,4× à 3,9×**.
 
 ### 5.3 Pas d'entraînement complet
 
-TABLE_ENDTOEND
+`Greyscale_Diffusion`, batch 16, `--headless-train`, 100 pas, binaires release.
+Huit exécutions **entrelacées ABBA dans une même fenêtre calme**, plus un
+**contrôle nul** : la même paire rejouée avec **deux copies du même binaire**,
+pour établir le plancher de bruit de l'instrument.
+
+| série | ancien (s) | nouveau (s) | écart |
+|---|---:|---:|---:|
+| moyenne des 4 | 54,86 | 55,48 | **+1,13 %** |
+| minimum des 4 | 54,56 | 55,37 | **+1,48 %** |
+| **contrôle nul** (binaire identique) | 54,49 | 54,44 | −0,09 % |
+
+Soit **549 → 555 ms/pas**. Le démarrage est négligeable : la pente entre 100 et
+300 pas donne 634–652 ms/pas là où 100 pas coûtent 62,5 s — moins d'une seconde
+de mise en route, identique des deux côtés.
+
+Le contrôle nul à 0,09 % dit que l'instrument résout **bien mieux** que l'effet
+mesuré, et les étendues des deux bras ne se recouvrent pas (54,56–55,06 contre
+55,37–55,57). **La conclusion est donc que l'ensemble des optimisations de la
+convolution ne fait gagner aucun temps sur le pas d'entraînement, et lui en
+coûte peut-être ~1 %.**
+
+Deux réserves, à charge :
+
+- c'est **une seule fenêtre de mesure**, celle de la session précédente ;
+- ma tentative de la reproduire a **échoué faute de machine disponible**, et a
+  même donné l'écart de **signe opposé** (−0,72 %) sur la seule paire de rondes
+  dont le contrôle nul était acceptable (0,53 %). Voir §5.5.
+
+Une troisième série, `lanes = 1` (réduction neutralisée, cf. §5.4) contre
+l'ancien, donne −1,06 % au minimum et −2,09 % en moyenne — mais sa fenêtre
+dérivait de 54,9 à 60,6 s en cours de série : **indicative, pas concluante**.
+
+### 5.4 Pourquoi le gain isolé ne se transmet pas — hypothèse, et ce qui manque
+
+Le banc isolé économise 2,30 − 0,62 = **1,68 ms/échantillon**, soit **27 ms** sur
+un pas de batch 16. Le pas en coûte ~550 : on devrait voir **−5 %**. On mesure
+**+1 %**. Il manque donc un facteur — et le précédent de `group_norm` interdit de
+l'attribuer à la prudence du banc, puisque là-bas le banc isolé était un
+*minorant* du gain réel (§4.3 de `PERF_GROUP_NORM.md`).
+
+Ce qui est **établi** :
+
+- **Le nombre de dispatches ne change pas.** Les lanes ne changent que le nombre
+  de workgroups *par* dispatch. Pour `grad_weights`, sur les quatre couches et
+  par échantillon : **228** workgroups à `lanes = 1`, **2664** avec la règle
+  livrée. Le surcoût éventuel n'est donc **pas** un surcoût de lancement.
+- Le graphe d'un échantillon est une **chaîne sérielle de dispatches minuscules
+  séparés par des barrières** : `diffusion.rs:250-277` crée un `CommandEncoder`
+  par échantillon, y encode tout le graphe et le **soumet** — **18 `submit` par
+  pas** à batch 16. Après optimisation, une passe conv coûte 0,02 à 0,10 ms.
+
+L'**hypothèse** : les kernels optimisés sont descendus au niveau du **coût fixe
+d'une passe de calcul**, et le banc isolé le masque parce qu'il enchaîne 200
+copies de la *même* passe dans un seul encoder — ce qui les laisse se recouvrir —
+alors que le vrai graphe le paie une fois par dispatch, entre deux barrières.
+
+Ce qui **manque pour la démontrer** : une mesure fiable de ce coût fixe.
+`profile_convolution` l'estime déjà (« per-compute-pass floor »), mais **en un
+seul échantillon non répliqué**. Il est sorti à **0,0854 ms** en fenêtre calme et
+à **0,6235 ms** cette nuit — dans les deux cas **au-dessus de passes qui font
+strictement plus de travail** (0,0217 ms pour `conv3 back_bias`). Un plancher
+supérieur à ce qu'il est censé minorer n'est pas un plancher : la sonde est
+inutilisable en l'état. **L'hypothèse reste une hypothèse.**
+
+#### Le retuning des lanes : implémenté, non livré
+
+Si l'hypothèse est vraie, découper les sommes en 2664 workgroups au lieu de 228
+coûte, dans le vrai graphe, plus que ça ne rapporte. Une règle plus conservatrice
+(`MAX_LANES = 8`, soit 666 workgroups) a donc été écrite et mesurée — mais dans
+une fenêtre où le voisin dérivait de **92 à 140 s** par exécution, ce qui rend
+ses chiffres inexploitables : l'ordre des deux bras **s'inverse** selon qu'on
+prend le minimum ou la moyenne.
+
+Elle **n'est pas livrée**. La règle calibrée en isolé (§2.2) est conservée, pour
+trois raisons : le seul argument contre elle n'est pas reproductible ; le gain
+isolé qu'elle apporte est solide et d'un facteur 12 ; et il redeviendra
+pleinement exploitable dès que le goulot structurel du §7 sera levé. Changer un
+réglage sur une mesure qu'on ne sait pas reproduire serait précisément l'erreur
+que la méthode de ce dépôt cherche à éviter.
+
+### 5.5 La re-mesure : pourquoi elle n'a rien donné
+
+Trois entraînements concurrents d'autres agents (le modèle `L` à 10 000 pas, et
+un comparatif SGD/Adam qui lançait ses propres bancs) occupaient le GPU. Effets
+mesurés, pas supposés :
+
+- le banc apparié isolé donne **0,65× sur `conv2 forward`** — un kernel pourtant
+  **bit à bit identique** au legacy. Un kernel identique ne peut pas être 35 %
+  plus lent : l'instrument ne lisait plus que du bruit ;
+- le total isolé tombe à **1,93×** (contre 3,4–3,9× en fenêtre calme), et même en
+  cumulant 45 rondes de minimum les petits kernels restent 3 à 4 fois au-dessus
+  de leur coût connu (`conv4 forward` : 0,143 ms contre 0,037) ;
+- en bout-en-bout, le **contrôle nul** — deux copies du même binaire — s'est
+  écarté de **4,06 %** sur une paire de rondes, soit quatre fois l'effet
+  recherché ; les deux paires se contredisent en signe.
+
+Décision (architecte) : ne pas re-bencher, conserver les mesures de la fenêtre
+calme — traçables commit par commit — et documenter la contention. Le **test de
+correction du §6 a bien été rejoué**, lui : il est déterministe, donc insensible
+à la contention, seulement plus lent.
 
 ## 6. Validation en conditions réelles
 
@@ -316,6 +466,13 @@ poids est un xorshift à graine fixe et les tirages de timestep/bruit dérivent
 du compteur de pas : les deux runs sont donc rigoureusement comparables. La
 loss finale du run ancien (0,074075) reproduit d'ailleurs à l'identique celle
 de `PERF_GROUP_NORM.md`.
+
+Cette section est la seule du rapport à avoir été **entièrement rejouée dans la
+session suivante**, sur des binaires reconstruits des deux côtés : le test est
+déterministe, donc la contention du GPU ne l'affecte pas (elle le ralentit
+seulement). Les deux exécutions indépendantes donnent **exactement les mêmes
+chiffres**, jusqu'au dernier de ceux cités ci-dessous — ce qui vérifie du même
+coup que la configuration livrée est bien celle qui a été validée.
 
 ### Trajectoire de loss — identique à toutes les décimales affichées
 
@@ -361,7 +518,55 @@ Sur les 821 enregistrements JSONL (`train_loss`, `train_probe`, `sample`,
 
 ## 7. Ce qui reste
 
-CEQUIRESTE
+### Le goulot est structurel : un encoder et un `submit` par échantillon
+
+C'est la découverte la plus utile de la mission, et elle déborde largement la
+convolution. `diffusion.rs:250-277` déroule le batch **côté CPU** : pour chaque
+échantillon un `CommandEncoder` est créé, tout le graphe (forward, loss,
+backward) y est encodé, et il est **soumis**. À batch 16 cela fait **18 `submit`
+par pas** et, surtout, chaque convolution ne travaille jamais que sur **un seul
+petit tenseur** — le forward de `conv4` a 1024 éléments de sortie, soit **16
+workgroups**.
+
+Trois faits déjà constatés dans ce rapport en découlent :
+
+- le **register-blocking du forward est plus lent** (§3), parce que diviser le
+  nombre de threads par 4 affame un GPU qui n'en avait déjà pas assez ;
+- les réductions `grad_weights` / `grad_bias` n'avaient à l'origine que **5 à
+  144 workgroups** à faire tourner (§1) — d'où leurs 55 % du coût ;
+- et le gain isolé ne se transmet pas au pas complet (§5.4).
+
+**Porter la dimension batch dans le dispatch** — un seul encoder par pas, les 16
+échantillons portés par une dimension du workgroup — attaquerait les trois d'un
+coup : les kernels deviendraient assez gros pour être limités par le *débit* et
+non par le parallélisme, le coût fixe par passe serait amorti sur 16 fois plus de
+travail, et le blocking comme les découpages en lanes agressifs redeviendraient
+rentables. C'est de loin le plus gros gain restant. Hors périmètre de cette
+mission, et à traiter **avant** de continuer à affiner des kernels.
+
+### Avant cela : rendre la sonde de coût fixe utilisable
+
+Une ligne à changer dans `profile_convolution` — minimum sur N rondes au lieu
+d'un échantillon unique, l'estimateur déjà utilisé partout ailleurs (§5.1). Sans
+elle, le §5.4 reste une hypothèse, et on ne sait pas si les kernels actuels sont
+encore optimisables ou déjà collés au plancher.
+
+### Refaire la mesure bout-en-bout sur une machine libre
+
+Le §5.3 repose sur une fenêtre unique et le §5.4 sur une hypothèse non
+démontrée : la question « les optimisations de la convolution font-elles gagner
+ou perdre ~1 % au pas ? » est **ouverte**. Elle se tranche en une demi-heure sur
+un GPU sans co-locataire, avec le protocole du §5.1 et les quatre bras déjà
+outillés (`base` / lanes livrées / `MAX_LANES = 8` / `lanes = 1`).
+
+### Ce qui reste dans la convolution elle-même
+
+La passe la plus chère après optimisation est `conv3 back_weights` (0,0983 ms,
+1,12× seulement) : 9216 sommes de 256 positions, un cas où le découpage en lanes
+n'apporte presque rien parce que le parallélisme était déjà là. Toutes les autres
+sont entre 0,022 et 0,060 ms, c'est-à-dire dans la zone où le coût fixe par passe
+domine probablement. Les optimiser davantage avant d'avoir levé le goulot
+structurel serait prématuré.
 
 ---
 
