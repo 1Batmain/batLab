@@ -443,64 +443,60 @@ fn worst_relative_to_reference(got: &[f32], reference: &[f64]) -> f64 {
 // The lane rule is duplicated in Rust and WGSL — pin them together
 // ---------------------------------------------------------------------------
 
-/// `back_convolution.wgsl` derives its reduction split from the shape instead
-/// of from a uniform field, so the Rust dispatch and the shader each hold a
-/// copy of the rule. If they ever disagree the dispatch under- or over-covers
-/// the weight buffer, which this catches directly: every weight and every bias
-/// must be reachable by exactly one slot.
+/// The lane count the shader reads out of the uniform and the slot count the
+/// Rust side sizes the dispatch with are two views of one decision. If they
+/// drift, the dispatch silently under-covers the weight buffer and some
+/// gradients are never written — a bug no shape-independent assertion would
+/// notice. This checks them against each other on every shape, and pins the
+/// uniform word to the offset the legacy fixtures expect to be padding.
 #[test]
-fn conv_reduction_lanes_matches_shader() {
-    // Reimplementation of the WGSL `reduction_lanes`, transcribed from the
-    // shader source rather than from the Rust helper it is checking.
-    fn wgsl_reduction_lanes(positions: u32) -> u32 {
-        let mut lanes = 1u32;
-        loop {
-            if lanes >= 64 {
-                break;
-            }
-            if positions / (lanes * 2) < 16 {
-                break;
-            }
-            lanes *= 2;
-        }
-        lanes
-    }
-
+fn conv_reduction_lanes_agrees_with_dispatch() {
     for shape in SHAPES {
         let mut ty = shape.conv_type();
         ty.set_dim_output().unwrap();
-        let dim_out = shape.dim_output();
-        let positions = dim_out.x * dim_out.y;
 
-        let expected = wgsl_reduction_lanes(positions);
-        let got = ConvolutionType::reduction_lanes(positions);
-        assert_eq!(
-            got, expected,
-            "\n{}: Rust reduction_lanes({positions}) = {got}, shader says {expected}\n",
+        // Word 3 of the uniform is the lane count (bytes 12..16).
+        let bytes = ty.get_spec_uniform_bytes();
+        let lanes = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+
+        assert!(
+            lanes.is_power_of_two() && (1..=64).contains(&lanes),
+            "\n{}: lanes = {lanes}, must be a power of two in 1..=64 \
+             (the tree reduction halves it down to 1)\n",
             shape.label
         );
-        assert!(got.is_power_of_two() && got <= 64, "{}: lanes = {got}", shape.label);
 
-        // The dispatch must cover every weight and every bias exactly once.
-        let slots = 64 / got;
+        let dim_out = shape.dim_output();
+        let positions = dim_out.x * dim_out.y;
+        assert!(
+            lanes == 1 || positions / lanes >= 16,
+            "\n{}: {lanes} lanes over {positions} positions leaves \
+             {} per lane — the reduction would cost more than the sum\n",
+            shape.label,
+            positions / lanes
+        );
+
+        // Every weight and every bias must be covered by the dispatch.
+        let slots = 64 / lanes;
         let counts = ty.get_back_workgroup_counts();
         let weight_len = shape.weight_len() as u32;
         assert_eq!(
             counts[1],
             weight_len.div_ceil(slots),
-            "\n{}: grad_weights dispatch covers {} slots for {weight_len} weights\n",
+            "\n{}: grad_weights dispatch is {} workgroups x {slots} slots for \
+             {weight_len} weights\n",
             shape.label,
-            counts[1] * slots
+            counts[1]
         );
         assert!(
             counts[1] * slots >= weight_len,
-            "\n{}: grad_weights dispatch would leave {} weights unwritten\n",
+            "\n{}: grad_weights dispatch leaves {} weights unwritten\n",
             shape.label,
             weight_len - counts[1] * slots
         );
         assert!(
             counts[2] * slots >= shape.nb_kernel,
-            "\n{}: grad_bias dispatch would leave biases unwritten\n",
+            "\n{}: grad_bias dispatch leaves biases unwritten\n",
             shape.label
         );
     }
@@ -817,28 +813,37 @@ fn profile_convolution() {
 ///   cargo test --release -p bat_building --lib bench_convolution_isolated \
 ///       -- --ignored --nocapture
 ///
-/// The GPU is shared with other work, so absolute timings taken at different
-/// moments are not comparable. Every pass is therefore measured as
-/// old/new/old/new/... within one run and reported by its **median** round,
-/// which is robust to a neighbour's burst landing in the middle of the sweep.
-/// The spread between rounds is printed so contention is visible rather than
-/// hidden.
+/// The GPU is shared with other work (a second agent trains a larger model on
+/// it), so absolute timings taken at different moments are not comparable.
+/// Every pass is therefore measured old/new/old/new/... within one run, and
+/// reported by the **minimum** round of each side.
+///
+/// The minimum, not the median: contention can only ever *add* time, so the
+/// fastest round is the closest estimate of what the kernel costs on its own,
+/// and taking it on both sides keeps the comparison fair. A median is not
+/// robust enough here — a neighbour's burst routinely outlasts a whole round,
+/// and it distorts the two sides unequally, because the optimised kernels are
+/// small enough (~0.03 ms) for one burst to triple them while the naive ones
+/// (~0.35 ms) barely move. The full min-max spread is printed for both sides
+/// so that distortion stays visible instead of being averaged away.
 #[test]
 #[ignore]
 fn bench_convolution_isolated() {
-    fn median(mut v: Vec<f64>) -> f64 {
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
+    fn stats(v: &[f64]) -> (f64, f64) {
+        (
+            v.iter().cloned().fold(f64::INFINITY, f64::min),
+            v.iter().cloned().fold(0.0f64, f64::max),
+        )
     }
 
     pollster::block_on(async {
         let gpu = Arc::new(GpuContext::new_headless().await);
         let iters = 200u32;
-        let rounds = 7;
+        let rounds = 9;
 
         println!(
-            "\n{:<24} {:>11} {:>11} {:>11} {:>9} {:>12}",
-            "layer", "pass", "naive (ms)", "new (ms)", "speedup", "new spread"
+            "\n{:<24} {:>12} {:>10} {:>10} {:>8}   {:<17} {:<17}",
+            "layer", "pass", "naive", "new", "speedup", "naive spread", "new spread"
         );
 
         let mut total_old = 0.0f64;
@@ -903,15 +908,19 @@ fn bench_convolution_isolated() {
                     olds.push(ms(time_dispatches(gpu.as_ref(), &[old], bg, iters)));
                     news.push(ms(time_dispatches(gpu.as_ref(), &[new], bg, iters)));
                 }
-                let new_lo = news.iter().cloned().fold(f64::INFINITY, f64::min);
-                let new_hi = news.iter().cloned().fold(0.0f64, f64::max);
-                let old_ms = median(olds);
-                let new_ms = median(news);
+                let (old_ms, old_hi) = stats(&olds);
+                let (new_ms, new_hi) = stats(&news);
                 total_old += old_ms;
                 total_new += new_ms;
                 println!(
-                    "{:<24} {:>11} {:>11.4} {:>11.4} {:>8.2}x  {:>5.4}-{:.4}",
-                    shape.label, name, old_ms, new_ms, old_ms / new_ms, new_lo, new_hi
+                    "{:<24} {:>12} {:>10.4} {:>10.4} {:>7.2}x   {:<17} {:<17}",
+                    shape.label,
+                    name,
+                    old_ms,
+                    new_ms,
+                    old_ms / new_ms,
+                    format!("{old_ms:.4}-{old_hi:.4}"),
+                    format!("{new_ms:.4}-{new_hi:.4}"),
                 );
             }
         }
@@ -921,6 +930,81 @@ fn bench_convolution_isolated() {
              {total_old:.4} ms -> {total_new:.4} ms ({:.2}x)\n",
             total_old / total_new
         );
+    });
+}
+
+/// Sweeps the `grad_weights` reduction split over every legal lane count, per
+/// layer, so `ConvolutionType::reduction_lanes` is calibrated on measurement
+/// rather than on intuition:
+///
+///   cargo test --release -p bat_building --lib bench_conv_reduction_lanes \
+///       -- --ignored --nocapture
+///
+/// The lane count lives in the uniform, so a sweep only has to rewrite that one
+/// word and re-dispatch with the matching workgroup count — the layer, its
+/// buffers and its pipeline are untouched between points, which is what makes
+/// the comparison apples-to-apples. `*` marks the value the shipped rule picks.
+#[test]
+#[ignore]
+fn bench_conv_reduction_lanes() {
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        let iters = 200u32;
+        let rounds = 7;
+
+        for shape in SHAPES.iter().take(4) {
+            let (model, _, _) = trained_conv(gpu.clone(), shape).await;
+            let layer = model.layers.first().unwrap();
+            let back_bg = layer.bind_group.backward.as_ref().unwrap();
+            let pipeline = &layer.pipeline.backward[1].0;
+            let specs = layer.buffers.forward[3].as_ref();
+
+            let dim_out = shape.dim_output();
+            let positions = dim_out.x * dim_out.y;
+            let weight_len = shape.weight_len() as u32;
+            let chosen = ConvolutionType::reduction_lanes(weight_len, positions);
+
+            let mut base = shape.conv_type();
+            base.set_dim_output().unwrap();
+            let uniform = base.get_spec_uniform_bytes();
+
+            println!(
+                "\n{}  ({weight_len} weights, {positions} positions)",
+                shape.label
+            );
+            for lanes in [1u32, 2, 4, 8, 16, 32, 64] {
+                if lanes > 1 && positions / lanes < 16 {
+                    continue;
+                }
+                let mut bytes = uniform.clone();
+                bytes[12..16].copy_from_slice(&lanes.to_le_bytes());
+                gpu.queue.write_buffer(specs, 0, &bytes);
+
+                let slots = 64 / lanes;
+                let wg = weight_len.div_ceil(slots);
+                let case = [(pipeline, wg)];
+
+                for _ in 0..2 {
+                    time_dispatches(gpu.as_ref(), &case, back_bg, 32);
+                }
+                let mut times = Vec::new();
+                for _ in 0..rounds {
+                    times.push(
+                        time_dispatches(gpu.as_ref(), &case, back_bg, iters).as_secs_f64() * 1e3
+                            / iters as f64,
+                    );
+                }
+                let lo = times.iter().cloned().fold(f64::INFINITY, f64::min);
+                let hi = times.iter().cloned().fold(0.0f64, f64::max);
+                println!(
+                    "  lanes {lanes:>3} ({wg:>5} wg) : {lo:.4} ms   (spread {lo:.4}-{hi:.4}){}",
+                    if lanes == chosen { "  *" } else { "" }
+                );
+            }
+            // Leave the uniform as the model built it.
+            gpu.queue.write_buffer(specs, 0, &uniform);
+        }
+        println!();
     });
 }
 
