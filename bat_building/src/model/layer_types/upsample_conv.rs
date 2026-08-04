@@ -144,6 +144,12 @@ impl LayerType for UpsampleConvType {
         })
     }
 
+    fn get_weight_fan_in(&self) -> Option<u32> {
+        // The upsample is a nearest-neighbour expansion followed by the same
+        // kh·kw·c_in accumulation as a plain convolution.
+        Some((self.dim_kernel.x * self.dim_kernel.y * self.dim_kernel.z).max(1))
+    }
+
     fn get_back_entrypoints(&self) -> Vec<&'static str> {
         vec![
             "upsample_conv_back_input",

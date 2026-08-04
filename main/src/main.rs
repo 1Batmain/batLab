@@ -15,8 +15,8 @@ use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
     FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
     LossMethod as PLoss, MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, ProbeConfig,
-    Stats, Trainer, UpsampleConvType, log_probe, log_train_loss, log_trajectory, model::Training,
-    probe_diffusion, sample_diffusion,
+    Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
+    model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -132,6 +132,11 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("invalid value for --optimizer: {value} (want sgd|adam)"))?,
         None => OptimizerKind::default(),
     };
+    let weight_init = match flag("--weight-init") {
+        Some(value) => WeightInit::parse(&value)
+            .ok_or_else(|| format!("invalid value for --weight-init: {value} (want uniform|he)"))?,
+        None => WeightInit::default(),
+    };
 
     let config_path = tui::storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
@@ -161,13 +166,15 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         // so any pre-existing checkpoint is meaningless. Always start fresh.
         load_checkpoint: false,
         optimizer,
+        weight_init,
     };
     config.run.mode = RunMode::Train(train_cfg.clone());
 
     println!(
         "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
-         optimizer={}, dataset={}",
+         optimizer={}, init={}, dataset={}",
         optimizer.label(),
+        weight_init.label(),
         train_cfg.dataset_path
     );
 
@@ -261,6 +268,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             INFERENCE_RUNTIME_LR,
             INFERENCE_RUNTIME_BATCH_SIZE,
             OptimizerKind::default(),
+            WeightInit::default(),
         )
         .await?;
         model
@@ -397,6 +405,7 @@ async fn build_execution_model(
     lr: f32,
     batch_size: u32,
     optimizer: OptimizerKind,
+    weight_init: WeightInit,
 ) -> Result<(Arc<GpuContext>, Model<Training>), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
     let mut model = Model::new_training_with_optimizer(
@@ -407,6 +416,7 @@ async fn build_execution_model(
         optimizer,
     )
     .await;
+    model.set_weight_init(weight_init);
     for draft in &config.layers {
         append_layer(&mut model, draft).map_err(|err| err.to_string())?;
     }
@@ -425,6 +435,7 @@ async fn run_training(
         train_cfg.lr,
         train_cfg.batch_size,
         train_cfg.optimizer,
+        train_cfg.weight_init,
     )
     .await?;
     let checkpoint_path = match train_cfg.checkpoint_path.as_deref() {
@@ -833,6 +844,7 @@ async fn run_inference(
         INFERENCE_RUNTIME_LR,
         INFERENCE_RUNTIME_BATCH_SIZE,
         OptimizerKind::default(),
+        WeightInit::default(),
     )
     .await?;
 

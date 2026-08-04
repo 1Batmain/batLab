@@ -7,6 +7,7 @@ use crate::model::layer::Layer;
 use crate::model::layer_types::{ConcatType, LayerType, LayerTypes, LossMethod, LossType};
 use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
+use crate::model::weight_init::WeightInit;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -68,6 +69,9 @@ pub struct Model<State = Infer> {
     /// Adam's bias correction is a function of `t` alone, so resuming with the
     /// wrong `t` is what makes a naive resume take a huge first step.
     optimizer_step: u64,
+    /// Initialisation scheme for trainable weight buffers. On the model rather
+    /// than on `Training` because `build_forwards` is shared with inference.
+    weight_init: WeightInit,
     pending_loss_readback: Option<PendingLossReadback>,
     last_reported_loss: Option<f32>,
     loss_readback_disabled: bool,
@@ -152,10 +156,17 @@ impl Model<Training> {
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
             optimizer_step: 0,
+            weight_init: WeightInit::default(),
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
         }
+    }
+
+    /// Choose how trainable weights are drawn at build time. Must be set
+    /// before `build()`; the default is the historical uniform draw.
+    pub fn set_weight_init(&mut self, init: WeightInit) {
+        self.weight_init = init;
     }
 
     pub fn optimizer(&self) -> OptimizerKind {
@@ -195,8 +206,13 @@ impl Model<Training> {
         // create_buffers shares last_fwd_output as binding 0 (model_result),
         // allocates binding 1 (target) and binding 2 (grad_output), returns grad_output.
         let empty_saved_outputs = HashMap::new();
-        let loss_grad_out =
-            loss_layer.create_buffers(&self.gpu, Some(last_fwd_output), &empty_saved_outputs)?;
+        let loss_grad_out = loss_layer.create_buffers(
+            &self.gpu,
+            Some(last_fwd_output),
+            &empty_saved_outputs,
+            WeightInit::default(),
+            self.layers.len(),
+        )?;
         loss_layer.set_pipeline(&self.gpu.device);
         loss_layer.set_bind_group(&self.gpu.device);
 
@@ -425,6 +441,7 @@ impl<State> Model<State> {
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
             optimizer_step: 0,
+            weight_init: WeightInit::default(),
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
@@ -790,9 +807,15 @@ impl<State> Model<State> {
     fn build_forwards(&mut self) -> Result<(), ModelError> {
         let mut last_output: Option<Arc<Buffer>> = None;
         let mut saved_output_buffers: HashMap<String, Arc<Buffer>> = HashMap::new();
-        for layer in &mut self.layers {
-            last_output =
-                Some(layer.create_buffers(&self.gpu, last_output, &saved_output_buffers)?);
+        let init = self.weight_init;
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            last_output = Some(layer.create_buffers(
+                &self.gpu,
+                last_output,
+                &saved_output_buffers,
+                init,
+                layer_index,
+            )?);
             layer.set_pipeline(&self.gpu.device);
             layer.set_bind_group(&self.gpu.device);
             if let Some(key) = layer.saved_output_key().map(str::to_string) {

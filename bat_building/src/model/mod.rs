@@ -9,6 +9,7 @@ pub mod model;
 pub mod optimizer;
 pub mod training;
 pub mod types;
+pub mod weight_init;
 
 pub use error::ModelError;
 pub use layer_types::{
@@ -18,6 +19,7 @@ pub use layer_types::{
 pub use model::{Infer, Model, Training};
 pub use optimizer::{AdamHyperparameters, OptimizerKind};
 pub use types::{Dim3, PaddingMode};
+pub use weight_init::WeightInit;
 
 #[cfg(test)]
 mod adam_tests;

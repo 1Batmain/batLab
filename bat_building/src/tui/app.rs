@@ -1,7 +1,7 @@
 //! File purpose: Implements app behavior for the terminal user interface flow.
 
 use super::storage::{self, SavedModelEntry};
-use crate::model::OptimizerKind;
+use crate::model::{OptimizerKind, WeightInit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -706,6 +706,10 @@ pub struct TrainingConfig {
     /// was selectable, which therefore keep SGD.
     #[serde(default)]
     pub optimizer: OptimizerKind,
+    /// Weight-initialisation scheme. Same story as `optimizer`: absent from
+    /// older configs, which therefore keep the uniform draw.
+    #[serde(default)]
+    pub weight_init: WeightInit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2297,6 +2301,7 @@ impl App {
                 checkpoint_path: self.selected_checkpoint_path.clone(),
                 load_checkpoint: self.load_checkpoint_on_start,
                 optimizer: OptimizerKind::default(),
+                weight_init: WeightInit::default(),
             }),
         });
         Ok(())
@@ -2407,7 +2412,7 @@ impl App {
 mod tests {
     use super::{
         App, InferenceConfig, LayerKind, LossMethod, ModelConfig, OptimizerKind, RunConfig,
-        RunMode, Screen, TrainingConfig, TrainingControlCommand,
+        RunMode, Screen, TrainingConfig, TrainingControlCommand, WeightInit,
     };
 
     #[test]
@@ -2579,6 +2584,7 @@ mod tests {
                     checkpoint_path: None,
                     load_checkpoint: false,
                     optimizer: OptimizerKind::default(),
+                    weight_init: WeightInit::default(),
                 }),
             },
         });

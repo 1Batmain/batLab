@@ -132,6 +132,11 @@ impl LayerType for ConvolutionType {
         })
     }
 
+    fn get_weight_fan_in(&self) -> Option<u32> {
+        // One output value sums kh·kw·c_in products.
+        Some((self.dim_kernel.x * self.dim_kernel.y * self.dim_kernel.z).max(1))
+    }
+
     fn get_back_entrypoints(&self) -> Vec<&'static str> {
         // Three separate sub-passes to avoid write races:
         //   1. grad_input  — one thread per input element

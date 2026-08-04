@@ -7,6 +7,7 @@ use crate::model::layer_types::{
 };
 use crate::model::optimizer::{AdamHyperparameters, AdamSpecs, OptimizerKind};
 use crate::model::types::Dim3;
+use crate::model::weight_init::{self, WeightInit};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::{
@@ -163,11 +164,15 @@ impl Layer {
     // Forward pass build
     // -----------------------------------------------------------------------
 
+    /// `layer_index` only seeds the weight PRNG: He draws a distinct stream per
+    /// layer, so two same-shaped layers do not start life identical.
     pub(crate) fn create_buffers(
         &mut self,
         gpu: &GpuContext,
         last_output: Option<Arc<Buffer>>,
         saved_outputs: &HashMap<String, Arc<Buffer>>,
+        init: WeightInit,
+        layer_index: usize,
     ) -> Result<Arc<Buffer>, ModelError> {
         let bindings = self.ty.get_forward_buffer_bindings();
         for binding in bindings.iter() {
@@ -200,7 +205,18 @@ impl Layer {
                 }
                 BufferInit::RandomWeights => {
                     let count = binding.spec.size as usize / 4;
-                    let weights = Self::init_random_weights(count);
+                    let weights = match (init, self.ty.get_weight_fan_in()) {
+                        (WeightInit::He, Some(fan_in)) => weight_init::he_weights(
+                            count,
+                            fan_in,
+                            // Odd multiplier: distinct, well-spread seeds that
+                            // never land on xorshift's absorbing 0.
+                            0x9E37_79B9u32.wrapping_mul(layer_index as u32 + 1) | 1,
+                        ),
+                        // No fan-in to speak of (e.g. GroupNorm's scale
+                        // parameters) — the historical draw stands.
+                        _ => weight_init::uniform_weights(count),
+                    };
                     gpu.queue
                         .write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
                 }
@@ -801,22 +817,5 @@ impl Layer {
         pass.set_pipeline(&merge.pipeline);
         pass.set_bind_group(0, &merge.bind_group, &[]);
         pass.dispatch_workgroups(merge.num_workgroups, 1, 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /// XorShift32 PRNG for deterministic weight initialisation (±0.1 range).
-    fn init_random_weights(count: usize) -> Vec<f32> {
-        let mut state: u32 = 2463534242;
-        (0..count)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state as f32 / u32::MAX as f32) * 0.2 - 0.1
-            })
-            .collect()
     }
 }

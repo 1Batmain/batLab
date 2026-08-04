@@ -17,5 +17,5 @@ pub use model::training::{
 pub use model::{
     ActivationMethod, ActivationType, AdamHyperparameters, ConcatType, ConvolutionType, Dim3,
     FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, ModelError, OptimizerKind,
-    PaddingMode, UpsampleConvType,
+    PaddingMode, UpsampleConvType, WeightInit,
 };
