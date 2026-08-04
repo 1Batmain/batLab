@@ -97,63 +97,150 @@ fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------------------
+// Cooperative reduction layout, shared by passes 2 and 3.
+//
+// Both are sums over the OH*OW output positions, one sum per output element
+// (a weight, resp. a kernel's bias). The naive version gave each sum a single
+// thread, which left conv1's bias pass running 16 threads over 1024 positions.
+//
+// Instead a workgroup of 64 threads is split into `slots` independent sums of
+// `lanes` threads each (lanes * slots == 64). Each lane walks the position
+// axis in strides of `lanes`, then the lanes of a slot are tree-reduced.
+//
+// `lanes` is derived from the shape alone — no new uniform field, so the
+// legacy fixtures keep binding the very same uniform buffer. The Rust side
+// mirrors this exact function to size the dispatch
+// (`ConvolutionType::reduction_lanes`); a `conv_reduction_lanes_matches_shader`
+// test pins the two together.
+const WG_SIZE: u32 = 64u;
+var<workgroup> partial: array<f32, WG_SIZE>;
+
+// Largest power of two <= 64 that still leaves at least 16 positions per lane,
+// so the tree reduction never costs more than the sum it parallelises.
+fn reduction_lanes(positions: u32) -> u32 {
+    var lanes: u32 = 1u;
+    loop {
+        if lanes >= WG_SIZE { break; }
+        if positions / (lanes * 2u) < 16u { break; }
+        lanes = lanes * 2u;
+    }
+    return lanes;
+}
+
+// Tree-reduce `partial` within each slot. `tid == lane * slots + slot`, so the
+// partner of a lane sits `stride * slots` further along. The barriers sit in
+// uniform control flow: `stride` and `slots` are the same for every invocation.
+fn reduce_slot(tid: u32, lane: u32, lanes: u32, slots: u32) {
+    workgroupBarrier();
+    var stride: u32 = lanes / 2u;
+    loop {
+        if stride == 0u { break; }
+        if lane < stride {
+            partial[tid] += partial[tid + stride * slots];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pass 2 — grad_weights
 //   grad_weights[k][ky][kx][kz] += Σ_{oy,ox} grad_output[oy][ox][k] * fwd_input[oy*s+ky][ox*s+kx][kz]
+//
+// One slot per weight element. Consecutive slots are consecutive `kz`, so the
+// threads of a slot-group read consecutive `fwd_input` addresses and share the
+// same `grad_output` value.
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
-fn conv_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn conv_back_weights(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
     let K   = layer_spec.dim_output.z;
     let KH  = layer_spec.dim_kernel.x;
     let KW  = layer_spec.dim_kernel.y;
     let IC  = layer_spec.dim_input.z;
-    if idx >= K * KH * KW * IC { return; }
-
-    let kz = idx % IC;
-    let kx = (idx / IC) % KW;
-    let ky = (idx / (IC * KW)) % KH;
-    let k  = idx / (IC * KW * KH);
+    let total = K * KH * KW * IC;
 
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
     let IH = layer_spec.dim_input.x;
     let IW = layer_spec.dim_input.y;
     let s  = layer_spec.stride;
+    let positions = OH * OW;
+
+    let lanes = reduction_lanes(positions);
+    let slots = WG_SIZE / lanes;
+    let tid   = lid.x;
+    let slot  = tid % slots;
+    let lane  = tid / slots;
+    let idx   = wid.x * slots + slot;
 
     var g: f32 = 0.0;
-    for (var oy: u32 = 0u; oy < OH; oy++) {
-        for (var ox: u32 = 0u; ox < OW; ox++) {
+    if idx < total {
+        let kz = idx % IC;
+        let kx = (idx / IC) % KW;
+        let ky = (idx / (IC * KW)) % KH;
+        let k  = idx / (IC * KW * KH);
+
+        // Same tap geometry and same zero-padding rule as the forward pass.
+        for (var p: u32 = lane; p < positions; p += lanes) {
+            let oy = p / OW;
+            let ox = p % OW;
             let sy = i32(oy * s) + i32(ky) - pad_y();
             let sx = i32(ox * s) + i32(kx) - pad_x();
             if sy < 0 || sy >= i32(IH) || sx < 0 || sx >= i32(IW) {
                 continue; // padded position — contributes zero to the gradient
             }
-            let in_i   = u32(sy) * IW * IC + u32(sx) * IC + kz;
-            let go_i   = oy * OW * K + ox * K + k;
+            let in_i = u32(sy) * IW * IC + u32(sx) * IC + kz;
+            let go_i = oy * OW * K + ox * K + k;
             g += grad_output[go_i] * fwd_input[in_i];
         }
     }
-    grad_weights[idx] += g;
+
+    partial[tid] = g;
+    reduce_slot(tid, lane, lanes, slots);
+    if lane == 0u && idx < total {
+        grad_weights[idx] += partial[slot];
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Pass 3 — grad_bias
 //   grad_bias[k] += Σ_{oy,ox} grad_output[oy][ox][k]
+//
+// One slot per kernel. Consecutive slots are consecutive `k`, which is the
+// fastest-varying axis of `grad_output`.
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
-fn conv_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let k  = gid.x;
+fn conv_back_bias(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
     let K  = layer_spec.dim_output.z;
-    if k >= K { return; }
-
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
+    let positions = OH * OW;
+
+    let lanes = reduction_lanes(positions);
+    let slots = WG_SIZE / lanes;
+    let tid   = lid.x;
+    let slot  = tid % slots;
+    let lane  = tid / slots;
+    let k     = wid.x * slots + slot;
 
     var g: f32 = 0.0;
-    for (var oy: u32 = 0u; oy < OH; oy++) {
-        for (var ox: u32 = 0u; ox < OW; ox++) {
+    if k < K {
+        for (var p: u32 = lane; p < positions; p += lanes) {
+            let oy = p / OW;
+            let ox = p % OW;
             g += grad_output[oy * OW * K + ox * K + k];
         }
     }
-    grad_bias[k] += g;
+
+    partial[tid] = g;
+    reduce_slot(tid, lane, lanes, slots);
+    if lane == 0u && k < K {
+        grad_bias[k] += partial[slot];
+    }
 }

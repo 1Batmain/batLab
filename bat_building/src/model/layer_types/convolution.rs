@@ -51,7 +51,34 @@ impl ConvolutionType {
     fn kernel_bytes(&self) -> u32 {
         self.dim_kernel.bytes_size() * self.nb_kernel
     }
+
+    /// Number of output positions the `grad_weights` / `grad_bias` reductions
+    /// sum over.
+    fn output_positions(&self) -> u32 {
+        self.dim_output.x * self.dim_output.y
+    }
+
+    /// MUST stay identical to `reduction_lanes()` in `back_convolution.wgsl`:
+    /// the shader derives the split from the shape rather than from a uniform
+    /// field (which would have changed the uniform's size and broken the
+    /// legacy fixtures), so the two definitions have to agree by construction.
+    /// `conv_reduction_lanes_matches_shader` pins them together.
+    pub(crate) fn reduction_lanes(positions: u32) -> u32 {
+        let mut lanes = 1u32;
+        while lanes < WG_SIZE && positions / (lanes * 2) >= 16 {
+            lanes *= 2;
+        }
+        lanes
+    }
+
+    /// Independent sums a single workgroup carries (`lanes * slots == 64`).
+    fn reduction_slots(&self) -> u32 {
+        WG_SIZE / Self::reduction_lanes(self.output_positions())
+    }
 }
+
+/// `@workgroup_size(64)` in every convolution shader.
+const WG_SIZE: u32 = 64;
 
 impl LayerType for ConvolutionType {
     fn get_forward_shader(&self) -> ShaderDescriptor {
@@ -141,10 +168,14 @@ impl LayerType for ConvolutionType {
     }
 
     fn get_back_workgroup_counts(&self) -> Vec<u32> {
+        // grad_weights / grad_bias no longer run one thread per output element:
+        // a workgroup carries `reduction_slots()` independent sums, each split
+        // across `64 / slots` cooperating lanes.
+        let slots = self.reduction_slots();
         vec![
-            self.dim_input.length().div_ceil(64),
-            (self.dim_kernel.length() * self.nb_kernel).div_ceil(64),
-            self.nb_kernel.div_ceil(64),
+            self.dim_input.length().div_ceil(WG_SIZE),
+            (self.dim_kernel.length() * self.nb_kernel).div_ceil(slots),
+            self.nb_kernel.div_ceil(slots),
         ]
     }
 
