@@ -17,7 +17,9 @@ Pour piloter le vrai TUI malgré tout (test end-to-end) : le lancer dans un pane
 
 ## Points d'attention
 
-- Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1]) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
+- Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
+- Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `INSIGHTS_TRAINING.md`).
+- Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
 - Format dataset `.batraw` : magic `BATRAW2` = payload en [-1,1] ; les fichiers `BATRAW1` ([0,1]) restent lisibles et sont rééchelonnés au chargement.
 - Tests de non-régression du pipeline : `bat_building/src/model/audit_tests.rs` (`cargo test`). Ne pas les affaiblir pour les faire passer.
 - macOS : l'event loop winit du visualiseur doit vivre sur le main thread (le TUI et l'entraînement tournent sur un worker) — ne pas réintroduire de `EventLoop::new()` dans un thread secondaire.
