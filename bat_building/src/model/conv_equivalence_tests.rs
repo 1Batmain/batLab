@@ -652,6 +652,19 @@ fn backward_matches_naive_implementation() {
                 let new_err = worst_relative_to_reference(new, oracle);
                 let old_err = worst_relative_to_reference(old, oracle);
 
+                // Visible with --nocapture: the actual magnitudes behind the
+                // thresholds, and which of the two f32 results the f64 oracle
+                // says is closer to the truth.
+                println!(
+                    "{:<24} {:<13} new^old {:>9.2e} | new^f64 {:>9.2e} | old^f64 {:>9.2e}{}",
+                    shape.label,
+                    name,
+                    cross,
+                    new_err,
+                    old_err,
+                    if new_err < old_err { "  (new closer)" } else { "" },
+                );
+
                 assert!(
                     cross < 1e-4,
                     "\n{} backward {name} disagrees with the naive implementation.\n\
