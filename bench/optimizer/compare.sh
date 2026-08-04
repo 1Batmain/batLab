@@ -13,10 +13,12 @@
 # two of ours in parallel would fight each other on top of that.
 set -u
 cd "$(dirname "$0")/../.."
+. bench/optimizer/lib.sh
 DATASET=/Users/bat/development/lab/batLab/datasets/cifar10_grey.batraw
 STEPS=${STEPS:-1500}
 BIN=./target/release/main
 mkdir -p runs
+ensure_binary
 
 run() {
   local tag=$1 opt=$2 lr=$3
