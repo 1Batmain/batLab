@@ -377,8 +377,13 @@ mod tests {
     fn set_dim_output_rejects_kernel_depth_not_matching_input_channels() {
         // input has 3 channels but kernel depth is 1 — the exact footgun that
         // silently mis-sized the weight buffer when adding timestep channels.
-        let mut conv =
-            ConvolutionType::new(Dim3::new((8, 8, 3)), 4, Dim3::new((3, 3, 1)), 1, PaddingMode::Same);
+        let mut conv = ConvolutionType::new(
+            Dim3::new((8, 8, 3)),
+            4,
+            Dim3::new((3, 3, 1)),
+            1,
+            PaddingMode::Same,
+        );
         assert!(matches!(
             conv.set_dim_output(),
             Err(ModelError::KernelChannelMismatch { .. })
@@ -387,8 +392,13 @@ mod tests {
 
     #[test]
     fn set_dim_output_accepts_matching_kernel_depth() {
-        let mut conv =
-            ConvolutionType::new(Dim3::new((8, 8, 3)), 4, Dim3::new((3, 3, 3)), 1, PaddingMode::Same);
+        let mut conv = ConvolutionType::new(
+            Dim3::new((8, 8, 3)),
+            4,
+            Dim3::new((3, 3, 3)),
+            1,
+            PaddingMode::Same,
+        );
         assert!(conv.set_dim_output().is_ok());
     }
 }

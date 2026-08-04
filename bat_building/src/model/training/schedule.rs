@@ -184,7 +184,11 @@ impl LinearNoiseSchedule {
         let beta = self.beta(step);
         let alpha = self.alpha(step);
         let alpha_bar = self.alpha_bar(step);
-        let alpha_bar_prev = if step == 0 { 1.0 } else { self.alpha_bar(step - 1) };
+        let alpha_bar_prev = if step == 0 {
+            1.0
+        } else {
+            self.alpha_bar(step - 1)
+        };
         // Posterior mean computed from the clipped x0 estimate. Clamping x0 to
         // the data range bounds the reverse chain by construction: an imperfect
         // (or degenerate) noise prediction can no longer be amplified
@@ -330,7 +334,10 @@ mod tests {
         let mut prev = f32::INFINITY;
         for step in 0..schedule.len() {
             let cos0 = schedule.timestep_embedding(step, 2)[1];
-            assert!(cos0 <= prev + 1e-6, "cos(pi·tau) not monotone at step {step}");
+            assert!(
+                cos0 <= prev + 1e-6,
+                "cos(pi·tau) not monotone at step {step}"
+            );
             prev = cos0;
         }
         assert!((schedule.timestep_embedding(0, 2)[1] - 1.0).abs() < 1e-4);

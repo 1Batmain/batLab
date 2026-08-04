@@ -1,6 +1,7 @@
 //! File purpose: Implements app behavior for the terminal user interface flow.
 
 use super::storage::{self, SavedModelEntry};
+use crate::model::OptimizerKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -701,6 +702,10 @@ pub struct TrainingConfig {
     pub checkpoint_path: Option<String>,
     #[serde(default)]
     pub load_checkpoint: bool,
+    /// Weight-update rule. Absent from configs written before the optimiser
+    /// was selectable, which therefore keep SGD.
+    #[serde(default)]
+    pub optimizer: OptimizerKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2291,6 +2296,7 @@ impl App {
                 loss: LossMethod::MeanSquared,
                 checkpoint_path: self.selected_checkpoint_path.clone(),
                 load_checkpoint: self.load_checkpoint_on_start,
+                optimizer: OptimizerKind::default(),
             }),
         });
         Ok(())
@@ -2572,6 +2578,7 @@ mod tests {
                     loss: LossMethod::MeanSquared,
                     checkpoint_path: None,
                     load_checkpoint: false,
+                    optimizer: OptimizerKind::default(),
                 }),
             },
         });
