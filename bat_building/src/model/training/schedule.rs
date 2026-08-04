@@ -184,8 +184,16 @@ impl LinearNoiseSchedule {
         let beta = self.beta(step);
         let alpha = self.alpha(step);
         let alpha_bar = self.alpha_bar(step);
-        let coeff = beta / (1.0 - alpha_bar).sqrt();
-        let mean_scale = 1.0 / alpha.sqrt();
+        let alpha_bar_prev = if step == 0 { 1.0 } else { self.alpha_bar(step - 1) };
+        // Posterior mean computed from the clipped x0 estimate. Clamping x0 to
+        // the data range bounds the reverse chain by construction: an imperfect
+        // (or degenerate) noise prediction can no longer be amplified
+        // multiplicatively across the ~1/sqrt(alpha_bar_T) chain gain. For a
+        // well-trained model x0_hat already lies in [-1, 1] and this is a no-op.
+        let coeff_x0 = alpha_bar_prev.sqrt() * beta / (1.0 - alpha_bar);
+        let coeff_xt = alpha.sqrt() * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar);
+        let noise_to_x0 = (1.0 - alpha_bar).sqrt();
+        let x0_scale = 1.0 / alpha_bar.sqrt().max(f32::EPSILON);
         let magnitude = denoise_magnitude.max(0.0);
         let sigma = if step == 0 {
             0.0
@@ -198,7 +206,8 @@ impl LinearNoiseSchedule {
             .zip(predicted_noise.iter())
             .enumerate()
             .map(|(index, (value, noise))| {
-                let mean = mean_scale * (*value - coeff * *noise);
+                let x0_hat = (x0_scale * (*value - noise_to_x0 * *noise)).clamp(-1.0, 1.0);
+                let mean = coeff_x0 * x0_hat + coeff_xt * *value;
                 if sigma == 0.0 {
                     mean
                 } else {
@@ -284,6 +293,25 @@ mod tests {
         let predicted_noise = vec![0.05, 0.01, -0.03];
         let next = schedule.denoise_step(&latent, &predicted_noise, 2, 42);
         assert_eq!(next.len(), latent.len());
+    }
+
+    #[test]
+    fn reverse_chain_stays_bounded_even_with_degenerate_noise_prediction() {
+        // Worst case for the sampler: the model predicts no noise at all.
+        // Without x0 clamping the chain gain (~1/sqrt(alpha_bar_T)) amplifies
+        // the latent by two orders of magnitude; with it the trajectory must
+        // stay within a few units of the data range.
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let mut latent = schedule.sample_noise(64, 0xbadc_0ffe);
+        let zero_noise = vec![0.0f32; latent.len()];
+        for step in (0..schedule.len()).rev() {
+            latent = schedule.denoise_step(&latent, &zero_noise, step, 7 ^ step as u64);
+        }
+        let max_abs = latent.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            max_abs < 5.0,
+            "reverse chain exploded despite x0 clamping: max |x| = {max_abs}"
+        );
     }
 
     #[test]
