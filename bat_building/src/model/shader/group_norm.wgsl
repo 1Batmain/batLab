@@ -1,4 +1,11 @@
 // File purpose: WGSL compute shader implementing group norm operations for model forward/backward or optimizer passes.
+//
+// Dispatch convention: ONE WORKGROUP PER GROUP (see
+// `GroupNormType::get_forward_workgroup_count`), not one thread per element.
+// The workgroup cooperates on two shared-memory reductions (sum, then sum of
+// squared deviations) and then writes its group's normalised elements. The
+// group statistics are therefore computed once per group instead of once per
+// element, which is what the naive version did.
 
 @group(0) @binding(0) var<storage, read>       input:  array<f32>;
 @group(0) @binding(1) var<storage, read>       gamma:  array<f32>;
@@ -15,47 +22,73 @@ struct GroupNormSpec {
     dim_output:         vec3<u32>,
 }
 
-fn flat_index(spatial_idx: u32, channel: u32) -> u32 {
+const WORKGROUP_SIZE: u32 = 256u;
+
+var<workgroup> partial: array<f32, WORKGROUP_SIZE>;
+
+/// Flat buffer index of the `ordinal`-th element of `group`, in the same
+/// (spatial-major, channel-minor) order the naive version walked.
+fn group_element_index(group: u32, ordinal: u32) -> u32 {
+    let cpg = layer_spec.channels_per_group;
+    let spatial_idx = ordinal / cpg;
+    let channel = group * cpg + ordinal % cpg;
     return spatial_idx * layer_spec.dim_input.z + channel;
 }
 
-fn compute_group_mean(group: u32) -> f32 {
-    let channel_start = group * layer_spec.channels_per_group;
-    let channel_end = channel_start + layer_spec.channels_per_group;
-    var sum: f32 = 0.0;
-    for (var spatial_idx: u32 = 0u; spatial_idx < layer_spec.spatial_len; spatial_idx++) {
-        for (var channel: u32 = channel_start; channel < channel_end; channel++) {
-            sum += input[flat_index(spatial_idx, channel)];
+/// Tree reduction over the workgroup. Every invocation must reach this call
+/// (the barriers are in uniform control flow) and every invocation gets the
+/// total back.
+fn workgroup_sum(tid: u32, value: f32) -> f32 {
+    // Guards against a previous reduction's reads of partial[0] racing with
+    // this one's writes.
+    workgroupBarrier();
+    partial[tid] = value;
+    workgroupBarrier();
+
+    var stride: u32 = WORKGROUP_SIZE / 2u;
+    loop {
+        if stride == 0u { break; }
+        if tid < stride {
+            partial[tid] += partial[tid + stride];
         }
+        workgroupBarrier();
+        stride = stride / 2u;
     }
-    let group_len = layer_spec.spatial_len * layer_spec.channels_per_group;
-    return sum / f32(group_len);
+    return partial[0];
 }
 
-fn compute_group_inv_std(group: u32, mean: f32) -> f32 {
-    let channel_start = group * layer_spec.channels_per_group;
-    let channel_end = channel_start + layer_spec.channels_per_group;
-    var variance_sum: f32 = 0.0;
-    for (var spatial_idx: u32 = 0u; spatial_idx < layer_spec.spatial_len; spatial_idx++) {
-        for (var channel: u32 = channel_start; channel < channel_end; channel++) {
-            let centered = input[flat_index(spatial_idx, channel)] - mean;
-            variance_sum += centered * centered;
-        }
-    }
+@compute @workgroup_size(WORKGROUP_SIZE)
+fn group_norm(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32,
+) {
+    let group = wid.x;
     let group_len = layer_spec.spatial_len * layer_spec.channels_per_group;
-    let variance = variance_sum / f32(group_len);
-    return 1.0 / sqrt(variance + layer_spec.epsilon);
-}
+    let group_len_f = f32(group_len);
 
-@compute @workgroup_size(64)
-fn group_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let index = gid.x;
-    if index >= arrayLength(&input) { return; }
+    // Pass 1 — sum.
+    var local_sum: f32 = 0.0;
+    for (var i: u32 = tid; i < group_len; i += WORKGROUP_SIZE) {
+        local_sum += input[group_element_index(group, i)];
+    }
+    let mean = workgroup_sum(tid, local_sum) / group_len_f;
 
-    let channel = index % layer_spec.dim_input.z;
-    let group = channel / layer_spec.channels_per_group;
-    let mean = compute_group_mean(group);
-    let inv_std = compute_group_inv_std(group, mean);
-    let normalized = (input[index] - mean) * inv_std;
-    output[index] = normalized * gamma[channel] + beta[channel];
+    // Pass 2 — sum of squared deviations from the mean (same centered form as
+    // the naive version; deliberately not the E[x^2] - E[x]^2 shortcut, which
+    // would change the numerics).
+    var local_var: f32 = 0.0;
+    for (var i: u32 = tid; i < group_len; i += WORKGROUP_SIZE) {
+        let centered = input[group_element_index(group, i)] - mean;
+        local_var += centered * centered;
+    }
+    let variance = workgroup_sum(tid, local_var) / group_len_f;
+    let inv_std = 1.0 / sqrt(variance + layer_spec.epsilon);
+
+    // Pass 3 — normalise, scale, shift.
+    for (var i: u32 = tid; i < group_len; i += WORKGROUP_SIZE) {
+        let index = group_element_index(group, i);
+        let channel = group * layer_spec.channels_per_group + i % layer_spec.channels_per_group;
+        let normalized = (input[index] - mean) * inv_std;
+        output[index] = normalized * gamma[channel] + beta[channel];
+    }
 }

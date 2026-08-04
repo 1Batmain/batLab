@@ -102,6 +102,14 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
     fn has_weights(&self) -> bool {
         false
     }
+    /// Workgroup count for the forward dispatch. The default assumes the
+    /// elementwise convention shared by most shaders: one thread per output
+    /// element, `@workgroup_size(64)`. Layers whose forward kernel maps a
+    /// workgroup to something else (e.g. GroupNorm: one workgroup per group,
+    /// cooperating on a reduction) override this.
+    fn get_forward_workgroup_count(&self) -> u32 {
+        self.get_dim_output().length().div_ceil(64)
+    }
     fn get_dim_input(&self) -> Dim3;
     fn get_dim_output(&self) -> Dim3;
     fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding>;
