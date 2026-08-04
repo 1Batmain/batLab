@@ -161,16 +161,21 @@ mod tests {
         let hp = AdamHyperparameters::default();
         for t in [1u64, 2, 5, 50, 1000] {
             let (bc1, bc2) = hp.bias_corrections(t);
-            let expect1 = 1.0 - 0.9f64.powi(t as i32);
-            let expect2 = 1.0 - 0.999f64.powi(t as i32);
+            // The reference uses the betas as they are actually stored (f32),
+            // promoted to f64 — 0.999 is not exactly representable in f32 and
+            // the gap compounds over a thousand steps.
+            let expect1 = 1.0 - (hp.beta1 as f64).powi(t as i32);
+            let expect2 = 1.0 - (hp.beta2 as f64).powi(t as i32);
             assert!(
-                (bc1 as f64 - expect1).abs() < 1e-6,
+                (bc1 as f64 - expect1).abs() < 1e-7,
                 "t={t}: bc1 {bc1} vs {expect1}"
             );
             assert!(
-                (bc2 as f64 - expect2).abs() < 1e-6,
+                (bc2 as f64 - expect2).abs() < 1e-7,
                 "t={t}: bc2 {bc2} vs {expect2}"
             );
+            // …and still within f32 noise of the ideal hyperparameters.
+            assert!((bc2 as f64 - (1.0 - 0.999f64.powi(t as i32))).abs() < 1e-4);
         }
         // t=1 is the strongest correction: m̂ = m / 0.1, v̂ = v / 0.001.
         let (bc1, bc2) = hp.bias_corrections(1);

@@ -2406,8 +2406,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, InferenceConfig, LayerKind, LossMethod, ModelConfig, RunConfig, RunMode, Screen,
-        TrainingConfig, TrainingControlCommand,
+        App, InferenceConfig, LayerKind, LossMethod, ModelConfig, OptimizerKind, RunConfig,
+        RunMode, Screen, TrainingConfig, TrainingControlCommand,
     };
 
     #[test]

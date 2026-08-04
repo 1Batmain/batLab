@@ -751,6 +751,16 @@ impl<State> Model<State> {
         Ok(())
     }
 
+    /// The run's global optimiser step counter `t` (0 before the first update).
+    pub fn optimizer_step(&self) -> u64 {
+        self.optimizer_step
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_optimizer_step(&mut self) {
+        self.optimizer_step = 0;
+    }
+
     pub fn predict(&mut self, input: &[f32]) -> Vec<f32> {
         debug_assert!(
             self.state.is_build,

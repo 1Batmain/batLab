@@ -20,6 +20,8 @@ pub use optimizer::{AdamHyperparameters, OptimizerKind};
 pub use types::{Dim3, PaddingMode};
 
 #[cfg(test)]
+mod adam_tests;
+#[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
 mod group_norm_equivalence_tests;
