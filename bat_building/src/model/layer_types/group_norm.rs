@@ -11,6 +11,10 @@ use wgpu::BufferUsages;
 
 const DEFAULT_EPSILON: f32 = 1e-5;
 
+/// f32 slots per group in the backward `stats` buffer; must match the
+/// `STATS_PER_GROUP` constant in `shader/back_group_norm.wgsl`.
+const STATS_PER_GROUP: u32 = 4;
+
 #[derive(Debug, Clone, Copy)]
 pub struct GroupNormType {
     pub num_groups: u32,
@@ -73,6 +77,8 @@ impl LayerType for GroupNormType {
 
     fn get_back_entrypoints(&self) -> Vec<&'static str> {
         vec![
+            "group_norm_stats",
+            "group_norm_grad_stats",
             "group_norm_back_input",
             "group_norm_back_gamma",
             "group_norm_back_beta",
@@ -81,10 +87,22 @@ impl LayerType for GroupNormType {
 
     fn get_back_workgroup_counts(&self) -> Vec<u32> {
         vec![
+            // The two reduction passes: one workgroup per group.
+            self.num_groups,
+            self.num_groups,
+            // grad_input is elementwise (@workgroup_size(64)).
             self.dim_input.length().div_ceil(64),
-            self.dim_input.z.div_ceil(64),
-            self.dim_input.z.div_ceil(64),
+            // grad_gamma / grad_beta reduce over the spatial axis: one
+            // workgroup per channel.
+            self.dim_input.z,
+            self.dim_input.z,
         ]
+    }
+
+    /// One workgroup per group — `group_norm.wgsl` reduces cooperatively
+    /// instead of running one thread per element.
+    fn get_forward_workgroup_count(&self) -> u32 {
+        self.num_groups
     }
 
     fn get_dim_input(&self) -> Dim3 {
@@ -298,6 +316,13 @@ impl LayerType for GroupNormType {
             (
                 "grad_beta".to_string(),
                 write_storage(self.channel_param_bytes()),
+            ),
+            // Scratch for the two reduction passes: 4 f32 per group
+            // ([mean, inv_std, sum_dxhat, sum_dxhat_xhat]). Appended last so
+            // the indices the other bindings are addressed by are untouched.
+            (
+                "stats".to_string(),
+                write_storage(self.num_groups * STATS_PER_GROUP * 4),
             ),
         ]
     }

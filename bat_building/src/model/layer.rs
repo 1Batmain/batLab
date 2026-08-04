@@ -92,7 +92,7 @@ impl Layer {
             ty.set_dim_input(input);
         }
         ty.set_dim_output()?;
-        let num_workgroups = ty.get_dim_output().length().div_ceil(64);
+        let num_workgroups = ty.get_forward_workgroup_count();
         let shader = Shaders {
             forward: Self::create_shader(device, &ty),
             backward: None,
