@@ -7,3 +7,6 @@
 *generated_samples*
 *log*
 worktrees/
+datasets/*.batraw
+datasets/cifar-10-batches-bin/
+*_metrics.jsonl
