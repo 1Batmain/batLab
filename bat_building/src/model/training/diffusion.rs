@@ -92,6 +92,11 @@ struct DiffusionPrepareUniform {
     signal_channels: u32,
     timestep_channels: u32,
     pixel_count: u32,
+    /// Schedule length T, so the shader's timestep embedding normalises `step`
+    /// to `[0, 1]` exactly like the CPU `LinearNoiseSchedule::timestep_embedding`
+    /// used at inference. The two MUST agree or the network is conditioned on
+    /// one signal and sampled with another.
+    total_steps: u32,
 }
 
 impl DiffusionTask {
@@ -145,6 +150,7 @@ impl DiffusionTask {
             signal_channels: output.z,
             timestep_channels: self.timestep_channels as u32,
             pixel_count: output.x * output.y,
+            total_steps: self.schedule.len() as u32,
         });
 
         let pass = self.ensure_prepare_pass(model, input, output)?;
@@ -252,6 +258,7 @@ impl DiffusionTask {
                 signal_channels: output.z,
                 timestep_channels,
                 pixel_count: output.x * output.y,
+                total_steps: schedule_len as u32,
             });
             model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
 

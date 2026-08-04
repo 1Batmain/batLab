@@ -98,20 +98,34 @@ impl LinearNoiseSchedule {
         }
     }
 
+    /// Smooth multi-resolution timestep embedding.
+    ///
+    /// The step is first normalised to `tau = step / (T - 1) ∈ [0, 1]`, then each
+    /// channel pair `i` encodes `[sin(pi·2^i·tau), cos(pi·2^i·tau)]`. The lowest
+    /// pair (`i = 0`) gives `cos(pi·tau)`, a strictly monotone signal running
+    /// `1 → -1` across the schedule, so even a single pair uniquely identifies t
+    /// *and* varies smoothly — unlike the previous `sin(step)`/`cos(step)` form
+    /// (period ≈ 6.28 steps), which aliased adjacent timesteps and gave the
+    /// network a near-random code it could not exploit in a short run.
+    ///
+    /// This MUST stay identical to `timestep_value` in
+    /// `shader/diffusion_prepare.wgsl` (checked by
+    /// `timestep_embedding_matches_shader_formula`): training composes the input
+    /// on the GPU with the shader, inference composes it here on the CPU, and the
+    /// network only works if both feed it the same conditioning.
     pub fn timestep_embedding(&self, step: usize, channels: usize) -> Vec<f32> {
         if channels == 0 {
             return Vec::new();
         }
 
-        let step_value = step.min(self.len().saturating_sub(1)) as f32;
+        let steps = self.len().max(1);
+        let denom = steps.saturating_sub(1).max(1) as f32;
+        let tau = step.min(steps - 1) as f32 / denom;
         let mut values = Vec::with_capacity(channels);
         let half = channels.div_ceil(2);
 
         for i in 0..half {
-            let denom = (half.saturating_sub(1)).max(1) as f32;
-            let exponent = i as f32 / denom;
-            let frequency = 1.0 / 10000.0f32.powf(exponent);
-            let phase = step_value * frequency;
+            let phase = tau * std::f32::consts::PI * 2.0f32.powi(i as i32);
             values.push(phase.sin());
             if values.len() < channels {
                 values.push(phase.cos());
@@ -277,5 +291,57 @@ mod tests {
         let schedule = LinearNoiseSchedule::new_linear(8, 1e-4, 0.02);
         let embedding = schedule.timestep_embedding(3, 5);
         assert_eq!(embedding.len(), 5);
+    }
+
+    /// `cos(pi·tau)` (the second value of pair 0) must fall monotonically from
+    /// ~+1 at t=0 to ~-1 at t=T-1 — the property that lets the network read the
+    /// timestep off a single channel pair.
+    #[test]
+    fn timestep_embedding_low_frequency_is_monotone_over_schedule() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let mut prev = f32::INFINITY;
+        for step in 0..schedule.len() {
+            let cos0 = schedule.timestep_embedding(step, 2)[1];
+            assert!(cos0 <= prev + 1e-6, "cos(pi·tau) not monotone at step {step}");
+            prev = cos0;
+        }
+        assert!((schedule.timestep_embedding(0, 2)[1] - 1.0).abs() < 1e-4);
+        assert!((schedule.timestep_embedding(255, 2)[1] + 1.0).abs() < 1e-4);
+    }
+
+    /// The consistency invariant: the CPU embedding used at inference must equal
+    /// the GPU shader embedding used at training. This mirrors the WGSL
+    /// `timestep_value` formula exactly; if either side changes without the
+    /// other, this fails.
+    #[test]
+    fn timestep_embedding_matches_shader_formula() {
+        fn shader_timestep_value(offset: u32, step: u32, total_steps: u32) -> f32 {
+            let steps = total_steps.max(1);
+            let denom = (steps.saturating_sub(1)).max(1) as f32;
+            let tau = step.min(steps - 1) as f32 / denom;
+            let pair_idx = offset / 2;
+            let phase = tau * std::f32::consts::PI * 2.0f32.powi(pair_idx as i32);
+            if offset % 2 == 0 {
+                phase.sin()
+            } else {
+                phase.cos()
+            }
+        }
+
+        for &t in &[16usize, 64, 256] {
+            let schedule = LinearNoiseSchedule::new_linear(t, 1e-4, 0.02);
+            for channels in [1usize, 2, 4] {
+                for step in [0usize, 1, t / 3, t - 1] {
+                    let cpu = schedule.timestep_embedding(step, channels);
+                    for (offset, cpu_val) in cpu.iter().enumerate() {
+                        let gpu = shader_timestep_value(offset as u32, step as u32, t as u32);
+                        assert!(
+                            (cpu_val - gpu).abs() < 1e-5,
+                            "T={t} ch={channels} step={step} offset={offset}: cpu={cpu_val} gpu={gpu}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

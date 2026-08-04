@@ -1,9 +1,9 @@
 {
-  "model_name": "Greyscale_Diffusion",
+  "model_name": "Greyscale_Diffusion_broken",
   "input_size": [
     32,
     32,
-    3
+    1
   ],
   "layers": [
     {
@@ -11,13 +11,13 @@
         "dim_input": [
           32,
           32,
-          3
+          1
         ],
         "nb_kernel": 16,
         "dim_kernel": [
           3,
           3,
-          3
+          1
         ],
         "stride": 1,
         "padding": "Same",

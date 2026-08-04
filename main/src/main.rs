@@ -14,8 +14,9 @@ use bat_building::tui::{
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
     FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
-    LossMethod as PLoss, Model, PaddingMode as PPadding, Trainer, UpsampleConvType,
-    model::Training,
+    LossMethod as PLoss, MetricsLogger, Model, PaddingMode as PPadding, ProbeConfig, Stats, Trainer,
+    UpsampleConvType, log_probe, log_train_loss, log_trajectory, model::Training, probe_diffusion,
+    sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -34,6 +35,10 @@ const DIFFUSION_BETA_END: f32 = 2e-2;
 const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
 const INFERENCE_RUNTIME_LR: f32 = 0.01;
 const INFERENCE_RUNTIME_BATCH_SIZE: u32 = 1;
+/// How often (in steps) the training loop generates an instrumented sample and
+/// logs the full per-step denoising trajectory. Coarser than the loss/probe
+/// interval because a full sample runs `schedule.len()` forward passes.
+const SAMPLE_INTERVAL_STEPS: usize = 200;
 
 #[derive(Debug, Clone)]
 struct ImageSample {
@@ -66,6 +71,26 @@ fn main() {
         if args.iter().any(|arg| arg == "--headless-train") {
             if let Err(err) = run_headless_train(&args) {
                 eprintln!("headless training failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        // -----------------------------------------------------------------
+        // DEV/CI ONLY — headless sampling entry point.
+        //
+        // Loads a checkpoint and generates images WITHOUT training, writing a
+        // JSONL log of per-step denoising stats (latent + ε̂ min/max/mean/σ) so
+        // the point where the latent diverges is visible. Never writes back the
+        // model config and never touches saved weights.
+        //
+        //   cargo run --release -- --headless-sample <model> \
+        //       --checkpoint <path> [--seed N] [--paths N] \
+        //       [--magnitude F] [--out <img>] [--log <jsonl>]
+        // -----------------------------------------------------------------
+        if args.iter().any(|arg| arg == "--headless-sample") {
+            if let Err(err) = run_headless_sample(&args) {
+                eprintln!("headless sampling failed: {err}");
                 std::process::exit(1);
             }
             return;
@@ -174,6 +199,117 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         Some(message) => Err(message),
         None => Ok(()),
     }
+}
+
+/// See the DEV/CI note in `main`. Not reachable from the TUI.
+fn run_headless_sample(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+
+    let model_name = flag("--headless-sample")
+        .ok_or_else(|| "--headless-sample requires a model name".to_string())?;
+    let checkpoint = flag("--checkpoint")
+        .ok_or_else(|| "--checkpoint <path to .ckpt> is required".to_string())?;
+    let checkpoint_path = PathBuf::from(&checkpoint);
+    if !checkpoint_path.exists() {
+        return Err(format!("checkpoint does not exist: {checkpoint}"));
+    }
+    let seed = flag("--seed")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let paths = flag("--paths")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let magnitude = flag("--magnitude")
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0);
+
+    let config_path = tui::storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = tui::storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    let out_path = flag("--out").unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join(format!("{model_name}_sample_{seed}.png"))
+            .to_string_lossy()
+            .to_string()
+    });
+    let log_path = flag("--log").unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join(format!("{model_name}_sample_{seed}_metrics.jsonl"))
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+    rt.block_on(async {
+        let (_gpu, mut model) =
+            build_execution_model(&config, INFERENCE_RUNTIME_LR, INFERENCE_RUNTIME_BATCH_SIZE)
+                .await?;
+        model
+            .load_checkpoint(&checkpoint_path)
+            .map_err(|err| format!("failed to load checkpoint {checkpoint}: {err}"))?;
+
+        let input_dims = model
+            .input_dim()
+            .ok_or_else(|| "model has no input dimensions".to_string())?;
+        let output_dims = model
+            .output_dim()
+            .ok_or_else(|| "model has no output dimensions".to_string())?;
+        let output_size = (output_dims.x, output_dims.y, output_dims.z);
+        let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+
+        let schedule = LinearNoiseSchedule::new_linear(
+            DIFFUSION_SCHEDULE_STEPS,
+            DIFFUSION_BETA_START,
+            DIFFUSION_BETA_END,
+        );
+
+        let mut metrics = MetricsLogger::create(Path::new(&log_path), true);
+        let mut trajectory = Vec::new();
+        let image = sample_diffusion(
+            &mut model,
+            input_dims.z as usize,
+            output_dims.z as usize,
+            output_len,
+            &schedule,
+            seed,
+            paths,
+            magnitude,
+            Some(&mut trajectory),
+            |_, _| {},
+        );
+        log_trajectory(&mut metrics, 0, seed, &trajectory, &Stats::of(&image));
+
+        let out = PathBuf::from(&out_path);
+        let sample_dir = out.parent().map(Path::to_path_buf).unwrap_or_default();
+        if !sample_dir.as_os_str().is_empty() {
+            fs::create_dir_all(&sample_dir)
+                .map_err(|err| format!("failed to create output dir: {err}"))?;
+        }
+        // Reuse the shared encoder so the saved file matches training previews.
+        let saved = save_tensor_as_image(&image, output_size, &sample_dir, 0)?;
+        // Rename the deterministic `step_0000.png` to the requested path.
+        if saved != out {
+            fs::rename(&saved, &out)
+                .map_err(|err| format!("failed to move sample to {out_path}: {err}"))?;
+        }
+
+        let img_stats = Stats::of(&image);
+        println!(
+            "headless sample '{model_name}': seed={seed} paths={paths} magnitude={magnitude}\n\
+             image → {out_path}\nmetrics → {log_path}\n\
+             final image stats: min={:.4} max={:.4} mean={:.4} std={:.4}",
+            img_stats.min, img_stats.max, img_stats.mean, img_stats.std
+        );
+        Ok::<(), String>(())
+    })
 }
 
 fn run_execution_loop(mut config: ModelConfig) {
@@ -318,8 +454,34 @@ async fn run_training(
     let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
     let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
     let gpu_samples: Vec<Vec<f32>> = dataset.into_iter().map(|sample| sample.target).collect();
+    // CPU copies of a handful of clean targets kept for the diagnostic probe
+    // (the GPU dataset is opaque to CPU-side readback).
+    let probe_config = ProbeConfig::default();
+    let probe_samples: Vec<Vec<f32>> = gpu_samples
+        .iter()
+        .take(probe_config.sample_count)
+        .cloned()
+        .collect();
     let mut gpu_dataset = GpuDataset::from_samples(gpu.as_ref(), gpu_samples, sample_len)
         .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
+
+    // Metrics land next to the checkpoint (`<stem>_metrics.jsonl`), or in a
+    // temp file when no checkpoint path is configured. Truncated per run so the
+    // file always describes the current run only.
+    let mut metrics = {
+        let metrics_path = checkpoint_path
+            .as_ref()
+            .map(|ckpt| {
+                let stem = ckpt
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "run".to_string());
+                ckpt.with_file_name(format!("{stem}_metrics.jsonl"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("diffusion_metrics.jsonl"));
+        MetricsLogger::create(&metrics_path, true)
+    };
+    println!("[metrics] writing training diagnostics to {}", metrics.path());
     let limits = gpu.device().limits();
     let estimated_training_bytes = model
         .estimated_gpu_bytes()
@@ -425,6 +587,50 @@ async fn run_training(
             None
         };
 
+        if should_report_loss {
+            if let Some(batch_loss) = loss {
+                log_train_loss(&mut metrics, step, batch_loss, current_lr, current_batch_size);
+            }
+            // Per-timestep-bucket diagnostic: how well ε̂ tracks ε across t.
+            let buckets = probe_diffusion(
+                &mut model,
+                &diffusion,
+                &probe_samples,
+                input_size.2 as usize,
+                output_size.2 as usize,
+                &probe_config,
+                0x50B0_1234 ^ step as u64,
+            );
+            log_probe(&mut metrics, step, &buckets);
+        }
+
+        // Periodic instrumented sample: capture where along the denoising chain
+        // the latent diverges.
+        if step > 0 && step % SAMPLE_INTERVAL_STEPS == 0 {
+            let mut trajectory = Vec::new();
+            let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+            let image = sample_diffusion(
+                &mut model,
+                input_size.2 as usize,
+                output_size.2 as usize,
+                output_len,
+                &diffusion,
+                step as u64,
+                1,
+                1.0,
+                Some(&mut trajectory),
+                |_, _| {},
+            );
+            log_trajectory(&mut metrics, step, step as u64, &trajectory, &Stats::of(&image));
+            if let Ok(path) = save_tensor_as_image(&image, output_size, &sample_dir, step) {
+                let _ = tx.send(tui::TrainingEvent::Step {
+                    step,
+                    loss: None,
+                    sample_path: Some(path.display().to_string()),
+                });
+            }
+        }
+
         if tx
             .send(tui::TrainingEvent::Step {
                 step,
@@ -440,12 +646,26 @@ async fn run_training(
     }
 
     let final_step = step.saturating_sub(1);
-    let output = sample_diffusion_image(
+    let mut final_trajectory = Vec::new();
+    let final_output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+    let output = sample_diffusion(
         &mut model,
-        input_size,
-        output_size,
+        input_size.2 as usize,
+        output_size.2 as usize,
+        final_output_len,
         &diffusion,
         final_step as u64,
+        1,
+        1.0,
+        Some(&mut final_trajectory),
+        |_, _| {},
+    );
+    log_trajectory(
+        &mut metrics,
+        final_step,
+        final_step as u64,
+        &final_trajectory,
+        &Stats::of(&output),
     );
     let sample_path = save_tensor_as_image(&output, output_size, &sample_dir, final_step)
         .map(|path| path.display().to_string())?;
@@ -1076,54 +1296,10 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
     tensor
 }
 
-fn compose_diffusion_input(
-    signal: &[f32],
-    input_dims: (u32, u32, u32),
-    output_dims: (u32, u32, u32),
-    timestep_features: &[f32],
-) -> Vec<f32> {
-    if signal.is_empty() || input_dims.2 == 0 {
-        return signal.to_vec();
-    }
-
-    let pixel_count = (output_dims.0 * output_dims.1) as usize;
-    let input_channels = input_dims.2 as usize;
-    let signal_channels = output_dims.2 as usize;
-    let mut packed = vec![0.0f32; pixel_count * input_channels];
-
-    for (pixel_idx, pixel) in signal.chunks(signal_channels).enumerate() {
-        let dst = &mut packed[pixel_idx * input_channels..(pixel_idx + 1) * input_channels];
-        dst[..signal_channels].copy_from_slice(pixel);
-        for (value, feature) in dst
-            .iter_mut()
-            .skip(signal_channels)
-            .zip(timestep_features.iter())
-        {
-            *value = *feature;
-        }
-    }
-    packed
-}
-
-fn sample_diffusion_image<State>(
-    model: &mut Model<State>,
-    input_dims: (u32, u32, u32),
-    output_dims: (u32, u32, u32),
-    schedule: &LinearNoiseSchedule,
-    seed: u64,
-) -> Vec<f32> {
-    sample_diffusion_image_with_controls(
-        model,
-        input_dims,
-        output_dims,
-        schedule,
-        seed,
-        1,
-        1.0,
-        |_, _| {},
-    )
-}
-
+/// Thin wrapper over the library's single diffusion sampler. Kept so the call
+/// sites can pass `(u32, u32, u32)` dims; the actual denoising math (and the
+/// `[signal | timestep]` input composition) lives in `bat_building::metrics` so
+/// training instrumentation and inference cannot drift apart.
 fn sample_diffusion_image_with_controls<State, F>(
     model: &mut Model<State>,
     input_dims: (u32, u32, u32),
@@ -1132,50 +1308,24 @@ fn sample_diffusion_image_with_controls<State, F>(
     seed: u64,
     denoising_paths: usize,
     denoise_magnitude: f32,
-    mut progress: F,
+    progress: F,
 ) -> Vec<f32>
 where
     F: FnMut(usize, usize),
 {
     let output_len = (output_dims.0 * output_dims.1 * output_dims.2) as usize;
-    let path_count = denoising_paths.max(1);
-    let steps = schedule.len().max(1);
-    let total_work = path_count.saturating_mul(steps);
-    let mut accumulated = vec![0.0f32; output_len];
-    let base_noise_seed = seed ^ 0xa5a5_5a5a_0123_4567;
-    let base_latent = schedule.sample_noise(output_len, base_noise_seed);
-
-    for path_idx in 0..path_count {
-        let path_seed = seed ^ ((path_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let mut latent = base_latent.clone();
-
-        for (step_idx, diffusion_step) in (0..schedule.len()).rev().enumerate() {
-            let timestep_features = schedule.timestep_embedding(
-                diffusion_step,
-                input_dims.2.saturating_sub(output_dims.2) as usize,
-            );
-            let model_input =
-                compose_diffusion_input(&latent, input_dims, output_dims, &timestep_features);
-            let predicted_noise = model.predict(&model_input);
-            latent = schedule.denoise_step_with_magnitude(
-                &latent,
-                &predicted_noise,
-                diffusion_step,
-                path_seed ^ diffusion_step as u64,
-                denoise_magnitude,
-            );
-            progress(path_idx * steps + step_idx + 1, total_work);
-        }
-
-        for (acc, value) in accumulated.iter_mut().zip(latent.iter()) {
-            *acc += *value;
-        }
-    }
-
-    for value in &mut accumulated {
-        *value /= path_count as f32;
-    }
-    accumulated
+    sample_diffusion(
+        model,
+        input_dims.2 as usize,
+        output_dims.2 as usize,
+        output_len,
+        schedule,
+        seed,
+        denoising_paths,
+        denoise_magnitude,
+        None,
+        progress,
+    )
 }
 
 fn random_seed() -> u64 {

@@ -9,8 +9,10 @@ pub use gpu_context::GpuContext;
 pub use model::Model;
 pub use model::training;
 pub use model::training::{
-    DiffusionTask, GpuDataset, GpuDatasetError, LinearNoiseSchedule, TaskPassSpec, Trainer,
-    TrainingTask, TrainingTaskError, Workgroups,
+    BucketStat, DenoiseStepStat, DiffusionTask, GpuDataset, GpuDatasetError, LinearNoiseSchedule,
+    MetricsLogger, ProbeConfig, Stats, TaskPassSpec, Trainer, TrainingTask, TrainingTaskError,
+    Workgroups, compose_diffusion_input, log_probe, log_train_loss, log_trajectory,
+    probe_diffusion, sample_diffusion,
 };
 pub use model::{
     ActivationMethod, ActivationType, ConcatType, ConvolutionType, Dim3, FullyConnectedType,

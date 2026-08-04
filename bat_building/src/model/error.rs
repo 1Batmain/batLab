@@ -21,6 +21,13 @@ pub enum ModelError {
         kernel: Dim3,
         mode: PaddingMode,
     },
+    /// The convolution shader iterates the kernel depth over `dim_input.z`, so a
+    /// `dim_kernel.z` that differs from the input channel count silently
+    /// mis-sizes the weight buffer and reads garbage. Caught at build time.
+    KernelChannelMismatch {
+        input: Dim3,
+        kernel: Dim3,
+    },
     NoLayersToMark,
     DuplicateSavedOutput {
         key: String,
@@ -75,6 +82,12 @@ impl Display for ModelError {
                 f,
                 "kernel larger than input for {:?} convolution: input=({}, {}, {}), kernel=({}, {}, {})",
                 mode, input.x, input.y, input.z, kernel.x, kernel.y, kernel.z
+            ),
+            ModelError::KernelChannelMismatch { input, kernel } => write!(
+                f,
+                "convolution kernel depth must equal input channels: input=({}, {}, {}), \
+                 kernel=({}, {}, {}) — set dim_kernel.z = {}",
+                input.x, input.y, input.z, kernel.x, kernel.y, kernel.z, input.z
             ),
             ModelError::NoLayersToMark => {
                 write!(f, "cannot mark a saved output before adding a layer")
