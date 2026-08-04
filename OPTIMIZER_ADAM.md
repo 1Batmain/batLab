@@ -10,6 +10,9 @@ CIFAR-10 gris, batch 16) : `--optimizer adam --lr 1e-3 --weight-init uniform`.**
 - Adam atteint **dès le pas 75** un niveau que SGD n'atteint **jamais en 1500
   pas**, sur les quatre tranches de t simultanément — un facteur **20 en nombre
   de pas**.
+- Le lr vit sur un **plateau entre 1e-3 et 3e-3** : `3e-3` converge ~2× plus vite
+  pour une qualité finale équivalente. `1e-3` est recommandé par prudence sur un
+  modèle plus profond ; `3e-3` est le premier essai si le budget de pas serre.
 - Le surcoût de calcul d'Adam est **non mesurable** : −0,2 ms sur ~620 ms/pas,
   sous le plancher de bruit de la mesure.
 - L'initialisation He est **légèrement en retrait** de l'uniforme historique sur
@@ -152,6 +155,7 @@ Les runs ont tourné pendant qu'un autre agent entraînait `Greyscale_Diffusion_
 | `sgd_lr1e-3` | 1500 | 1508 | 1,005 |
 | `adam_lr1e-3` | 1500 | 1081 | 0,721 |
 | `adam_lr3e-4` | 1500 | 1965 | 1,310 |
+| `adam_lr3e-3` | 1500 | 939 | 0,626 |
 
 Adam y apparaît **28 % plus rapide** que SGD, ce qui est impossible : Adam fait
 strictement plus de travail par paramètre. Ce chiffre mesure la charge de la
@@ -196,20 +200,23 @@ Loss du probe par tranche de t, moyenne des 5 derniers points (pas 1400–1499) 
 | `sgd_lr1e-3` | 0,6506 | 0,0940 | 0,0474 | 0,0415 | 0,2084 |
 | **`adam_lr1e-3`** | **0,5651** | **0,0490** | **0,0102** | **0,0027** | **0,1567** |
 | `adam_lr3e-4` | 0,5744 | 0,0525 | 0,0132 | 0,0065 | 0,1617 |
+| `adam_lr3e-3` | 0,5698 | 0,0492 | 0,0099 | 0,0024 | 0,1578 |
 
-Aucun ε̂ non fini sur aucun bras : les trois runs sont numériquement sains.
+Aucun ε̂ non fini sur aucun bras : les quatre runs sont numériquement sains. Le
+bras en gras est celui retenu par la recommandation ; `3e-3` le devance de peu sur
+deux colonnes, ce que départage le §3.3.
 
 ### 3.1 Pas nécessaires pour atteindre — et tenir — un seuil
 
 Tranche haut-t (t∈[192,256)), celle que la mission prend pour référence :
 
-| seuil | `sgd_lr1e-3` | `adam_lr1e-3` | `adam_lr3e-4` |
-|---|---:|---:|---:|
-| ≤ 0,20 | 150 | **25** | 50 |
-| ≤ 0,10 | 350 | **25** | 75 |
-| ≤ 0,05 | 1075 | **75** | 175 |
-| ≤ 0,02 | jamais | **200** | 550 |
-| ≤ 0,01 | jamais | **375** | 950 |
+| seuil | `sgd_lr1e-3` | `adam_lr1e-3` | `adam_lr3e-4` | `adam_lr3e-3` |
+|---|---:|---:|---:|---:|
+| ≤ 0,20 | 150 | 25 | 50 | **25** |
+| ≤ 0,10 | 350 | 25 | 75 | **25** |
+| ≤ 0,05 | 1075 | 75 | 175 | **25** |
+| ≤ 0,02 | jamais | 200 | 550 | **125** |
+| ≤ 0,01 | jamais | 375 | 950 | **250** |
 
 **Le seuil de 0,05 en haut-t demandé par la mission : 1075 pas pour SGD, 75 pour
 Adam — un facteur 14.**
@@ -243,12 +250,35 @@ t∈[128,192)   sgd   ██▇▆▆▆▅▅▅▅▅▅▅▅▄▄▄▄▄�
 SGD ne stagne pas — il descend, simplement **beaucoup** plus lentement, et son
 allure ne suggère pas qu'il rattraperait Adam en prolongeant le run.
 
-### 3.3 Learning rate
+### 3.3 Learning rate : un plateau, pas un optimum net
 
-`lr = 1e-3` bat `3e-4` sur **toutes** les tranches et **tous** les seuils, sans
-aucun signe d'instabilité (zéro ε̂ non fini, aucune divergence tardive). L'optimum
-n'étant donc borné que par le bas, un bras `lr = 3e-3` a été ajouté pour
-l'encadrer par le haut — voir §6.
+`lr = 1e-3` bat `3e-4` sur **toutes** les tranches et **tous** les seuils. Comme
+l'optimum n'était alors borné que par le bas, un bras `lr = 3e-3` a été ajouté.
+
+| | `3e-4` | `1e-3` | `3e-3` |
+|---|---:|---:|---:|
+| haut-t final | 0,00649 | 0,00266 | **0,00241** |
+| moyenne finale | 0,16165 | **0,15674** | 0,15783 |
+| t∈[0,64) final | 0,57443 | **0,56511** | 0,56979 |
+| pas pour tenir 0,05 (haut-t) | 175 | 75 | **25** |
+| pas pour tenir 0,01 (haut-t) | 950 | 375 | **250** |
+| ε̂ non finis | 0 | 0 | 0 |
+
+Les rendements sont **manifestement décroissants** : passer de 3e-4 à 1e-3 divise
+la loss haut-t finale par 2,4 ; passer de 1e-3 à 3e-3 ne gagne plus que 9 %, et
+**dégrade** légèrement la moyenne et la tranche t bas. `3e-3` converge en revanche
+environ deux fois plus vite vers les seuils.
+
+Seul effet indésirable observé à `3e-3` : au tout premier point de mesure, la
+tranche t bas **remonte au-dessus de son point de départ** (1,319 contre 1,091 à
+`1e-3`) — la première mise à jour, de ±lr par poids, dépasse. C'est résorbé dès le
+pas 25 et il n'y a aucune instabilité tardive : sur les trois bras, le maximum de
+chaque tranche est atteint au pas 0.
+
+Conclusion : l'optimum n'est **toujours pas encadré par le haut**, mais il est
+clair qu'on est sur un **plateau** entre 1e-3 et 3e-3 plutôt que devant un optimum
+marqué. Pousser plus haut n'a pas été tenté : le gain marginal est déjà plat, et
+la tolérance au lr diminue avec la profondeur — or L est plus profond.
 
 ### 3.4 Le plancher de la tranche t∈[0,64)
 
@@ -351,9 +381,17 @@ cargo build --release -p main     # PAS `cargo build --release` seul (§2.4)
 | paramètre | valeur | fondement |
 |---|---|---|
 | optimiseur | **adam** | 14× moins de pas pour 0,05 en haut-t ; 14,4× plus bas à 1500 pas ; surcoût non mesurable |
-| lr | **1e-3** | bat 3e-4 sur toutes les tranches et tous les seuils, sans instabilité ; voir ci-dessous pour la borne haute |
+| lr | **1e-3** | plateau 1e-3 – 3e-3 ; 1e-3 est le point sûr, voir ci-dessous |
 | init | **uniform** (défaut) | He en retrait partout sur la baseline, sous la réserve du §4 |
 | batch | 16 (inchangé) | non testé dans cette mission |
+
+**Sur le lr, précisément.** `3e-3` converge ~2× plus vite que `1e-3` pour une
+qualité finale équivalente (meilleure de 9 % en haut-t, un peu moins bonne en
+moyenne). Le choix de recommander `1e-3` est un choix de **prudence, pas de
+performance** : `3e-3` dépasse déjà visiblement au premier pas sur la baseline, et
+un réseau plus profond tolère moins bien un lr élevé. Si le budget de pas est le
+facteur limitant sur L, **`3e-3` est le premier essai à tenter** — en surveillant
+la tranche haut-t sur les 100 premiers pas, où le dépassement se verrait.
 
 ### Réserves à porter au dossier
 
@@ -365,10 +403,10 @@ cargo build --release -p main     # PAS `cargo build --release` seul (§2.4)
    mécanisme qui rendrait aussi He inoffensif à toute profondeur. **Si un run L
    sous-performe, l'init est le premier paramètre à rejouer**, et le bras propre
    du §4 (uniforme à flux par couche) est à faire avant.
-2. **Le lr n'est encadré que par le bas** au moment d'écrire ces lignes ; un bras
-   `lr = 3e-3` est en cours pour tester la borne haute. Si 3e-3 fait mieux que
-   1e-3, la recommandation de lr doit être révisée vers le haut — les autres
-   conclusions n'en dépendent pas.
+2. **Le lr n'est pas encadré par le haut.** Trois valeurs ont été testées (3e-4,
+   1e-3, 3e-3) et la meilleure reste à la borne supérieure de l'intervalle testé.
+   Ce qu'on sait : les rendements y sont déjà plats, donc le plateau est atteint.
+   Ce qu'on ne sait pas : où il se termine. Aucune autre conclusion n'en dépend.
 3. **Un seul run par configuration.** L'appariement est exact (mêmes données, même
    bruit), donc les comparaisons sont valides comme comparaisons *de ces graines*.
    Les écarts SGD/Adam sont trop grands pour venir du hasard de l'init ; l'écart
