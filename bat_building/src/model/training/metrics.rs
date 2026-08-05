@@ -332,6 +332,76 @@ pub struct DenoiseFrame<'a> {
     pub x0_hat: &'a [f32],
 }
 
+/// Odd increment used to fold the timestep into a path's seed.
+const STEP_SEED_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The seed one reverse step draws its injected noise from.
+///
+/// The timestep is mixed in by **multiply-add, not XOR**: `path_seed ^
+/// diffusion_step` collided with the XOR the noise field itself once used to
+/// fold in the pixel index, so every step of the chain re-drew one single field
+/// under an `index ^ step` permutation and the sampler painted horizontal bands
+/// whatever the model predicted. See `gaussian_at` in `schedule.rs` and
+/// `ANISOTROPY_HUNT.md`. The schedule-side fix already breaks the collision;
+/// this keeps callers from relying on it — and being one function, no caller
+/// can derive its step seed a *different*, broken way.
+pub fn reverse_step_seed(path_seed: u64, diffusion_step: usize) -> u64 {
+    path_seed.wrapping_add((diffusion_step as u64 + 1).wrapping_mul(STEP_SEED_GAMMA))
+}
+
+/// What one reverse step produced.
+pub struct ReverseStep {
+    /// x_{t-1}, the latent after the step.
+    pub latent: Vec<f32>,
+    /// ε̂, the noise the model predicted from x_t.
+    pub predicted_noise: Vec<f32>,
+    /// The clipped x0 estimate the posterior mean was built from — present only
+    /// when asked for, since nothing in the recursion needs it.
+    pub x0_hat: Option<Vec<f32>>,
+}
+
+/// One step down the reverse chain: compose `[x_t | timestep]`, predict ε̂, and
+/// sample the posterior.
+///
+/// **This is the only place the reverse recursion is written.** Both walkers go
+/// through it — [`sample_diffusion`], which descends T→0 once per path, and the
+/// perpetual drift, which descends arbitrary spans and re-noises between them.
+/// The input composition, the step-seed derivation and the posterior draw
+/// therefore cannot diverge between a finite sample and an endless one.
+#[allow(clippy::too_many_arguments)]
+pub fn reverse_step<State>(
+    model: &mut Model<State>,
+    schedule: &LinearNoiseSchedule,
+    input_channels: usize,
+    signal_channels: usize,
+    latent: &[f32],
+    diffusion_step: usize,
+    path_seed: u64,
+    denoise_magnitude: f32,
+    want_x0_hat: bool,
+) -> ReverseStep {
+    let timestep_channels = input_channels.saturating_sub(signal_channels);
+    let features = schedule.timestep_embedding(diffusion_step, timestep_channels);
+    let model_input = compose_diffusion_input(latent, input_channels, signal_channels, &features);
+    let predicted_noise = model.predict(&model_input);
+    // Derived from x_t, so it must be read before the reverse step produces
+    // x_{t-1}. Skipped entirely when nobody is watching.
+    let x0_hat =
+        want_x0_hat.then(|| schedule.x0_estimate(latent, &predicted_noise, diffusion_step));
+    let next = schedule.denoise_step_with_magnitude(
+        latent,
+        &predicted_noise,
+        diffusion_step,
+        reverse_step_seed(path_seed, diffusion_step),
+        denoise_magnitude,
+    );
+    ReverseStep {
+        latent: next,
+        predicted_noise,
+        x0_hat,
+    }
+}
+
 /// Core diffusion sampler with optional per-step trajectory capture.
 ///
 /// This is the *single* sampler used by inference and by the diagnostics, so the
@@ -361,7 +431,6 @@ pub fn sample_diffusion<State, F>(
 where
     F: FnMut(usize, usize),
 {
-    let timestep_channels = input_channels.saturating_sub(signal_channels);
     let path_count = denoising_paths.max(1);
     let steps = schedule.len().max(1);
     let total_work = path_count.saturating_mul(steps);
@@ -374,44 +443,33 @@ where
         let mut latent = base_latent.clone();
 
         for (step_idx, diffusion_step) in (0..schedule.len()).rev().enumerate() {
-            let features = schedule.timestep_embedding(diffusion_step, timestep_channels);
-            let model_input =
-                compose_diffusion_input(&latent, input_channels, signal_channels, &features);
-            let predicted_noise = model.predict(&model_input);
             let latent_in_stats = Stats::of(&latent);
-            // Derived from x_t, so it must be read before the reverse step
-            // overwrites `latent`. Skipped entirely when nobody is watching.
-            let x0_hat = observer
-                .is_some()
-                .then(|| schedule.x0_estimate(&latent, &predicted_noise, diffusion_step));
-            // The per-step seed mixes the timestep in by multiply-add, not by
-            // XOR: `path_seed ^ diffusion_step` collided with the XOR the noise
-            // field itself used to fold in the pixel index, so every step of
-            // the chain re-drew one single field under an `index ^ step`
-            // permutation. See `gaussian_at` in `schedule.rs`. The schedule-side
-            // fix already breaks the collision; this keeps the caller from
-            // relying on it.
-            let step_seed = path_seed
-                .wrapping_add((diffusion_step as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            latent = schedule.denoise_step_with_magnitude(
+            let stepped = reverse_step(
+                model,
+                schedule,
+                input_channels,
+                signal_channels,
                 &latent,
-                &predicted_noise,
                 diffusion_step,
-                step_seed,
+                path_seed,
                 denoise_magnitude,
+                observer.is_some(),
             );
+            latent = stepped.latent;
             if path_idx == 0 {
                 if let Some(traj) = trajectory.as_deref_mut() {
                     traj.push(DenoiseStepStat {
                         step_index: step_idx,
                         diffusion_step,
                         latent_in: latent_in_stats,
-                        eps_hat: Stats::of(&predicted_noise),
+                        eps_hat: Stats::of(&stepped.predicted_noise),
                         latent_out: Stats::of(&latent),
                     });
                 }
             }
-            if let (Some(observe), Some(x0_hat)) = (observer.as_deref_mut(), x0_hat.as_deref()) {
+            if let (Some(observe), Some(x0_hat)) =
+                (observer.as_deref_mut(), stepped.x0_hat.as_deref())
+            {
                 observe(&DenoiseFrame {
                     path_idx,
                     path_count,
@@ -492,6 +550,27 @@ mod tests {
         assert!((s.min - 1.0).abs() < 1e-6);
         assert!((s.max - 3.0).abs() < 1e-6);
         assert!(s.std > 0.0);
+    }
+
+    /// Now that every walker of the chain derives its per-step seed here, this
+    /// is the one place the anisotropy defect could come back. Under the old
+    /// `path_seed ^ diffusion_step` the seeds of two steps differed by a few low
+    /// bits — exactly the relation the pixel-index XOR turned into a reindexing
+    /// of one single noise field (`ANISOTROPY_HUNT.md`).
+    #[test]
+    fn reverse_step_seed_folds_the_timestep_in_without_xor() {
+        let path_seed = 0xdead_beef_u64;
+        for step in 0..256usize {
+            assert_ne!(
+                reverse_step_seed(path_seed, step),
+                path_seed ^ step as u64,
+                "step {step} seed fell back to the XOR derivation"
+            );
+        }
+        let distinct: std::collections::HashSet<u64> = (0..256)
+            .map(|step| reverse_step_seed(path_seed, step))
+            .collect();
+        assert_eq!(distinct.len(), 256, "two timesteps share a seed");
     }
 
     #[test]

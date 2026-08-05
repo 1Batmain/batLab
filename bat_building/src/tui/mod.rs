@@ -8,7 +8,8 @@ pub mod visualiser_control;
 
 pub use app::{
     ActivationMethod, App, InferenceConfig, LayerDraft, LayerKind, LossMethod, ModelConfig,
-    MonitorImage, PaddingMode, RunConfig, RunMode, Screen, TrainingConfig, TrainingControlCommand,
+    MonitorImage, PaddingMode, PerpetualConfig, PerpetualStatus, RunConfig, RunMode, Screen,
+    TrainingConfig, TrainingControlCommand,
 };
 pub use events::TrainingEvent;
 pub use visualiser_control::{
@@ -98,6 +99,7 @@ fn run_builder_loop(
                 },
                 denoising_paths,
                 denoise_magnitude,
+                checkpoint: app.selected_checkpoint_path.clone(),
             };
             return Ok(ModelConfig {
                 model_name: app.active_model_name.clone(),
@@ -136,6 +138,18 @@ pub fn run_monitor(
             app.inference_params.fields[2] = config.inference.denoise_magnitude.to_string();
             app.inference_params.field_idx = 0;
             app.inference_params.error = None;
+        }
+        RunMode::Perpetual(pc) => {
+            app.mode_selector.selected = 2;
+            app.perpetual_params.random_seed = pc.random_seed;
+            app.perpetual_params.regime = pc.regime;
+            app.perpetual_params.fields[0] = pc.seed.unwrap_or(0).to_string();
+            app.perpetual_params.fields[1] = pc.denoise_magnitude.to_string();
+            app.perpetual_params.fields[2] = pc.renoise_depth.to_string();
+            app.perpetual_params.fields[3] = pc.tempo.to_string();
+            app.perpetual_params.field_idx = 0;
+            app.perpetual_params.error = None;
+            app.selected_checkpoint_path = pc.checkpoint.clone();
         }
         RunMode::Train(tc) => {
             app.mode_selector.selected = 1;
@@ -273,6 +287,10 @@ fn run_monitor_loop(
                         train.batch_size = batch_size;
                         train.steps = total_steps;
                     }
+                }
+                TrainingEvent::PerpetualState(status) => {
+                    app.monitor.is_training_paused = status.paused;
+                    app.monitor.perpetual = Some(status);
                 }
                 TrainingEvent::SaveStatus { message, is_error } => {
                     if is_error {

@@ -28,7 +28,7 @@
 
 mod live_frame;
 
-pub use live_frame::LiveFrame;
+pub use live_frame::{LiveFrame, compose_live_frame, live_frame_width};
 
 use std::sync::Arc;
 use std::sync::OnceLock;

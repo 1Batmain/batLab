@@ -8,16 +8,16 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use bat_building::tui::{
-    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, RunMode,
-    TrainingConfig,
+    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, PerpetualConfig,
+    RunMode, TrainingConfig,
 };
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
-    DenoiseFrame, DiffusionTask, Dim3, FullyConnectedType, GpuContext, GpuDataset, GroupNormType,
-    LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting, MetricsLogger,
-    Model, OptimizerKind,
-    PaddingMode as PPadding, ProbeConfig, Stats, Trainer, UpsampleConvType, WeightInit, log_probe,
-    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
+    DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
+    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting, compose_live_frame, live_frame_width,
+    MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
+    Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
+    model::Training, probe_diffusion, reverse_step, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -99,6 +99,26 @@ fn main() {
             return;
         }
 
+        // -----------------------------------------------------------------
+        // DEV/CI ONLY — headless perpetual time-lapse.
+        //
+        // Walks the same drift the TUI's Perpetual mode walks and writes one
+        // PNG per completed cycle, so the wandering can be inspected as a
+        // sequence of stills without a window.
+        //
+        //   cargo run --release -p main -- --headless-perpetual <model> \
+        //       --frames N [--checkpoint <path>] [--depth T] \
+        //       [--regime wander|breathe] [--seed N] [--magnitude F] \
+        //       [--out <dir>]
+        // -----------------------------------------------------------------
+        if args.iter().any(|arg| arg == "--headless-perpetual") {
+            if let Err(err) = run_headless_perpetual(&args) {
+                eprintln!("headless perpetual failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
         let config = match tui::run() {
             Ok(c) => c,
             Err(_) => return,
@@ -169,7 +189,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         dataset_path,
         loss: match &config.run.mode {
             RunMode::Train(existing) => existing.loss.clone(),
-            RunMode::Infer => tui::LossMethod::MeanSquared,
+            RunMode::Infer | RunMode::Perpetual(_) => tui::LossMethod::MeanSquared,
         },
         checkpoint_path: Some(checkpoint_path),
         // Fixes #1 and #4 changed the convolution operator and the data range,
@@ -344,6 +364,203 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
     })
 }
 
+/// See the DEV/CI note in `main`. Not reachable from the TUI.
+///
+/// Walks the same drift the TUI mode walks and writes one PNG per completed
+/// cycle — a time-lapse of the wandering, without a window. It also reports the
+/// mean absolute change between consecutive frames, which is the number that
+/// says whether the run is *drifting* or merely redrawing the same image.
+fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+
+    let model_name = flag("--headless-perpetual")
+        .ok_or_else(|| "--headless-perpetual requires a model name".to_string())?;
+    let frames = flag("--frames")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1);
+    let depth = flag("--depth")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PerpetualConfig::default_renoise_depth());
+    let regime = match flag("--regime") {
+        Some(value) => bat_building::PerpetualRegime::parse(&value)
+            .ok_or_else(|| format!("invalid --regime: {value} (want wander|breathe)"))?,
+        None => bat_building::PerpetualRegime::default(),
+    };
+    let seed = flag("--seed")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let magnitude = flag("--magnitude")
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    // `--window` also writes the composed x_t | x̂₀ frame the live visualiser
+    // would be showing — the layout, out of the same function the window uses.
+    let window_frames = args.iter().any(|arg| arg == "--window");
+    let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
+        tui::storage::project_root()
+            .join("perpetual_samples")
+            .join(regime.label())
+    });
+
+    let config_path = tui::storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = tui::storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+    let checkpoint = flag("--checkpoint");
+
+    let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+    rt.block_on(async {
+        let (_gpu, mut model) = build_execution_model(
+            &config,
+            INFERENCE_RUNTIME_LR,
+            INFERENCE_RUNTIME_BATCH_SIZE,
+            OptimizerKind::default(),
+            WeightInit::default(),
+        )
+        .await?;
+        let checkpoint_path = resolve_sampling_checkpoint_path(&config, checkpoint.as_deref())?;
+        model
+            .load_checkpoint(&checkpoint_path)
+            .map_err(|err| format!("failed to load {}: {err}", checkpoint_path.display()))?;
+
+        let input_dims = model
+            .input_dim()
+            .ok_or_else(|| "model has no input dimensions".to_string())?;
+        let output_dims = model
+            .output_dim()
+            .ok_or_else(|| "model has no output dimensions".to_string())?;
+        let output_size = (output_dims.x, output_dims.y, output_dims.z);
+        let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+
+        let schedule = LinearNoiseSchedule::new_linear(
+            DIFFUSION_SCHEDULE_STEPS,
+            DIFFUSION_BETA_START,
+            DIFFUSION_BETA_END,
+        );
+        let mut drift = PerpetualDrift::new(schedule.len(), regime, depth, seed);
+        let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
+        let mut last_x0 = vec![0.0f32; output_len];
+        let mut previous_frame: Option<Vec<f32>> = None;
+        let mut mid_captured = false;
+
+        println!(
+            "headless perpetual '{model_name}': regime={} t_r={} frames={frames} \
+             magnitude={magnitude} seed={seed}\nweights → {}\nframes  → {}",
+            drift.regime().label(),
+            drift.depth(),
+            checkpoint_path.display(),
+            out_dir.display()
+        );
+
+        let started = std::time::Instant::now();
+        let mut steps = 0usize;
+        let mut written = 0usize;
+        while written < frames {
+            match drift.step() {
+                DriftAction::Descend {
+                    diffusion_step,
+                    path_seed,
+                } => {
+                    let stepped = reverse_step(
+                        &mut model,
+                        &schedule,
+                        input_dims.z as usize,
+                        output_dims.z as usize,
+                        &latent,
+                        diffusion_step,
+                        path_seed,
+                        magnitude,
+                        true,
+                    );
+                    latent = stepped.latent;
+                    if let Some(x0_hat) = stepped.x0_hat {
+                        last_x0 = x0_hat;
+                    }
+                    steps += 1;
+
+                    // One mid-descent frame per cycle: the moment the panes are
+                    // most unlike each other — x_t still visibly noisy, x̂₀
+                    // already an image. That contrast is what a user reads as
+                    // "the two halves are decorrelated", so it is the frame the
+                    // rule has to survive.
+                    if window_frames && !mid_captured && diffusion_step * 2 <= drift.depth() {
+                        write_tensor_png(
+                            &compose_live_frame(
+                                &latent,
+                                &last_x0,
+                                output_size.0,
+                                output_size.1,
+                                output_size.2,
+                            ),
+                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            &out_dir.join(format!("window_{:03}_mid_t{diffusion_step}.png", written)),
+                        )?;
+                        mid_captured = true;
+                    }
+                }
+                DriftAction::Renoise { to_step, seed } => {
+                    // A cycle just closed: `last_x0` is the image it settled on.
+                    let path = write_tensor_png(
+                        &last_x0,
+                        output_size,
+                        &out_dir.join(format!("{:03}.png", written)),
+                    )?;
+                    // …and, on request, the frame the live window would be
+                    // showing at this instant. In errance the cycle closes at
+                    // t=0, where the sampler's output IS its x̂₀ estimate, so
+                    // the two panes must land on the same image — the visual
+                    // half of the check `identical_sources_produce_two_identical_panes`
+                    // makes on synthetic data.
+                    if window_frames {
+                        write_tensor_png(
+                            &compose_live_frame(
+                                &latent,
+                                &last_x0,
+                                output_size.0,
+                                output_size.1,
+                                output_size.2,
+                            ),
+                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            &out_dir.join(format!("window_{:03}.png", written)),
+                        )?;
+                    }
+                    let change = previous_frame.as_ref().map(|prev| {
+                        prev.iter()
+                            .zip(last_x0.iter())
+                            .map(|(a, b)| (a - b).abs() as f64)
+                            .sum::<f64>()
+                            / last_x0.len() as f64
+                    });
+                    println!(
+                        "  cycle {:>3} → {}  (mean |Δ| vs previous frame: {})",
+                        drift.cycle(),
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        change.map_or("—".to_string(), |c| format!("{c:.4}"))
+                    );
+                    previous_frame = Some(last_x0.clone());
+                    written += 1;
+                    mid_captured = false;
+
+                    let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
+                    latent = noisy;
+                }
+            }
+        }
+
+        let elapsed = started.elapsed().as_secs_f32();
+        println!(
+            "{steps} reverse steps in {elapsed:.2} s ({:.0} steps/s, unthrottled)",
+            steps as f32 / elapsed.max(f32::EPSILON)
+        );
+        Ok::<(), String>(())
+    })
+}
+
 fn run_execution_loop(mut config: ModelConfig) {
     loop {
         if let Err(err) = normalize_config_for_models_layout(&mut config) {
@@ -353,7 +570,9 @@ fn run_execution_loop(mut config: ModelConfig) {
 
         let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<tui::TrainingControlCommand>();
-        let is_training_run = matches!(&config.run.mode, RunMode::Train(_));
+        // Both training and perpetual runs are steered while they run; a plain
+        // inference has nothing to steer.
+        let is_steerable = matches!(&config.run.mode, RunMode::Train(_) | RunMode::Perpetual(_));
         let config_clone = config.clone();
 
         std::thread::spawn(move || {
@@ -362,6 +581,9 @@ fn run_execution_loop(mut config: ModelConfig) {
                 let run_result = match config_clone.run.mode.clone() {
                     RunMode::Train(train_cfg) => {
                         run_training(config_clone, train_cfg, &tx, control_rx).await
+                    }
+                    RunMode::Perpetual(perpetual_cfg) => {
+                        run_perpetual(config_clone, perpetual_cfg, &tx, control_rx).await
                     }
                     RunMode::Infer => run_inference(config_clone, &tx).await,
                 };
@@ -372,11 +594,7 @@ fn run_execution_loop(mut config: ModelConfig) {
             });
         });
 
-        let maybe_control_tx = if is_training_run {
-            Some(control_tx)
-        } else {
-            None
-        };
+        let maybe_control_tx = if is_steerable { Some(control_tx) } else { None };
         match tui::run_monitor(config.clone(), rx, maybe_control_tx) {
             Ok(MonitorOutcome::Restart(new_config)) => {
                 config = new_config;
@@ -867,6 +1085,14 @@ fn apply_training_control_command(
             model.set_learning_rate(*current_lr);
             model.set_batch_size(*current_batch_size);
         }
+        // Perpetual-only controls. The monitor gates them on the run mode, so
+        // reaching one here means a stale command from a previous run's
+        // keystroke — ignoring it is the whole handling.
+        tui::TrainingControlCommand::NudgeRenoiseDepth(_)
+        | tui::TrainingControlCommand::NudgeTempo(_)
+        | tui::TrainingControlCommand::Reseed
+        | tui::TrainingControlCommand::ToggleRegime
+        | tui::TrainingControlCommand::SaveImage => {}
     }
 }
 
@@ -883,7 +1109,8 @@ async fn run_inference(
     )
     .await?;
 
-    let checkpoint_path = resolve_inference_checkpoint_path(&config)?;
+    let checkpoint_path =
+        resolve_sampling_checkpoint_path(&config, config.inference.checkpoint.as_deref())?;
     model.load_checkpoint(&checkpoint_path).map_err(|err| {
         format!(
             "failed to load inference checkpoint {}: {err}",
@@ -943,8 +1170,10 @@ async fn run_inference(
         live.frame_width(),
         live.frame_height(),
         live.channels(),
+        // The window title is the only legend a user sees while watching the
+        // frame, so it names the halves rather than merely separating them.
         format!(
-            "Denoising  —  x_t | x̂₀  ({}×{}×{} channels)",
+            "Denoising  —  gauche: x_t (bruité)  |  droite: x̂₀ (estimation)  —  {}×{}×{}",
             output_size.0, output_size.1, output_size.2
         ),
     );
@@ -990,6 +1219,301 @@ async fn run_inference(
     Ok(())
 }
 
+/// An inference that never returns.
+///
+/// The reverse chain is walked exactly as [`sample_diffusion`] walks it — same
+/// [`reverse_step`], same seed derivation — but instead of stopping at `t = 0`
+/// and handing back an image, the run re-noises what it just made and descends
+/// again. [`PerpetualDrift`] owns the itinerary (which `t`, when to turn round);
+/// this function owns the tensors, the pacing and the controls.
+///
+/// It is the *only* consumer of the run-control channel besides training, and
+/// it never sends `Done`: the run ends when the TUI drops the channel.
+async fn run_perpetual(
+    config: ModelConfig,
+    cfg: PerpetualConfig,
+    tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+    control_rx: Receiver<tui::TrainingControlCommand>,
+) -> Result<(), String> {
+    let (gpu, mut model) = build_execution_model(
+        &config,
+        INFERENCE_RUNTIME_LR,
+        INFERENCE_RUNTIME_BATCH_SIZE,
+        OptimizerKind::default(),
+        WeightInit::default(),
+    )
+    .await?;
+
+    let checkpoint_path = resolve_sampling_checkpoint_path(&config, cfg.checkpoint.as_deref())?;
+    model.load_checkpoint(&checkpoint_path).map_err(|err| {
+        format!(
+            "failed to load perpetual checkpoint {}: {err}",
+            checkpoint_path.display()
+        )
+    })?;
+
+    let limits = gpu.device().limits();
+    let _ = tx.send(tui::TrainingEvent::ResourceReport {
+        max_buffer_bytes: limits.max_buffer_size,
+        max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
+        estimated_training_bytes: model.estimated_gpu_bytes(),
+    });
+
+    let input_dims = model
+        .input_dim()
+        .ok_or_else(|| "model has no input dimensions".to_string())?;
+    let output_dims = model
+        .output_dim()
+        .ok_or_else(|| "model has no output dimensions".to_string())?;
+    let output_size = (output_dims.x, output_dims.y, output_dims.z);
+    let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+    let input_channels = input_dims.z as usize;
+    let signal_channels = output_dims.z as usize;
+
+    let schedule = LinearNoiseSchedule::new_linear(
+        DIFFUSION_SCHEDULE_STEPS,
+        DIFFUSION_BETA_START,
+        DIFFUSION_BETA_END,
+    );
+
+    let seed = if cfg.random_seed {
+        random_seed()
+    } else {
+        cfg.seed.unwrap_or(0)
+    };
+    let mut drift = PerpetualDrift::new(schedule.len(), cfg.regime, cfg.renoise_depth, seed);
+    let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
+    // Until the first reverse step reports one, the best clean estimate we hold
+    // is a flat mid-grey — never the pure-noise latent, which `add_noise` would
+    // take for a clean image (see the perpetual module's header).
+    let mut last_x0 = vec![0.0f32; output_len];
+
+    let mut live = LiveFrame::new(
+        model.gpu_context(),
+        output_size.0,
+        output_size.1,
+        output_size.2,
+    );
+    tui::register_visualiser_source(
+        model.gpu_context(),
+        live.buffer(),
+        live.frame_width(),
+        live.frame_height(),
+        live.channels(),
+        format!(
+            "Perpetual  —  gauche: x_t (bruité)  |  droite: x̂₀ (estimation)  —  {}×{}×{}",
+            output_size.0, output_size.1, output_size.2
+        ),
+    );
+
+    let sample_dir = tui::storage::project_root().join("perpetual_samples");
+    let mut tempo = cfg
+        .tempo
+        .clamp(PerpetualConfig::MIN_TEMPO, PerpetualConfig::MAX_TEMPO);
+    let mut paused = false;
+    let mut steps = 0usize;
+    let mut saved = 0usize;
+    let mut next_step_at = std::time::Instant::now();
+    let mut pace = PaceMeter::new();
+    let mut last_published = std::time::Instant::now();
+
+    let publish = |tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+                   drift: &PerpetualDrift,
+                   steps: usize,
+                   steps_per_sec: f32,
+                   tempo: f32,
+                   paused: bool|
+     -> bool {
+        tx.send(tui::TrainingEvent::PerpetualState(tui::PerpetualStatus {
+            regime: drift.regime().label().to_string(),
+            depth: drift.depth(),
+            min_depth: bat_building::MIN_RENOISE_DEPTH,
+            max_depth: drift.max_depth(),
+            cycle: drift.cycle(),
+            diffusion_step: drift.current_step(),
+            steps,
+            steps_per_sec,
+            tempo,
+            paused,
+        }))
+        .is_ok()
+    };
+    if !publish(tx, &drift, steps, 0.0, tempo, paused) {
+        tui::clear_visualiser_source();
+        return Ok(());
+    }
+
+    loop {
+        let mut dirty = false;
+        loop {
+            match control_rx.try_recv() {
+                Ok(command) => {
+                    dirty = true;
+                    match command {
+                        tui::TrainingControlCommand::SetPaused(next) => {
+                            paused = next;
+                            next_step_at = std::time::Instant::now();
+                            pace.reset();
+                        }
+                        tui::TrainingControlCommand::NudgeRenoiseDepth(delta) => {
+                            drift.nudge_depth(delta)
+                        }
+                        tui::TrainingControlCommand::ToggleRegime => drift.toggle_regime(),
+                        tui::TrainingControlCommand::Reseed => {
+                            let next_seed = random_seed();
+                            drift.reseed(next_seed);
+                            latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
+                            last_x0 = vec![0.0f32; output_len];
+                        }
+                        tui::TrainingControlCommand::NudgeTempo(delta) => {
+                            let factor = PerpetualConfig::TEMPO_FACTOR.powi(delta);
+                            tempo = (tempo * factor)
+                                .clamp(PerpetualConfig::MIN_TEMPO, PerpetualConfig::MAX_TEMPO);
+                            next_step_at = std::time::Instant::now();
+                            pace.reset();
+                        }
+                        tui::TrainingControlCommand::SaveImage => {
+                            let name = format!(
+                                "{}_c{:03}_{:03}.png",
+                                drift.regime().label(),
+                                drift.cycle(),
+                                saved
+                            );
+                            let message = match write_tensor_png(
+                                &last_x0,
+                                output_size,
+                                &sample_dir.join(name),
+                            ) {
+                                Ok(path) => {
+                                    saved += 1;
+                                    format!("image → {}", path.display())
+                                }
+                                Err(err) => err,
+                            };
+                            let is_error = !message.starts_with("image");
+                            if tx
+                                .send(tui::TrainingEvent::SaveStatus { message, is_error })
+                                .is_err()
+                            {
+                                tui::clear_visualiser_source();
+                                return Ok(());
+                            }
+                        }
+                        // Training-only commands; a perpetual run has no
+                        // optimiser to retune and no weights of its own to save.
+                        tui::TrainingControlCommand::SaveCheckpoint
+                        | tui::TrainingControlCommand::UpdateParams { .. } => {}
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The monitor is gone: the only way this run ever ends.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tui::clear_visualiser_source();
+                    return Ok(());
+                }
+            }
+        }
+
+        if paused {
+            if dirty && !publish(tx, &drift, steps, 0.0, tempo, paused) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        match drift.step() {
+            DriftAction::Descend {
+                diffusion_step,
+                path_seed,
+            } => {
+                let stepped = reverse_step(
+                    &mut model,
+                    &schedule,
+                    input_channels,
+                    signal_channels,
+                    &latent,
+                    diffusion_step,
+                    path_seed,
+                    cfg.denoise_magnitude,
+                    true,
+                );
+                latent = stepped.latent;
+                if let Some(x0_hat) = stepped.x0_hat {
+                    live.publish(&latent, &x0_hat);
+                    last_x0 = x0_hat;
+                }
+                steps += 1;
+                pace.tick();
+            }
+            DriftAction::Renoise { to_step, seed } => {
+                // The forward process, unchanged, applied to the clipped x̂₀ —
+                // the same `add_noise` training uses to build its examples.
+                let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
+                latent = noisy;
+                live.publish(&latent, &last_x0);
+                dirty = true;
+            }
+        }
+
+        let now = std::time::Instant::now();
+        next_step_at += Duration::from_secs_f32(1.0 / tempo);
+        if next_step_at > now {
+            std::thread::sleep(next_step_at - now);
+        } else {
+            // Fell behind the requested pace (the sampler is the ceiling): drop
+            // the debt instead of sprinting to repay it.
+            next_step_at = now;
+        }
+
+        if dirty || last_published.elapsed() >= Duration::from_millis(100) {
+            last_published = std::time::Instant::now();
+            if !publish(tx, &drift, steps, pace.per_second(), tempo, paused) {
+                break;
+            }
+        }
+    }
+
+    tui::clear_visualiser_source();
+    Ok(())
+}
+
+/// Rolling measurement of how fast the chain is actually being walked, which is
+/// not the requested tempo whenever the sampler is the bottleneck.
+struct PaceMeter {
+    window_start: std::time::Instant,
+    ticks: usize,
+    last_rate: f32,
+}
+
+impl PaceMeter {
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            ticks: 0,
+            last_rate: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.window_start = std::time::Instant::now();
+        self.ticks = 0;
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            self.last_rate = self.ticks as f32 / elapsed.as_secs_f32();
+            self.reset();
+        }
+    }
+
+    fn per_second(&self) -> f32 {
+        self.last_rate
+    }
+}
+
 /// Renders "which path, which step, which t" from the sampler's flat work
 /// counter.
 ///
@@ -1023,7 +1547,21 @@ fn denoising_progress_label(
     }
 }
 
-fn resolve_inference_checkpoint_path(config: &ModelConfig) -> Result<PathBuf, String> {
+/// Which weights a sampling run loads.
+///
+/// The weight selector lets the user pick any file in the model's
+/// `pretrained_weights/`; honouring that choice here is what makes the screen
+/// mean something for inference. `latest.ckpt` stays the fallback, so configs
+/// written before the choice was recorded behave exactly as they did.
+fn resolve_sampling_checkpoint_path(
+    config: &ModelConfig,
+    selected: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = selected.map(PathBuf::from)
+        && path.exists()
+    {
+        return Ok(path);
+    }
     let model_name = config
         .model_name
         .as_deref()
@@ -1516,6 +2054,19 @@ fn save_tensor_as_image(
     sample_dir: &Path,
     step: usize,
 ) -> Result<PathBuf, String> {
+    write_tensor_png(
+        tensor,
+        dims,
+        &sample_dir.join(format!("step_{step:04}.png")),
+    )
+}
+
+/// Encodes a `[-1, 1]` tensor to a PNG at `path`, creating its directory.
+///
+/// Same encoder as the training previews and the headless sampler — a saved
+/// frame of a perpetual run and a saved sample of a finite one are the same
+/// bytes for the same tensor.
+fn write_tensor_png(tensor: &[f32], dims: (u32, u32, u32), path: &Path) -> Result<PathBuf, String> {
     let (width, height, channels) = dims;
     let expected_len = (width * height * channels) as usize;
     if tensor.len() != expected_len {
@@ -1524,8 +2075,14 @@ fn save_tensor_as_image(
             tensor.len()
         ));
     }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
 
-    let path = sample_dir.join(format!("step_{step:04}.png"));
+    let path = path.to_path_buf();
     if channels == 1 {
         let pixels: Vec<u8> = tensor.iter().map(|value| to_u8(*value)).collect();
         let image = GrayImage::from_raw(width, height, pixels)
