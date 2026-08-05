@@ -208,7 +208,7 @@ def fig_timeline():
     ax.set_xlim(-0.05, 4.15)
     ax.set_ylim(0.45, total + 0.55)
     ax.axis("off")
-    ax.set_title("La campagne en un coup d'œil — 8 missions, 3 actes",
+    ax.set_title("La campagne en un coup d'œil — 8 missions, 3 actes  ·  20 juillet → 5 août 2026",
                  color=INK, fontsize=11.5, pad=14)
     save(fig, "01_carte_campagne.png")
 
