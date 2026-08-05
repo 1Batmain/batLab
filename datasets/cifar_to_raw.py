@@ -39,6 +39,11 @@ import struct
 import os
 import sys
 
+try:  # chemin rapide : 50000×32×32×3 f32 en pur Python coûte des minutes
+    import numpy as _np
+except ImportError:
+    _np = None
+
 MAGIC = b"BATRAW1\0"
 CIFAR_RECORD_BYTES = 3073  # 1 label byte + 3*1024 channel bytes
 CIFAR_WIDTH = 32
@@ -85,6 +90,30 @@ def _parse_cifar_batch(data: bytes, mode: str) -> list:
     return samples
 
 
+def _parse_cifar_batch_np(data: bytes, mode: str):
+    """Version vectorisée de `_parse_cifar_batch` (résultat bit-à-bit identique).
+
+    Les calculs se font en float64 comme en pur Python, puis sont abaissés en
+    float32 au moment de l'écriture — mêmes octets que `struct.pack('<f', …)`.
+    """
+    if len(data) % CIFAR_RECORD_BYTES != 0:
+        raise ValueError(
+            f"Unexpected batch size: {len(data)} bytes "
+            f"(not a multiple of {CIFAR_RECORD_BYTES})"
+        )
+
+    records = _np.frombuffer(data, dtype=_np.uint8).reshape(-1, CIFAR_RECORD_BYTES)
+    # record[0] = label (inutilisé) ; puis 3 plans de 1024 octets (R, G, B)
+    planes = records[:, 1:].reshape(-1, CIFAR_RGB_CHANNELS, CIFAR_PIXELS).astype(_np.float64)
+
+    if mode == "grey":
+        out = (0.299 * planes[:, 0] + 0.587 * planes[:, 1] + 0.114 * planes[:, 2]) / 255.0
+    else:  # rgb : entrelacement plan → pixel (row-major, canaux R,G,B contigus)
+        out = (planes / 255.0).transpose(0, 2, 1).reshape(-1, CIFAR_PIXELS * CIFAR_RGB_CHANNELS)
+
+    return _np.ascontiguousarray(out, dtype=_np.float32)
+
+
 def _chunks(data: bytes, size: int):
     for i in range(0, len(data), size):
         yield data[i : i + size]
@@ -122,10 +151,13 @@ def convert(cifar_dir: str, out_path: str, mode: str, include_test: bool) -> Non
         print(f"  Reading {batch_file} …", flush=True)
         with open(batch_file, "rb") as fh:
             data = fh.read()
-        all_samples.extend(_parse_cifar_batch(data, mode))
+        if _np is not None:
+            all_samples.append(_parse_cifar_batch_np(data, mode))
+        else:
+            all_samples.extend(_parse_cifar_batch(data, mode))
 
-    count = len(all_samples)
     sample_floats = CIFAR_WIDTH * CIFAR_HEIGHT * channels
+    count = sum(len(chunk) for chunk in all_samples) if _np is not None else len(all_samples)
 
     print(
         f"  Writing {count} samples ({CIFAR_WIDTH}×{CIFAR_HEIGHT}×{channels}) → {out_path}",
@@ -135,8 +167,13 @@ def convert(cifar_dir: str, out_path: str, mode: str, include_test: bool) -> Non
     with open(out_path, "wb") as fh:
         fh.write(MAGIC)
         fh.write(struct.pack("<IIII", count, CIFAR_WIDTH, CIFAR_HEIGHT, channels))
-        for sample in all_samples:
-            fh.write(struct.pack(f"<{sample_floats}f", *sample))
+        if _np is not None:
+            for chunk in all_samples:
+                assert chunk.shape[1] == sample_floats, chunk.shape
+                fh.write(chunk.tobytes())
+        else:
+            for sample in all_samples:
+                fh.write(struct.pack(f"<{sample_floats}f", *sample))
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
     print(f"  Done – {size_mb:.1f} MiB written to {out_path}")
