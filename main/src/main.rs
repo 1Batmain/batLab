@@ -1126,8 +1126,10 @@ async fn run_inference(
         live.frame_width(),
         live.frame_height(),
         live.channels(),
+        // The window title is the only legend a user sees while watching the
+        // frame, so it names the halves rather than merely separating them.
         format!(
-            "Denoising  —  x_t | x̂₀  ({}×{}×{} channels)",
+            "Denoising  —  gauche: x_t (bruité)  |  droite: x̂₀ (estimation)  —  {}×{}×{}",
             output_size.0, output_size.1, output_size.2
         ),
     );
@@ -1255,7 +1257,7 @@ async fn run_perpetual(
         live.frame_height(),
         live.channels(),
         format!(
-            "Perpetual  —  x_t | x̂₀  ({}×{}×{} channels)",
+            "Perpetual  —  gauche: x_t (bruité)  |  droite: x̂₀ (estimation)  —  {}×{}×{}",
             output_size.0, output_size.1, output_size.2
         ),
     );

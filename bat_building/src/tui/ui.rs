@@ -814,13 +814,20 @@ fn draw_monitor(f: &mut Frame, app: &App) {
         } else {
             ""
         };
+        // Same legend as the perpetual panel: the window shows two panes, and
+        // a user with no caption reads them as one image that has split.
+        let legend = if super::visualiser_control::has_visualiser_source() {
+            "  (fenêtre : gauche x_t, droite x̂₀)"
+        } else {
+            ""
+        };
         if let Some(progress) = app.monitor.loading_progress.as_ref() {
             format!(
-                " inference: {} ({}/{}) |{visualise}  [s] save  [q] quit",
+                " inference: {} ({}/{}) |{visualise}  [s] save  [q] quit{legend}",
                 progress.label, progress.current, progress.total
             )
         } else {
-            format!(" inference: running |{visualise}  [s] save  [q] quit")
+            format!(" inference: running |{visualise}  [s] save  [q] quit{legend}")
         }
     } else if is_training_mode(app) {
         let status = if app.monitor.is_training_paused {
@@ -962,7 +969,11 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "  The image is in the [v] window — x_t on the left, x̂₀ on the right.",
+            "  Fenêtre [v] : gauche x_t (bruité) │ droite x̂₀ (estimation).",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  Les deux moitiés convergent vers la même image quand t → 0.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
