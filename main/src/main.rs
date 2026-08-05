@@ -12,11 +12,11 @@ use bat_building::tui::{
     TrainingConfig,
 };
 use bat_building::{
-    ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
-    FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
-    LossMethod as PLoss, MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, ProbeConfig,
-    Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
-    model::Training, probe_diffusion, sample_diffusion,
+    ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
+    DiffusionTask, Dim3, FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes,
+    LinearNoiseSchedule, LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind,
+    PaddingMode as PPadding, ProbeConfig, Stats, Trainer, UpsampleConvType, WeightInit, log_probe,
+    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -62,7 +62,9 @@ fn main() {
         // path and cannot drift from it.
         //
         //   cargo run --release -- --headless-train <model> --steps N \
-        //       --dataset <path> [--lr F] [--batch N] [--out <ckpt path>]
+        //       --dataset <path> [--lr F] [--batch N] [--out <ckpt path>] \
+        //       [--optimizer sgd|adam] [--weight-init uniform|he] \
+        //       [--loss-weighting uniform|snr] [--snr-gamma F]
         //
         // It never writes back to the model's config_file and defaults its
         // checkpoint to a scratch path, so it cannot clobber saved weights.
@@ -137,6 +139,13 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             .ok_or_else(|| format!("invalid value for --weight-init: {value} (want uniform|he)"))?,
         None => WeightInit::default(),
     };
+    let snr_gamma = parse("--snr-gamma", DEFAULT_SNR_GAMMA)?;
+    let loss_weighting = match flag("--loss-weighting") {
+        Some(value) => LossWeighting::parse(&value, snr_gamma).ok_or_else(|| {
+            format!("invalid value for --loss-weighting: {value} (want uniform|snr)")
+        })?,
+        None => LossWeighting::default(),
+    };
 
     let config_path = tui::storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
@@ -167,14 +176,16 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         load_checkpoint: false,
         optimizer,
         weight_init,
+        loss_weighting,
     };
     config.run.mode = RunMode::Train(train_cfg.clone());
 
     println!(
         "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
-         optimizer={}, init={}, dataset={}",
+         optimizer={}, init={}, loss-weighting={}, dataset={}",
         optimizer.label(),
         weight_init.label(),
+        loss_weighting.label(),
         train_cfg.dataset_path
     );
 
@@ -480,11 +491,31 @@ async fn run_training(
         DIFFUSION_BETA_START,
         DIFFUSION_BETA_END,
     );
-    let mut trainer = Trainer::new(DiffusionTask::new(schedule));
+    let mut trainer = Trainer::new(DiffusionTask::new_with_weighting(
+        schedule,
+        train_cfg.loss_weighting,
+    ));
     trainer
         .configure_for_model(&model)
         .map_err(|err| format!("failed to configure diffusion task: {err}"))?;
     let diffusion = trainer.task().schedule().clone();
+    {
+        // Re-emits the weighting the training loop actually built, and the share
+        // of draws it sends to each probe bucket — the number the report reads.
+        let mass = trainer.task().timestep_bucket_mass(4);
+        let mass = if mass.is_empty() {
+            "uniform (0.25 each)".to_string()
+        } else {
+            mass.iter()
+                .map(|m| format!("{m:.4}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!(
+            "[weighting] {} — timestep mass per bucket: {mass}",
+            train_cfg.loss_weighting.label()
+        );
+    }
 
     let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
     let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;

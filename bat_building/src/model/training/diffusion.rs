@@ -1,5 +1,6 @@
 //! File purpose: Implements diffusion logic used by the training pipeline.
 
+use super::weighting::{LossWeighting, TimestepSampler};
 use super::{
     GpuDataset, LinearNoiseSchedule, TaskPassSpec, TrainingTask, TrainingTaskError, Workgroups,
 };
@@ -16,6 +17,8 @@ pub struct DiffusionTask {
     configured_output: Option<Dim3>,
     prepare_pass: Option<DiffusionPreparePass>,
     shuffle: SampleShuffle,
+    weighting: LossWeighting,
+    sampler: TimestepSampler,
 }
 
 /// Per-epoch permutation of the dataset.
@@ -101,6 +104,14 @@ struct DiffusionPrepareUniform {
 
 impl DiffusionTask {
     pub fn new(schedule: LinearNoiseSchedule) -> Self {
+        Self::new_with_weighting(schedule, LossWeighting::default())
+    }
+
+    /// Same task, but the training timestep is drawn from `p(t) ∝ w(t)` instead
+    /// of uniformly — see `weighting.rs` for why that is exactly a `w(t)`-weighted
+    /// loss and why it is done here rather than in the loss shader.
+    pub fn new_with_weighting(schedule: LinearNoiseSchedule, weighting: LossWeighting) -> Self {
+        let sampler = TimestepSampler::new(&schedule, weighting);
         Self {
             schedule,
             timestep_channels: 0,
@@ -109,11 +120,34 @@ impl DiffusionTask {
             configured_output: None,
             prepare_pass: None,
             shuffle: SampleShuffle::default(),
+            weighting,
+            sampler,
         }
     }
 
     pub fn schedule(&self) -> &LinearNoiseSchedule {
         &self.schedule
+    }
+
+    pub fn loss_weighting(&self) -> LossWeighting {
+        self.weighting
+    }
+
+    /// Share of the timestep draws landing in each of the four probe buckets,
+    /// for the run banner. Empty for the uniform sampler.
+    pub fn timestep_bucket_mass(&self, buckets: usize) -> Vec<f64> {
+        let p = self.sampler.probabilities();
+        if p.is_empty() || buckets == 0 {
+            return Vec::new();
+        }
+        let span = p.len().div_ceil(buckets);
+        (0..buckets)
+            .map(|b| {
+                let lo = (b * span).min(p.len());
+                let hi = ((b + 1) * span).min(p.len());
+                p[lo..hi].iter().sum()
+            })
+            .collect()
     }
 
     pub fn timestep_channels(&self) -> usize {
@@ -231,7 +265,7 @@ impl DiffusionTask {
                 let sample_index = self.shuffle.sample_index(position, epoch, sample_count);
                 (
                     sample_index,
-                    diffusion_step_for(counter, schedule_len, seed),
+                    self.sampler.draw(counter, schedule_len, seed),
                 )
             })
             .collect();
@@ -543,6 +577,16 @@ pub(crate) fn diffusion_step_for(counter: usize, schedule_len: usize, seed: u64)
     }
     let mut rng = SplitMix64::new(seed ^ (counter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     (rng.next_u64() % schedule_len as u64) as usize
+}
+
+/// The same draw as [`diffusion_step_for`], stopped one step earlier: the raw
+/// uniform in `[0, 1)` that a non-uniform sampler feeds to its inverse CDF.
+/// Keeping the stream identical means the two samplers see the same randomness
+/// and differ only by the mapping applied to it.
+pub(crate) fn uniform_unit_for(counter: usize, seed: u64) -> f64 {
+    let mut rng = SplitMix64::new(seed ^ (counter as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    // Top 53 bits: the exactly-representable mantissa range of f64.
+    (rng.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
 }
 
 fn same_dims(saved: Option<Dim3>, target: Dim3) -> bool {

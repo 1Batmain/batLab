@@ -4,6 +4,7 @@ pub mod dataset;
 pub mod diffusion;
 pub mod metrics;
 pub mod schedule;
+pub mod weighting;
 
 use crate::model::{Dim3, Model};
 use std::error::Error;
@@ -16,6 +17,7 @@ pub use metrics::{
     log_probe, log_train_loss, log_trajectory, probe_diffusion, sample_diffusion,
 };
 pub use schedule::LinearNoiseSchedule;
+pub use weighting::{DEFAULT_SNR_GAMMA, LossWeighting};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Workgroups {

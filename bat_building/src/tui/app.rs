@@ -1,6 +1,7 @@
 //! File purpose: Implements app behavior for the terminal user interface flow.
 
 use super::storage::{self, SavedModelEntry};
+use crate::model::training::LossWeighting;
 use crate::model::{OptimizerKind, WeightInit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -710,6 +711,11 @@ pub struct TrainingConfig {
     /// older configs, which therefore keep the uniform draw.
     #[serde(default)]
     pub weight_init: WeightInit,
+    /// Per-timestep loss weighting for diffusion runs, applied by biasing the
+    /// timestep draw (see `training::weighting`). Absent from older configs,
+    /// which therefore keep the uniform draw and the unweighted ε-MSE.
+    #[serde(default)]
+    pub loss_weighting: LossWeighting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2302,6 +2308,7 @@ impl App {
                 load_checkpoint: self.load_checkpoint_on_start,
                 optimizer: OptimizerKind::default(),
                 weight_init: WeightInit::default(),
+                loss_weighting: LossWeighting::default(),
             }),
         });
         Ok(())
@@ -2411,8 +2418,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, InferenceConfig, LayerKind, LossMethod, ModelConfig, OptimizerKind, RunConfig,
-        RunMode, Screen, TrainingConfig, TrainingControlCommand, WeightInit,
+        App, InferenceConfig, LayerKind, LossMethod, LossWeighting, ModelConfig, OptimizerKind,
+        RunConfig, RunMode, Screen, TrainingConfig, TrainingControlCommand, WeightInit,
     };
 
     #[test]
@@ -2585,6 +2592,7 @@ mod tests {
                     load_checkpoint: false,
                     optimizer: OptimizerKind::default(),
                     weight_init: WeightInit::default(),
+                    loss_weighting: LossWeighting::default(),
                 }),
             },
         });
