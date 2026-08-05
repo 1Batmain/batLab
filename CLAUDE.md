@@ -17,6 +17,10 @@ Pour piloter le vrai TUI malgré tout (test end-to-end) : le lancer dans un pane
 
 ## Points d'attention
 
+- **Piège du workspace** : `cargo build --release` à la racine ne reconstruit PAS le binaire `main` (il ne bâtit que la lib racine). Toujours `cargo build/run --release -p main`. Après un changement de flag CLI, vérifier la bannière du run (le binaire réémet sa config parsée).
+- **Optimiseur** : Adam (`--optimizer adam --lr 1e-3`) converge ~20x plus vite que SGD en nombre de pas, surcoût < 1 % (voir `OPTIMIZER_ADAM.md`). L'init He est disponible (`--weight-init he`) mais n'a pas montré de gain (GroupNorm neutralise l'échelle en aval).
+- **Lecture des métriques de diffusion** : la MSE sur ε inverse l'importance des tranches — convertir en erreur x₀ (facteur ᾱ/(1−ᾱ)) avant de conclure. Le contenu global d'une image se décide à t haut ; une loss non pondérée y écrase le gradient (~1e5) et produit du mode collapse (voir `SCALE_UNET.md`). Baselines triviales : `tools/trivial_baselines.py`.
+
 - Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
 - Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `INSIGHTS_TRAINING.md`).
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
