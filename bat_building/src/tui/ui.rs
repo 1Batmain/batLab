@@ -2,7 +2,7 @@
 
 use super::app::{
     App, HOME_CHOICES, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode,
-    LayerKind, MonitorImage, PERPETUAL_PARAM_FIELD_NAMES, RunMode, Screen,
+    LayerKind, MonitorImage, PERPETUAL_PARAM_FIELD_NAMES, RUN_MODE_CHOICES, RunMode, Screen,
     TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
@@ -604,7 +604,7 @@ fn draw_mode_selector(f: &mut Frame, app: &App) {
     draw_choice_screen(
         f,
         "Run Mode",
-        &["Inference", "Training", "Perpetual"],
+        &RUN_MODE_CHOICES,
         app.mode_selector.selected,
         "[arrow] select  [Enter] configure/run  [e] edit layers  [q] quit",
     );

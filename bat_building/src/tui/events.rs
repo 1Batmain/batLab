@@ -2,7 +2,7 @@
 
 use super::app::{
     App, HOME_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, PERPETUAL_PARAM_FIELD_NAMES,
-    PerpetualStatus, Screen, TrainingControlCommand,
+    PerpetualStatus, RUN_MODE_CHOICES, Screen, TrainingControlCommand,
 };
 use crossterm::event::KeyCode;
 
@@ -262,7 +262,7 @@ fn handle_mode_selector(app: &mut App, code: KeyCode) {
             }
         }
         KeyCode::Down => {
-            if app.mode_selector.selected < 1 {
+            if app.mode_selector.selected + 1 < RUN_MODE_CHOICES.len() {
                 app.mode_selector.selected += 1;
             }
         }
@@ -486,6 +486,27 @@ mod tests {
             run: RunConfig { mode },
         });
         app
+    }
+
+    /// Found by driving the real TUI: `Perpetual` was drawn as a third option
+    /// but the cursor stopped at index 1, so it could never be selected. The
+    /// bound now comes from the choice list itself.
+    #[test]
+    fn the_mode_cursor_reaches_every_run_mode() {
+        let mut app = App::new();
+        app.screen = Screen::ModeSelector;
+        app.mode_selector.selected = 0;
+
+        for expected in 1..RUN_MODE_CHOICES.len() {
+            handle_key(&mut app, KeyCode::Down);
+            assert_eq!(app.mode_selector.selected, expected);
+        }
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.mode_selector.selected,
+            RUN_MODE_CHOICES.len() - 1,
+            "cursor ran past the last mode"
+        );
     }
 
     #[test]

@@ -975,8 +975,13 @@ pub enum LayerBuilderMode {
 }
 
 pub struct ModeSelectorState {
-    pub selected: usize, // 0 = Infer, 1 = Train
+    pub selected: usize, // index into RUN_MODE_CHOICES
 }
+
+/// The run modes offered, in the order they are drawn. The key handler bounds
+/// its cursor on this, so adding a mode here is enough to make it reachable —
+/// the third one was drawn but unselectable while the bound was hard-coded.
+pub const RUN_MODE_CHOICES: [&str; 3] = ["Inference", "Training", "Perpetual"];
 
 pub struct TrainingParamsState {
     pub fields: Vec<String>, // [lr, batch_size, steps, dataset_path]
