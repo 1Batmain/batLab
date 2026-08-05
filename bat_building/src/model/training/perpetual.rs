@@ -5,8 +5,9 @@
 //! `0` and hands back an image. A perpetual run has none. It descends, reaches
 //! its floor, walks the *forward* chain back up to `t_r`, and descends again —
 //! forever. What changes between the two is *only* the itinerary: every step
-//! down is the same [`crate::reverse_step`], and every step up is one increment
-//! of the forward process, [`LinearNoiseSchedule::forward_step`].
+//! down is the same [`crate::reverse_step`], and every step up is one level of
+//! the forward process in closed form,
+//! [`LinearNoiseSchedule::forward_from`](crate::LinearNoiseSchedule::forward_from).
 //!
 //! That itinerary is the whole of this module, and it holds no model, no GPU
 //! handle and no tensor — so the thing that is hardest to eyeball (an infinite
@@ -36,19 +37,38 @@
 //! settled image straight to `t_r` between two frames. Distributionally that is
 //! the same destination, and to watch it was a slap — "an immense quantity of
 //! noise, all at once", which is no way to hold a contemplative image. Walking
-//! the same distance one `forward_step` at a time, one visualiser frame per
-//! increment, dissolves the image over the same number of frames it took to
-//! resolve. Same maths, opposite experience.
+//! the same distance one level at a time, one visualiser frame per level,
+//! dissolves the image over the same number of frames it took to resolve. Same
+//! maths, opposite experience.
+//!
+//! # Why the climb is walked in closed form and not as a Markov chain
+//!
+//! The walked version was first written as the exact forward chain: one
+//! [`LinearNoiseSchedule::forward_step`] per frame. That is the textbook
+//! process and it is correct — and it *shimmered*. Each increment draws its own
+//! independent field, so at thirty frames a second the climb showed thirty
+//! unrelated grains a second: television static laid over a dissolving image.
+//! The descent has no such artefact, because consecutive latents of the reverse
+//! chain are strongly correlated; the climb crackled because its noise was not.
+//!
+//! The climb therefore runs
+//! [`forward_from`](crate::LinearNoiseSchedule::forward_from): every level is
+//! computed from the *departure* state with **one field per cycle**, drawn once
+//! and then revealed as its amplitude rises. Every frame keeps the marginal it
+//! had before and the destination keeps its distribution — only the correlation
+//! *between* frames changes, from zero to one. See `CLIMB_COHERENCE.md`.
 //!
 //! # What the climb starts from
 //!
-//! The current latent, wherever the descent left it — never a re-interpretation
-//! of it as a clean image. This is the whole reason the climb is expressed as
-//! increments: `x_k = sqrt(α_k)·x_{k-1} + sqrt(β_k)·ε` is valid from *any*
-//! legitimate `x_{k-1}`, by the Markov property of the forward process, whereas
-//! `add_noise(x, t)` implements `x_t = sqrt(ᾱ_t)·x₀ + sqrt(1-ᾱ_t)·ε` and is only
-//! valid when `x` really is a clean `x₀` — feed it a latent that already carries
-//! noise and the signal decays by an extra `sqrt(ᾱ_floor)` every cycle.
+//! The latent the descent left, wherever it left it — never a re-interpretation
+//! of it as a clean image. This is what the closed form from an intermediate
+//! state exists for: `x_t = sqrt(ᾱ_t/ᾱ_dep)·x_dep + sqrt(1 - ᾱ_t/ᾱ_dep)·ε` is
+//! valid from *any* legitimate `x_dep`, being `q(x_t | x_dep)` of the forward
+//! process, whereas `add_noise(x, t)` implements
+//! `x_t = sqrt(ᾱ_t)·x₀ + sqrt(1-ᾱ_t)·ε` and is only valid when `x` really is a
+//! clean `x₀` — feed it a latent that already carries noise and the signal
+//! decays by an extra `sqrt(ᾱ_floor)` every cycle. The ratio of `ᾱ`s is exactly
+//! the correction that makes the departure's own noise level accounted for.
 //!
 //! So the climb runs from `floor` to `t_r`, and the two regimes both come out
 //! right for the same reason:
@@ -62,6 +82,11 @@
 //!   that the image never fully resolves; starting the climb from x̂₀ instead
 //!   would flash the resolved image on the way up and make breathing a slower
 //!   wander.
+//!
+//! The caller therefore snapshots the latent on the increment that reports
+//! `opens_cycle` and feeds that same snapshot to every level of the climb —
+//! [`DriftAction::Climb`] names the level it departed from so the schedule can
+//! form the right `ᾱ` ratio.
 
 use serde::{Deserialize, Serialize};
 
@@ -121,13 +146,10 @@ pub const RENOISE_DEPTH_STEP: usize = 8;
 pub const CLIMB_TEMPO_RATIO: f32 = 1.0;
 
 /// Odd increments for the independent seed streams a cycle needs. Distinct
-/// constants so a cycle's descent noise and its climb fields are unrelated;
-/// all are avalanched by `gaussian_at` before any pixel index is folded in.
+/// constants so a cycle's descent noise and its climb field are unrelated;
+/// both are avalanched by `gaussian_at` before any pixel index is folded in.
 const DESCENT_STREAM: u64 = 0x9e37_79b9_7f4a_7c15;
 const RENOISE_STREAM: u64 = 0xbf58_476d_1ce4_e5b9;
-/// Third stream, folded in per climb increment so that no two increments — of
-/// this cycle or of any other — ever draw the same field.
-const CLIMB_STREAM: u64 = 0x94d0_49bb_1331_11eb;
 
 /// Which way the run is currently moving on the schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,14 +180,27 @@ pub enum DriftAction {
         diffusion_step: usize,
         path_seed: u64,
     },
-    /// Take one forward increment at `forward_step` with `seed`, applied to the
-    /// current latent — see the module header on why it is never applied to a
-    /// re-interpretation of it.
+    /// Carry the climb's departure state up to level `forward_step`.
+    ///
+    /// The caller applies
+    /// `schedule.forward_from(departure, departure_step, forward_step, cycle_seed)`,
+    /// where `departure` is the latent it snapshotted on the increment that
+    /// reported `opens_cycle` — never a re-interpretation of it as a clean
+    /// image, see the module header.
     Climb {
+        /// The level this frame lands on. Rises by one per action, `departure_step`
+        /// through the ceiling.
         forward_step: usize,
-        seed: u64,
+        /// The level the climb set out from — the departure state sits just
+        /// below it. Constant for the whole climb, and what fixes the `ᾱ` ratio.
+        departure_step: usize,
+        /// The climb's **single** noise field, drawn once per cycle. Every level
+        /// of one climb reveals more of this same field; the next cycle draws a
+        /// different one.
+        cycle_seed: u64,
         /// Set on the first increment of a climb: the cycle just closed, and
-        /// the latent is the image it settled on. The moment to save a frame.
+        /// the latent is the image it settled on. The moment to save a frame —
+        /// and the moment to snapshot the departure.
         opens_cycle: bool,
     },
 }
@@ -182,6 +217,10 @@ pub struct PerpetualDrift {
     cycle: usize,
     base_seed: u64,
     phase: DriftPhase,
+    /// The level the climb in progress set out from — its departure state sits
+    /// just below this. Fixed for the whole climb, so every level is formed
+    /// from the same departure and the same field.
+    departure_step: usize,
     /// Set when a cycle closes, cleared by the climb increment that reports it.
     opens_cycle: bool,
 }
@@ -202,6 +241,7 @@ impl PerpetualDrift {
             cycle: 0,
             base_seed,
             phase: DriftPhase::Descent,
+            departure_step: 0,
             opens_cycle: false,
         };
         drift.set_depth(depth);
@@ -283,6 +323,7 @@ impl PerpetualDrift {
         self.t = self.steps - 1;
         self.cycle = 0;
         self.phase = DriftPhase::Descent;
+        self.departure_step = 0;
         self.opens_cycle = false;
     }
 
@@ -308,6 +349,9 @@ impl PerpetualDrift {
                     self.cycle += 1;
                     self.opens_cycle = true;
                     self.t = diffusion_step;
+                    // Where the whole climb is formed from: the latent this
+                    // very step is about to produce sits just below here.
+                    self.departure_step = diffusion_step;
                 } else {
                     self.t = diffusion_step - 1;
                 }
@@ -317,7 +361,8 @@ impl PerpetualDrift {
                 let forward_step = self.t;
                 let action = DriftAction::Climb {
                     forward_step,
-                    seed: self.climb_seed(forward_step),
+                    departure_step: self.departure_step,
+                    cycle_seed: self.stream_seed(RENOISE_STREAM),
                     opens_cycle: std::mem::take(&mut self.opens_cycle),
                 };
                 if forward_step >= self.ceiling() {
@@ -333,25 +378,27 @@ impl PerpetualDrift {
         }
     }
 
-    fn stream_seed(&self, stream: u64) -> u64 {
-        self.base_seed
-            .wrapping_add((self.cycle as u64 + 1).wrapping_mul(stream))
-    }
-
-    /// Seed for one increment of this cycle's climb.
+    /// One seed per `(cycle, stream)`.
     ///
-    /// Fresh per `(cycle, increment)`. Per *cycle* is what keeps the piece from
-    /// looping — re-adding the same field every cycle would walk the image back
-    /// to where it was instead of onwards. Per *increment* is what makes the
-    /// climb a Gaussian walk rather than one field applied `t_r` times.
+    /// `RENOISE_STREAM` names the climb's single noise field, and its being
+    /// fresh per *cycle* is the whole anti-frozen-loop guarantee: re-adding the
+    /// same field every cycle would walk the image back where it was instead of
+    /// onwards. Within a cycle it is deliberately constant — that constancy is
+    /// the coherence of the grain (module header).
     ///
     /// The additive structure here is harmless because `gaussian_at` avalanches
     /// the seed before folding the pixel index in; deriving the field from a
     /// seed that shares an additive relation with the index stream is the
     /// defect `ANISOTROPY_HUNT.md` documents.
-    fn climb_seed(&self, forward_step: usize) -> u64 {
-        self.stream_seed(RENOISE_STREAM)
-            .wrapping_add((forward_step as u64 + 1).wrapping_mul(CLIMB_STREAM))
+    fn stream_seed(&self, stream: u64) -> u64 {
+        self.base_seed
+            .wrapping_add((self.cycle as u64 + 1).wrapping_mul(stream))
+    }
+
+    /// The level the climb in progress departed from, for a caller that needs
+    /// it outside of a [`DriftAction`].
+    pub fn departure_step(&self) -> usize {
+        self.departure_step
     }
 }
 
@@ -573,46 +620,98 @@ mod tests {
         );
     }
 
-    /// Two cycles that drew the same noise would loop, not drift — the image
-    /// would come back to where it was. And within one climb, two increments
-    /// that shared a field would add the same field twice instead of walking.
+    /// One field per climb, a different one every cycle.
+    ///
+    /// **Reformulated** from `no_two_climb_increments_anywhere_draw_the_same_seed`,
+    /// which demanded the exact opposite *within* a climb — a fresh field per
+    /// increment — because the climb used to be an exact Markov walk, where
+    /// reusing a field would have meant adding the same field `t_r` times
+    /// instead of walking. The climb is now the closed form from the departure,
+    /// where one field per climb is the *design*: it is what makes the grain
+    /// cohere between frames. The property that has **not** moved is uniqueness
+    /// per cycle — that is the anti-frozen-loop guarantee, and it is asserted
+    /// here as strictly as before.
+    ///
+    /// Run in **both** regimes: wander departs from `0`, where a departure
+    /// level that was never updated would still look right, and breathing
+    /// departs from `t_r/2`, where it would not.
     #[test]
-    fn no_two_climb_increments_anywhere_draw_the_same_seed() {
+    fn one_field_per_climb_and_a_new_one_every_cycle() {
         let depth = 16;
-        let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, depth, 0x5eed);
-        let mut climb_seeds = Vec::new();
-        let mut descent_seeds = std::collections::HashSet::new();
-        for _ in 0..(STEPS + 8 * 2 * (depth + 1)) {
-            match drift.step() {
-                DriftAction::Descend { path_seed, .. } => {
-                    descent_seeds.insert(path_seed);
+        for regime in [PerpetualRegime::Wander, PerpetualRegime::Breathe] {
+            let mut drift = PerpetualDrift::new(STEPS, regime, depth, 0x5eed);
+            let floor = drift.floor();
+            // Seeds grouped by climb, in order; a climb opens on `opens_cycle`.
+            let mut climbs: Vec<Vec<u64>> = Vec::new();
+            let mut departures: Vec<Vec<(usize, usize)>> = Vec::new();
+            let mut descent_seeds = std::collections::HashSet::new();
+            for _ in 0..(STEPS + 8 * 2 * (depth + 1)) {
+                match drift.step() {
+                    DriftAction::Descend { path_seed, .. } => {
+                        descent_seeds.insert(path_seed);
+                    }
+                    DriftAction::Climb {
+                        forward_step,
+                        departure_step,
+                        cycle_seed,
+                        opens_cycle,
+                    } => {
+                        if opens_cycle {
+                            climbs.push(Vec::new());
+                            departures.push(Vec::new());
+                        }
+                        if let Some(current) = climbs.last_mut() {
+                            current.push(cycle_seed);
+                            departures
+                                .last_mut()
+                                .expect("same push")
+                                .push((forward_step, departure_step));
+                        }
+                    }
                 }
-                DriftAction::Climb { seed, .. } => climb_seeds.push(seed),
             }
-        }
-        // Finish on a descent, so the cycle in progress has drawn its seed and
-        // the count below is exact rather than off by whichever action the
-        // fixed loop length happened to stop on.
-        while drift.phase() != DriftPhase::Descent {
-            if let DriftAction::Climb { seed, .. } = drift.step() {
-                climb_seeds.push(seed);
-            }
-        }
-        if let DriftAction::Descend { path_seed, .. } = drift.step() {
-            descent_seeds.insert(path_seed);
-        }
+            assert!(climbs.len() >= 8, "{regime:?}: not enough climbing sampled");
 
-        let unique: std::collections::HashSet<u64> = climb_seeds.iter().copied().collect();
-        assert!(climb_seeds.len() > 8 * depth, "not enough climbing sampled");
-        assert_eq!(
-            unique.len(),
-            climb_seeds.len(),
-            "a climb increment reused a field"
-        );
-        // One descent seed per cycle (the timestep is folded in downstream by
-        // `reverse_step_seed`), and no descent ever shares with a climb.
-        assert_eq!(descent_seeds.len(), drift.cycle() + 1);
-        assert!(unique.is_disjoint(&descent_seeds));
+            for (index, seeds) in climbs.iter().enumerate() {
+                assert!(
+                    seeds.windows(2).all(|w| w[0] == w[1]),
+                    "{regime:?} climb {index} changed field mid-ascent: the grain \
+                     would crackle"
+                );
+            }
+            // The departure is fixed for a whole climb, and it is the level the
+            // climb opened at — the floor the descent stopped on. Anything else
+            // and the alpha_bar ratio is formed against the wrong noise level.
+            for (index, levels) in departures.iter().enumerate() {
+                let opening = levels[0].0;
+                assert_eq!(
+                    opening, floor,
+                    "{regime:?} climb {index} opened at {opening}, not at the floor \
+                     {floor} the descent left the latent on"
+                );
+                assert!(
+                    levels.iter().all(|(_, dep)| *dep == opening),
+                    "{regime:?} climb {index} moved its departure mid-ascent: {levels:?}"
+                );
+                assert_eq!(
+                    levels.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+                    (opening..=opening + levels.len() - 1).collect::<Vec<_>>(),
+                    "{regime:?} climb {index} did not visit every level from its departure"
+                );
+            }
+
+            // A field per cycle, never reused: the anti-frozen-loop guarantee.
+            let fields: Vec<u64> = climbs.iter().map(|seeds| seeds[0]).collect();
+            let unique: std::collections::HashSet<u64> = fields.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                fields.len(),
+                "{regime:?}: two cycles dissolved the image under the same field"
+            );
+            // One descent seed per cycle (the timestep is folded in downstream
+            // by `reverse_step_seed`), and no descent ever shares with a climb.
+            assert!(unique.is_disjoint(&descent_seeds));
+        }
     }
 
     /// The fear this addresses, stated as the user stated it: a re-noising that
@@ -627,23 +726,24 @@ mod tests {
         let schedule = crate::LinearNoiseSchedule::new_linear(STEPS, 1e-4, 0.02);
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, depth, 0x5eed);
 
-        // The seeds of two consecutive climbs, in order. Collected until a
+        // The plan of two consecutive climbs, in order. Collected until a
         // *third* one opens: a climb is only complete once the next has begun,
         // and comparing a full climb against a truncated one compares lengths
         // rather than fields.
-        let mut climbs: Vec<Vec<(usize, u64)>> = Vec::new();
+        let mut climbs: Vec<Vec<(usize, usize, u64)>> = Vec::new();
         while climbs.len() < 3 {
             match drift.step() {
                 DriftAction::Climb {
                     forward_step,
-                    seed,
+                    departure_step,
+                    cycle_seed,
                     opens_cycle,
                 } => {
                     if opens_cycle {
                         climbs.push(Vec::new());
                     }
                     if let Some(current) = climbs.last_mut() {
-                        current.push((forward_step, seed));
+                        current.push((forward_step, departure_step, cycle_seed));
                     }
                 }
                 DriftAction::Descend { .. } => {}
@@ -652,18 +752,23 @@ mod tests {
 
         // Same starting image, both climbs — any difference is the noise.
         let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.03).sin() * 0.7).collect();
-        let climb = |plan: &[(usize, u64)]| -> Vec<f32> {
-            plan.iter().fold(x0.clone(), |x, (step, seed)| {
-                schedule.forward_step(&x, *step, *seed)
-            })
+        // The frames the viewer would see, walked through the real schedule.
+        let climb = |plan: &[(usize, usize, u64)]| -> Vec<Vec<f32>> {
+            plan.iter()
+                .map(|(level, departure, seed)| {
+                    schedule.forward_from(&x0, *departure, *level, *seed)
+                })
+                .collect()
         };
         assert_eq!(
             climbs[0].len(),
             climbs[1].len(),
             "climbs collected unevenly"
         );
-        assert_eq!(climbs[0].len(), depth + 1, "a climb is t_r + 1 increments");
-        let (first, second) = (climb(&climbs[0]), climb(&climbs[1]));
+        assert_eq!(climbs[0].len(), depth + 1, "a climb is t_r + 1 levels");
+        let (first_frames, second_frames) = (climb(&climbs[0]), climb(&climbs[1]));
+        let first = first_frames.last().expect("non-empty climb").clone();
+        let second = second_frames.last().expect("non-empty climb").clone();
 
         // Correlation of the two injected fields: independent draws sit at 0,
         // a repeated re-noising would sit at 1.
@@ -682,6 +787,31 @@ mod tests {
             correlation.abs() < 0.05,
             "two cycles injected near-identical noise (r = {correlation:.3}): the run \
              loops instead of drifting"
+        );
+
+        // The other half of the same coin, on the same frames: *within* a
+        // cycle the grain must hold from one frame to the next. Uncorrelated
+        // across cycles and correlated along one — the run drifts without
+        // crackling. (The number itself, and the before/after comparison, are
+        // in `consecutive_climb_frames_change_by_the_same_grain`.)
+        let deltas: Vec<Vec<f64>> = first_frames
+            .windows(2)
+            .map(|w| {
+                w[1].iter()
+                    .zip(w[0].iter())
+                    .map(|(a, b)| (*a - *b) as f64)
+                    .collect()
+            })
+            .collect();
+        let along: Vec<f64> = deltas
+            .windows(2)
+            .map(|w| dot(&w[0], &w[1]) / (dot(&w[0], &w[0]).sqrt() * dot(&w[1], &w[1]).sqrt()))
+            .collect();
+        let mean_along = along.iter().sum::<f64>() / along.len() as f64;
+        assert!(
+            mean_along > 0.95,
+            "a cycle's frames change by unrelated grain (r = {mean_along:.3}): the \
+             ascent crackles"
         );
     }
 

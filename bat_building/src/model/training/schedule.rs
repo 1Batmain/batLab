@@ -90,6 +90,21 @@ impl LinearNoiseSchedule {
         self.alpha_bars[step.min(self.alpha_bars.len().saturating_sub(1))]
     }
 
+    /// `alpha_bar` of the level *just below* `step` — the level a state sits at
+    /// before a [`Self::forward_step`] at `step` carries it up, and the level a
+    /// [`Self::denoise_step`] at `step` carries it down to.
+    ///
+    /// Below the bottom of the schedule that state is a clean `x0`, which
+    /// carries all of its signal: `1`. Single definition of an off-by-one that
+    /// three formulas depend on.
+    pub fn alpha_bar_below(&self, step: usize) -> f32 {
+        if step == 0 {
+            1.0
+        } else {
+            self.alpha_bar(step - 1)
+        }
+    }
+
     pub fn normalized_step(&self, step: usize) -> f32 {
         if self.len() <= 1 {
             0.0
@@ -162,18 +177,77 @@ impl LinearNoiseSchedule {
     ///
     /// The two are therefore interchangeable in maths and not at all in
     /// experience: the jump replaces an image with noise between two frames,
-    /// while the walk dissolves it over `t` of them. The perpetual mode needs
-    /// the second (see [`crate::PerpetualDrift`]); training keeps the first,
+    /// while the walk dissolves it over `t` of them. Training keeps the jump,
     /// which draws an independent `t` per example and has nothing to animate.
     ///
-    /// `seed` must be fresh per increment — reusing one across the climb would
-    /// add the *same* field `t` times, i.e. a single field scaled up, which is
-    /// not a Gaussian walk at all.
+    /// **The perpetual climb does not use this** — it uses [`Self::forward_from`],
+    /// for the reason spelled out there: an exact Markov walk draws an
+    /// *independent* field per frame, which at 30 frames a second is television
+    /// static. This stays because it is the correct, tested definition of one
+    /// forward increment, and it is what `forward_from` is measured against.
+    ///
+    /// `seed` must be fresh per increment — reusing one across a walk would add
+    /// the *same* field `t` times, i.e. a single field scaled up, which is not a
+    /// Gaussian walk at all.
     pub fn forward_step(&self, previous: &[f32], step: usize, seed: u64) -> Vec<f32> {
         let step = step.min(self.len().saturating_sub(1));
         let signal_scale = self.alpha(step).sqrt();
         let noise_scale = self.beta(step).sqrt();
         previous
+            .iter()
+            .enumerate()
+            .map(|(index, value)| signal_scale * *value + noise_scale * gaussian_at(seed, index))
+            .collect()
+    }
+
+    /// The forward process in closed form, from an arbitrary intermediate state.
+    ///
+    /// `departure` is the state a climb sets out from — the one that sits just
+    /// *below* level `departure_step`, i.e. exactly what
+    /// `forward_step(departure, departure_step, _)` consumes. `step` is the
+    /// level to land on. With `r = alpha_bar(step) / alpha_bar_below(departure_step)`:
+    ///
+    /// ```text
+    ///   x_t = sqrt(r) * x_dep + sqrt(1 - r) * eps
+    /// ```
+    ///
+    /// This is `q(x_t | x_s)` for any `s < t`, not just `s = clean`: the ratio of
+    /// `alpha_bar`s *is* the generalisation, which is why the departure is
+    /// allowed to be a noisy latent where [`Self::add_noise`] would need a clean
+    /// `x0`. At `departure_step = 0` the ratio's denominator is `1` and this
+    /// reduces to `add_noise` exactly.
+    ///
+    /// # Why the perpetual climb walks this and not [`Self::forward_step`]
+    ///
+    /// Chaining `forward_step` up the schedule is the *exact* Markov walk, and
+    /// it lands on the same marginal — but every increment draws its **own**
+    /// field. Displayed one increment per frame at 30 Hz, thirty independent
+    /// grains a second is television static: the image dissolved smoothly and
+    /// *seethed* while doing it ("ça frise pendant la phase de remontée"). The
+    /// descent has no such artefact because consecutive latents of the reverse
+    /// chain are strongly correlated.
+    ///
+    /// Here `seed` names **one field for the whole climb**, and every level is
+    /// computed from the departure rather than from the previous frame. Each
+    /// frame keeps the same marginal, the endpoint keeps the same distribution
+    /// — and the grain, being one fixed pattern whose amplitude rises, is
+    /// *revealed* instead of reshuffled. The frames are no longer a Markov
+    /// chain: they are maximally correlated, which is precisely the property the
+    /// eye was asking for.
+    pub fn forward_from(
+        &self,
+        departure: &[f32],
+        departure_step: usize,
+        step: usize,
+        seed: u64,
+    ) -> Vec<f32> {
+        let step = step.min(self.len().saturating_sub(1));
+        // Clamped so a caller that asks to land at or below its own departure
+        // gets the departure back rather than a NaN out of sqrt of a negative.
+        let ratio = (self.alpha_bar(step) / self.alpha_bar_below(departure_step)).clamp(0.0, 1.0);
+        let signal_scale = ratio.sqrt();
+        let noise_scale = (1.0 - ratio).sqrt();
+        departure
             .iter()
             .enumerate()
             .map(|(index, value)| signal_scale * *value + noise_scale * gaussian_at(seed, index))
@@ -237,11 +311,7 @@ impl LinearNoiseSchedule {
         let beta = self.beta(step);
         let alpha = self.alpha(step);
         let alpha_bar = self.alpha_bar(step);
-        let alpha_bar_prev = if step == 0 {
-            1.0
-        } else {
-            self.alpha_bar(step - 1)
-        };
+        let alpha_bar_prev = self.alpha_bar_below(step);
         // Posterior mean computed from the clipped x0 estimate. Clamping x0 to
         // the data range bounds the reverse chain by construction: an imperfect
         // (or degenerate) noise prediction can no longer be amplified
@@ -500,11 +570,168 @@ mod tests {
         }
     }
 
-    /// The failure mode the climb invites: one seed for the whole ascent adds
-    /// the *same* field over and over, which is a single field scaled up — the
-    /// pixels stay perfectly correlated with it and the image never dissolves,
-    /// it just gains a fixed pattern. The variance check above would pass; only
-    /// comparing two increments catches it.
+    /// `forward_from` must produce a legitimate `x_t` at **every** level it is
+    /// asked for, departing from a clean `x0` *and* from a noisy latent — the
+    /// second is the case breathing lives in, and the one `add_noise` cannot
+    /// serve.
+    ///
+    /// Measured, not deduced: signal coefficient by least squares, mean and
+    /// standard deviation of the residual, against theory *and* against an
+    /// exact Markov walk (`forward_step`) launched from the same departure.
+    /// The last level is the one the next descent is handed, so its agreement
+    /// with the walk is the statement "the wandering has not changed nature".
+    #[test]
+    fn the_closed_form_climb_is_a_valid_x_t_at_every_level() {
+        // Large enough that the tolerances below sit well clear of the
+        // estimator's own noise: the least-squares coefficient has a standard
+        // error of sigma/sqrt(sum x_dep^2) ~= 0.003 here, so the 0.02 gate is a
+        // ~6-sigma statement and not a coin flip that happens to be green.
+        const N: usize = 65_536;
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.017).sin() * 0.8).collect();
+
+        // Two departures: the settled image a wander closes on, and a genuine
+        // intermediate latent of the kind breathing floors at.
+        let from_clean = (0usize, x0.clone());
+        let from_latent = (24usize, schedule.add_noise(&x0, 23, 0x0dd_1a7e).0);
+
+        for (departure_step, departure) in [from_clean, from_latent] {
+            let energy: f64 = departure.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+            let signal_of = |x: &[f32]| -> f64 {
+                x.iter()
+                    .zip(departure.iter())
+                    .map(|(a, b)| (*a as f64) * (*b as f64))
+                    .sum::<f64>()
+                    / energy
+            };
+            let residual_of = |x: &[f32], signal: f64| -> (f64, f64) {
+                let residual: Vec<f64> = x
+                    .iter()
+                    .zip(departure.iter())
+                    .map(|(a, b)| *a as f64 - signal * *b as f64)
+                    .collect();
+                let mean = residual.iter().sum::<f64>() / N as f64;
+                let variance =
+                    residual.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / N as f64;
+                (mean, variance.sqrt())
+            };
+
+            // The reference the closed form has to match: the exact Markov walk
+            // from the same departure, a fresh field per increment.
+            let ceiling = departure_step + 64;
+            let mut walked = departure.clone();
+            let alpha_bar_dep = schedule.alpha_bar_below(departure_step) as f64;
+
+            for level in departure_step..=ceiling {
+                let carried = schedule.forward_from(&departure, departure_step, level, 0xc0e5_7e57);
+                walked = schedule.forward_step(&walked, level, 0x1_0000 + level as u64);
+
+                let ratio = schedule.alpha_bar(level) as f64 / alpha_bar_dep;
+                let expected_signal = ratio.sqrt();
+                let expected_sigma = (1.0 - ratio).sqrt();
+
+                for (name, sample) in [("closed form", &carried), ("markov walk", &walked)] {
+                    let signal = signal_of(sample);
+                    let (mean, sigma) = residual_of(sample, signal);
+                    assert!(
+                        (signal - expected_signal).abs() < 0.02,
+                        "dep={departure_step} level={level} {name}: signal {signal:.4}, \
+                         want sqrt(alpha_bar ratio) {expected_signal:.4}"
+                    );
+                    assert!(
+                        mean.abs() < 4.0 * expected_sigma.max(1e-3) / (N as f64).sqrt(),
+                        "dep={departure_step} level={level} {name}: noise mean {mean:.4} \
+                         is not centred"
+                    );
+                    // The first level of a climb from a clean x0 carries almost
+                    // no noise (sqrt(1 - alpha_bar_0) = 0.02), where a relative
+                    // tolerance is meaningless; the absolute one covers it.
+                    assert!(
+                        (sigma - expected_sigma).abs() < 0.03 * expected_sigma.max(0.3),
+                        "dep={departure_step} level={level} {name}: noise sd {sigma:.4}, \
+                         want {expected_sigma:.4}"
+                    );
+                }
+            }
+
+            // …and the endpoint — the x_t the next descent is handed — agrees
+            // with the walk, not merely each with theory.
+            let landed = schedule.forward_from(&departure, departure_step, ceiling, 0xc0e5_7e57);
+            let (a, b) = (signal_of(&landed), signal_of(&walked));
+            let (sa, sb) = (residual_of(&landed, a).1, residual_of(&walked, b).1);
+            assert!(
+                (a - b).abs() < 0.03 && (sa / sb - 1.0).abs() < 0.05,
+                "dep={departure_step}: closed form ({a:.4}, {sa:.4}) and walk \
+                 ({b:.4}, {sb:.4}) hand the sampler different distributions"
+            );
+        }
+    }
+
+    /// The point of the closed form, as a number: the noise a climb adds
+    /// between two consecutive frames must be **the same pattern**, where the
+    /// Markov walk draws an unrelated one every frame. Thirty unrelated grains
+    /// a second is what "ça frise pendant la remontée" was.
+    ///
+    /// Measured on the frame-to-frame change, which is what the eye integrates,
+    /// and identically on both branches so the comparison is fair.
+    #[test]
+    fn consecutive_climb_frames_change_by_the_same_grain() {
+        const N: usize = 4096;
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.017).sin() * 0.8).collect();
+        let ceiling = 64usize;
+
+        let mut carried = Vec::new();
+        let mut walked = Vec::new();
+        let mut walking = x0.clone();
+        for level in 0..=ceiling {
+            carried.push(schedule.forward_from(&x0, 0, level, 0xc0e5_7e57));
+            walking = schedule.forward_step(&walking, level, 0x1_0000 + level as u64);
+            walked.push(walking.clone());
+        }
+
+        // Correlation between the change at one frame and the change at the
+        // next, averaged over the climb.
+        let coherence = |frames: &[Vec<f32>]| -> f64 {
+            let deltas: Vec<Vec<f64>> = frames
+                .windows(2)
+                .map(|w| {
+                    w[1].iter()
+                        .zip(w[0].iter())
+                        .map(|(a, b)| (*a - *b) as f64)
+                        .collect()
+                })
+                .collect();
+            let dot = |u: &[f64], v: &[f64]| u.iter().zip(v).map(|(a, b)| a * b).sum::<f64>();
+            let pairs: Vec<f64> = deltas
+                .windows(2)
+                .map(|w| dot(&w[0], &w[1]) / (dot(&w[0], &w[0]).sqrt() * dot(&w[1], &w[1]).sqrt()))
+                .collect();
+            pairs.iter().sum::<f64>() / pairs.len() as f64
+        };
+
+        let (coherent, incoherent) = (coherence(&carried), coherence(&walked));
+        assert!(
+            coherent > 0.95,
+            "the closed-form climb does not reveal one grain: mean frame-to-frame \
+             correlation {coherent:.3}"
+        );
+        assert!(
+            incoherent.abs() < 0.15,
+            "the Markov walk was supposed to be the incoherent branch, and measured \
+             {incoherent:.3} — this test no longer compares what it claims to"
+        );
+    }
+
+    /// The failure mode an *incremental* climb invites: one seed for the whole
+    /// ascent adds the same field over and over, which is a single field scaled
+    /// up — the pixels stay perfectly correlated with it and the image never
+    /// dissolves, it just gains a fixed pattern. The variance check above would
+    /// pass; only comparing two increments catches it.
+    ///
+    /// This is the invariant of [`LinearNoiseSchedule::forward_step`], which the
+    /// perpetual climb no longer uses; it guards the operator, which the closed
+    /// form is measured against in the two tests above.
     #[test]
     fn a_climb_draws_a_different_field_at_every_increment() {
         let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
