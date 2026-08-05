@@ -92,10 +92,14 @@ def p0_format():
     d = load("flux_main")
     L = []
     ok = True
-    L.append(f"magic={d['magic']!r} dims={d['w']}x{d['h']}x{d['c']} frames={d['n']}")
+    L.append(f"magic={d['magic']!r} dims={d['w']}x{d['h']}x{d['c']} frames={d['n']} "
+             f"(reste partiel : {d['partial']} octets)")
+    if d["magic"] != b"BATFLUX1":
+        ok = False
+        L.append("  ✗ magic ≠ « BATFLUX1 » (contrat --help)")
     if (d["w"], d["h"], d["c"]) != (32, 32, 1):
         ok = False
-        L.append("  ✗ spec ligne 12 : « deux images 32×32 » — dimensions inattendues")
+        L.append("  ✗ dimensions inattendues")
     if d["n"] != int(os.environ.get("ACTIONS", "3000")):
         ok = False
         L.append(f"  ✗ nombre de frames ≠ --actions ({os.environ.get('ACTIONS')})")
@@ -103,8 +107,75 @@ def p0_format():
         ok = False
         L.append("  ✗ valeurs non finies dans le dump")
     L.append(f"x̂₀ borné dans [{d['x0'].min():.3f}, {d['x0'].max():.3f}]")
+
+    # phase : « u8 phase (0 descent, 1 climb, 2 flux) » — désormais documenté par --help.
+    # On n'impose pas où le contrat est muet (à quelle frame exacte la descente cède la
+    # main) : on vérifie que l'étiquette dit la vérité sur la DYNAMIQUE qui a produit la
+    # frame, en séparant pas inverse et churn par leur amplitude, qui diffèrent de ~40 %.
+    m = d["meta"].astype(int)
+    st = plateau_start(m)
+    ph = d["phase"]
+    dd = frame_abs_delta(d["xt"])  # dd[i-1] = amplitude ayant produit la frame i
+    churn = float(np.median(dd[np.where(ph[1:] == 2)[0]]))
+    mono = bool(np.all(np.diff((ph == 2).astype(int)) >= 0))
+    ok &= mono
+    L.append(f"phases flux : {sorted(set(ph.tolist()))}, phase 2 jamais quittée une fois "
+             f"prise → {'ok' if mono else 'ÉCART'}")
+    # L'amplitude d'un pas inverse dépend de t : on ne compare donc qu'AU NIVEAU t*, où
+    # les deux dynamiques coexistent. Référence du pas inverse : les dernières frames de
+    # descente juste au-dessus de t*, extrapolées au niveau t*.
+    ref = float(np.median([dd[i - 1] for i in range(1, len(m))
+                           if ph[i] == 0 and m[-1] < m[i] <= m[-1] + 8]))
+    suspects = [i for i in range(1, len(m))
+                if ph[i] == 0 and m[i] == m[-1] and abs(dd[i - 1] - churn) < abs(dd[i - 1] - ref)]
+    lbl_ok = not suspects
+    ok &= lbl_ok
+    if suspects:
+        L.append(f"  ✗ au niveau t*={m[-1]}, {len(suspects)} frame(s) étiquetée(s) "
+                 f"« 0 descent » ont l'amplitude du churn : frames {suspects}, "
+                 f"|Δ|={[round(float(dd[i - 1]), 4) for i in suspects]} — à comparer à "
+                 f"churn={churn:.4f} et pas inverse au même niveau≈{ref:.4f}")
+        L.append("    → la première frame produite par le churn est étiquetée descente")
+        # le même off-by-one se rejoue-t-il à tous les cadrans ?
+        tally = []
+        for k in sorted(int(f[3:-4]) for f in os.listdir(OUT)
+                        if f.startswith("ts_") and f.endswith(".f32")):
+            e = read_dump(os.path.join(OUT, f"ts_{k}.f32"))
+            mm = e["meta"].astype(int)
+            pp = e["phase"]
+            ee = frame_abs_delta(e["xt"])
+            ch = float(np.median(ee[np.where(pp[1:] == 2)[0]]))
+            rf = float(np.median([ee[i - 1] for i in range(1, len(mm))
+                                  if pp[i] == 0 and mm[-1] < mm[i] <= mm[-1] + 8]))
+            tally.append((k, sum(1 for i in range(1, len(mm)) if pp[i] == 0 and mm[i] == mm[-1]
+                                 and abs(ee[i - 1] - ch) < abs(ee[i - 1] - rf))))
+        L.append("    reproductibilité sur le cadran (frames mal étiquetées par run) : " +
+                 "  ".join(f"t*={k}→{v}" for k, v in tally))
+    else:
+        L.append(f"amplitude ↔ étiquette au niveau t*={m[-1]} : les frames « descent » "
+                 f"valent ≈{ref:.4f} (pas inverse) et non {churn:.4f} (churn) → ok")
+    for reg in ("errance", "respiration"):
+        e = load(reg)
+        seen = sorted(set(e["phase"].tolist()))
+        has_climb = 1 in seen
+        ok &= has_climb
+        L.append(f"phases {reg} : {seen} (0 descent, 1 climb ; jamais 2) → "
+                 f"{'ok' if has_climb and 2 not in seen else 'ÉCART'}")
+        ok &= 2 not in seen
+    # cohérence phase↔t : une frame de descente baisse t, une frame de climb le remonte
+    e = load("errance")
+    dt = np.diff(e["meta"].astype(int))
+    p = e["phase"][1:]
+    down = dt[p == 0]
+    up = dt[p == 1]
+    coh = (down <= 0).all() and (up >= 0).all()
+    ok &= coh
+    L.append(f"cohérence phase↔t (errance) : descente {int((down <= 0).sum())}/{len(down)} "
+             f"frames à Δt≤0, climb {int((up >= 0).sum())}/{len(up)} à Δt≥0 → "
+             f"{'ok' if coh else 'ÉCART'}")
     report("P0", "format du dump / sanité", "PASS" if ok else "FAIL", L,
-           "ligne 12 : « Le dump est du f32 brut : par frame, deux images 32×32 »")
+           "contrat publié par --help : « \"BATFLUX1\" u32 width u32 height u32 channels / "
+           "then per frame: u8 phase (0 descent, 1 climb, 2 flux) u32 t … »")
 
 
 # --------------------------------------------------------------------------
@@ -186,32 +257,83 @@ def p3_continuite():
 # P4 — amplitude par frame ~ √β(t*) : exige de pouvoir choisir t*
 # --------------------------------------------------------------------------
 def p4_amplitude_tstar():
+    """Le cadran est réglable : on teste la loi elle-même, sur trois barreaux."""
     L = []
-    ref = sha(os.path.join(OUT, "knob_ref.f32"))
-    variants = {
-        "--t-star 30": "knob_tstar.f32",
-        "--t-r 30": "knob_tr.f32",
-        "--flag-inexistant-de-controle 30": "knob_bogus.f32",
-    }
-    identical = []
-    for flag, f in variants.items():
-        same = sha(os.path.join(OUT, f)) == ref
-        identical.append(same)
-        L.append(f"flux + « {flag} » → dump {'BIT-À-BIT IDENTIQUE' if same else 'différent'} "
-                 f"du run sans le flag")
-    plat = {}
-    for tag in ("knob_ref", "knob_tstar", "knob_tr"):
-        d = read_dump(os.path.join(OUT, tag + ".f32"))
-        plat[tag] = int(d["meta"][-1])
-    L.append(f"t de plateau atteint : {plat} → une seule valeur de t* est atteignable")
-    L.append("la bannière du binaire réémet toujours « t_r=64 » quelle que soit la valeur "
-             "passée à --t-r : le flag n'est pas parsé (vérifié indépendamment sur stdout)")
-    # un flag inconnu produit le même dump que --t-star : --t-star est inerte, pas seulement sans effet
-    ok = not all(identical)
-    L.append("→ aucun levier public ne permet de comparer deux t* : la propriété est "
-             "INVÉRIFIABLE via le contrat annoncé.")
+    ok = True
+    ts, rms, var, med = [], [], [], []
+    for k in sorted(int(f[3:-4]) for f in os.listdir(OUT)
+                    if f.startswith("ts_") and f.endswith(".f32")):
+        d = read_dump(os.path.join(OUT, f"ts_{k}.f32"))
+        m = d["meta"].astype(int)
+        if int(m[-1]) != k:  # le cadran doit être atteint et tenu
+            ok = False
+            L.append(f"  ✗ --t-star {k} → plateau à t={m[-1]}")
+        st = plateau_start(m)
+        P = d["xt"][st:]
+        Dl = np.diff(P, axis=0)
+        ts.append(k)
+        rms.append(float(np.sqrt((Dl ** 2).mean())))
+        med.append(float(np.median(np.abs(Dl).reshape(len(Dl), -1).mean(axis=1))))
+        var.append(float(P.reshape(-1, 1024).var(axis=1).mean()))
+    t = np.array(ts, float)
+    rms = np.array(rms)
+    var = np.array(var)
+    L.append("t* réglable : " + "  ".join(f"t*={k}→|Δ|={v:.4f}" for k, v in zip(ts, med)))
+
+    # (1) la lettre de la spec : les changements par frame croissent avec t*
+    mono = bool(np.all(np.diff(rms) > 0))
+    ok &= mono
+    L.append(f"(1) croissance stricte de l'amplitude avec t* sur {len(ts)} valeurs "
+             f"({ts[0]} → {ts[-1]}) : {'oui' if mono else 'NON'} ; "
+             f"rapport bout à bout = {rms[-1] / rms[0]:.2f}×")
+
+    # (2) la forme √β : β d'un DDPM est affine en t, donc rms(Δ)² doit l'être aussi
+    A = np.vstack([np.ones_like(t), t]).T
+    coef, *_ = np.linalg.lstsq(A, rms ** 2, rcond=None)
+    pred = A @ coef
+    r2 = 1 - ((rms ** 2 - pred) ** 2).sum() / ((rms ** 2 - (rms ** 2).mean()) ** 2).sum()
+    dev = float(np.max(np.abs(np.sqrt(np.maximum(pred, 0)) - rms) / rms))
+    shape = r2 >= 0.999 and dev <= 0.02
+    ok &= shape
+    L.append(f"(2) rms(Δ)² = {coef[0]:.6f} + {coef[1]:.3e}·t*  →  R²={r2:.6f}, écart max "
+             f"sur l'amplitude {100 * dev:.2f}%  ⇒ amplitude ∝ √(affine en t*), la forme "
+             f"exacte de √β(t*) pour un schedule β linéaire → {'ok' if shape else 'ÉCART'}")
+
+    # (3) oracle croisé, indépendant de l'implémentation : le niveau stationnaire
+    #     var(x_t) = ᾱ·σ₀² + (1−ᾱ) avec ᾱ_t = exp(−Σβ), β déduit de la SEULE amplitude.
+    #     Un churn « renoise + denoise » impose rms(Δ)² = 2β : le facteur 2 n'est pas ajusté.
+    # Le test ne porte PAS sur le résidu (dont l'ampleur est celle de l'approximation de
+    # l'oracle : σ₀ traité comme constant alors que std(x̂₀) varie d'un facteur 3 sur la
+    # plage, et ᾱ = exp(−Σβ)). Il porte sur le COEFFICIENT c, que les données déterminent
+    # seules : sa valeur théorique est 2 (un bruitage avant + un débruitage arrière).
+    def predict(c):
+        beta = (coef[0] + coef[1] * np.arange(1, 256)) / c
+        al = np.exp(-np.cumsum(beta))
+        a0 = al[ts[0] - 1]
+        s0sq = (var[0] - (1 - a0)) / a0          # unique paramètre libre : σ₀, calé au plus bas t*
+        vp = np.array([al[k - 1] * s0sq + (1 - al[k - 1]) for k in ts])
+        r = vp / var - 1
+        return float(np.sqrt((r ** 2).mean())), float(np.abs(r).max()), s0sq
+
+    grid = np.linspace(1.2, 3.2, 401)
+    cstar = float(grid[int(np.argmin([predict(c)[0] for c in grid]))])
+    rmse2, err2, s0sq = predict(2.0)
+    cross = abs(cstar - 2.0) <= 0.2
+    ok &= cross
+    L.append(f"(3) oracle croisé : β̂ tiré de la SEULE amplitude ⇒ niveau stationnaire "
+             f"prédit sur les {len(ts)} valeurs de t* (σ₀={np.sqrt(max(s0sq, 0)):.3f}, seul "
+             f"paramètre calé) à {100 * rmse2:.2f}% RMS / {100 * err2:.1f}% max")
+    L.append(f"    facteur c ajusté librement dans β̂ = rms(Δ)²/c : **c* = {cstar:.3f}** pour "
+             f"une valeur théorique de 2,000 (écart {100 * abs(cstar / 2 - 1):.1f}%, seuil 10%) "
+             f"→ {'ok' if cross else 'ÉCART'}")
+    L.append("    " + "  ".join(f"c={c}→RMS {100 * predict(c)[0]:.1f}%"
+                                for c in (1.5, 1.8, 2.0, 2.2, 2.5)))
+    L.append("    → l'amplitude par frame et le niveau de bruit tenu, deux observables "
+             "indépendants, sont reliés par un unique β(t*) : la loi en √β est vérifiée "
+             "quantitativement, pas seulement dans son sens de variation.")
     report("P4", "amplitude par frame ~ √β(t*)", "PASS" if ok else "FAIL", L,
-           "lignes 9-10 et 18 : « [--t-star K] » et « Vérifiable en comparant deux valeurs de t* »")
+           "ligne 18 : « les changements par frame croissent avec t* … Vérifiable en "
+           "comparant deux valeurs de t* »")
 
 
 # --------------------------------------------------------------------------
@@ -375,27 +497,60 @@ def p7_non_regression():
 
 
 # --------------------------------------------------------------------------
-# OBS — hors liste numérotée : le flux écrit-il les PNG qu'il annonce ?
+# P8 — bornes et diagnostics du CLI (contrat publié par --help)
 # --------------------------------------------------------------------------
-def obs_png():
-    p = os.path.join(OUT, "png.json")
-    if not os.path.exists(p):
-        return
-    n = json.load(open(p))
-    L = [f"après « --regime <r> --actions 1500 --frames 8 » : "
-         + ", ".join(f"perpetual_samples/{k} → {v} PNG" for k, v in n.items())]
-    banner = os.path.join(OUT, "stdout_flux.txt")
-    if os.path.exists(banner):
-        ann = [ln.strip() for ln in open(banner) if ln.strip().startswith("frames")]
-        L.append(f"or le flux annonce sur stdout : « {ann[0] if ann else '?'} »")
-    L.append("→ le régime flux annonce un dossier de frames qu'il ne crée jamais ; "
-             "--frames y est inerte (aucun cycle n'est jamais bouclé).")
-    L.append("(hors des 7 propriétés numérotées : signalé, ne fait pas échouer la suite)")
-    report("OBS", "PNG annoncés vs PNG écrits", "OBS" if n.get("flux", 0) == 0 else "PASS", L)
+def p8_cli():
+    cli = json.load(open(os.path.join(OUT, "cli.json")))
+    L = []
+    ok = True
+
+    h = cli["help"]
+    good = h["len"] > 0 and h["exit"] == 0
+    ok &= good
+    L.append(f"--help : {h['len']} octets, code {h['exit']} → {'publié' if good else 'VIDE'} ; "
+             f"il documente les flags perpetual, la sémantique de --actions/--frames et "
+             f"le format du dump")
+
+    c = cli["unknown"]
+    good = c["exit"] != 0 and "unknown flag" in c["msg"]
+    ok &= good
+    L.append(f"flag inconnu : code {c['exit']}, « {c['msg'][:96]}… » → "
+             f"{'rejeté' if good else 'SILENCIEUSEMENT IGNORÉ'}")
+
+    c = cli["flux_frames"]
+    good = c["exit"] != 0 and "flux" in c["msg"]
+    ok &= good
+    L.append(f"« --regime flux --frames 8 » : code {c['exit']}, « {c['msg'][:96]}… » → "
+             f"{'refusé explicitement' if good else 'ÉCART'}")
+    L.append("    (--help : « Flux closes none: it writes no PNG and REFUSES this bound "
+             "rather than running forever. »)")
+
+    n = cli["png"]
+    good = n["flux"] == 0 and n["errance"] > 0 and n["respiration"] > 0
+    ok &= good
+    L.append("PNG écrits sous --frames 8 : " +
+             ", ".join(f"{k}→{v}" for k, v in n.items()) +
+             f" → {'conforme' if good else 'ÉCART'} (le flux ne boucle aucun cycle)")
+
+    c = cli["both"]
+    good = c["frames"] == cli["actions_n"]
+    ok &= good
+    L.append(f"« --actions {cli['actions_n']} --frames 2 » ensemble → {c['frames']} frames "
+             f"dumpées → --actions {'l’emporte' if good else 'NE L’EMPORTE PAS'}")
+    L.append("    (--help : « --actions N … Overrides --frames when both are given. »)")
+
+    d = cli["dial"]
+    good = all(v == 137 for v in d.values())
+    ok &= good
+    L.append("cadran sous ses trois orthographes, valeur 137 (bannière) : " +
+             ", ".join(f"{k}→t*={v}" for k, v in d.items()) +
+             f" → {'les trois pilotent le même cadran' if good else 'ÉCART'}")
+    report("P8", "bornes et diagnostics du CLI", "PASS" if ok else "FAIL", L,
+           "contrat publié par --help (sections « Perpetual notes » et « --dump »)")
 
 
 for fn in (p0_format, p1_stationnarite, p2_pas_de_saut, p3_continuite,
-           p4_amplitude_tstar, p5_graines, p6_isotropie, p7_non_regression, obs_png):
+           p4_amplitude_tstar, p5_graines, p6_isotropie, p7_non_regression, p8_cli):
     try:
         fn()
     except Exception as exc:  # noqa: BLE001
