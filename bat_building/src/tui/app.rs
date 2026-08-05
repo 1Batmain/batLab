@@ -796,7 +796,7 @@ impl PerpetualConfig {
 
     /// A quarter of the 256-step schedule: deep enough to recompose the image,
     /// shallow enough that its lineage survives the cycle.
-    const fn default_renoise_depth() -> usize {
+    pub const fn default_renoise_depth() -> usize {
         64
     }
 

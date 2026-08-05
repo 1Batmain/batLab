@@ -99,6 +99,26 @@ fn main() {
             return;
         }
 
+        // -----------------------------------------------------------------
+        // DEV/CI ONLY — headless perpetual time-lapse.
+        //
+        // Walks the same drift the TUI's Perpetual mode walks and writes one
+        // PNG per completed cycle, so the wandering can be inspected as a
+        // sequence of stills without a window.
+        //
+        //   cargo run --release -p main -- --headless-perpetual <model> \
+        //       --frames N [--checkpoint <path>] [--depth T] \
+        //       [--regime wander|breathe] [--seed N] [--magnitude F] \
+        //       [--out <dir>]
+        // -----------------------------------------------------------------
+        if args.iter().any(|arg| arg == "--headless-perpetual") {
+            if let Err(err) = run_headless_perpetual(&args) {
+                eprintln!("headless perpetual failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
         let config = match tui::run() {
             Ok(c) => c,
             Err(_) => return,
@@ -339,6 +359,159 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
              image → {out_path}\nmetrics → {log_path}\n\
              final image stats: min={:.4} max={:.4} mean={:.4} std={:.4}",
             img_stats.min, img_stats.max, img_stats.mean, img_stats.std
+        );
+        Ok::<(), String>(())
+    })
+}
+
+/// See the DEV/CI note in `main`. Not reachable from the TUI.
+///
+/// Walks the same drift the TUI mode walks and writes one PNG per completed
+/// cycle — a time-lapse of the wandering, without a window. It also reports the
+/// mean absolute change between consecutive frames, which is the number that
+/// says whether the run is *drifting* or merely redrawing the same image.
+fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+
+    let model_name = flag("--headless-perpetual")
+        .ok_or_else(|| "--headless-perpetual requires a model name".to_string())?;
+    let frames = flag("--frames")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1);
+    let depth = flag("--depth")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PerpetualConfig::default_renoise_depth());
+    let regime = match flag("--regime") {
+        Some(value) => bat_building::PerpetualRegime::parse(&value)
+            .ok_or_else(|| format!("invalid --regime: {value} (want wander|breathe)"))?,
+        None => bat_building::PerpetualRegime::default(),
+    };
+    let seed = flag("--seed")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let magnitude = flag("--magnitude")
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
+        tui::storage::project_root()
+            .join("perpetual_samples")
+            .join(regime.label())
+    });
+
+    let config_path = tui::storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = tui::storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+    let checkpoint = flag("--checkpoint");
+
+    let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+    rt.block_on(async {
+        let (_gpu, mut model) = build_execution_model(
+            &config,
+            INFERENCE_RUNTIME_LR,
+            INFERENCE_RUNTIME_BATCH_SIZE,
+            OptimizerKind::default(),
+            WeightInit::default(),
+        )
+        .await?;
+        let checkpoint_path = resolve_sampling_checkpoint_path(&config, checkpoint.as_deref())?;
+        model
+            .load_checkpoint(&checkpoint_path)
+            .map_err(|err| format!("failed to load {}: {err}", checkpoint_path.display()))?;
+
+        let input_dims = model
+            .input_dim()
+            .ok_or_else(|| "model has no input dimensions".to_string())?;
+        let output_dims = model
+            .output_dim()
+            .ok_or_else(|| "model has no output dimensions".to_string())?;
+        let output_size = (output_dims.x, output_dims.y, output_dims.z);
+        let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+
+        let schedule = LinearNoiseSchedule::new_linear(
+            DIFFUSION_SCHEDULE_STEPS,
+            DIFFUSION_BETA_START,
+            DIFFUSION_BETA_END,
+        );
+        let mut drift = PerpetualDrift::new(schedule.len(), regime, depth, seed);
+        let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
+        let mut last_x0 = vec![0.0f32; output_len];
+        let mut previous_frame: Option<Vec<f32>> = None;
+
+        println!(
+            "headless perpetual '{model_name}': regime={} t_r={} frames={frames} \
+             magnitude={magnitude} seed={seed}\nweights → {}\nframes  → {}",
+            drift.regime().label(),
+            drift.depth(),
+            checkpoint_path.display(),
+            out_dir.display()
+        );
+
+        let started = std::time::Instant::now();
+        let mut steps = 0usize;
+        let mut written = 0usize;
+        while written < frames {
+            match drift.step() {
+                DriftAction::Descend {
+                    diffusion_step,
+                    path_seed,
+                } => {
+                    let stepped = reverse_step(
+                        &mut model,
+                        &schedule,
+                        input_dims.z as usize,
+                        output_dims.z as usize,
+                        &latent,
+                        diffusion_step,
+                        path_seed,
+                        magnitude,
+                        true,
+                    );
+                    latent = stepped.latent;
+                    if let Some(x0_hat) = stepped.x0_hat {
+                        last_x0 = x0_hat;
+                    }
+                    steps += 1;
+                }
+                DriftAction::Renoise { to_step, seed } => {
+                    // A cycle just closed: `last_x0` is the image it settled on.
+                    let path = write_tensor_png(
+                        &last_x0,
+                        output_size,
+                        &out_dir.join(format!("{:03}.png", written)),
+                    )?;
+                    let change = previous_frame.as_ref().map(|prev| {
+                        prev.iter()
+                            .zip(last_x0.iter())
+                            .map(|(a, b)| (a - b).abs() as f64)
+                            .sum::<f64>()
+                            / last_x0.len() as f64
+                    });
+                    println!(
+                        "  cycle {:>3} → {}  (mean |Δ| vs previous frame: {})",
+                        drift.cycle(),
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        change.map_or("—".to_string(), |c| format!("{c:.4}"))
+                    );
+                    previous_frame = Some(last_x0.clone());
+                    written += 1;
+
+                    let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
+                    latent = noisy;
+                }
+            }
+        }
+
+        let elapsed = started.elapsed().as_secs_f32();
+        println!(
+            "{steps} reverse steps in {elapsed:.2} s ({:.0} steps/s, unthrottled)",
+            steps as f32 / elapsed.max(f32::EPSILON)
         );
         Ok::<(), String>(())
     })
