@@ -771,13 +771,20 @@ fn draw_monitor(f: &mut Frame, app: &App) {
     } else if app.monitor.done {
         " [r] new run  [s] save config  [q] quit".to_string()
     } else if is_inference_mode(app) {
+        // `[v]` is only advertised once the denoising frame is registered —
+        // offering it during model build would be a key that does nothing.
+        let visualise = if super::visualiser_control::has_visualiser_source() {
+            "  [v] visualise"
+        } else {
+            ""
+        };
         if let Some(progress) = app.monitor.loading_progress.as_ref() {
             format!(
-                " inference: {} ({}/{}) | [s] save  [q] quit",
+                " inference: {} ({}/{}) |{visualise}  [s] save  [q] quit",
                 progress.label, progress.current, progress.total
             )
         } else {
-            " inference: running | [s] save  [q] quit".to_string()
+            format!(" inference: running |{visualise}  [s] save  [q] quit")
         }
     } else if is_training_mode(app) {
         let status = if app.monitor.is_training_paused {

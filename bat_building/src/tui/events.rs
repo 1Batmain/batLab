@@ -354,7 +354,12 @@ fn handle_monitor(app: &mut App, code: KeyCode) {
             }
         }
         KeyCode::Char('r') if app.monitor.done => app.request_restart(),
-        KeyCode::Char('v') if !app.monitor.done && app.monitor.current_lr.is_some() => {
+        // Gated on there being a source to show, not on the run mode: training
+        // registers the model output buffer, inference registers its live
+        // denoising frame, and `[v]` means the same thing in both.
+        KeyCode::Char('v')
+            if !app.monitor.done && super::visualiser_control::has_visualiser_source() =>
+        {
             app.toggle_visualise()
         }
         _ => {}

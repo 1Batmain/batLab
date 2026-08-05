@@ -308,12 +308,42 @@ pub struct DenoiseStepStat {
     pub latent_out: Stats,
 }
 
+/// One denoising step's tensors, handed to an observer as they are produced.
+///
+/// Borrowed, never owned: the observer runs inside the sampling loop and is
+/// expected to forward the data somewhere (a GPU buffer, a file) rather than
+/// accumulate it — a 256-step run over 4 paths would otherwise retain a
+/// thousand tensors for nothing.
+pub struct DenoiseFrame<'a> {
+    /// Index of the denoising path currently being walked.
+    pub path_idx: usize,
+    /// Total number of paths this run will walk.
+    pub path_count: usize,
+    /// How many steps of this path are done (0-based, counts *up*).
+    pub step_index: usize,
+    /// Position on the noise schedule (counts *down* from `total_steps - 1`).
+    pub diffusion_step: usize,
+    /// Length of the noise schedule.
+    pub total_steps: usize,
+    /// The latent *after* this reverse step: x_{t-1}.
+    pub latent: &'a [f32],
+    /// The clipped x0 estimate this step's posterior mean was built from —
+    /// "what the model believes the clean image looks like" from x_t.
+    pub x0_hat: &'a [f32],
+}
+
 /// Core diffusion sampler with optional per-step trajectory capture.
 ///
 /// This is the *single* sampler used by inference and by the diagnostics, so the
 /// denoising math the metrics observe is exactly the one production runs use.
 /// When `trajectory` is `Some`, the first path's per-step latent/ε̂ stats are
 /// recorded — enough to see *where* along the 256-step chain the latent diverges.
+///
+/// `observer`, when `Some`, is called once per reverse step with the freshly
+/// computed latent and x0 estimate; this is what the live inference visualiser
+/// hangs off, so it watches the real chain instead of a re-implementation of it.
+/// The x0 estimate is only computed when an observer is attached, so the
+/// non-observed path allocates exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub fn sample_diffusion<State, F>(
     model: &mut Model<State>,
@@ -325,6 +355,7 @@ pub fn sample_diffusion<State, F>(
     denoising_paths: usize,
     denoise_magnitude: f32,
     mut trajectory: Option<&mut Vec<DenoiseStepStat>>,
+    mut observer: Option<&mut dyn FnMut(&DenoiseFrame)>,
     mut progress: F,
 ) -> Vec<f32>
 where
@@ -348,6 +379,11 @@ where
                 compose_diffusion_input(&latent, input_channels, signal_channels, &features);
             let predicted_noise = model.predict(&model_input);
             let latent_in_stats = Stats::of(&latent);
+            // Derived from x_t, so it must be read before the reverse step
+            // overwrites `latent`. Skipped entirely when nobody is watching.
+            let x0_hat = observer
+                .is_some()
+                .then(|| schedule.x0_estimate(&latent, &predicted_noise, diffusion_step));
             // The per-step seed mixes the timestep in by multiply-add, not by
             // XOR: `path_seed ^ diffusion_step` collided with the XOR the noise
             // field itself used to fold in the pixel index, so every step of
@@ -374,6 +410,17 @@ where
                         latent_out: Stats::of(&latent),
                     });
                 }
+            }
+            if let (Some(observe), Some(x0_hat)) = (observer.as_deref_mut(), x0_hat.as_deref()) {
+                observe(&DenoiseFrame {
+                    path_idx,
+                    path_count,
+                    step_index: step_idx,
+                    diffusion_step,
+                    total_steps: steps,
+                    latent: &latent,
+                    x0_hat,
+                });
             }
             progress(path_idx * steps + step_idx + 1, total_work);
         }

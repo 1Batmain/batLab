@@ -107,6 +107,18 @@ pub fn register_visualiser_source(
     }
 }
 
+/// Whether a run has registered something for the visualiser to display.
+///
+/// This is what gates the `[v]` key: the offer to visualise is made exactly when
+/// there is a source behind it, whatever the run mode. Training registers the
+/// model's output buffer; inference registers its live denoising frame.
+pub fn has_visualiser_source() -> bool {
+    controller()
+        .lock()
+        .map(|ctrl| ctrl.source.is_some())
+        .unwrap_or(false)
+}
+
 /// Clear registered visualiser source and close any active window.
 pub fn clear_visualiser_source() {
     let mut ctrl = controller()

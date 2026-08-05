@@ -26,6 +26,10 @@
 //! drop(handle);
 //! ```
 
+mod live_frame;
+
+pub use live_frame::LiveFrame;
+
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
