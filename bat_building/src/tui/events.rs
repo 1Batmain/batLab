@@ -1,6 +1,9 @@
 //! File purpose: Implements events behavior for the terminal user interface flow.
 
-use super::app::{App, HOME_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen};
+use super::app::{
+    App, HOME_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, PERPETUAL_PARAM_FIELD_NAMES,
+    PerpetualStatus, Screen, TrainingControlCommand,
+};
 use crossterm::event::KeyCode;
 
 #[derive(Debug)]
@@ -34,6 +37,10 @@ pub enum TrainingEvent {
         batch_size: u32,
         total_steps: usize,
     },
+    /// Live read-out of a perpetual run. Republished on every change, so the
+    /// footer always shows what the worker actually did rather than what the
+    /// UI asked for.
+    PerpetualState(PerpetualStatus),
     SaveStatus {
         message: String,
         is_error: bool,
@@ -54,6 +61,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::LayerBuilder => handle_layer_builder(app, code),
         Screen::ModeSelector => handle_mode_selector(app, code),
         Screen::InferenceParams => handle_inference_params(app, code),
+        Screen::PerpetualParams => handle_perpetual_params(app, code),
         Screen::TrainingParams => handle_training_params(app, code),
         Screen::DatasetSelector => handle_dataset_selector(app, code),
         Screen::Monitor => handle_monitor(app, code),
@@ -321,6 +329,47 @@ fn handle_inference_params(app: &mut App, code: KeyCode) {
     }
 }
 
+fn handle_perpetual_params(app: &mut App, code: KeyCode) {
+    let max_field = PERPETUAL_PARAM_FIELD_NAMES.len() - 1;
+    // The two toggles are the first and last field; the four in between are typed.
+    let seed_toggle = 0;
+    let regime_toggle = max_field;
+    match code {
+        KeyCode::Esc => app.screen = Screen::ModeSelector,
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => {
+            if app.perpetual_params.field_idx > 0 {
+                app.perpetual_params.field_idx -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.perpetual_params.field_idx < max_field {
+                app.perpetual_params.field_idx += 1;
+            }
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if app.perpetual_params.field_idx == seed_toggle =>
+        {
+            app.toggle_perpetual_seed_mode();
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if app.perpetual_params.field_idx == regime_toggle =>
+        {
+            app.toggle_perpetual_regime();
+        }
+        KeyCode::Backspace => app.handle_backspace_perpetual(),
+        KeyCode::Enter => {
+            if app.perpetual_params.field_idx < max_field {
+                app.perpetual_params.field_idx += 1;
+            } else if let Err(e) = app.finish_perpetual_params() {
+                app.perpetual_params.error = Some(e);
+            }
+        }
+        KeyCode::Char(c) => app.handle_char_perpetual(c),
+        _ => {}
+    }
+}
+
 fn handle_training_params(app: &mut App, code: KeyCode) {
     let max_field = 2;
     match code {
@@ -349,6 +398,48 @@ fn handle_training_params(app: &mut App, code: KeyCode) {
 }
 
 fn handle_monitor(app: &mut App, code: KeyCode) {
+    // A perpetual run rebinds most of the monitor: `s` writes a PNG of what is
+    // on screen rather than the model config, `r` re-seeds instead of asking
+    // for a new run, and space pauses. These arms sit first and are gated on
+    // the run mode, so every other mode keeps its keys untouched.
+    if app.is_perpetual_run() && !app.monitor.done {
+        match code {
+            KeyCode::Up => {
+                app.send_perpetual_command(TrainingControlCommand::NudgeRenoiseDepth(1));
+                return;
+            }
+            KeyCode::Down => {
+                app.send_perpetual_command(TrainingControlCommand::NudgeRenoiseDepth(-1));
+                return;
+            }
+            KeyCode::Right => {
+                app.send_perpetual_command(TrainingControlCommand::NudgeTempo(1));
+                return;
+            }
+            KeyCode::Left => {
+                app.send_perpetual_command(TrainingControlCommand::NudgeTempo(-1));
+                return;
+            }
+            KeyCode::Char(' ') => {
+                app.toggle_perpetual_pause();
+                return;
+            }
+            KeyCode::Char('r') => {
+                app.send_perpetual_command(TrainingControlCommand::Reseed);
+                return;
+            }
+            KeyCode::Char('m') => {
+                app.send_perpetual_command(TrainingControlCommand::ToggleRegime);
+                return;
+            }
+            KeyCode::Char('s') => {
+                app.send_perpetual_command(TrainingControlCommand::SaveImage);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('s') => {
@@ -374,6 +465,93 @@ fn handle_monitor(app: &mut App, code: KeyCode) {
             app.toggle_visualise()
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::{
+        InferenceConfig, ModelConfig, PerpetualConfig, RunConfig, RunMode, TrainingConfig,
+    };
+
+    fn monitor_app(mode: RunMode) -> App {
+        let mut app = App::new();
+        app.screen = Screen::Monitor;
+        app.monitor.model_config = Some(ModelConfig {
+            model_name: Some("unit-test-monitor".to_string()),
+            input_size: (32, 32, 5),
+            layers: Vec::new(),
+            inference: InferenceConfig::default(),
+            run: RunConfig { mode },
+        });
+        app
+    }
+
+    #[test]
+    fn perpetual_monitor_keys_steer_the_drift() {
+        let mut app = monitor_app(RunMode::Perpetual(PerpetualConfig::default()));
+
+        for (key, expected) in [
+            (KeyCode::Up, TrainingControlCommand::NudgeRenoiseDepth(1)),
+            (KeyCode::Down, TrainingControlCommand::NudgeRenoiseDepth(-1)),
+            (KeyCode::Right, TrainingControlCommand::NudgeTempo(1)),
+            (KeyCode::Left, TrainingControlCommand::NudgeTempo(-1)),
+            (KeyCode::Char('r'), TrainingControlCommand::Reseed),
+            (KeyCode::Char('m'), TrainingControlCommand::ToggleRegime),
+            (KeyCode::Char('s'), TrainingControlCommand::SaveImage),
+        ] {
+            handle_key(&mut app, key);
+            assert_eq!(
+                app.drain_monitor_control_commands(),
+                vec![expected],
+                "key {key:?} did not reach the drift"
+            );
+        }
+
+        handle_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.drain_monitor_control_commands(),
+            vec![TrainingControlCommand::SetPaused(true)]
+        );
+
+        handle_key(&mut app, KeyCode::Char('q'));
+        assert!(app.should_quit, "[q] must still leave a perpetual run");
+    }
+
+    /// The perpetual bindings rebind keys that mean something else everywhere
+    /// else — `r` asks for a new run, `s` saves the model config. They are gated
+    /// on the run mode, and this is what proves the gate holds.
+    #[test]
+    fn a_training_monitor_keeps_its_own_bindings() {
+        let mut app = monitor_app(RunMode::Train(TrainingConfig {
+            lr: 0.01,
+            batch_size: 1,
+            steps: 10,
+            dataset_path: ".".to_string(),
+            loss: crate::tui::app::LossMethod::MeanSquared,
+            checkpoint_path: None,
+            load_checkpoint: false,
+            optimizer: Default::default(),
+            weight_init: Default::default(),
+            loss_weighting: Default::default(),
+        }));
+
+        for key in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('m'),
+            KeyCode::Char('r'),
+        ] {
+            handle_key(&mut app, key);
+            assert!(
+                app.drain_monitor_control_commands().is_empty(),
+                "key {key:?} leaked a perpetual command into a training run"
+            );
+        }
+        assert!(!app.should_quit);
     }
 }
 

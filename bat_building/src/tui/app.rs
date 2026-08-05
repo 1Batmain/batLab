@@ -1,7 +1,7 @@
 //! File purpose: Implements app behavior for the terminal user interface flow.
 
 use super::storage::{self, SavedModelEntry};
-use crate::model::training::LossWeighting;
+use crate::model::training::{LossWeighting, MIN_RENOISE_DEPTH, PerpetualRegime};
 use crate::model::{OptimizerKind, WeightInit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -761,10 +761,85 @@ impl Default for InferenceConfig {
     }
 }
 
+/// An inference that never finishes: descend the chain, re-noise, descend
+/// again. See [`crate::model::training::perpetual`] for the itinerary itself —
+/// this is only what the TUI asks for and what the config file remembers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerpetualConfig {
+    #[serde(default = "PerpetualConfig::default_random_seed")]
+    pub random_seed: bool,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default = "PerpetualConfig::default_denoise_magnitude")]
+    pub denoise_magnitude: f32,
+    /// `t_r` — how far back up the schedule each cycle throws the image.
+    #[serde(default = "PerpetualConfig::default_renoise_depth")]
+    pub renoise_depth: usize,
+    #[serde(default)]
+    pub regime: PerpetualRegime,
+    /// Reverse steps per second the run is paced to. The sampler runs an order
+    /// of magnitude faster than this; see [`PerpetualConfig::default_tempo`].
+    #[serde(default = "PerpetualConfig::default_tempo")]
+    pub tempo: f32,
+    #[serde(default)]
+    pub checkpoint: Option<String>,
+}
+
+impl PerpetualConfig {
+    const fn default_random_seed() -> bool {
+        true
+    }
+
+    const fn default_denoise_magnitude() -> f32 {
+        1.0
+    }
+
+    /// A quarter of the 256-step schedule: deep enough to recompose the image,
+    /// shallow enough that its lineage survives the cycle.
+    const fn default_renoise_depth() -> usize {
+        64
+    }
+
+    /// Reverse steps per second.
+    ///
+    /// The sampler measures ~300 steps/s on this model, which would run a
+    /// `t_r = 64` cycle to completion five times a second — a flicker, not a
+    /// drift. 30 steps/s puts one denoising step on each visualiser frame (the
+    /// window renders at ~28 fps, `INFER_VIZ.md` §4) and makes a full cycle a
+    /// couple of seconds long.
+    const fn default_tempo() -> f32 {
+        30.0
+    }
+
+    /// Bounds on the tempo dial. The floor keeps a stalled-looking run
+    /// distinguishable from a paused one; the ceiling is past what the sampler
+    /// can sustain, so it means "as fast as it goes".
+    pub const MIN_TEMPO: f32 = 2.0;
+    pub const MAX_TEMPO: f32 = 400.0;
+    /// One press of the tempo key. Multiplicative, because the interesting
+    /// range spans two orders of magnitude.
+    pub const TEMPO_FACTOR: f32 = 1.5;
+}
+
+impl Default for PerpetualConfig {
+    fn default() -> Self {
+        Self {
+            random_seed: Self::default_random_seed(),
+            seed: None,
+            denoise_magnitude: Self::default_denoise_magnitude(),
+            renoise_depth: Self::default_renoise_depth(),
+            regime: PerpetualRegime::default(),
+            tempo: Self::default_tempo(),
+            checkpoint: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RunMode {
     Infer,
     Train(TrainingConfig),
+    Perpetual(PerpetualConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -772,6 +847,11 @@ pub struct RunConfig {
     pub mode: RunMode,
 }
 
+/// Commands the monitor sends down to whichever worker is running.
+///
+/// Named for training because that is the only worker that used to accept any,
+/// but the channel is the run-control channel: the perpetual worker listens on
+/// the same one, which is why `SetPaused` needs no perpetual twin.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrainingControlCommand {
     SetPaused(bool),
@@ -781,6 +861,16 @@ pub enum TrainingControlCommand {
         batch_size: u32,
         total_steps: usize,
     },
+    /// Move `t_r` by `delta` notches (perpetual runs).
+    NudgeRenoiseDepth(i32),
+    /// Move the pace by `delta` notches (perpetual runs).
+    NudgeTempo(i32),
+    /// Restart the drift from fresh noise (perpetual runs).
+    Reseed,
+    /// Swap wander ↔ breathe (perpetual runs).
+    ToggleRegime,
+    /// Write the frame currently on screen to a PNG (perpetual runs).
+    SaveImage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -819,6 +909,7 @@ pub enum Screen {
     LayerBuilder,
     ModeSelector,
     InferenceParams,
+    PerpetualParams,
     TrainingParams,
     DatasetSelector,
     Monitor,
@@ -907,6 +998,25 @@ pub struct InferenceParamsState {
 pub const INFERENCE_PARAM_FIELD_NAMES: [&str; 4] =
     ["Random Seed", "Seed", "Denoising Paths", "Magnitude"];
 
+pub struct PerpetualParamsState {
+    pub random_seed: bool,
+    pub regime: PerpetualRegime,
+    /// [seed, magnitude, renoise depth, tempo]
+    pub fields: Vec<String>,
+    /// 0=random toggle, 1=seed, 2=magnitude, 3=depth, 4=tempo, 5=regime toggle
+    pub field_idx: usize,
+    pub error: Option<String>,
+}
+
+pub const PERPETUAL_PARAM_FIELD_NAMES: [&str; 6] = [
+    "Random Seed",
+    "Seed",
+    "Magnitude",
+    "Renoise Depth (t_r)",
+    "Steps / second",
+    "Regime",
+];
+
 pub struct TrainingControlState {
     pub fields: Vec<String>, // [lr, batch_size, total_steps]
     pub field_idx: usize,
@@ -921,6 +1031,27 @@ pub struct MonitorImage {
     pub height: u32,
     pub channels: u32,
     pub pixels: Vec<u8>,
+}
+
+/// Live read-out of a perpetual run, republished by the worker on every change.
+///
+/// The worker owns the drift — the TUI only ever *asks* for a change and is
+/// told the result. Mirroring `t_r` in the UI and hoping the two agree is how a
+/// footer starts lying about what the sampler is doing.
+#[derive(Debug, Clone)]
+pub struct PerpetualStatus {
+    pub regime: String,
+    pub depth: usize,
+    pub min_depth: usize,
+    pub max_depth: usize,
+    pub cycle: usize,
+    pub diffusion_step: usize,
+    /// Reverse steps walked since the run started.
+    pub steps: usize,
+    /// Measured pace, as opposed to the requested `tempo`.
+    pub steps_per_sec: f32,
+    pub tempo: f32,
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -966,6 +1097,8 @@ pub struct MonitorState {
     pub current_batch_size: Option<u32>,
     /// Commands queued from UI to training worker.
     pub pending_control_commands: Vec<TrainingControlCommand>,
+    /// Live state of a perpetual run, as reported by its worker.
+    pub perpetual: Option<PerpetualStatus>,
 }
 
 // App
@@ -981,6 +1114,7 @@ pub struct App {
     pub layer_builder: LayerBuilderState,
     pub mode_selector: ModeSelectorState,
     pub inference_params: InferenceParamsState,
+    pub perpetual_params: PerpetualParamsState,
     pub training_params: TrainingParamsState,
     pub training_control: TrainingControlState,
     pub monitor: MonitorState,
@@ -1149,6 +1283,18 @@ impl App {
                 field_idx: 0,
                 error: None,
             },
+            perpetual_params: PerpetualParamsState {
+                random_seed: true,
+                regime: PerpetualRegime::default(),
+                fields: vec![
+                    "0".into(),
+                    PerpetualConfig::default_denoise_magnitude().to_string(),
+                    PerpetualConfig::default_renoise_depth().to_string(),
+                    PerpetualConfig::default_tempo().to_string(),
+                ],
+                field_idx: 0,
+                error: None,
+            },
             training_params: TrainingParamsState {
                 fields: vec![
                     default_lr.to_string(),
@@ -1187,6 +1333,7 @@ impl App {
                 current_lr: None,
                 current_batch_size: None,
                 pending_control_commands: Vec::new(),
+                perpetual: None,
             },
             run_config: None,
             active_model_name: None,
@@ -1353,6 +1500,12 @@ impl App {
                 self.selected_checkpoint_path = train.checkpoint_path.clone();
                 self.load_checkpoint_on_start = train.load_checkpoint;
                 self.sync_selected_dataset_from_field();
+            }
+            RunMode::Perpetual(perpetual) => {
+                self.mode_selector.selected = 2;
+                self.selected_checkpoint_path = perpetual.checkpoint.clone();
+                self.load_checkpoint_on_start = perpetual.checkpoint.is_some();
+                self.sync_perpetual_params_from_config(&perpetual);
             }
         }
 
@@ -2242,10 +2395,15 @@ impl App {
                 self.inference_params.field_idx = 0;
                 self.screen = Screen::InferenceParams;
             }
-            _ => {
+            1 => {
                 self.training_params.error = None;
                 self.training_params.field_idx = 0;
                 self.screen = Screen::TrainingParams;
+            }
+            _ => {
+                self.perpetual_params.error = None;
+                self.perpetual_params.field_idx = 0;
+                self.screen = Screen::PerpetualParams;
             }
         }
     }
@@ -2295,6 +2453,128 @@ impl App {
         self.inference_params.fields[1] = denoising_paths.to_string();
         self.inference_params.fields[2] = denoise_magnitude.to_string();
         Ok(())
+    }
+
+    // --- Perpetual ---
+
+    pub fn toggle_perpetual_seed_mode(&mut self) {
+        self.perpetual_params.random_seed = !self.perpetual_params.random_seed;
+        self.perpetual_params.error = None;
+    }
+
+    pub fn toggle_perpetual_regime(&mut self) {
+        self.perpetual_params.regime = self.perpetual_params.regime.toggle();
+        self.perpetual_params.error = None;
+    }
+
+    fn sync_perpetual_params_from_config(&mut self, cfg: &PerpetualConfig) {
+        self.perpetual_params.random_seed = cfg.random_seed;
+        self.perpetual_params.regime = cfg.regime;
+        self.perpetual_params.fields[0] = cfg.seed.unwrap_or(0).to_string();
+        self.perpetual_params.fields[1] = cfg.denoise_magnitude.to_string();
+        self.perpetual_params.fields[2] = cfg.renoise_depth.to_string();
+        self.perpetual_params.fields[3] = cfg.tempo.to_string();
+        self.perpetual_params.field_idx = 0;
+        self.perpetual_params.error = None;
+    }
+
+    pub fn finish_perpetual_params(&mut self) -> Result<(), String> {
+        let seed = if self.perpetual_params.random_seed {
+            None
+        } else {
+            Some(
+                self.perpetual_params.fields[0]
+                    .parse::<u64>()
+                    .map_err(|_| "Seed must be an unsigned integer".to_string())?,
+            )
+        };
+        let denoise_magnitude = self.perpetual_params.fields[1]
+            .parse::<f32>()
+            .map_err(|_| "Magnitude must be a number".to_string())?;
+        if denoise_magnitude <= 0.0 {
+            return Err("Magnitude must be > 0".to_string());
+        }
+        let renoise_depth = self.perpetual_params.fields[2]
+            .parse::<usize>()
+            .map_err(|_| "Renoise depth must be a positive integer".to_string())?;
+        if renoise_depth < MIN_RENOISE_DEPTH {
+            return Err(format!("Renoise depth must be >= {MIN_RENOISE_DEPTH}"));
+        }
+        let tempo = self.perpetual_params.fields[3]
+            .parse::<f32>()
+            .map_err(|_| "Steps/second must be a number".to_string())?;
+        if !(PerpetualConfig::MIN_TEMPO..=PerpetualConfig::MAX_TEMPO).contains(&tempo) {
+            return Err(format!(
+                "Steps/second must be between {} and {}",
+                PerpetualConfig::MIN_TEMPO,
+                PerpetualConfig::MAX_TEMPO
+            ));
+        }
+
+        let perpetual = PerpetualConfig {
+            random_seed: self.perpetual_params.random_seed,
+            seed,
+            denoise_magnitude,
+            renoise_depth,
+            regime: self.perpetual_params.regime,
+            tempo,
+            checkpoint: self.selected_checkpoint_path.clone(),
+        };
+
+        self.perpetual_params.error = None;
+        self.perpetual_params.fields[1] = denoise_magnitude.to_string();
+        self.perpetual_params.fields[2] = renoise_depth.to_string();
+        self.perpetual_params.fields[3] = tempo.to_string();
+        self.run_config = Some(RunConfig {
+            mode: RunMode::Perpetual(perpetual.clone()),
+        });
+        if let Some(config) = self.monitor.model_config.as_mut() {
+            config.run.mode = RunMode::Perpetual(perpetual);
+        }
+        Ok(())
+    }
+
+    pub fn handle_char_perpetual(&mut self, c: char) {
+        let idx = self.perpetual_params.field_idx;
+        let accepted = match idx {
+            1 | 3 => c.is_ascii_digit(),
+            2 | 4 => c.is_ascii_digit() || c == '.',
+            _ => false,
+        };
+        if accepted {
+            self.perpetual_params.fields[idx - 1].push(c);
+            self.perpetual_params.error = None;
+        }
+    }
+
+    pub fn handle_backspace_perpetual(&mut self) {
+        let idx = self.perpetual_params.field_idx;
+        if (1..=4).contains(&idx) {
+            self.perpetual_params.fields[idx - 1].pop();
+        }
+    }
+
+    /// Whether the monitor is watching a perpetual run — the gate on every
+    /// perpetual key, so they cannot fire during a training or inference run
+    /// where they would mean something else (or nothing).
+    pub fn is_perpetual_run(&self) -> bool {
+        self.monitor
+            .model_config
+            .as_ref()
+            .is_some_and(|config| matches!(config.run.mode, RunMode::Perpetual(_)))
+    }
+
+    /// Queues a perpetual control command. The worker owns the drift, so
+    /// nothing here anticipates the result: the footer updates when the run
+    /// says so.
+    pub fn send_perpetual_command(&mut self, command: TrainingControlCommand) {
+        self.monitor.pending_control_commands.push(command);
+    }
+
+    pub fn toggle_perpetual_pause(&mut self) {
+        let next = !self.monitor.is_training_paused;
+        self.monitor.is_training_paused = next;
+        self.send_perpetual_command(TrainingControlCommand::SetPaused(next));
     }
 
     pub fn enter_layer_builder_from_mode(&mut self) {
@@ -2464,8 +2744,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, InferenceConfig, LayerKind, LossMethod, LossWeighting, ModelConfig, OptimizerKind,
-        RunConfig, RunMode, Screen, TrainingConfig, TrainingControlCommand, WeightInit,
+        App, InferenceConfig, LayerKind, LossMethod, LossWeighting, MIN_RENOISE_DEPTH, ModelConfig,
+        OptimizerKind, PerpetualRegime, RunConfig, RunMode, Screen, TrainingConfig,
+        TrainingControlCommand, WeightInit,
     };
 
     #[test]
@@ -2583,6 +2864,50 @@ mod tests {
             panic!("run config should be set");
         };
         assert!(matches!(run.mode, RunMode::Infer));
+    }
+
+    #[test]
+    fn perpetual_selection_builds_a_perpetual_run_config() {
+        let mut app = App::new();
+        app.finish_template_selector();
+        app.finish_weight_selector();
+        app.mode_selector.selected = 2;
+
+        app.finish_mode_selector();
+        assert!(matches!(app.screen, Screen::PerpetualParams));
+
+        app.perpetual_params.random_seed = false;
+        app.perpetual_params.fields[0] = "99".to_string();
+        app.perpetual_params.fields[1] = "0.9".to_string();
+        app.perpetual_params.fields[2] = "48".to_string();
+        app.perpetual_params.fields[3] = "20".to_string();
+        app.toggle_perpetual_regime();
+        app.finish_perpetual_params()
+            .expect("perpetual params should be accepted");
+
+        let Some(run) = app.run_config.as_ref() else {
+            panic!("run config should be set");
+        };
+        match &run.mode {
+            RunMode::Perpetual(cfg) => {
+                assert_eq!(cfg.seed, Some(99));
+                assert_eq!(cfg.denoise_magnitude, 0.9);
+                assert_eq!(cfg.renoise_depth, 48);
+                assert_eq!(cfg.tempo, 20.0);
+                assert_eq!(cfg.regime, PerpetualRegime::Breathe);
+            }
+            _ => panic!("expected a perpetual run mode"),
+        }
+    }
+
+    /// `t_r` below the drift's own minimum would make a cycle a single step and
+    /// freeze the piece; the form must refuse it rather than let the drift
+    /// silently clamp something the user cannot see.
+    #[test]
+    fn perpetual_params_reject_a_depth_below_the_drift_minimum() {
+        let mut app = App::new();
+        app.perpetual_params.fields[2] = (MIN_RENOISE_DEPTH - 1).to_string();
+        assert!(app.finish_perpetual_params().is_err());
     }
 
     #[test]

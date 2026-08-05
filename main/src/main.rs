@@ -8,16 +8,16 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use bat_building::tui::{
-    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, RunMode,
-    TrainingConfig,
+    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, PerpetualConfig,
+    RunMode, TrainingConfig,
 };
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
-    DenoiseFrame, DiffusionTask, Dim3, FullyConnectedType, GpuContext, GpuDataset, GroupNormType,
-    LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting, MetricsLogger,
-    Model, OptimizerKind,
-    PaddingMode as PPadding, ProbeConfig, Stats, Trainer, UpsampleConvType, WeightInit, log_probe,
-    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
+    DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
+    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
+    MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
+    Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
+    model::Training, probe_diffusion, reverse_step, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -169,7 +169,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         dataset_path,
         loss: match &config.run.mode {
             RunMode::Train(existing) => existing.loss.clone(),
-            RunMode::Infer => tui::LossMethod::MeanSquared,
+            RunMode::Infer | RunMode::Perpetual(_) => tui::LossMethod::MeanSquared,
         },
         checkpoint_path: Some(checkpoint_path),
         // Fixes #1 and #4 changed the convolution operator and the data range,
@@ -353,7 +353,9 @@ fn run_execution_loop(mut config: ModelConfig) {
 
         let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<tui::TrainingControlCommand>();
-        let is_training_run = matches!(&config.run.mode, RunMode::Train(_));
+        // Both training and perpetual runs are steered while they run; a plain
+        // inference has nothing to steer.
+        let is_steerable = matches!(&config.run.mode, RunMode::Train(_) | RunMode::Perpetual(_));
         let config_clone = config.clone();
 
         std::thread::spawn(move || {
@@ -362,6 +364,9 @@ fn run_execution_loop(mut config: ModelConfig) {
                 let run_result = match config_clone.run.mode.clone() {
                     RunMode::Train(train_cfg) => {
                         run_training(config_clone, train_cfg, &tx, control_rx).await
+                    }
+                    RunMode::Perpetual(perpetual_cfg) => {
+                        run_perpetual(config_clone, perpetual_cfg, &tx, control_rx).await
                     }
                     RunMode::Infer => run_inference(config_clone, &tx).await,
                 };
@@ -372,11 +377,7 @@ fn run_execution_loop(mut config: ModelConfig) {
             });
         });
 
-        let maybe_control_tx = if is_training_run {
-            Some(control_tx)
-        } else {
-            None
-        };
+        let maybe_control_tx = if is_steerable { Some(control_tx) } else { None };
         match tui::run_monitor(config.clone(), rx, maybe_control_tx) {
             Ok(MonitorOutcome::Restart(new_config)) => {
                 config = new_config;
@@ -867,6 +868,14 @@ fn apply_training_control_command(
             model.set_learning_rate(*current_lr);
             model.set_batch_size(*current_batch_size);
         }
+        // Perpetual-only controls. The monitor gates them on the run mode, so
+        // reaching one here means a stale command from a previous run's
+        // keystroke — ignoring it is the whole handling.
+        tui::TrainingControlCommand::NudgeRenoiseDepth(_)
+        | tui::TrainingControlCommand::NudgeTempo(_)
+        | tui::TrainingControlCommand::Reseed
+        | tui::TrainingControlCommand::ToggleRegime
+        | tui::TrainingControlCommand::SaveImage => {}
     }
 }
 
@@ -989,6 +998,301 @@ async fn run_inference(
 
     let _ = tx.send(tui::TrainingEvent::Done);
     Ok(())
+}
+
+/// An inference that never returns.
+///
+/// The reverse chain is walked exactly as [`sample_diffusion`] walks it — same
+/// [`reverse_step`], same seed derivation — but instead of stopping at `t = 0`
+/// and handing back an image, the run re-noises what it just made and descends
+/// again. [`PerpetualDrift`] owns the itinerary (which `t`, when to turn round);
+/// this function owns the tensors, the pacing and the controls.
+///
+/// It is the *only* consumer of the run-control channel besides training, and
+/// it never sends `Done`: the run ends when the TUI drops the channel.
+async fn run_perpetual(
+    config: ModelConfig,
+    cfg: PerpetualConfig,
+    tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+    control_rx: Receiver<tui::TrainingControlCommand>,
+) -> Result<(), String> {
+    let (gpu, mut model) = build_execution_model(
+        &config,
+        INFERENCE_RUNTIME_LR,
+        INFERENCE_RUNTIME_BATCH_SIZE,
+        OptimizerKind::default(),
+        WeightInit::default(),
+    )
+    .await?;
+
+    let checkpoint_path = resolve_sampling_checkpoint_path(&config, cfg.checkpoint.as_deref())?;
+    model.load_checkpoint(&checkpoint_path).map_err(|err| {
+        format!(
+            "failed to load perpetual checkpoint {}: {err}",
+            checkpoint_path.display()
+        )
+    })?;
+
+    let limits = gpu.device().limits();
+    let _ = tx.send(tui::TrainingEvent::ResourceReport {
+        max_buffer_bytes: limits.max_buffer_size,
+        max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
+        estimated_training_bytes: model.estimated_gpu_bytes(),
+    });
+
+    let input_dims = model
+        .input_dim()
+        .ok_or_else(|| "model has no input dimensions".to_string())?;
+    let output_dims = model
+        .output_dim()
+        .ok_or_else(|| "model has no output dimensions".to_string())?;
+    let output_size = (output_dims.x, output_dims.y, output_dims.z);
+    let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+    let input_channels = input_dims.z as usize;
+    let signal_channels = output_dims.z as usize;
+
+    let schedule = LinearNoiseSchedule::new_linear(
+        DIFFUSION_SCHEDULE_STEPS,
+        DIFFUSION_BETA_START,
+        DIFFUSION_BETA_END,
+    );
+
+    let seed = if cfg.random_seed {
+        random_seed()
+    } else {
+        cfg.seed.unwrap_or(0)
+    };
+    let mut drift = PerpetualDrift::new(schedule.len(), cfg.regime, cfg.renoise_depth, seed);
+    let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
+    // Until the first reverse step reports one, the best clean estimate we hold
+    // is a flat mid-grey — never the pure-noise latent, which `add_noise` would
+    // take for a clean image (see the perpetual module's header).
+    let mut last_x0 = vec![0.0f32; output_len];
+
+    let mut live = LiveFrame::new(
+        model.gpu_context(),
+        output_size.0,
+        output_size.1,
+        output_size.2,
+    );
+    tui::register_visualiser_source(
+        model.gpu_context(),
+        live.buffer(),
+        live.frame_width(),
+        live.frame_height(),
+        live.channels(),
+        format!(
+            "Perpetual  —  x_t | x̂₀  ({}×{}×{} channels)",
+            output_size.0, output_size.1, output_size.2
+        ),
+    );
+
+    let sample_dir = tui::storage::project_root().join("perpetual_samples");
+    let mut tempo = cfg
+        .tempo
+        .clamp(PerpetualConfig::MIN_TEMPO, PerpetualConfig::MAX_TEMPO);
+    let mut paused = false;
+    let mut steps = 0usize;
+    let mut saved = 0usize;
+    let mut next_step_at = std::time::Instant::now();
+    let mut pace = PaceMeter::new();
+    let mut last_published = std::time::Instant::now();
+
+    let publish = |tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
+                   drift: &PerpetualDrift,
+                   steps: usize,
+                   steps_per_sec: f32,
+                   tempo: f32,
+                   paused: bool|
+     -> bool {
+        tx.send(tui::TrainingEvent::PerpetualState(tui::PerpetualStatus {
+            regime: drift.regime().label().to_string(),
+            depth: drift.depth(),
+            min_depth: bat_building::MIN_RENOISE_DEPTH,
+            max_depth: drift.max_depth(),
+            cycle: drift.cycle(),
+            diffusion_step: drift.current_step(),
+            steps,
+            steps_per_sec,
+            tempo,
+            paused,
+        }))
+        .is_ok()
+    };
+    if !publish(tx, &drift, steps, 0.0, tempo, paused) {
+        tui::clear_visualiser_source();
+        return Ok(());
+    }
+
+    loop {
+        let mut dirty = false;
+        loop {
+            match control_rx.try_recv() {
+                Ok(command) => {
+                    dirty = true;
+                    match command {
+                        tui::TrainingControlCommand::SetPaused(next) => {
+                            paused = next;
+                            next_step_at = std::time::Instant::now();
+                            pace.reset();
+                        }
+                        tui::TrainingControlCommand::NudgeRenoiseDepth(delta) => {
+                            drift.nudge_depth(delta)
+                        }
+                        tui::TrainingControlCommand::ToggleRegime => drift.toggle_regime(),
+                        tui::TrainingControlCommand::Reseed => {
+                            let next_seed = random_seed();
+                            drift.reseed(next_seed);
+                            latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
+                            last_x0 = vec![0.0f32; output_len];
+                        }
+                        tui::TrainingControlCommand::NudgeTempo(delta) => {
+                            let factor = PerpetualConfig::TEMPO_FACTOR.powi(delta);
+                            tempo = (tempo * factor)
+                                .clamp(PerpetualConfig::MIN_TEMPO, PerpetualConfig::MAX_TEMPO);
+                            next_step_at = std::time::Instant::now();
+                            pace.reset();
+                        }
+                        tui::TrainingControlCommand::SaveImage => {
+                            let name = format!(
+                                "{}_c{:03}_{:03}.png",
+                                drift.regime().label(),
+                                drift.cycle(),
+                                saved
+                            );
+                            let message = match write_tensor_png(
+                                &last_x0,
+                                output_size,
+                                &sample_dir.join(name),
+                            ) {
+                                Ok(path) => {
+                                    saved += 1;
+                                    format!("image → {}", path.display())
+                                }
+                                Err(err) => err,
+                            };
+                            let is_error = !message.starts_with("image");
+                            if tx
+                                .send(tui::TrainingEvent::SaveStatus { message, is_error })
+                                .is_err()
+                            {
+                                tui::clear_visualiser_source();
+                                return Ok(());
+                            }
+                        }
+                        // Training-only commands; a perpetual run has no
+                        // optimiser to retune and no weights of its own to save.
+                        tui::TrainingControlCommand::SaveCheckpoint
+                        | tui::TrainingControlCommand::UpdateParams { .. } => {}
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The monitor is gone: the only way this run ever ends.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tui::clear_visualiser_source();
+                    return Ok(());
+                }
+            }
+        }
+
+        if paused {
+            if dirty && !publish(tx, &drift, steps, 0.0, tempo, paused) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        match drift.step() {
+            DriftAction::Descend {
+                diffusion_step,
+                path_seed,
+            } => {
+                let stepped = reverse_step(
+                    &mut model,
+                    &schedule,
+                    input_channels,
+                    signal_channels,
+                    &latent,
+                    diffusion_step,
+                    path_seed,
+                    cfg.denoise_magnitude,
+                    true,
+                );
+                latent = stepped.latent;
+                if let Some(x0_hat) = stepped.x0_hat {
+                    live.publish(&latent, &x0_hat);
+                    last_x0 = x0_hat;
+                }
+                steps += 1;
+                pace.tick();
+            }
+            DriftAction::Renoise { to_step, seed } => {
+                // The forward process, unchanged, applied to the clipped x̂₀ —
+                // the same `add_noise` training uses to build its examples.
+                let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
+                latent = noisy;
+                live.publish(&latent, &last_x0);
+                dirty = true;
+            }
+        }
+
+        let now = std::time::Instant::now();
+        next_step_at += Duration::from_secs_f32(1.0 / tempo);
+        if next_step_at > now {
+            std::thread::sleep(next_step_at - now);
+        } else {
+            // Fell behind the requested pace (the sampler is the ceiling): drop
+            // the debt instead of sprinting to repay it.
+            next_step_at = now;
+        }
+
+        if dirty || last_published.elapsed() >= Duration::from_millis(100) {
+            last_published = std::time::Instant::now();
+            if !publish(tx, &drift, steps, pace.per_second(), tempo, paused) {
+                break;
+            }
+        }
+    }
+
+    tui::clear_visualiser_source();
+    Ok(())
+}
+
+/// Rolling measurement of how fast the chain is actually being walked, which is
+/// not the requested tempo whenever the sampler is the bottleneck.
+struct PaceMeter {
+    window_start: std::time::Instant,
+    ticks: usize,
+    last_rate: f32,
+}
+
+impl PaceMeter {
+    fn new() -> Self {
+        Self {
+            window_start: std::time::Instant::now(),
+            ticks: 0,
+            last_rate: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.window_start = std::time::Instant::now();
+        self.ticks = 0;
+    }
+
+    fn tick(&mut self) {
+        self.ticks += 1;
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            self.last_rate = self.ticks as f32 / elapsed.as_secs_f32();
+            self.reset();
+        }
+    }
+
+    fn per_second(&self) -> f32 {
+        self.last_rate
+    }
 }
 
 /// Renders "which path, which step, which t" from the sampler's flat work
@@ -1531,6 +1835,19 @@ fn save_tensor_as_image(
     sample_dir: &Path,
     step: usize,
 ) -> Result<PathBuf, String> {
+    write_tensor_png(
+        tensor,
+        dims,
+        &sample_dir.join(format!("step_{step:04}.png")),
+    )
+}
+
+/// Encodes a `[-1, 1]` tensor to a PNG at `path`, creating its directory.
+///
+/// Same encoder as the training previews and the headless sampler — a saved
+/// frame of a perpetual run and a saved sample of a finite one are the same
+/// bytes for the same tensor.
+fn write_tensor_png(tensor: &[f32], dims: (u32, u32, u32), path: &Path) -> Result<PathBuf, String> {
     let (width, height, channels) = dims;
     let expected_len = (width * height * channels) as usize;
     if tensor.len() != expected_len {
@@ -1539,8 +1856,14 @@ fn save_tensor_as_image(
             tensor.len()
         ));
     }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
 
-    let path = sample_dir.join(format!("step_{step:04}.png"));
+    let path = path.to_path_buf();
     if channels == 1 {
         let pixels: Vec<u8> = tensor.iter().map(|value| to_u8(*value)).collect();
         let image = GrayImage::from_raw(width, height, pixels)

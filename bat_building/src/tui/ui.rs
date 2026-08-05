@@ -2,8 +2,8 @@
 
 use super::app::{
     App, HOME_CHOICES, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode,
-    LayerKind, MonitorImage, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES,
-    TRAINING_PARAM_FIELD_NAMES,
+    LayerKind, MonitorImage, PERPETUAL_PARAM_FIELD_NAMES, RunMode, Screen,
+    TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -17,6 +17,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::LayerBuilder => draw_layer_builder(f, app),
         Screen::ModeSelector => draw_mode_selector(f, app),
         Screen::InferenceParams => draw_inference_params(f, app),
+        Screen::PerpetualParams => draw_perpetual_params(f, app),
         Screen::TrainingParams => draw_training_params(f, app),
         Screen::DatasetSelector => draw_dataset_selector(f, app),
         Screen::Monitor => draw_monitor(f, app),
@@ -603,7 +604,7 @@ fn draw_mode_selector(f: &mut Frame, app: &App) {
     draw_choice_screen(
         f,
         "Run Mode",
-        &["Inference", "Training"],
+        &["Inference", "Training", "Perpetual"],
         app.mode_selector.selected,
         "[arrow] select  [Enter] configure/run  [e] edit layers  [q] quit",
     );
@@ -646,6 +647,31 @@ fn draw_inference_params(f: &mut Frame, app: &App) {
         app.inference_params.field_idx,
         app.inference_params.error.as_deref(),
         "[up/down] field  [left/right/space] toggle random seed  [type] edit  [Enter] next/run",
+    );
+}
+
+fn draw_perpetual_params(f: &mut Frame, app: &App) {
+    let seed_mode = if app.perpetual_params.random_seed {
+        "Random"
+    } else {
+        "Manual"
+    };
+    let values = vec![
+        seed_mode.to_string(),
+        app.perpetual_params.fields[0].clone(),
+        app.perpetual_params.fields[1].clone(),
+        app.perpetual_params.fields[2].clone(),
+        app.perpetual_params.fields[3].clone(),
+        app.perpetual_params.regime.label().to_string(),
+    ];
+    draw_form_screen(
+        f,
+        "Perpetual Inference",
+        &PERPETUAL_PARAM_FIELD_NAMES,
+        &values,
+        app.perpetual_params.field_idx,
+        app.perpetual_params.error.as_deref(),
+        "[up/down] field  [left/right/space] toggle  [type] edit  [Enter] next/run  [Esc] back",
     );
 }
 
@@ -750,7 +776,12 @@ fn draw_monitor(f: &mut Frame, app: &App) {
         .split(main_area);
 
     draw_monitor_architecture(f, app, horizontal[0]);
-    if is_inference_mode(app) {
+    if is_perpetual_mode(app) {
+        let right = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(horizontal[1]);
+        draw_perpetual_panel(f, app, right[0]);
+        draw_analytics(f, app, right[1]);
+    } else if is_inference_mode(app) {
         let right = Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
             .split(horizontal[1]);
         draw_inference_image(f, app, right[0]);
@@ -765,7 +796,11 @@ fn draw_monitor(f: &mut Frame, app: &App) {
     let block = Block::default().borders(Borders::TOP);
     let inner = block.inner(hint_area);
     f.render_widget(block, hint_area);
-    let hint_text = if let Some(save_status) = &app.monitor.save_status {
+    // A perpetual run has no end state to fall through to, and its keys differ
+    // from every other mode's, so it claims the footer first.
+    let hint_text = if is_perpetual_mode(app) && !app.monitor.done {
+        perpetual_hint(app)
+    } else if let Some(save_status) = &app.monitor.save_status {
         format!(" ✓ {save_status} | [s] save  [q] quit")
     } else if let Some(error) = &app.monitor.error {
         format!(" error: {error} | [s] save  [q] quit")
@@ -818,6 +853,124 @@ fn draw_monitor_architecture(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, l)| Line::from(format!("  {}: {}", i, l.display())))
         .collect();
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn is_perpetual_mode(app: &App) -> bool {
+    app.monitor
+        .model_config
+        .as_ref()
+        .is_some_and(|config| matches!(config.run.mode, RunMode::Perpetual(_)))
+}
+
+/// The perpetual footer: what the drift is doing, then every key that steers it.
+///
+/// Built from `monitor.perpetual`, which only the worker writes — so `t_r` and
+/// the regime on screen are the ones the sampler is using, not the ones the UI
+/// last asked for.
+fn perpetual_hint(app: &App) -> String {
+    const KEYS: &str = "[↑↓] t_r  [←→] tempo  [espace] pause  [r] re-seed  \
+                        [m] regime  [s] PNG  [v] visualise  [q] quit";
+
+    // The last PNG write (or failure) is worth a word, but must not cost the
+    // user the key list — it rides as a prefix instead of replacing the line.
+    let notice = app
+        .monitor
+        .error
+        .as_deref()
+        .map(|error| format!(" ✗ {error} |"))
+        .or_else(|| {
+            app.monitor
+                .save_status
+                .as_deref()
+                .map(|status| format!(" ✓ {status} |"))
+        })
+        .unwrap_or_default();
+
+    let Some(state) = app.monitor.perpetual.as_ref() else {
+        return format!("{notice} perpetual: starting… | {KEYS}");
+    };
+
+    let status = if state.paused { "en pause" } else { "en cours" };
+    format!(
+        "{notice} perpetual · {} · {status} · t_r={} (max {}) · t={} · cycle {} · {:.0}/{:.0} pas/s | {KEYS}",
+        state.regime,
+        state.depth,
+        state.max_depth,
+        state.diffusion_step,
+        state.cycle,
+        state.steps_per_sec,
+        state.tempo,
+    )
+}
+
+/// The drift's read-out. The image itself lives in the `[v]` window — this pane
+/// is the instrument panel beside it.
+fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Perpetual Drift ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(state) = app.monitor.perpetual.as_ref() else {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  building the model and loading weights…",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]),
+            inner,
+        );
+        return;
+    };
+
+    let row = |label: &str, value: String, key: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {label:<22}"), Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{value:<20}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(key.to_string(), Style::default().fg(Color::DarkGray)),
+        ])
+    };
+
+    let lines = vec![
+        Line::from(""),
+        row("regime", state.regime.clone(), "[m]"),
+        row(
+            "renoise depth t_r",
+            format!("{} / {}", state.depth, state.max_depth),
+            "[↑ / ↓]",
+        ),
+        row("timestep t", state.diffusion_step.to_string(), ""),
+        row("cycle", state.cycle.to_string(), "[r] re-seed"),
+        row("reverse steps", state.steps.to_string(), ""),
+        row(
+            "pace",
+            format!("{:.1} / {:.0} steps/s", state.steps_per_sec, state.tempo),
+            "[← / →]",
+        ),
+        row(
+            "state",
+            if state.paused { "paused" } else { "running" }.to_string(),
+            "[space]",
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  The image is in the [v] window — x_t on the left, x̂₀ on the right.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  [s] writes the current x̂₀ to perpetual_samples/.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn is_inference_mode(app: &App) -> bool {
