@@ -165,6 +165,32 @@ impl LinearNoiseSchedule {
         self.denoise_step_with_magnitude(latent, predicted_noise, step, seed, 1.0)
     }
 
+    /// The clipped x0 estimate the posterior mean is built from, for the whole
+    /// tensor: `clamp(x_t - sqrt(1 - alpha_bar) * eps_hat) / sqrt(alpha_bar)`.
+    ///
+    /// This is "what the model believes the clean image is" at `step`, and it is
+    /// the exact same quantity [`Self::denoise_step_with_magnitude`] computes
+    /// internally — both go through [`x0_hat_at`], so the live visualiser cannot
+    /// drift from the sampler. Nothing here is part of the recursion: the value
+    /// is derived from `latent`/`predicted_noise` alone, so computing it is
+    /// side-effect free and optional.
+    pub fn x0_estimate(&self, latent: &[f32], predicted_noise: &[f32], step: usize) -> Vec<f32> {
+        assert_eq!(
+            latent.len(),
+            predicted_noise.len(),
+            "latent and predicted noise lengths must match"
+        );
+        let step = step.min(self.len().saturating_sub(1));
+        let alpha_bar = self.alpha_bar(step);
+        let noise_to_x0 = (1.0 - alpha_bar).sqrt();
+        let x0_scale = 1.0 / alpha_bar.sqrt().max(f32::EPSILON);
+        latent
+            .iter()
+            .zip(predicted_noise.iter())
+            .map(|(value, noise)| x0_hat_at(*value, *noise, x0_scale, noise_to_x0))
+            .collect()
+    }
+
     pub fn denoise_step_with_magnitude(
         &self,
         latent: &[f32],
@@ -208,7 +234,7 @@ impl LinearNoiseSchedule {
             .zip(predicted_noise.iter())
             .enumerate()
             .map(|(index, (value, noise))| {
-                let x0_hat = (x0_scale * (*value - noise_to_x0 * *noise)).clamp(-1.0, 1.0);
+                let x0_hat = x0_hat_at(*value, *noise, x0_scale, noise_to_x0);
                 let mean = coeff_x0 * x0_hat + coeff_xt * *value;
                 if sigma == 0.0 {
                     mean
@@ -218,6 +244,17 @@ impl LinearNoiseSchedule {
             })
             .collect()
     }
+}
+
+/// The clipped x0 estimate for a single element.
+///
+/// Sole definition of the formula: the reverse step builds its posterior mean
+/// from it, and `x0_estimate` exposes it for display. Keeping one definition is
+/// what makes the visualiser's "what the model believes" pane trustworthy — a
+/// second copy could drift and quietly show something the sampler never used.
+#[inline]
+fn x0_hat_at(latent: f32, predicted_noise: f32, x0_scale: f32, noise_to_x0: f32) -> f32 {
+    (x0_scale * (latent - noise_to_x0 * predicted_noise)).clamp(-1.0, 1.0)
 }
 
 /// Odd increment of the SplitMix64 stream (the golden-ratio constant).
@@ -429,6 +466,46 @@ mod tests {
                 permuted_matches < 1024,
                 "field(seed ^ {delta}) is field(seed) permuted by `index ^ {delta}` \
                  ({permuted_matches}/1024 elements identical)"
+            );
+        }
+    }
+
+    /// The visualiser shows `x0_estimate` as "what the model believes the clean
+    /// image is". That claim is only honest if it is the *same* x0 the reverse
+    /// step builds its posterior mean from.
+    ///
+    /// At step 0 the sampler is noiseless (sigma = 0) and alpha_bar_prev = 1, so
+    /// the returned latent is exactly `coeff_x0 * x0_hat + coeff_xt * x_t`.
+    /// Rebuilding that from `x0_estimate` and demanding bit-equality pins the two
+    /// paths to one formula: inline the clamp differently in either one and this
+    /// fails.
+    #[test]
+    fn x0_estimate_is_the_x0_the_reverse_step_uses() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let latent = schedule.sample_noise(256, 0xfeed_beef);
+        // Deliberately oversized predictions: x0_hat then leaves [-1, 1] and the
+        // clamp is load-bearing, so an unclamped copy would diverge here.
+        let eps_hat: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin() * 3.0).collect();
+
+        let step = 0usize;
+        let x0 = schedule.x0_estimate(&latent, &eps_hat, step);
+        assert!(
+            x0.iter().all(|v| (-1.0..=1.0).contains(v)),
+            "x0 estimate must be clipped to the data range"
+        );
+
+        let beta = schedule.beta(step);
+        let alpha = schedule.alpha(step);
+        let alpha_bar = schedule.alpha_bar(step);
+        let coeff_x0 = 1.0f32.sqrt() * beta / (1.0 - alpha_bar);
+        let coeff_xt = alpha.sqrt() * (1.0 - 1.0) / (1.0 - alpha_bar);
+
+        let actual = schedule.denoise_step(&latent, &eps_hat, step, 12345);
+        for (i, out) in actual.iter().enumerate() {
+            let rebuilt = coeff_x0 * x0[i] + coeff_xt * latent[i];
+            assert_eq!(
+                *out, rebuilt,
+                "step 0 output at {i} is not the posterior mean of the reported x0"
             );
         }
     }
