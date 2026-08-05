@@ -5,7 +5,9 @@ use crate::model::debug::{LayerDebugView, read_back_f32};
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
 use crate::model::layer_types::{ConcatType, LayerType, LayerTypes, LossMethod, LossType};
+use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
+use crate::model::weight_init::WeightInit;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -14,7 +16,15 @@ use std::path::Path;
 use std::sync::Arc;
 use wgpu::Buffer;
 
-const CHECKPOINT_MAGIC: &[u8; 7] = b"BBCKPT1";
+/// Weights + biases only. Still read; never written any more.
+const CHECKPOINT_MAGIC_V1: &[u8; 7] = b"BBCKPT1";
+/// V1 body followed by an optimiser-state trailer (see `save_checkpoint`).
+const CHECKPOINT_MAGIC_V2: &[u8; 7] = b"BBCKPT2";
+const CHECKPOINT_MAGIC_LEN: usize = 7;
+
+/// Trailer tags for the optimiser-state section of a V2 checkpoint.
+const OPT_STATE_NONE: u32 = 0;
+const OPT_STATE_ADAM: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // State markers
@@ -27,6 +37,7 @@ pub struct Infer;
 pub struct Training {
     pub lr: f32,
     pub batch_size: u32,
+    pub optimizer: OptimizerKind,
     pub(crate) loss_method: LossMethod,
 }
 
@@ -51,6 +62,16 @@ pub struct Model<State = Infer> {
     pub(crate) training: Option<State>,
     pub(crate) state: ModelState,
     pub(crate) saved_outputs: HashMap<String, usize>,
+    /// Global optimiser step counter `t`, 1-based at the first update.
+    ///
+    /// Lives on the model rather than on `Training` so that checkpoint I/O —
+    /// which is shared with `Model<Infer>` — can persist and restore it.
+    /// Adam's bias correction is a function of `t` alone, so resuming with the
+    /// wrong `t` is what makes a naive resume take a huge first step.
+    optimizer_step: u64,
+    /// Initialisation scheme for trainable weight buffers. On the model rather
+    /// than on `Training` because `build_forwards` is shared with inference.
+    weight_init: WeightInit,
     pending_loss_readback: Option<PendingLossReadback>,
     last_reported_loss: Option<f32>,
     loss_readback_disabled: bool,
@@ -103,12 +124,24 @@ impl Model<Infer> {
 // ---------------------------------------------------------------------------
 
 impl Model<Training> {
-    /// Create a model ready for training.
+    /// Create a model ready for training with the default optimiser (SGD).
     pub async fn new_training(
         gpu: Arc<GpuContext>,
         lr: f32,
         batch_size: u32,
         loss_method: LossMethod,
+    ) -> Self {
+        Self::new_training_with_optimizer(gpu, lr, batch_size, loss_method, OptimizerKind::Sgd)
+            .await
+    }
+
+    /// Create a model ready for training with an explicit optimiser.
+    pub async fn new_training_with_optimizer(
+        gpu: Arc<GpuContext>,
+        lr: f32,
+        batch_size: u32,
+        loss_method: LossMethod,
+        optimizer: OptimizerKind,
     ) -> Self {
         Self {
             gpu,
@@ -117,14 +150,30 @@ impl Model<Training> {
             training: Some(Training {
                 lr,
                 batch_size,
+                optimizer,
                 loss_method,
             }),
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
+            optimizer_step: 0,
+            weight_init: WeightInit::default(),
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
         }
+    }
+
+    /// Choose how trainable weights are drawn at build time. Must be set
+    /// before `build()`; the default is the historical uniform draw.
+    pub fn set_weight_init(&mut self, init: WeightInit) {
+        self.weight_init = init;
+    }
+
+    pub fn optimizer(&self) -> OptimizerKind {
+        self.training
+            .as_ref()
+            .map(|t| t.optimizer)
+            .unwrap_or_default()
     }
 
     /// Build all forward + backward + SGD passes in the correct order.
@@ -157,14 +206,20 @@ impl Model<Training> {
         // create_buffers shares last_fwd_output as binding 0 (model_result),
         // allocates binding 1 (target) and binding 2 (grad_output), returns grad_output.
         let empty_saved_outputs = HashMap::new();
-        let loss_grad_out =
-            loss_layer.create_buffers(&self.gpu, Some(last_fwd_output), &empty_saved_outputs)?;
+        let loss_grad_out = loss_layer.create_buffers(
+            &self.gpu,
+            Some(last_fwd_output),
+            &empty_saved_outputs,
+            WeightInit::default(),
+            self.layers.len(),
+        )?;
         loss_layer.set_pipeline(&self.gpu.device);
         loss_layer.set_bind_group(&self.gpu.device);
 
         // 3. Backward passes in reverse layer order.
         //    Each layer receives the previous layer's grad_input as its grad_output.
         let lr = self.training.as_ref().unwrap().lr;
+        let optimizer = self.training.as_ref().unwrap().optimizer;
         let mut incoming_grad = loss_grad_out;
         let mut pending_saved_grads: HashMap<String, Arc<Buffer>> = HashMap::new();
 
@@ -189,12 +244,16 @@ impl Model<Training> {
                 }
             }
             if layer.ty.has_weights() {
-                layer.create_opt_pass(&self.gpu, lr);
+                layer.create_opt_pass(&self.gpu, lr, optimizer);
             }
         }
 
         self.loss_layer = Some(loss_layer);
         self.state.is_build = true;
+        // Freshly allocated optimiser state (Adam's m and v are zero) — the
+        // step counter must restart with it. load_checkpoint() restores both
+        // together afterwards.
+        self.optimizer_step = 0;
         Ok(())
     }
 
@@ -234,6 +293,8 @@ impl Model<Training> {
         F: FnOnce(&mut wgpu::CommandEncoder),
     {
         debug_assert!(self.state.is_build, "call build() before train_step()");
+        // Single sample, no accumulation: the gradient is already its own mean.
+        self.publish_optimizer_specs(1.0);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         prepass(&mut encoder);
         self.encode_zero_optimizer_gradients(&mut encoder);
@@ -281,15 +342,7 @@ impl Model<Training> {
             "call build() before finish_batch_accumulation()"
         );
         let batch_size = batch_size.max(1) as f32;
-        let base_lr = self
-            .training
-            .as_ref()
-            .expect("training config unavailable")
-            .lr;
-        let scaled_lr = base_lr / batch_size;
-        for layer in &self.layers {
-            layer.set_opt_learning_rate(self.gpu.as_ref(), scaled_lr);
-        }
+        self.publish_optimizer_specs(1.0 / batch_size);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_train_optimizer_graph(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
@@ -316,10 +369,28 @@ impl Model<Training> {
             .queue
             .write_buffer(loss_buf.as_ref(), 0, bytemuck::cast_slice(target));
 
+        // Single sample, no accumulation: the gradient is already its own mean.
+        self.publish_optimizer_specs(1.0);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_zero_optimizer_gradients(&mut encoder);
         self.encode_train_graph(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
+    }
+
+    /// Advance the global step counter and push the resulting hyperparameters
+    /// to every optimiser pass. Must be called exactly once per weight update,
+    /// immediately before the optimiser dispatch is encoded.
+    fn publish_optimizer_specs(&mut self, grad_scale: f32) {
+        self.optimizer_step += 1;
+        let step = self.optimizer_step;
+        let lr = self
+            .training
+            .as_ref()
+            .expect("training config unavailable")
+            .lr;
+        for layer in &self.layers {
+            layer.write_opt_specs(self.gpu.as_ref(), lr, grad_scale, step);
+        }
     }
 
     fn encode_train_graph(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -369,6 +440,8 @@ impl<State> Model<State> {
             training: None,
             state: ModelState { is_build: false },
             saved_outputs: HashMap::new(),
+            optimizer_step: 0,
+            weight_init: WeightInit::default(),
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
@@ -381,6 +454,7 @@ impl<State> Model<State> {
         self.loss_layer = None;
         self.state.is_build = false;
         self.saved_outputs.clear();
+        self.optimizer_step = 0;
         self.pending_loss_readback = None;
         self.last_reported_loss = None;
         self.loss_readback_disabled = false;
@@ -455,7 +529,7 @@ impl<State> Model<State> {
         }
 
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(CHECKPOINT_MAGIC_V2);
         bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for entry in entries {
             bytes.extend_from_slice(&entry.layer_index.to_le_bytes());
@@ -464,6 +538,17 @@ impl<State> Model<State> {
             bytes.extend_from_slice(&(entry.bias.len() as u32).to_le_bytes());
             bytes.extend_from_slice(bytemuck::cast_slice(&entry.bias));
         }
+
+        // Optimiser-state trailer.
+        //
+        // Adam's m and v are as much part of the training state as the weights:
+        // dropping them on resume restarts the bias correction at t=1, where
+        // m̂ = g and the very first update is a full ±lr on every weight, i.e. a
+        // visible loss spike. They are therefore persisted, and the run's step
+        // counter with them. SGD is stateless and writes the `none` tag, which
+        // keeps its checkpoints byte-identical to V1 apart from the magic and
+        // the 4-byte tag.
+        self.append_optimizer_state(&mut bytes)?;
 
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -478,7 +563,111 @@ impl<State> Model<State> {
         })
     }
 
-    pub fn load_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<(), ModelError> {
+    /// Serialise the persistent optimiser state (see `save_checkpoint`).
+    fn append_optimizer_state(&self, bytes: &mut Vec<u8>) -> Result<(), ModelError> {
+        let stateful: Vec<(u32, &Layer)> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| !layer.opt_state_buffers().is_empty())
+            .map(|(i, layer)| (i as u32, layer))
+            .collect();
+
+        if stateful.is_empty() {
+            bytes.extend_from_slice(&OPT_STATE_NONE.to_le_bytes());
+            return Ok(());
+        }
+
+        bytes.extend_from_slice(&OPT_STATE_ADAM.to_le_bytes());
+        bytes.extend_from_slice(&self.optimizer_step.to_le_bytes());
+        bytes.extend_from_slice(&(stateful.len() as u32).to_le_bytes());
+        for (layer_index, layer) in stateful {
+            let buffers = layer.opt_state_buffers();
+            bytes.extend_from_slice(&layer_index.to_le_bytes());
+            bytes.extend_from_slice(&(buffers.len() as u32).to_le_bytes());
+            for buffer in buffers {
+                let values =
+                    read_back_f32(self.gpu.as_ref(), buffer, buffer.size()).ok_or_else(|| {
+                        ModelError::CheckpointLayerMismatch {
+                            layer_index: layer_index as usize,
+                            message: "optimiser state buffer is not readable from GPU".to_string(),
+                        }
+                    })?;
+                bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(bytemuck::cast_slice(&values));
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the optimiser state trailer written by `append_optimizer_state`.
+    ///
+    /// A mismatch between the checkpoint's optimiser and the model's is not an
+    /// error: loading Adam state into an SGD run simply drops it, and loading
+    /// an SGD (stateless) checkpoint into an Adam run leaves m = v = 0 and
+    /// t = 0, i.e. a cold Adam start on warm weights.
+    fn restore_optimizer_state(
+        &mut self,
+        bytes: &[u8],
+        offset: &mut usize,
+    ) -> Result<(), ModelError> {
+        let tag = read_u32_le(bytes, offset)?;
+        if tag == OPT_STATE_NONE {
+            return Ok(());
+        }
+        if tag != OPT_STATE_ADAM {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: format!("unknown optimiser state tag {tag}"),
+            });
+        }
+
+        let step = read_u64_le(bytes, offset)?;
+        let layer_count = read_u32_le(bytes, offset)? as usize;
+        let mut restored_any = false;
+        for _ in 0..layer_count {
+            let layer_index = read_u32_le(bytes, offset)? as usize;
+            let buffer_count = read_u32_le(bytes, offset)? as usize;
+            let targets: Vec<Arc<Buffer>> = self
+                .layers
+                .get(layer_index)
+                .map(|layer| layer.opt_state_buffers().to_vec())
+                .unwrap_or_default();
+            // The whole record is consumed either way — a state section the
+            // current model cannot use must still be walked past so the offset
+            // stays aligned with the stream.
+            let mut section = Vec::with_capacity(buffer_count);
+            for _ in 0..buffer_count {
+                let len = read_u32_le(bytes, offset)? as usize;
+                section.push(read_f32_vec_le(bytes, offset, len)?);
+            }
+            if targets.len() != buffer_count {
+                continue;
+            }
+            for (target, values) in targets.iter().zip(&section) {
+                let expected = (target.size() as usize) / std::mem::size_of::<f32>();
+                if values.len() != expected {
+                    return Err(ModelError::CheckpointLayerMismatch {
+                        layer_index,
+                        message: format!(
+                            "optimiser state length mismatch (expected {expected}, got {})",
+                            values.len()
+                        ),
+                    });
+                }
+                self.gpu
+                    .queue
+                    .write_buffer(target.as_ref(), 0, bytemuck::cast_slice(values));
+                restored_any = true;
+            }
+        }
+
+        if restored_any {
+            self.optimizer_step = step;
+        }
+        Ok(())
+    }
+
+    pub fn load_checkpoint<P: AsRef<Path>>(&mut self, path: P) -> Result<(), ModelError> {
         if !self.state.is_build {
             return Err(ModelError::InvalidCheckpointFormat {
                 message: "model must be built before loading checkpoint".to_string(),
@@ -490,15 +679,17 @@ impl<State> Model<State> {
             path: path.display().to_string(),
             message: err.to_string(),
         })?;
-        if bytes.len() < CHECKPOINT_MAGIC.len() + 4
-            || &bytes[..CHECKPOINT_MAGIC.len()] != CHECKPOINT_MAGIC
-        {
-            return Err(ModelError::InvalidCheckpointFormat {
-                message: "missing or invalid checkpoint magic".to_string(),
-            });
-        }
+        let has_optimizer_trailer = match bytes.get(..CHECKPOINT_MAGIC_LEN) {
+            Some(magic) if magic == CHECKPOINT_MAGIC_V2 => true,
+            Some(magic) if magic == CHECKPOINT_MAGIC_V1 => false,
+            _ => {
+                return Err(ModelError::InvalidCheckpointFormat {
+                    message: "missing or invalid checkpoint magic".to_string(),
+                });
+            }
+        };
 
-        let mut offset = CHECKPOINT_MAGIC.len();
+        let mut offset = CHECKPOINT_MAGIC_LEN;
         let entry_count = read_u32_le(&bytes, &mut offset)? as usize;
         for _ in 0..entry_count {
             let layer_index = read_u32_le(&bytes, &mut offset)? as usize;
@@ -565,12 +756,26 @@ impl<State> Model<State> {
                 .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(&bias));
         }
 
+        if has_optimizer_trailer {
+            self.restore_optimizer_state(&bytes, &mut offset)?;
+        }
+
         if offset != bytes.len() {
             return Err(ModelError::InvalidCheckpointFormat {
                 message: "checkpoint has trailing bytes".to_string(),
             });
         }
         Ok(())
+    }
+
+    /// The run's global optimiser step counter `t` (0 before the first update).
+    pub fn optimizer_step(&self) -> u64 {
+        self.optimizer_step
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_optimizer_step(&mut self) {
+        self.optimizer_step = 0;
     }
 
     pub fn predict(&mut self, input: &[f32]) -> Vec<f32> {
@@ -602,9 +807,15 @@ impl<State> Model<State> {
     fn build_forwards(&mut self) -> Result<(), ModelError> {
         let mut last_output: Option<Arc<Buffer>> = None;
         let mut saved_output_buffers: HashMap<String, Arc<Buffer>> = HashMap::new();
-        for layer in &mut self.layers {
-            last_output =
-                Some(layer.create_buffers(&self.gpu, last_output, &saved_output_buffers)?);
+        let init = self.weight_init;
+        for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            last_output = Some(layer.create_buffers(
+                &self.gpu,
+                last_output,
+                &saved_output_buffers,
+                init,
+                layer_index,
+            )?);
             layer.set_pipeline(&self.gpu.device);
             layer.set_bind_group(&self.gpu.device);
             if let Some(key) = layer.saved_output_key().map(str::to_string) {
@@ -706,7 +917,7 @@ impl<State> Model<State> {
                 }
             }
             if let Some(opt) = &layer.opt_pass {
-                for buffer in &opt.buffers {
+                for buffer in opt.owned_buffers() {
                     add_unique(&mut total, &mut seen, buffer);
                 }
             }
@@ -865,6 +1076,18 @@ fn read_u32_le(bytes: &[u8], offset: &mut usize) -> Result<u32, ModelError> {
         });
     }
     let value = u32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
+}
+
+fn read_u64_le(bytes: &[u8], offset: &mut usize) -> Result<u64, ModelError> {
+    let end = offset.saturating_add(8);
+    if end > bytes.len() {
+        return Err(ModelError::InvalidCheckpointFormat {
+            message: "unexpected end of checkpoint while reading u64".to_string(),
+        });
+    }
+    let value = u64::from_le_bytes(bytes[*offset..end].try_into().unwrap());
     *offset = end;
     Ok(value)
 }

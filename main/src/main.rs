@@ -14,9 +14,9 @@ use bat_building::tui::{
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DiffusionTask, Dim3,
     FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes, LinearNoiseSchedule,
-    LossMethod as PLoss, MetricsLogger, Model, PaddingMode as PPadding, ProbeConfig, Stats, Trainer,
-    UpsampleConvType, log_probe, log_train_loss, log_trajectory, model::Training, probe_diffusion,
-    sample_diffusion,
+    LossMethod as PLoss, MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, ProbeConfig,
+    Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
+    model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -127,6 +127,16 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
     let steps = parse("--steps", 500.0)? as usize;
     let lr = parse("--lr", 1e-3)?;
     let batch_size = parse("--batch", 16.0)? as u32;
+    let optimizer = match flag("--optimizer") {
+        Some(value) => OptimizerKind::parse(&value)
+            .ok_or_else(|| format!("invalid value for --optimizer: {value} (want sgd|adam)"))?,
+        None => OptimizerKind::default(),
+    };
+    let weight_init = match flag("--weight-init") {
+        Some(value) => WeightInit::parse(&value)
+            .ok_or_else(|| format!("invalid value for --weight-init: {value} (want uniform|he)"))?,
+        None => WeightInit::default(),
+    };
 
     let config_path = tui::storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
@@ -155,12 +165,16 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         // Fixes #1 and #4 changed the convolution operator and the data range,
         // so any pre-existing checkpoint is meaningless. Always start fresh.
         load_checkpoint: false,
+        optimizer,
+        weight_init,
     };
     config.run.mode = RunMode::Train(train_cfg.clone());
 
     println!(
         "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
-         dataset={}",
+         optimizer={}, init={}, dataset={}",
+        optimizer.label(),
+        weight_init.label(),
         train_cfg.dataset_path
     );
 
@@ -249,9 +263,14 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
 
     let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
     rt.block_on(async {
-        let (_gpu, mut model) =
-            build_execution_model(&config, INFERENCE_RUNTIME_LR, INFERENCE_RUNTIME_BATCH_SIZE)
-                .await?;
+        let (_gpu, mut model) = build_execution_model(
+            &config,
+            INFERENCE_RUNTIME_LR,
+            INFERENCE_RUNTIME_BATCH_SIZE,
+            OptimizerKind::default(),
+            WeightInit::default(),
+        )
+        .await?;
         model
             .load_checkpoint(&checkpoint_path)
             .map_err(|err| format!("failed to load checkpoint {checkpoint}: {err}"))?;
@@ -385,9 +404,19 @@ async fn build_execution_model(
     config: &ModelConfig,
     lr: f32,
     batch_size: u32,
+    optimizer: OptimizerKind,
+    weight_init: WeightInit,
 ) -> Result<(Arc<GpuContext>, Model<Training>), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
-    let mut model = Model::new_training(gpu.clone(), lr, batch_size, PLoss::MeanSquared).await;
+    let mut model = Model::new_training_with_optimizer(
+        gpu.clone(),
+        lr,
+        batch_size,
+        PLoss::MeanSquared,
+        optimizer,
+    )
+    .await;
+    model.set_weight_init(weight_init);
     for draft in &config.layers {
         append_layer(&mut model, draft).map_err(|err| err.to_string())?;
     }
@@ -401,8 +430,14 @@ async fn run_training(
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
     control_rx: Receiver<tui::TrainingControlCommand>,
 ) -> Result<(), String> {
-    let (gpu, mut model) =
-        build_execution_model(&config, train_cfg.lr, train_cfg.batch_size).await?;
+    let (gpu, mut model) = build_execution_model(
+        &config,
+        train_cfg.lr,
+        train_cfg.batch_size,
+        train_cfg.optimizer,
+        train_cfg.weight_init,
+    )
+    .await?;
     let checkpoint_path = match train_cfg.checkpoint_path.as_deref() {
         Some(path) => Some(PathBuf::from(path)),
         None => config
@@ -481,7 +516,10 @@ async fn run_training(
             .unwrap_or_else(|| std::env::temp_dir().join("diffusion_metrics.jsonl"));
         MetricsLogger::create(&metrics_path, true)
     };
-    println!("[metrics] writing training diagnostics to {}", metrics.path());
+    println!(
+        "[metrics] writing training diagnostics to {}",
+        metrics.path()
+    );
     let limits = gpu.device().limits();
     let estimated_training_bytes = model
         .estimated_gpu_bytes()
@@ -589,7 +627,13 @@ async fn run_training(
 
         if should_report_loss {
             if let Some(batch_loss) = loss {
-                log_train_loss(&mut metrics, step, batch_loss, current_lr, current_batch_size);
+                log_train_loss(
+                    &mut metrics,
+                    step,
+                    batch_loss,
+                    current_lr,
+                    current_batch_size,
+                );
             }
             // Per-timestep-bucket diagnostic: how well ε̂ tracks ε across t.
             let buckets = probe_diffusion(
@@ -621,7 +665,13 @@ async fn run_training(
                 Some(&mut trajectory),
                 |_, _| {},
             );
-            log_trajectory(&mut metrics, step, step as u64, &trajectory, &Stats::of(&image));
+            log_trajectory(
+                &mut metrics,
+                step,
+                step as u64,
+                &trajectory,
+                &Stats::of(&image),
+            );
             if let Ok(path) = save_tensor_as_image(&image, output_size, &sample_dir, step) {
                 let _ = tx.send(tui::TrainingEvent::Step {
                     step,
@@ -789,8 +839,14 @@ async fn run_inference(
     config: ModelConfig,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
 ) -> Result<(), String> {
-    let (gpu, mut model) =
-        build_execution_model(&config, INFERENCE_RUNTIME_LR, INFERENCE_RUNTIME_BATCH_SIZE).await?;
+    let (gpu, mut model) = build_execution_model(
+        &config,
+        INFERENCE_RUNTIME_LR,
+        INFERENCE_RUNTIME_BATCH_SIZE,
+        OptimizerKind::default(),
+        WeightInit::default(),
+    )
+    .await?;
 
     let checkpoint_path = resolve_inference_checkpoint_path(&config)?;
     model.load_checkpoint(&checkpoint_path).map_err(|err| {

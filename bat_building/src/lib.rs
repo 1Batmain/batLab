@@ -15,6 +15,7 @@ pub use model::training::{
     probe_diffusion, sample_diffusion,
 };
 pub use model::{
-    ActivationMethod, ActivationType, ConcatType, ConvolutionType, Dim3, FullyConnectedType,
-    GroupNormType, LayerTypes, LossMethod, LossType, ModelError, PaddingMode, UpsampleConvType,
+    ActivationMethod, ActivationType, AdamHyperparameters, ConcatType, ConvolutionType, Dim3,
+    FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, ModelError, OptimizerKind,
+    PaddingMode, UpsampleConvType, WeightInit,
 };

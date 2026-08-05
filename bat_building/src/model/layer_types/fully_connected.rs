@@ -142,6 +142,11 @@ impl LayerType for FullyConnectedType {
         })
     }
 
+    fn get_weight_fan_in(&self) -> Option<u32> {
+        // Every neuron sums over the whole flattened input.
+        Some(self.dim_input.length().max(1))
+    }
+
     fn set_dim_input(&mut self, input: Dim3) {
         self.dim_input = input;
     }

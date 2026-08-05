@@ -138,6 +138,15 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
     fn get_optimizer_bindings(&self) -> Option<OptimizerBindings> {
         None
     }
+    /// Number of input activations each output unit sums over — the `fan_in` of
+    /// He initialisation (`std = sqrt(2 / fan_in)`).
+    ///
+    /// `None` means the layer has no fan-in-sensitive weight matrix (GroupNorm's
+    /// γ/β are scale parameters, not a projection), and its initialisation is
+    /// left alone whatever the chosen scheme.
+    fn get_weight_fan_in(&self) -> Option<u32> {
+        None
+    }
     fn set_dim_input(&mut self, input: Dim3);
     fn set_dim_output(&mut self) -> Result<Dim3, ModelError>;
     fn get_spec_uniform_bytes_size(&self) -> u32;

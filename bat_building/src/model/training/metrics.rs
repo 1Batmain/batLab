@@ -135,8 +135,14 @@ impl MetricsLogger {
 
     pub fn write(&mut self, record: &serde_json::Value) {
         if let Some(writer) = self.writer.as_mut() {
-            if writeln!(writer, "{record}").and_then(|_| writer.flush()).is_err() {
-                eprintln!("[metrics] write failed; disabling metrics for {}", self.path);
+            if writeln!(writer, "{record}")
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
+                eprintln!(
+                    "[metrics] write failed; disabling metrics for {}",
+                    self.path
+                );
                 self.writer = None;
             }
         }

@@ -5,7 +5,9 @@ use crate::model::error::ModelError;
 use crate::model::layer_types::{
     BackwardBufferSource, BufferInit, ForwardBufferSource, LayerType, LayerTypes,
 };
+use crate::model::optimizer::{AdamHyperparameters, AdamSpecs, OptimizerKind};
 use crate::model::types::Dim3;
+use crate::model::weight_init::{self, WeightInit};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wgpu::{
@@ -45,15 +47,25 @@ pub(crate) struct Shaders {
     pub(crate) backward: Option<ShaderModule>,
 }
 
-/// Per-layer SGD optimiser pass (only present on trainable layers).
+/// Per-layer optimiser pass (only present on trainable layers).
 #[derive(Debug, Clone)]
 pub(crate) struct OptPass {
+    pub(crate) kind: OptimizerKind,
     pub(crate) pipeline: ComputePipeline,
     pub(crate) bind_group: BindGroup,
-    /// Keeps the lr uniform buffer alive for the lifetime of this pass.
-    #[allow(dead_code)]
-    pub(crate) buffers: Vec<Arc<Buffer>>,
+    /// Hyperparameter uniform, rewritten before every optimiser dispatch.
+    pub(crate) specs: Arc<Buffer>,
+    /// Adam only: `[m_weights, v_weights, m_bias, v_bias]`. Empty for SGD.
+    pub(crate) state: Vec<Arc<Buffer>>,
     pub(crate) num_workgroups: u32,
+}
+
+impl OptPass {
+    /// Every GPU buffer owned by the pass (uniform + optimiser state), for
+    /// memory accounting.
+    pub(crate) fn owned_buffers(&self) -> impl Iterator<Item = &Arc<Buffer>> {
+        std::iter::once(&self.specs).chain(self.state.iter())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -152,11 +164,15 @@ impl Layer {
     // Forward pass build
     // -----------------------------------------------------------------------
 
+    /// `layer_index` only seeds the weight PRNG: He draws a distinct stream per
+    /// layer, so two same-shaped layers do not start life identical.
     pub(crate) fn create_buffers(
         &mut self,
         gpu: &GpuContext,
         last_output: Option<Arc<Buffer>>,
         saved_outputs: &HashMap<String, Arc<Buffer>>,
+        init: WeightInit,
+        layer_index: usize,
     ) -> Result<Arc<Buffer>, ModelError> {
         let bindings = self.ty.get_forward_buffer_bindings();
         for binding in bindings.iter() {
@@ -189,7 +205,18 @@ impl Layer {
                 }
                 BufferInit::RandomWeights => {
                     let count = binding.spec.size as usize / 4;
-                    let weights = Self::init_random_weights(count);
+                    let weights = match (init, self.ty.get_weight_fan_in()) {
+                        (WeightInit::He, Some(fan_in)) => weight_init::he_weights(
+                            count,
+                            fan_in,
+                            // Odd multiplier: distinct, well-spread seeds that
+                            // never land on xorshift's absorbing 0.
+                            0x9E37_79B9u32.wrapping_mul(layer_index as u32 + 1) | 1,
+                        ),
+                        // No fan-in to speak of (e.g. GroupNorm's scale
+                        // parameters) — the historical draw stands.
+                        _ => weight_init::uniform_weights(count),
+                    };
                     gpu.queue
                         .write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
                 }
@@ -435,11 +462,15 @@ impl Layer {
     }
 
     // -----------------------------------------------------------------------
-    // SGD optimiser pass (per-layer, trainable layers only)
+    // Optimiser pass (per-layer, trainable layers only)
     // -----------------------------------------------------------------------
 
-    /// Build the SGD compute pass for this layer.
-    pub(crate) fn create_opt_pass(&mut self, gpu: &GpuContext, lr: f32) {
+    /// Build the optimiser compute pass for this layer.
+    ///
+    /// SGD binds 5 buffers; Adam binds 4 more (the first and second moment for
+    /// weights and bias), which is why the pass is built per optimiser kind
+    /// rather than shared.
+    pub(crate) fn create_opt_pass(&mut self, gpu: &GpuContext, lr: f32, kind: OptimizerKind) {
         let Some(layout) = self.ty.get_optimizer_bindings() else {
             return;
         };
@@ -453,72 +484,24 @@ impl Layer {
         let grad_weights = Arc::clone(&bwd[layout.grad_weights_backward_index]);
         let grad_bias = Arc::clone(&bwd[layout.grad_bias_backward_index]);
 
-        // lr uniform: 4 bytes f32 padded to 16 bytes for alignment safety
-        let lr_buf = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
-            label: Some("lr_uniform"),
-            size: 16,
-            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        }));
-        let mut lr_bytes = [0u8; 16];
-        lr_bytes[0..4].copy_from_slice(&lr.to_le_bytes());
-        gpu.queue.write_buffer(&lr_buf, 0, &lr_bytes);
-
-        let sgd_shader = gpu
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("sgd"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                    "shader/sgd.wgsl"
-                ))),
-            });
-
-        let layout_entries = [
-            // [0] weights  read_write storage
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
+        // Storage bindings shared by both kinds: weights, bias (rw) then the
+        // two gradient buffers (ro), then the hyperparameter uniform.
+        let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
             },
-            // [1] bias  read_write storage
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // [2] grad_weights  read storage
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // [3] grad_bias  read storage
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            // [4] lr  uniform
+            count: None,
+        };
+        let mut layout_entries = vec![
+            storage_entry(0, false), // weights
+            storage_entry(1, false), // bias
+            storage_entry(2, true),  // grad_weights
+            storage_entry(3, true),  // grad_bias
+            // [4] specs uniform
             wgpu::BindGroupLayoutEntry {
                 binding: 4,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -531,62 +514,125 @@ impl Layer {
             },
         ];
 
+        // The uniform is 16 bytes for SGD (a padded lr) and 32 for Adam; the
+        // larger allocation is harmless and keeps one code path.
+        let specs = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
+            label: Some("opt_specs_uniform"),
+            size: 32,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        // Adam moment buffers, zero-initialised. wgpu zeroes new buffers, and
+        // m₀ = v₀ = 0 is exactly the algorithm's initial state.
+        let state: Vec<Arc<Buffer>> = match kind {
+            OptimizerKind::Sgd => Vec::new(),
+            OptimizerKind::Adam => {
+                let make = |label: &str, size: u64| {
+                    Arc::new(gpu.device.create_buffer(&BufferDescriptor {
+                        label: Some(label),
+                        size,
+                        usage: BufferUsages::STORAGE
+                            | BufferUsages::COPY_SRC
+                            | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }))
+                };
+                let w_size = weights.size();
+                let b_size = bias.size();
+                vec![
+                    make("adam_m_weights", w_size),
+                    make("adam_v_weights", w_size),
+                    make("adam_m_bias", b_size),
+                    make("adam_v_bias", b_size),
+                ]
+            }
+        };
+        for binding in 5..(5 + state.len() as u32) {
+            layout_entries.push(storage_entry(binding, false));
+        }
+
+        let (label, source, entry_point) = match kind {
+            OptimizerKind::Sgd => ("sgd", include_str!("shader/sgd.wgsl"), "sgd"),
+            OptimizerKind::Adam => ("adam", include_str!("shader/adam.wgsl"), "adam"),
+        };
+        let module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+            });
+
         let bgl = gpu
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("sgd_bgl"),
+                label: Some("opt_bgl"),
                 entries: &layout_entries,
             });
         let pl = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("sgd_pl"),
+                label: Some("opt_pl"),
                 bind_group_layouts: &[&bgl],
                 immediate_size: 0,
             });
         let pipeline = gpu
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("sgd_pipeline"),
+                label: Some("opt_pipeline"),
                 layout: Some(&pl),
-                module: &sgd_shader,
-                entry_point: Some("sgd"),
+                module: &module,
+                entry_point: Some(entry_point),
                 compilation_options: Default::default(),
                 cache: Default::default(),
             });
+
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: weights.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: bias.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: grad_weights.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: grad_bias.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: specs.as_entire_binding(),
+            },
+        ];
+        for (i, buffer) in state.iter().enumerate() {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 5 + i as u32,
+                resource: buffer.as_entire_binding(),
+            });
+        }
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sgd_bg"),
+            label: Some("opt_bg"),
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: weights.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bias.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: grad_weights.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: grad_bias.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: lr_buf.as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         });
 
         self.opt_pass = Some(OptPass {
+            kind,
             pipeline,
             bind_group,
-            buffers: vec![lr_buf],
+            specs,
+            state,
             num_workgroups: layout.weight_count.div_ceil(64),
         });
+
+        // Sensible contents before the first dispatch: a step of t=1 with no
+        // batch averaging, matching what the SGD pass used to be built with.
+        self.write_opt_specs(gpu, lr, 1.0, 1);
     }
 
     pub(crate) fn encode_opt_pass(&self, encoder: &mut CommandEncoder) {
@@ -597,16 +643,53 @@ impl Layer {
         pass.dispatch_workgroups(opt.num_workgroups, 1, 1);
     }
 
-    pub(crate) fn set_opt_learning_rate(&self, gpu: &GpuContext, lr: f32) {
+    /// Refresh the optimiser uniform for the step about to be dispatched.
+    ///
+    /// `grad_scale` is `1 / batch_size` — the batch mean. SGD folds it into the
+    /// learning rate (its update is linear in the gradient), Adam applies it to
+    /// the gradient itself (its update is not).
+    pub(crate) fn write_opt_specs(
+        &self,
+        gpu: &GpuContext,
+        lr: f32,
+        grad_scale: f32,
+        step: u64,
+    ) -> bool {
         let Some(opt) = &self.opt_pass else {
-            return;
+            return false;
         };
-        let Some(lr_buf) = opt.buffers.first() else {
-            return;
-        };
-        let mut lr_bytes = [0u8; 16];
-        lr_bytes[0..4].copy_from_slice(&lr.to_le_bytes());
-        gpu.queue.write_buffer(lr_buf, 0, &lr_bytes);
+        match opt.kind {
+            OptimizerKind::Sgd => {
+                let mut bytes = [0u8; 16];
+                bytes[0..4].copy_from_slice(&(lr * grad_scale).to_le_bytes());
+                gpu.queue.write_buffer(&opt.specs, 0, &bytes);
+            }
+            OptimizerKind::Adam => {
+                let hp = AdamHyperparameters::default();
+                let (bias_correction1, bias_correction2) = hp.bias_corrections(step);
+                let bytes = AdamSpecs {
+                    lr,
+                    beta1: hp.beta1,
+                    beta2: hp.beta2,
+                    eps: hp.eps,
+                    grad_scale,
+                    bias_correction1,
+                    bias_correction2,
+                }
+                .to_bytes();
+                gpu.queue.write_buffer(&opt.specs, 0, &bytes);
+            }
+        }
+        true
+    }
+
+    /// The persistent optimiser state buffers, in checkpoint order
+    /// (`[m_weights, v_weights, m_bias, v_bias]` for Adam, empty for SGD).
+    pub(crate) fn opt_state_buffers(&self) -> &[Arc<Buffer>] {
+        self.opt_pass
+            .as_ref()
+            .map(|o| o.state.as_slice())
+            .unwrap_or(&[])
     }
 
     pub(crate) fn encode_zero_opt_gradients(&self, encoder: &mut CommandEncoder) {
@@ -734,22 +817,5 @@ impl Layer {
         pass.set_pipeline(&merge.pipeline);
         pass.set_bind_group(0, &merge.bind_group, &[]);
         pass.dispatch_workgroups(merge.num_workgroups, 1, 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /// XorShift32 PRNG for deterministic weight initialisation (±0.1 range).
-    fn init_random_weights(count: usize) -> Vec<f32> {
-        let mut state: u32 = 2463534242;
-        (0..count)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state as f32 / u32::MAX as f32) * 0.2 - 0.1
-            })
-            .collect()
     }
 }

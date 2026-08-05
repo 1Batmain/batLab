@@ -1,6 +1,7 @@
 //! File purpose: Implements app behavior for the terminal user interface flow.
 
 use super::storage::{self, SavedModelEntry};
+use crate::model::{OptimizerKind, WeightInit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -701,6 +702,14 @@ pub struct TrainingConfig {
     pub checkpoint_path: Option<String>,
     #[serde(default)]
     pub load_checkpoint: bool,
+    /// Weight-update rule. Absent from configs written before the optimiser
+    /// was selectable, which therefore keep SGD.
+    #[serde(default)]
+    pub optimizer: OptimizerKind,
+    /// Weight-initialisation scheme. Same story as `optimizer`: absent from
+    /// older configs, which therefore keep the uniform draw.
+    #[serde(default)]
+    pub weight_init: WeightInit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2291,6 +2300,8 @@ impl App {
                 loss: LossMethod::MeanSquared,
                 checkpoint_path: self.selected_checkpoint_path.clone(),
                 load_checkpoint: self.load_checkpoint_on_start,
+                optimizer: OptimizerKind::default(),
+                weight_init: WeightInit::default(),
             }),
         });
         Ok(())
@@ -2400,8 +2411,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, InferenceConfig, LayerKind, LossMethod, ModelConfig, RunConfig, RunMode, Screen,
-        TrainingConfig, TrainingControlCommand,
+        App, InferenceConfig, LayerKind, LossMethod, ModelConfig, OptimizerKind, RunConfig,
+        RunMode, Screen, TrainingConfig, TrainingControlCommand, WeightInit,
     };
 
     #[test]
@@ -2572,6 +2583,8 @@ mod tests {
                     loss: LossMethod::MeanSquared,
                     checkpoint_path: None,
                     load_checkpoint: false,
+                    optimizer: OptimizerKind::default(),
+                    weight_init: WeightInit::default(),
                 }),
             },
         });

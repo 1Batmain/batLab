@@ -25,7 +25,13 @@ const LEGACY_BACKWARD: &str = include_str!("shader/legacy/back_group_norm_naive.
 /// Worst relative difference between two f32 vectors, using a floor on the
 /// denominator so near-zero entries do not blow the ratio up.
 fn worst_relative_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
     let scale = a
         .iter()
         .chain(b.iter())
@@ -61,10 +67,12 @@ fn dispatch_legacy(
     bind_group: &wgpu::BindGroup,
     workgroups: u32,
 ) {
-    let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("legacy_group_norm"),
-        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
-    });
+    let module = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("legacy_group_norm"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+        });
     let pl = gpu
         .device
         .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -219,7 +227,10 @@ fn reference_backward(
 /// the oracle's own scale.
 fn worst_relative_to_reference(got: &[f32], reference: &[f64]) -> f64 {
     assert_eq!(got.len(), reference.len());
-    let scale = reference.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-12);
+    let scale = reference
+        .iter()
+        .fold(0.0f64, |a, v| a.max(v.abs()))
+        .max(1e-12);
     got.iter()
         .zip(reference)
         .fold(0.0f64, |acc, (g, r)| acc.max((*g as f64 - r).abs() / scale))
@@ -333,8 +344,8 @@ async fn trained_group_norm(
     dim: Dim3,
     num_groups: u32,
 ) -> (Model<Training>, Vec<f32>, Vec<f32>) {
-    let mut model = Model::<Training>::new_training(gpu.clone(), 0.0, 1, LossMethod::MeanSquared)
-        .await;
+    let mut model =
+        Model::<Training>::new_training(gpu.clone(), 0.0, 1, LossMethod::MeanSquared).await;
     model
         .add_layer(LayerTypes::GroupNorm(GroupNormType::new(dim, num_groups)))
         .unwrap();
@@ -665,10 +676,12 @@ fn bench_group_norm_isolated() {
         entry_point: &str,
         bgl: &wgpu::BindGroupLayout,
     ) -> wgpu::ComputePipeline {
-        let module = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("legacy_bench"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
-        });
+        let module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("legacy_bench"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+            });
         let pl = gpu
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
