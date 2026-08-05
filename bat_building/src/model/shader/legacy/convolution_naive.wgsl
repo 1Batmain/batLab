@@ -41,21 +41,6 @@ fn pad_x() -> i32 {
     return 0;
 }
 
-// One thread per output element, as before.
-//
-// Register-blocking this kernel (one thread producing a run of 2 or 4 adjacent
-// output pixels, so each weight load is reused across them) was tried and is
-// SLOWER on every layer of the model — see PERF_CONVOLUTION.md. The batch is
-// looped sample by sample on the CPU, so a convolution here works on a single
-// small tensor: conv4's forward has only 1024 output elements to begin with,
-// and dividing the thread count by 4 starves the GPU faster than the saved
-// bandwidth pays back. These dispatches are parallelism-bound, not
-// bandwidth-bound.
-//
-// What is left is the free part: hoist the padding offsets and the per-tap base
-// addresses out of the inner loop, and reject a kernel row that falls entirely
-// in the padding once per row instead of once per column. Same taps, same
-// order, same skips — bit-identical output, strictly less integer work.
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -75,26 +60,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let KH = layer_spec.dim_kernel.x;
     let KW = layer_spec.dim_kernel.y;
     let s  = layer_spec.stride;
-    let py = pad_y();
-    let px = pad_x();
-    let kbase = k * KH * KW * IC;
 
     var sum: f32 = bias[k];
     for (var ky: u32 = 0u; ky < KH; ky++) {
-        let sy = i32(oy * s) + i32(ky) - py;
-        if sy < 0 || sy >= i32(IH) {
-            continue; // whole kernel row sits in the zero padding
-        }
-        let row = u32(sy) * IW * IC;
         for (var kx: u32 = 0u; kx < KW; kx++) {
-            let sx = i32(ox * s) + i32(kx) - px;
-            if sx < 0 || sx >= i32(IW) {
+            let sy = i32(oy * s) + i32(ky) - pad_y();
+            let sx = i32(ox * s) + i32(kx) - pad_x();
+            if sy < 0 || sy >= i32(IH) || sx < 0 || sx >= i32(IW) {
                 continue; // zero padding
             }
-            let in_base = row + u32(sx) * IC;
-            let w_base  = kbase + ky * KW * IC + kx * IC;
+            let iy = u32(sy);
+            let ix = u32(sx);
             for (var kz: u32 = 0u; kz < IC; kz++) {
-                sum += input[in_base + kz] * weights[w_base + kz];
+                let in_i  = iy * IW * IC + ix * IC + kz;
+                let w_i   = k * KH * KW * IC + ky * KW * IC + kx * IC + kz;
+                sum += input[in_i] * weights[w_i];
             }
         }
     }

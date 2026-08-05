@@ -24,7 +24,11 @@ pub struct ConvolutionUniform {
     pub nb_kernel: u32,
     pub stride: u32,
     pub padding_mode: u32, // 0 = Valid, 1 = Same
-    pub _padding: u32,
+    /// Cooperating threads per `grad_weights` / `grad_bias` sum. Occupies the
+    /// word that used to be explicit padding, so the uniform's size and every
+    /// other field offset are unchanged — the legacy fixtures still bind this
+    /// very same buffer and simply ignore the word.
+    pub reduction_lanes: u32,
     pub dim_kernel: Dim3,
     pub dim_input: Dim3,
     pub dim_output: Dim3,
@@ -51,7 +55,77 @@ impl ConvolutionType {
     fn kernel_bytes(&self) -> u32 {
         self.dim_kernel.bytes_size() * self.nb_kernel
     }
+
+    /// Number of output positions the `grad_weights` / `grad_bias` reductions
+    /// sum over.
+    fn output_positions(&self) -> u32 {
+        self.dim_output.x * self.dim_output.y
+    }
+
+    /// How many threads cooperate on one `grad_weights` / `grad_bias` sum.
+    ///
+    /// Splitting a sum across lanes buys parallelism but costs a tree reduction
+    /// with its barriers, so it only pays when there are too few sums to keep
+    /// the GPU busy on their own. `conv3` has 9216 weights — already plenty —
+    /// and measurably *lost* time when every sum was split 16 ways; `conv1` has
+    /// 432 weights and 1024 positions, and gains ~9x from splitting maximally.
+    ///
+    /// The rule is therefore: use the fewest lanes that still put roughly
+    /// `TARGET_THREADS` threads in flight, never splitting so far that a lane
+    /// has fewer than `MIN_POSITIONS_PER_LANE` positions left to sum (below
+    /// that the reduction costs more than the sum it replaces), and never past
+    /// `MAX_LANES`.
+    ///
+    /// `MAX_LANES` is 32, not 64, on purpose: at 64 lanes a workgroup holds a
+    /// single slot, so consecutive threads no longer walk consecutive `kz` and
+    /// the coalescing the slot layout exists for is lost. Measured on conv4
+    /// that costs 35% (0.0220 ms at 32 lanes vs 0.0297 at 64), and on conv1 it
+    /// buys nothing (0.0291 vs 0.0290).
+    ///
+    /// Calibrated against `bench_conv_reduction_lanes`, which sweeps every
+    /// legal lane count per layer. The resulting choices land within 1.4% of
+    /// the per-layer optimum on all four convolutions of Greyscale_Diffusion:
+    ///
+    /// | layer | sums | positions | picked | best measured |
+    /// |---|---:|---:|---:|---:|
+    /// | conv1 |  432 | 1024 | 32 | 32 (0.0291 ms) |
+    /// | conv2 | 4608 |  256 | 16 |  4 (0.0576 ms; 16 gives 0.0584) |
+    /// | conv3 | 9216 |  256 |  8 |  8 (0.0965 ms) |
+    /// | conv4 |  288 | 1024 | 32 | 32 (0.0220 ms) |
+    pub(crate) fn reduction_lanes(sums: u32, positions: u32) -> u32 {
+        const TARGET_THREADS: u32 = 65_536;
+        const MIN_POSITIONS_PER_LANE: u32 = 16;
+        const MAX_LANES: u32 = WG_SIZE / 2;
+
+        let mut lanes = 1u32;
+        while lanes < MAX_LANES
+            && sums * lanes < TARGET_THREADS
+            && positions / (lanes * 2) >= MIN_POSITIONS_PER_LANE
+        {
+            lanes *= 2;
+        }
+        lanes
+    }
+
+    /// Independent sums a single workgroup carries (`lanes * slots == 64`).
+    /// The two passes reduce different numbers of sums, so they get different
+    /// splits; the uniform therefore carries the `grad_weights` value and the
+    /// bias pass reuses it (its sum count, `nb_kernel`, is always tiny, so the
+    /// weights-driven choice is never worse for it than not splitting).
+    fn reduction_lanes_for_weights(&self) -> u32 {
+        Self::reduction_lanes(
+            self.dim_kernel.length() * self.nb_kernel,
+            self.output_positions(),
+        )
+    }
+
+    fn reduction_slots(&self) -> u32 {
+        WG_SIZE / self.reduction_lanes_for_weights()
+    }
 }
+
+/// `@workgroup_size(64)` in every convolution shader.
+const WG_SIZE: u32 = 64;
 
 impl LayerType for ConvolutionType {
     fn get_forward_shader(&self) -> ShaderDescriptor {
@@ -146,10 +220,14 @@ impl LayerType for ConvolutionType {
     }
 
     fn get_back_workgroup_counts(&self) -> Vec<u32> {
+        // grad_weights / grad_bias no longer run one thread per output element:
+        // a workgroup carries `reduction_slots()` independent sums, each split
+        // across `64 / slots` cooperating lanes.
+        let slots = self.reduction_slots();
         vec![
-            self.dim_input.length().div_ceil(64),
-            (self.dim_kernel.length() * self.nb_kernel).div_ceil(64),
-            self.nb_kernel.div_ceil(64),
+            self.dim_input.length().div_ceil(WG_SIZE),
+            (self.dim_kernel.length() * self.nb_kernel).div_ceil(slots),
+            self.nb_kernel.div_ceil(slots),
         ]
     }
 
@@ -361,7 +439,7 @@ impl LayerType for ConvolutionType {
                 PaddingMode::Valid => 0,
                 PaddingMode::Same => 1,
             },
-            _padding: 0,
+            reduction_lanes: self.reduction_lanes_for_weights(),
             dim_kernel: self.dim_kernel,
             dim_input: self.dim_input,
             dim_output: self.dim_output,

@@ -26,4 +26,6 @@ mod adam_tests;
 #[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
+mod conv_equivalence_tests;
+#[cfg(test)]
 mod group_norm_equivalence_tests;
