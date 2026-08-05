@@ -528,6 +528,44 @@ quand un test d'audit s'est révélé insatisfiable par construction, la réserv
 
 ---
 
+## Épilogue — la nuit du 4 au 5 août
+
+Deux expériences ont conclu la campagne pendant la nuit.
+
+**La pondération de la loss : NO-GO, et c'est une donnée.** L'hypothèse finale
+de `SCALE_UNET.md` — le contenu global serait sacrifié parce que la loss écrase
+le gradient des t hauts — a été testée en bras appariés (min-SNR par tirage
+biaisé des timesteps, aucun shader modifié). Résultat : ×1,20 sur le haut-t là
+où le critère exigeait ×10 (`LOSS_WEIGHTING.md`). L'explication est arithmétique :
+le déséquilibre « ×10⁵ » était exprimé en unités x₀ ; dans les unités ε où le
+gradient est réellement calculé, il ne vaut que ×5,7 — et la pondération rend
+exactement ce que ×5,7 peut rendre. Les deux bras plafonnent au même endroit :
+le haut-t n'était **pas** affamé de gradient.
+
+**Le run de nuit : les meilleures métriques du projet, et le même collapse.**
+8 000 pas, modèle L + Adam (lr 10⁻³), la configuration recommandée par
+`OPTIMIZER_ADAM.md`. Loss par tranche finale : 0,49 / 0,044 / 0,0076 / 0,0015 —
+la tranche « contenu » est 12× meilleure que le même modèle sous SGD, l'écart au
+prédicteur trivial se resserre de ×36 à ×2,5. Et pourtant : les images générées
+restent des bandes horizontales quasi identiques d'un seed à l'autre
+(`morning_samples/`), et le banding *empire* (ratio 9,4 contre 1,6 sous SGD).
+
+**L'indice qui reste.** Les images générées sont presque **unidimensionnelles** :
+la variation colonne-à-colonne y est ~10× plus faible que rangée-à-rangée
+(`col_diff_rms` 0,004 contre `row_diff_rms` 0,035), alors que le dataset est
+isotrope (0,096 contre 0,103). Un modèle dont la reconstruction d'entraînement
+est excellente mais dont la génération ne dépend que de y, sur deux
+architectures et deux optimiseurs, pointe vers une cause structurelle du
+framework — le prochain chantier, avec le portage de l'axe batch dans le
+dispatch GPU.
+
+Quatre hypothèses sont éliminées et documentées : capacité, champ réceptif
+(il explique le banding de SGD, pas le collapse), famine de gradient à t haut,
+optimiseur. Ce rétrécissement du champ des causes est le vrai livrable de la
+nuit.
+
+---
+
 ## Index des sources
 
 | Rapport | Contenu |
