@@ -100,6 +100,28 @@ def main():
     for triv, key in (("ε̂=x_t", "copy"), ("ε̂ moyenne", "mean")):
         print(f"{triv:>12} " + " ".join(f"{totals[n][key]:12.4f}" for n in names))
 
+    # --- le rapport qui explique tout -------------------------------------
+    # Dans la cible ε, la part qui porte le CONTENU de l'image vaut
+    # √ᾱ·x₀/√(1-ᾱ) : c'est tout ce qu'un modèle peut extraire à ce t. Si son
+    # erreur dépasse cette amplitude, sa sortie ne contient aucune information
+    # exploitable sur l'image — et à `t` élevé, c'est là que le contenu global
+    # de l'échantillon se décide (la génération part de t=255).
+    print("\nSignal de contenu présent dans ε, vs erreur des modèles :")
+    print(f"{'tranche':>12} {'MSE signal':>12} {'RMS signal':>11} | "
+          + " ".join(f"{k:>22}" for k in obs))
+    ex2 = float((test**2).mean())
+    for b, name in enumerate(names):
+        lo = b * steps // 4
+        hi = max((b + 1) * steps // 4, lo + 1)
+        ts = [lo, lo + (hi - lo) // 2]
+        sig = float(np.mean([ab[t] / (1.0 - ab[t]) * ex2 for t in ts]))
+        cells = []
+        for label, vals in obs.items():
+            ratio = np.sqrt(vals[b] / sig)
+            cells.append(f"erreur = {ratio:6.2f}x signal")
+        print(f"{name:>12} {sig:12.5f} {np.sqrt(sig):11.4f} | " + " ".join(f"{c:>22}" for c in cells))
+    print("\n  (>1 = le modèle n'apporte aucune information exploitable sur le contenu)")
+
 
 if __name__ == "__main__":
     main()
