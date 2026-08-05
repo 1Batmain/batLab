@@ -13,8 +13,9 @@ use bat_building::tui::{
 };
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
-    DiffusionTask, Dim3, FullyConnectedType, GpuContext, GpuDataset, GroupNormType, LayerTypes,
-    LinearNoiseSchedule, LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind,
+    DenoiseFrame, DiffusionTask, Dim3, FullyConnectedType, GpuContext, GpuDataset, GroupNormType,
+    LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting, MetricsLogger,
+    Model, OptimizerKind,
     PaddingMode as PPadding, ProbeConfig, Stats, Trainer, UpsampleConvType, WeightInit, log_probe,
     log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
@@ -313,6 +314,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             paths,
             magnitude,
             Some(&mut trajectory),
+            None,
             |_, _| {},
         );
         log_trajectory(&mut metrics, 0, seed, &trajectory, &Stats::of(&image));
@@ -694,6 +696,7 @@ async fn run_training(
                 1,
                 1.0,
                 Some(&mut trajectory),
+                None,
                 |_, _| {},
             );
             log_trajectory(
@@ -739,6 +742,7 @@ async fn run_training(
         1,
         1.0,
         Some(&mut final_trajectory),
+        None,
         |_, _| {},
     );
     log_trajectory(
@@ -924,6 +928,27 @@ async fn run_inference(
         total: total_steps.max(1),
     });
 
+    // The reverse chain keeps its latent on the CPU, so — unlike training, which
+    // hands the visualiser the model's own output buffer — inference needs a GPU
+    // frame to publish into. It shows x_t next to the model's x0 estimate.
+    let mut live = LiveFrame::new(
+        model.gpu_context(),
+        output_size.0,
+        output_size.1,
+        output_size.2,
+    );
+    tui::register_visualiser_source(
+        model.gpu_context(),
+        live.buffer(),
+        live.frame_width(),
+        live.frame_height(),
+        live.channels(),
+        format!(
+            "Denoising  —  x_t | x̂₀  ({}×{}×{} channels)",
+            output_size.0, output_size.1, output_size.2
+        ),
+    );
+
     let output = sample_diffusion_image_with_controls(
         &mut model,
         input_size,
@@ -932,14 +957,19 @@ async fn run_inference(
         seed,
         inference.denoising_paths,
         inference.denoise_magnitude,
+        Some(&mut |frame: &DenoiseFrame| live.publish(frame.latent, frame.x0_hat)),
         |current, total| {
             let _ = tx.send(tui::TrainingEvent::InferenceProgress {
-                label: "Running denoising paths".to_string(),
+                label: denoising_progress_label(current, &diffusion, inference.denoising_paths),
                 current,
                 total,
             });
         },
     );
+
+    // The latent is gone once sampling returns; leaving the window bound to a
+    // frozen frame would misrepresent it as still live.
+    tui::clear_visualiser_source();
     let pixels = tensor_to_rgb_pixels(&output, output_size)?;
 
     if tx
@@ -958,6 +988,39 @@ async fn run_inference(
 
     let _ = tx.send(tui::TrainingEvent::Done);
     Ok(())
+}
+
+/// Renders "which path, which step, which t" from the sampler's flat work
+/// counter.
+///
+/// The sampler reports a single `current`/`total` across all paths, but the two
+/// numbers a user actually watches are the path and the timestep — and t counts
+/// *down* while the step counter counts up, so showing the raw counter as "t"
+/// would state the schedule backwards.
+fn denoising_progress_label(
+    current: usize,
+    schedule: &LinearNoiseSchedule,
+    denoising_paths: usize,
+) -> String {
+    let steps = schedule.len().max(1);
+    let path_count = denoising_paths.max(1);
+    // `current` is 1-based (it counts completed steps); step 0 has none done.
+    let done = current.saturating_sub(1);
+    let path_idx = (done / steps).min(path_count - 1);
+    let step_index = done % steps;
+    let t = steps - 1 - step_index;
+
+    if path_count > 1 {
+        format!(
+            "Denoising · path {}/{} · step {}/{} (t={t})",
+            path_idx + 1,
+            path_count,
+            step_index + 1,
+            steps
+        )
+    } else {
+        format!("Denoising · step {}/{} (t={t})", step_index + 1, steps)
+    }
 }
 
 fn resolve_inference_checkpoint_path(config: &ModelConfig) -> Result<PathBuf, String> {
@@ -1387,6 +1450,7 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
 /// sites can pass `(u32, u32, u32)` dims; the actual denoising math (and the
 /// `[signal | timestep]` input composition) lives in `bat_building::metrics` so
 /// training instrumentation and inference cannot drift apart.
+#[allow(clippy::too_many_arguments)]
 fn sample_diffusion_image_with_controls<State, F>(
     model: &mut Model<State>,
     input_dims: (u32, u32, u32),
@@ -1395,6 +1459,7 @@ fn sample_diffusion_image_with_controls<State, F>(
     seed: u64,
     denoising_paths: usize,
     denoise_magnitude: f32,
+    observer: Option<&mut dyn FnMut(&DenoiseFrame)>,
     progress: F,
 ) -> Vec<f32>
 where
@@ -1411,6 +1476,7 @@ where
         denoising_paths,
         denoise_magnitude,
         None,
+        observer,
         progress,
     )
 }
@@ -1638,6 +1704,53 @@ fn convert_activation(a: &ActivationMethod) -> PActivation {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The progress label must run t *downwards* while the step counter runs up
+    /// — the reverse chain starts at the noisiest timestep. Reading these two the
+    /// same way round is the easy mistake, so pin both ends of the schedule.
+    #[test]
+    fn denoising_label_counts_t_down_while_steps_count_up() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+
+        let first = denoising_progress_label(1, &schedule, 1);
+        assert!(
+            first.contains("step 1/256") && first.contains("t=255"),
+            "first step should be step 1 at t=255, got {first:?}"
+        );
+
+        let last = denoising_progress_label(256, &schedule, 1);
+        assert!(
+            last.contains("step 256/256") && last.contains("t=0"),
+            "last step should be step 256 at t=0, got {last:?}"
+        );
+    }
+
+    /// With several paths the counter is flat across all of them; the label has
+    /// to split it back into path and step, and must not run past the last path
+    /// on the final tick.
+    #[test]
+    fn denoising_label_splits_flat_counter_into_paths() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+
+        let start_of_second = denoising_progress_label(257, &schedule, 4);
+        assert!(
+            start_of_second.contains("path 2/4") && start_of_second.contains("step 1/256"),
+            "unit 257 should open path 2, got {start_of_second:?}"
+        );
+
+        let final_unit = denoising_progress_label(1024, &schedule, 4);
+        assert!(
+            final_unit.contains("path 4/4") && final_unit.contains("t=0"),
+            "last unit should close path 4 at t=0, got {final_unit:?}"
+        );
+    }
+
+    /// The single-path case is the common one; naming a path there is noise.
+    #[test]
+    fn denoising_label_omits_path_when_there_is_only_one() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        assert!(!denoising_progress_label(10, &schedule, 1).contains("path"));
+    }
 
     fn write_batraw(
         path: &std::path::Path,

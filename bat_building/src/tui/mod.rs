@@ -12,8 +12,8 @@ pub use app::{
 };
 pub use events::TrainingEvent;
 pub use visualiser_control::{
-    clear_visualiser_source, register_visualiser_source, set_visualiser_visible, toggle_visualiser,
-    warmup_visualiser,
+    clear_visualiser_source, has_visualiser_source, register_visualiser_source,
+    set_visualiser_visible, toggle_visualiser, warmup_visualiser,
 };
 
 use std::io;
