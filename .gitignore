@@ -11,3 +11,4 @@ datasets/*.batraw
 datasets/cifar-10-batches-bin/
 *_metrics.jsonl
 runs/
+blind_tests/out/
