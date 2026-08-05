@@ -1046,6 +1046,9 @@ pub struct MonitorImage {
 #[derive(Debug, Clone)]
 pub struct PerpetualStatus {
     pub regime: String,
+    /// Which way the run is going — "descente" or "remontée". Half of a cycle
+    /// is spent dissolving the image on purpose, and the panel has to say so.
+    pub phase: String,
     pub depth: usize,
     pub min_depth: usize,
     pub max_depth: usize,

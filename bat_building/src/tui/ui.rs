@@ -899,8 +899,9 @@ fn perpetual_hint(app: &App) -> String {
 
     let status = if state.paused { "en pause" } else { "en cours" };
     format!(
-        "{notice} perpetual · {} · {status} · t_r={} (max {}) · t={} · cycle {} · {:.0}/{:.0} pas/s | {KEYS}",
+        "{notice} perpetual · {} · {} · {status} · t_r={} (max {}) · t={} · cycle {} · {:.0}/{:.0} pas/s | {KEYS}",
         state.regime,
+        state.phase,
         state.depth,
         state.max_depth,
         state.diffusion_step,
@@ -949,6 +950,7 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(""),
         row("regime", state.regime.clone(), "[m]"),
+        row("phase", state.phase.clone(), ""),
         row(
             "renoise depth t_r",
             format!("{} / {}", state.depth, state.max_depth),
@@ -974,6 +976,10 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled(
             "  Les deux moitiés convergent vers la même image quand t → 0.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  En remontée, x_t se dissout pas à pas — x̂₀ reste figé, le modèle ne prédit pas.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
