@@ -151,6 +151,35 @@ impl LinearNoiseSchedule {
         (noisy, noise)
     }
 
+    /// One increment of the forward Markov chain:
+    /// `x_t = sqrt(1 - beta_t) * x_{t-1} + sqrt(beta_t) * eps`.
+    ///
+    /// [`Self::add_noise`] jumps straight to `t` from a clean `x0`; this walks
+    /// there. Chaining increments `0..=t` from the same `x0`, each with its own
+    /// noise draw, is the *same distribution* — that is the standard DDPM
+    /// identity, and `climbing_the_forward_chain_matches_add_noise_in_distribution`
+    /// measures it rather than asserting it from the algebra.
+    ///
+    /// The two are therefore interchangeable in maths and not at all in
+    /// experience: the jump replaces an image with noise between two frames,
+    /// while the walk dissolves it over `t` of them. The perpetual mode needs
+    /// the second (see [`crate::PerpetualDrift`]); training keeps the first,
+    /// which draws an independent `t` per example and has nothing to animate.
+    ///
+    /// `seed` must be fresh per increment — reusing one across the climb would
+    /// add the *same* field `t` times, i.e. a single field scaled up, which is
+    /// not a Gaussian walk at all.
+    pub fn forward_step(&self, previous: &[f32], step: usize, seed: u64) -> Vec<f32> {
+        let step = step.min(self.len().saturating_sub(1));
+        let signal_scale = self.alpha(step).sqrt();
+        let noise_scale = self.beta(step).sqrt();
+        previous
+            .iter()
+            .enumerate()
+            .map(|(index, value)| signal_scale * *value + noise_scale * gaussian_at(seed, index))
+            .collect()
+    }
+
     pub fn sample_noise(&self, len: usize, seed: u64) -> Vec<f32> {
         (0..len).map(|index| gaussian_at(seed, index)).collect()
     }
@@ -369,6 +398,126 @@ mod tests {
         let second = schedule.add_noise(&clean, 2, 1234);
         assert_eq!(first.0, second.0);
         assert_eq!(first.1, second.1);
+    }
+
+    /// Walking the forward chain one step at a time must land where the single
+    /// `add_noise` jump lands — same signal coefficient, same noise variance.
+    ///
+    /// This is what licenses the perpetual mode's gradual re-noising: the user
+    /// sees the image dissolve over `t_r` frames instead of being replaced by
+    /// noise between two, and the sampler is handed exactly the `x_t` it would
+    /// have been handed before. Asserted by measurement, not by algebra: the
+    /// claim is about `gaussian_at`'s *actual* draws, and a chain that reused a
+    /// seed (or scaled a field twice) would satisfy the algebra and fail here.
+    ///
+    /// Every intermediate level is checked too — not just the destination —
+    /// because a climb whose middle frames are not legitimate `x_k` would show
+    /// the right start and end with something arbitrary in between, which is
+    /// precisely the part the user looks at.
+    #[test]
+    fn climbing_the_forward_chain_matches_add_noise_in_distribution() {
+        const N: usize = 16_384;
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        // A structured, non-degenerate x0 in the data range: a flat field would
+        // make the signal coefficient unmeasurable.
+        let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.017).sin() * 0.8).collect();
+        let energy: f64 = x0.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+
+        // Least-squares coefficient of x0 in x — the surviving signal.
+        let signal_of = |x: &[f32]| -> f64 {
+            x.iter()
+                .zip(x0.iter())
+                .map(|(a, b)| (*a as f64) * (*b as f64))
+                .sum::<f64>()
+                / energy
+        };
+        // Mean and standard deviation of what is left once that signal is removed.
+        let residual_of = |x: &[f32], signal: f64| -> (f64, f64) {
+            let residual: Vec<f64> = x
+                .iter()
+                .zip(x0.iter())
+                .map(|(a, b)| *a as f64 - signal * *b as f64)
+                .collect();
+            let mean = residual.iter().sum::<f64>() / N as f64;
+            let variance =
+                residual.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / N as f64;
+            (mean, variance.sqrt())
+        };
+
+        for target in [8usize, 32, 64] {
+            // The walk: one increment per timestep, each with its own field.
+            let mut climbed = x0.clone();
+            for k in 0..=target {
+                climbed = schedule.forward_step(&climbed, k, 0xc11b_0000 + k as u64);
+
+                // Each frame the user sees must itself be a valid x_k.
+                let expected = schedule.alpha_bar(k).sqrt() as f64;
+                let measured = signal_of(&climbed);
+                assert!(
+                    (measured - expected).abs() < 0.02,
+                    "intermediate frame at k={k} is not an x_k: signal {measured:.4} \
+                     vs sqrt(alpha_bar) {expected:.4}"
+                );
+            }
+
+            // The jump, for the same destination.
+            let (direct, _) = schedule.add_noise(&x0, target, 0xd1_5ec7);
+
+            let expected_signal = schedule.alpha_bar(target).sqrt() as f64;
+            let expected_sigma = (1.0 - schedule.alpha_bar(target) as f64).sqrt();
+
+            for (name, sample) in [("climbed", &climbed), ("direct", &direct)] {
+                let signal = signal_of(sample);
+                let (mean, sigma) = residual_of(sample, signal);
+                assert!(
+                    (signal - expected_signal).abs() < 0.02,
+                    "t={target} {name}: signal {signal:.4}, want {expected_signal:.4}"
+                );
+                // 4 standard errors of the mean (sigma / sqrt(N)).
+                assert!(
+                    mean.abs() < 4.0 * expected_sigma / (N as f64).sqrt(),
+                    "t={target} {name}: noise mean {mean:.4} is not centred"
+                );
+                assert!(
+                    (sigma / expected_sigma - 1.0).abs() < 0.03,
+                    "t={target} {name}: noise sd {sigma:.4}, want {expected_sigma:.4}"
+                );
+            }
+
+            // …and the two agree with each other, not merely each with theory.
+            let (climbed_signal, direct_signal) = (signal_of(&climbed), signal_of(&direct));
+            let climbed_sigma = residual_of(&climbed, climbed_signal).1;
+            let direct_sigma = residual_of(&direct, direct_signal).1;
+            assert!(
+                (climbed_signal - direct_signal).abs() < 0.03
+                    && (climbed_sigma / direct_sigma - 1.0).abs() < 0.05,
+                "t={target}: climb ({climbed_signal:.4}, {climbed_sigma:.4}) and jump \
+                 ({direct_signal:.4}, {direct_sigma:.4}) disagree"
+            );
+        }
+    }
+
+    /// The failure mode the climb invites: one seed for the whole ascent adds
+    /// the *same* field over and over, which is a single field scaled up — the
+    /// pixels stay perfectly correlated with it and the image never dissolves,
+    /// it just gains a fixed pattern. The variance check above would pass; only
+    /// comparing two increments catches it.
+    #[test]
+    fn a_climb_draws_a_different_field_at_every_increment() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let flat = vec![0.0f32; 1024];
+        let first = schedule.forward_step(&flat, 40, 0xa11ce);
+        let second = schedule.forward_step(&flat, 40, 0xb0b);
+        let same = first
+            .iter()
+            .zip(second.iter())
+            .filter(|(a, b)| (*a - *b).abs() < 1e-6)
+            .count();
+        assert!(
+            same < flat.len() / 100,
+            "{same}/{} elements coincide: the two increments drew the same field",
+            flat.len()
+        );
     }
 
     #[test]
