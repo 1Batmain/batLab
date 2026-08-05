@@ -14,10 +14,11 @@ use bat_building::tui::{
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
     DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
-    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting, compose_live_frame, live_frame_width,
+    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
     MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
-    Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
-    model::Training, probe_diffusion, reverse_step, sample_diffusion,
+    Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame, live_frame_width, log_probe,
+    log_train_loss, log_trajectory, model::Training, probe_diffusion, reverse_step,
+    sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -109,7 +110,7 @@ fn main() {
         //   cargo run --release -p main -- --headless-perpetual <model> \
         //       --frames N [--checkpoint <path>] [--depth T] \
         //       [--regime wander|breathe] [--seed N] [--magnitude F] \
-        //       [--out <dir>]
+        //       [--window] [--climb-frames N] [--out <dir>]
         // -----------------------------------------------------------------
         if args.iter().any(|arg| arg == "--headless-perpetual") {
             if let Err(err) = run_headless_perpetual(&args) {
@@ -370,6 +371,18 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
 /// cycle — a time-lapse of the wandering, without a window. It also reports the
 /// mean absolute change between consecutive frames, which is the number that
 /// says whether the run is *drifting* or merely redrawing the same image.
+/// Spacing between the climb frames `--climb-frames n` writes: enough to land
+/// about `n` of them across a climb of `ceiling + 1` increments.
+///
+/// `None` when nothing should be written, so the caller never divides by zero
+/// on a degenerate request.
+fn climb_stride(ceiling: usize, wanted: usize) -> Option<usize> {
+    if wanted == 0 {
+        return None;
+    }
+    Some((ceiling + 1).div_ceil(wanted).max(1))
+}
+
 fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -401,6 +414,10 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // `--window` also writes the composed x_t | x̂₀ frame the live visualiser
     // would be showing — the layout, out of the same function the window uses.
     let window_frames = args.iter().any(|arg| arg == "--window");
+    // `--climb-frames N` writes roughly N composed frames per climb, so the
+    // gradual dissolve can be read as a contact sheet instead of being taken on
+    // trust. It is the only way to see the climb without a window.
+    let climb_frames = flag("--climb-frames").and_then(|v| v.parse::<usize>().ok());
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
         tui::storage::project_root()
             .join("perpetual_samples")
@@ -497,13 +514,51 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                                 output_size.1,
                                 output_size.2,
                             ),
-                            (live_frame_width(output_size.0), output_size.1, output_size.2),
-                            &out_dir.join(format!("window_{:03}_mid_t{diffusion_step}.png", written)),
+                            (
+                                live_frame_width(output_size.0),
+                                output_size.1,
+                                output_size.2,
+                            ),
+                            &out_dir
+                                .join(format!("window_{:03}_mid_t{diffusion_step}.png", written)),
                         )?;
                         mid_captured = true;
                     }
                 }
-                DriftAction::Renoise { to_step, seed } => {
+                DriftAction::Climb {
+                    forward_step,
+                    seed,
+                    opens_cycle,
+                } => {
+                    // Mid-climb: apply the increment and, on request, write the
+                    // frames that show the image dissolving. Sampled rather
+                    // than exhaustive — a t_r = 64 climb is 65 frames and a
+                    // contact sheet wants a handful.
+                    if !opens_cycle {
+                        latent = schedule.forward_step(&latent, forward_step, seed);
+                        if let Some(count) = climb_frames
+                            && climb_stride(drift.ceiling(), count)
+                                .is_some_and(|stride| forward_step % stride == 0)
+                        {
+                            write_tensor_png(
+                                &compose_live_frame(
+                                    &latent,
+                                    &last_x0,
+                                    output_size.0,
+                                    output_size.1,
+                                    output_size.2,
+                                ),
+                                (
+                                    live_frame_width(output_size.0),
+                                    output_size.1,
+                                    output_size.2,
+                                ),
+                                &out_dir.join(format!("climb_{written:03}_t{forward_step:03}.png")),
+                            )?;
+                        }
+                        continue;
+                    }
+
                     // A cycle just closed: `last_x0` is the image it settled on.
                     let path = write_tensor_png(
                         &last_x0,
@@ -525,7 +580,11 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                                 output_size.1,
                                 output_size.2,
                             ),
-                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            (
+                                live_frame_width(output_size.0),
+                                output_size.1,
+                                output_size.2,
+                            ),
                             &out_dir.join(format!("window_{:03}.png", written)),
                         )?;
                     }
@@ -546,8 +605,25 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     written += 1;
                     mid_captured = false;
 
-                    let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
-                    latent = noisy;
+                    // The first increment of the climb, from the latent the
+                    // descent left — the same call every later increment makes.
+                    latent = schedule.forward_step(&latent, forward_step, seed);
+                    // Written here rather than above so the contact sheet opens
+                    // on the first dissolved frame, not on the settled image
+                    // (which `window_NNN.png` already holds).
+                    if climb_frames.is_some() {
+                        write_tensor_png(
+                            &compose_live_frame(
+                                &latent,
+                                &last_x0,
+                                output_size.0,
+                                output_size.1,
+                                output_size.2,
+                            ),
+                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            &out_dir.join(format!("climb_{written:03}_t{forward_step:03}.png")),
+                        )?;
+                    }
                 }
             }
         }
@@ -1326,6 +1402,9 @@ async fn run_perpetual(
      -> bool {
         tx.send(tui::TrainingEvent::PerpetualState(tui::PerpetualStatus {
             regime: drift.regime().label().to_string(),
+            // An image coming apart on screen is the nominal behaviour half the
+            // time; unlabelled, it reads as a fault.
+            phase: drift.phase().label().to_string(),
             depth: drift.depth(),
             min_depth: bat_building::MIN_RENOISE_DEPTH,
             max_depth: drift.max_depth(),
@@ -1422,6 +1501,7 @@ async fn run_perpetual(
             continue;
         }
 
+        let mut climbing = false;
         match drift.step() {
             DriftAction::Descend {
                 diffusion_step,
@@ -1446,18 +1526,39 @@ async fn run_perpetual(
                 steps += 1;
                 pace.tick();
             }
-            DriftAction::Renoise { to_step, seed } => {
-                // The forward process, unchanged, applied to the clipped x̂₀ —
-                // the same `add_noise` training uses to build its examples.
-                let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
-                latent = noisy;
+            DriftAction::Climb {
+                forward_step,
+                seed,
+                opens_cycle,
+            } => {
+                // One increment of the forward process, applied to the latent
+                // where the descent left it. The image dissolves over as many
+                // frames as it took to resolve instead of being replaced by
+                // noise between two of them.
+                latent = schedule.forward_step(&latent, forward_step, seed);
+                // x̂₀ stays put: the model is not predicting during the climb,
+                // and inventing a right-hand pane would be a lie. The frozen
+                // estimate beside the dissolving latent is also what makes the
+                // dissolution legible.
                 live.publish(&latent, &last_x0);
-                dirty = true;
+                climbing = true;
+                steps += 1;
+                pace.tick();
+                // The turn of the cycle is worth a redraw of the panel; the
+                // rest of the climb rides the usual 100 ms refresh.
+                dirty |= opens_cycle;
             }
         }
 
         let now = std::time::Instant::now();
-        next_step_at += Duration::from_secs_f32(1.0 / tempo);
+        // A climb increment costs no model call, so its pace is free to differ
+        // from the descent's; `CLIMB_TEMPO_RATIO` keeps them equal by default.
+        let step_tempo = if climbing {
+            tempo * bat_building::CLIMB_TEMPO_RATIO
+        } else {
+            tempo
+        };
+        next_step_at += Duration::from_secs_f32(1.0 / step_tempo.max(f32::EPSILON));
         if next_step_at > now {
             std::thread::sleep(next_step_at - now);
         } else {

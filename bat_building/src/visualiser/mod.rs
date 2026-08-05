@@ -52,7 +52,73 @@ use winit::window::{Window, WindowId};
 const FRAME_INTERVAL_MS: u64 = 33;
 /// Poll interval when no visible visualiser is active.
 const IDLE_INTERVAL_MS: u64 = 100;
+/// Longest edge, in logical pixels, the window aims for when it opens.
+///
+/// The size is derived from the frame, never fixed: the window used to open at
+/// a hard-coded 512×512 whatever it was about to show, which stretched every
+/// non-square source. The live perpetual/inference frame is `2W + 3` wide by
+/// `H` high (67×32 on this model), so a square window squashed it by 2.1× —
+/// the pixels were rectangles and the images read as distorted.
+const INITIAL_WINDOW_TARGET_EDGE: u32 = 560;
 static VISUALISER_CMD_TX: OnceLock<Sender<ManagerCommand>> = OnceLock::new();
+
+/// Colour of the letterbox bands, as a plain neutral.
+///
+/// Not black: the frame's own darkest pixel is black too, so black bands would
+/// merge with the image and hide where it actually ends. Not mid-grey either,
+/// which competes with the picture. This is the "outside the image" chrome.
+///
+/// **Values are linear, the surface is sRGB.** The clear colour is not passed
+/// through the transfer function, so an innocent-looking `0.08` came out at
+/// `sRGB 80/255` — a mid-grey that framed the image like a mount. Measured on a
+/// screenshot, not assumed: these three land near `sRGB 28/255`.
+const LETTERBOX_COLOUR: wgpu::Color = wgpu::Color {
+    r: 0.0115,
+    g: 0.0115,
+    b: 0.0135,
+    a: 1.0,
+};
+
+/// Size the window opens at: the largest **integer** multiple of the frame that
+/// fits inside [`INITIAL_WINDOW_TARGET_EDGE`] on both axes.
+///
+/// An integer multiple is what makes every source pixel the same square block
+/// of screen pixels — the point of the exercise. A 67×32 frame therefore opens
+/// at ×8 = 536×256, not at a square 512×512.
+fn initial_window_size(frame_width: u32, frame_height: u32) -> (u32, u32) {
+    let (width, height) = (frame_width.max(1), frame_height.max(1));
+    let scale = (INITIAL_WINDOW_TARGET_EDGE / width)
+        .min(INITIAL_WINDOW_TARGET_EDGE / height)
+        .max(1);
+    (width * scale, height * scale)
+}
+
+/// The `(x, y, width, height)` viewport that fits `frame` inside `surface`
+/// without distorting it — the same scale on both axes, centred, the remainder
+/// left to the clear colour as bands.
+///
+/// Resizing the window used to stretch the quad to whatever shape the surface
+/// had, because the shader draws a full-screen quad and nothing else set a
+/// viewport. Letterboxing here rather than in the shader keeps the shader a
+/// pure row-major indexer: the fragment stage never learns about aspect ratio,
+/// it just gets asked for fewer pixels.
+fn letterbox_viewport(surface: (u32, u32), frame: (u32, u32)) -> (f32, f32, f32, f32) {
+    let (surface_w, surface_h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
+    let (frame_w, frame_h) = (frame.0.max(1) as f32, frame.1.max(1) as f32);
+
+    let scale = (surface_w / frame_w).min(surface_h / frame_h);
+    let width = (frame_w * scale).min(surface_w).max(1.0);
+    let height = (frame_h * scale).min(surface_h).max(1.0);
+
+    // Floor the offsets so the viewport never spills past the attachment on the
+    // far edge (wgpu rejects that outright).
+    (
+        ((surface_w - width) * 0.5).floor().max(0.0),
+        ((surface_h - height) * 0.5).floor().max(0.0),
+        width,
+        height,
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -282,9 +348,10 @@ struct ActiveVisualiser {
 
 impl ActiveVisualiser {
     fn from_open_request(event_loop: &ActiveEventLoop, req: OpenRequest) -> Option<Self> {
+        let (window_w, window_h) = initial_window_size(req.width, req.height);
         let attrs = Window::default_attributes()
             .with_title(req.title.clone())
-            .with_inner_size(winit::dpi::LogicalSize::new(512u32, 512u32))
+            .with_inner_size(winit::dpi::LogicalSize::new(window_w, window_h))
             .with_visible(req.initial_visible);
 
         let window = match event_loop.create_window(attrs) {
@@ -388,6 +455,9 @@ struct RenderState {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    /// Geometry of the source frame, kept so every frame can be letterboxed
+    /// into whatever shape the window currently has.
+    frame_size: (u32, u32),
     // Keep uniforms alive for the lifetime of the bind group/pipeline.
     _uniform_buf: wgpu::Buffer,
 }
@@ -517,6 +587,7 @@ impl RenderState {
             config,
             pipeline,
             bind_group,
+            frame_size: (width, height),
             _uniform_buf: uniform_buf,
         }
     }
@@ -569,7 +640,11 @@ impl RenderState {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        // The clear covers the whole attachment; the viewport
+                        // below only lets the quad rasterise over the part that
+                        // keeps the frame's aspect ratio, so what is left of
+                        // this colour *is* the letterbox.
+                        load: wgpu::LoadOp::Clear(LETTERBOX_COLOUR),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -579,9 +654,13 @@ impl RenderState {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
+            let (x, y, w, h) =
+                letterbox_viewport((self.config.width, self.config.height), self.frame_size);
+            pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            // 4 vertices → TriangleStrip → full-screen quad.
+            // 4 vertices → TriangleStrip → a quad filling the viewport, which is
+            // the frame's own shape rather than the window's.
             pass.draw(0..4, 0..1);
         }
         // Submit to the SHARED queue – training compute commands and render
@@ -834,4 +913,99 @@ fn build_event_loop() -> Option<EventLoop<()>> {
     };
 
     Some(event_loop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INITIAL_WINDOW_TARGET_EDGE, initial_window_size, letterbox_viewport};
+
+    /// Aspect ratio of a viewport, to compare against the source's.
+    fn ratio(w: f32, h: f32) -> f32 {
+        w / h
+    }
+
+    /// The live frame of this project: two 32×32 panes and a 3-column rule.
+    const LIVE_FRAME: (u32, u32) = (67, 32);
+
+    /// The reported defect: the window opened square and stretched the frame.
+    /// ×8 is the largest integer scale that fits the target edge, and 536×256
+    /// has exactly the frame's proportions.
+    #[test]
+    fn the_window_opens_at_an_integer_multiple_of_the_frame() {
+        let (w, h) = initial_window_size(LIVE_FRAME.0, LIVE_FRAME.1);
+        assert_eq!((w, h), (536, 256));
+        assert_eq!(w % LIVE_FRAME.0, 0, "width is not a whole number of panes");
+        assert_eq!(h % LIVE_FRAME.1, 0);
+        assert_eq!(
+            w / LIVE_FRAME.0,
+            h / LIVE_FRAME.1,
+            "the two axes were scaled differently — that is the distortion itself"
+        );
+    }
+
+    #[test]
+    fn the_opening_size_stays_within_the_target_edge_for_any_frame() {
+        for frame in [(67u32, 32u32), (32, 32), (1, 1), (0, 0), (700, 3), (4, 900)] {
+            let (w, h) = initial_window_size(frame.0, frame.1);
+            assert!(w >= 1 && h >= 1, "degenerate window for {frame:?}");
+            let fits = w <= INITIAL_WINDOW_TARGET_EDGE.max(frame.0.max(1))
+                && h <= INITIAL_WINDOW_TARGET_EDGE.max(frame.1.max(1));
+            assert!(fits, "{frame:?} opened at {w}×{h}");
+        }
+    }
+
+    /// A frame already in the window's proportions must use the whole surface:
+    /// letterboxing that bands a correctly-shaped window would be a regression
+    /// of its own.
+    #[test]
+    fn a_matching_surface_is_filled_edge_to_edge() {
+        let (x, y, w, h) = letterbox_viewport((536, 256), LIVE_FRAME);
+        assert_eq!((x, y, w, h), (0.0, 0.0, 536.0, 256.0));
+    }
+
+    /// The resize case the user hits: whatever shape the window is dragged to,
+    /// the drawn area keeps the frame's ratio and is centred, and the leftover
+    /// is symmetric bands.
+    #[test]
+    fn resizing_letterboxes_instead_of_stretching() {
+        let frame_ratio = ratio(LIVE_FRAME.0 as f32, LIVE_FRAME.1 as f32);
+
+        // Too tall: bands above and below.
+        let (x, y, w, h) = letterbox_viewport((536, 800), LIVE_FRAME);
+        assert!((ratio(w, h) - frame_ratio).abs() < 1e-4, "{w}×{h}");
+        assert_eq!(x, 0.0, "no horizontal band when width is the binding edge");
+        assert!(y > 0.0 && (y + h) <= 800.0, "band at y={y}, height={h}");
+        assert!(
+            (y - (800.0 - h - y)).abs() <= 1.0,
+            "bands are not the same size: {y} vs {}",
+            800.0 - h - y
+        );
+
+        // Too wide: bands left and right.
+        let (x, y, w, h) = letterbox_viewport((1600, 256), LIVE_FRAME);
+        assert!((ratio(w, h) - frame_ratio).abs() < 1e-4, "{w}×{h}");
+        assert_eq!(y, 0.0);
+        assert!(x > 0.0 && (x + w) <= 1600.0);
+    }
+
+    /// wgpu rejects a viewport that leaves the attachment, so the arithmetic
+    /// has to hold for shapes nobody would choose on purpose too.
+    #[test]
+    fn the_viewport_never_leaves_the_surface() {
+        let surfaces = [(1u32, 1u32), (0, 0), (3, 1000), (1000, 3), (537, 257)];
+        for surface in surfaces {
+            for frame in [LIVE_FRAME, (32, 32), (1, 1)] {
+                let (x, y, w, h) = letterbox_viewport(surface, frame);
+                let (sw, sh) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
+                assert!(
+                    w > 0.0 && h > 0.0,
+                    "empty viewport for {surface:?}/{frame:?}"
+                );
+                assert!(
+                    x >= 0.0 && y >= 0.0 && x + w <= sw && y + h <= sh,
+                    "viewport ({x},{y},{w},{h}) escapes {surface:?}"
+                );
+            }
+        }
+    }
 }
