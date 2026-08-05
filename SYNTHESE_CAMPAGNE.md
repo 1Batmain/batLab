@@ -564,6 +564,36 @@ Quatre hypothèses sont éliminées et documentées : capacité, champ réceptif
 optimiseur. Ce rétrécissement du champ des causes est le vrai livrable de la
 nuit.
 
+### Dénouement — le matin du 5 août
+
+La chasse à l'anisotropie a trouvé le coupable en une mission
+(`ANISOTROPY_HUNT.md`) : **le générateur de bruit du sampler**. La graine de
+chaque pas XORait le numéro de pas (`path_seed ^ step`) pendant que le champ de
+bruit XORait l'index du pixel (`seed ^ index`) ; les deux XOR se composent, si
+bien que les 256 pas de la chaîne retiraient tous **le même champ, simplement
+permuté** par `index ^ d ^ d'`. Chaque champ isolé était parfaitement isotrope —
+seule leur somme s'effondrait en fonction de la rangée. D'où un entraînement et
+des sondes impeccables face à une génération morte, sur toutes les architectures
+et tous les optimiseurs : le sampler peignait des bandes tout seul.
+
+Le correctif (avalanche de la graine avant le flux d'index, `gaussian_at`) est
+côté inférence uniquement. Sur le **même checkpoint de nuit, sans réentraîner** :
+
+| | banding | diversité inter-seeds | `row_diff` |
+|---|---|---|---|
+| avant | 15,07 | 0,0125 | 0,26 |
+| après | **1,23** | **0,195** (86 % du dataset) | 0,093 (dataset : 0,103) |
+
+Huit seeds donnent désormais huit images distinctes, avec des formes
+(`hunt_samples/plate_after.png`). La première tentative de correctif était
+elle-même dégénérée (champs constants sur les anti-diagonales) — attrapée par
+le test écrit pour l'occasion, validé par mutation.
+
+Restent, consignés dans le rapport : un discriminant DDIM à faire pour mesurer
+combien le modèle exploite réellement x_T, la même fragilité de graine encore
+présente (volontairement) dans le shader d'entraînement, et le portage de l'axe
+batch dans le dispatch GPU. Mais la boucle est bouclée : **batLab génère**.
+
 ---
 
 ## Index des sources
