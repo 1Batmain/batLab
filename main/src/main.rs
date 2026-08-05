@@ -37,6 +37,114 @@ const DIFFUSION_BETA_END: f32 = 2e-2;
 const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
 const INFERENCE_RUNTIME_LR: f32 = 0.01;
 const INFERENCE_RUNTIME_BATCH_SIZE: u32 = 1;
+/// What `--help` prints. The headless entry points are the whole scriptable
+/// surface of this binary, so this text *is* their contract: an agent, a CI job
+/// or a black-box tester has nothing else to read, and a flag that is not here
+/// does not exist. The dump layout is spelled out for the same reason — a reader
+/// written from a prose description of "raw f32" reads it shifted by five bytes.
+const HELP: &str = "\
+batBuilder — deep-learning framework (Rust + wgpu). Run with no arguments for
+the interactive TUI. The flags below are the DEV/CI headless entry points; they
+are not reachable from the TUI and never write back a model's config_file.
+
+  --headless-train <model> --steps N --dataset <path>
+      [--lr F] [--batch N] [--out <ckpt>] [--optimizer sgd|adam]
+      [--weight-init uniform|he] [--loss-weighting uniform|snr] [--snr-gamma F]
+
+  --headless-sample <model> [--checkpoint <path>] [--seed N] [--paths N]
+      [--magnitude F] [--out <img>] [--log <jsonl>]
+
+  --headless-perpetual <model> [--checkpoint <path>] [--regime wander|breathe|flux]
+      [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
+      [--frames N] [--actions N] [--window] [--climb-frames N] [--out <dir>]
+
+Perpetual notes:
+  --regime          wander (errance) | breathe (respiration) | flux. French
+                    spellings are accepted too.
+  --t-r/--t-star    the level dial, one flag under three spellings. It is a
+                    renoise depth in wander/breathe and the level held in flux,
+                    which is why it answers to both names.
+  --frames N        stops after N *closed cycles*, and writes one PNG per cycle.
+                    Flux closes none: it writes no PNG and REFUSES this bound
+                    rather than running forever.
+  --actions N       stops after N drift actions (frames). The only bound flux
+                    accepts, and how two regimes are compared over equal frames.
+                    Overrides --frames when both are given.
+
+--dump <path> writes every frame of the run, little-endian throughout:
+
+    \"BATFLUX1\"  u32 width  u32 height  u32 channels
+    then per frame:  u8 phase (0 descent, 1 climb, 2 flux)
+                     u32 t (the level this frame landed on)
+                     f32[w*h*c] x_t        f32[w*h*c] x0_hat
+
+The frame count is left to be inferred from the file size, so a run killed
+mid-write still parses up to its last whole frame. Read it with
+`tools/flux_analysis.py`.
+";
+
+/// Rejects any flag the parser does not know, before anything expensive runs.
+///
+/// A headless run is driven by scripts and agents that cannot see a typo. While
+/// unknown flags were dropped in silence, `--t-star` — a flag named in the
+/// public contract but never parsed — was indistinguishable from a flag that
+/// worked: a whole black-box campaign passed it, got byte-identical dumps, and
+/// only caught it by diffing against a deliberately invented flag.
+///
+/// `valued` flags consume the token after them, so a path or a negative number
+/// can never be mistaken for a flag of its own.
+fn reject_unknown_flags(args: &[String], valued: &[&str], bare: &[&str]) -> Result<(), String> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg.starts_with("--") || (arg.starts_with('-') && arg.len() > 1) {
+            if valued.contains(&arg) {
+                index += 2;
+                continue;
+            }
+            if !bare.contains(&arg) {
+                let mut known: Vec<&str> = valued.iter().chain(bare.iter()).copied().collect();
+                known.sort_unstable();
+                return Err(format!(
+                    "unknown flag `{arg}`. Known flags here: {}. See --help.",
+                    known.join(" ")
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+/// The level dial of a perpetual run, under any of its three spellings.
+///
+/// One field, three names, because the field means two things: `t_r`, the depth
+/// a cycle re-noises back to, and `t*`, the level flux holds. The public
+/// contract named `--t-r` and `--t-star` while only `--depth` was parsed, so
+/// both were accepted by the shell, dropped by the binary, and the run went
+/// ahead at the default level — a blind test campaign passed `--t-star` for a
+/// whole day against dumps that were byte-identical to no flag at all.
+///
+/// `Ok(None)` means no dial was given; the caller supplies the default.
+fn dial_level(args: &[String]) -> Result<Option<usize>, String> {
+    let named = |name: &'static str| {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .map(|value| (name, value.as_str()))
+    };
+    match named("--t-star")
+        .or_else(|| named("--t-r"))
+        .or_else(|| named("--depth"))
+    {
+        Some((name, value)) => value
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("{name} takes a level (an integer), got `{value}`")),
+        None => Ok(None),
+    }
+}
+
 /// How often (in steps) the training loop generates an instrumented sample and
 /// logs the full per-step denoising trajectory. Coarser than the loss/probe
 /// interval because a full sample runs `schedule.len()` forward passes.
@@ -72,6 +180,14 @@ fn main() {
         // checkpoint to a scratch path, so it cannot clobber saved weights.
         // -----------------------------------------------------------------
         let args: Vec<String> = std::env::args().collect();
+        // Before anything else: the binary has to be able to say what it takes.
+        // Without this the only way to discover a flag was to try it, and an
+        // unknown flag used to be ignored in silence — so trying it proved
+        // nothing either.
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            print!("{HELP}");
+            return;
+        }
         if args.iter().any(|arg| arg == "--headless-train") {
             if let Err(err) = run_headless_train(&args) {
                 eprintln!("headless training failed: {err}");
@@ -137,6 +253,22 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    reject_unknown_flags(
+        args,
+        &[
+            "--headless-train",
+            "--steps",
+            "--dataset",
+            "--lr",
+            "--batch",
+            "--out",
+            "--optimizer",
+            "--weight-init",
+            "--loss-weighting",
+            "--snr-gamma",
+        ],
+        &[],
+    )?;
     let parse = |name: &str, fallback: f32| -> Result<f32, String> {
         match flag(name) {
             Some(v) => v
@@ -256,6 +388,20 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+
+    reject_unknown_flags(
+        args,
+        &[
+            "--headless-sample",
+            "--checkpoint",
+            "--seed",
+            "--paths",
+            "--magnitude",
+            "--out",
+            "--log",
+        ],
+        &[],
+    )?;
 
     let model_name = flag("--headless-sample")
         .ok_or_else(|| "--headless-sample requires a model name".to_string())?;
@@ -474,18 +620,41 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             .cloned()
     };
 
+    reject_unknown_flags(
+        args,
+        &[
+            "--headless-perpetual",
+            "--checkpoint",
+            "--regime",
+            "--t-r",
+            "--t-star",
+            "--depth",
+            "--seed",
+            "--magnitude",
+            "--frames",
+            "--actions",
+            "--climb-frames",
+            "--dump",
+            "--out",
+        ],
+        &["--window"],
+    )?;
+
     let model_name = flag("--headless-perpetual")
-        .ok_or_else(|| "--headless-perpetual requires a model name".to_string())?;
+        .filter(|value| !value.starts_with('-'))
+        .ok_or_else(|| {
+            "--headless-perpetual takes the model name as its value, e.g. \
+             `--headless-perpetual Greyscale_Diffusion_L --regime flux`"
+                .to_string()
+        })?;
     let frames = flag("--frames")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(8)
         .max(1);
-    let depth = flag("--depth")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(PerpetualConfig::default_renoise_depth());
+    let depth = dial_level(args)?.unwrap_or_else(PerpetualConfig::default_renoise_depth);
     let regime = match flag("--regime") {
         Some(value) => bat_building::PerpetualRegime::parse(&value)
-            .ok_or_else(|| format!("invalid --regime: {value} (want wander|breathe)"))?,
+            .ok_or_else(|| format!("invalid --regime: {value} (want wander|breathe|flux)"))?,
         None => bat_building::PerpetualRegime::default(),
     };
     let seed = flag("--seed")
@@ -506,6 +675,15 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // only way to bound a flux run, and it is also how the two regimes get
     // compared over the same number of frames.
     let action_budget = flag("--actions").and_then(|v| v.parse::<usize>().ok());
+    // Refused rather than defaulted: `--frames` counts *closed cycles*, and flux
+    // closes none. The old code would have spun on `written < frames` with
+    // `written` stuck at zero — a run that never ends and never says why.
+    if regime == bat_building::PerpetualRegime::Flux && action_budget.is_none() {
+        return Err(
+            "--regime flux never closes a cycle, so --frames cannot bound it: pass --actions N"
+                .to_string(),
+        );
+    }
     // `--dump <path>` writes every frame's two panes as raw f32, which is the
     // only honest substrate for the frame-to-frame measurements: |Δ| in flux is
     // of the order of one 8-bit level, so a PNG would quantise away the very
@@ -561,14 +739,31 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         // cycle closes and read by every level of that climb.
         let mut climb_departure: Option<Vec<f32>> = None;
 
+        // The banner is the only place a caller can check that what it typed was
+        // heard — which is why it reports the dial under the name the *regime*
+        // gives it, and reads it back off the drift (post-clamp) rather than off
+        // the parse. A banner frozen at `t_r=64` is how `--t-star` went a whole
+        // campaign without being parsed.
         println!(
-            "headless perpetual '{model_name}': regime={} t_r={} frames={frames} \
-             magnitude={magnitude} seed={seed}\nweights → {}\nframes  → {}",
+            "headless perpetual '{model_name}': regime={} {}={} bound={} \
+             magnitude={magnitude} seed={seed}\nweights → {}",
             drift.regime().label(),
+            drift.regime().depth_label(),
             drift.depth(),
+            match action_budget {
+                Some(budget) => format!("--actions {budget}"),
+                None => format!("--frames {frames} (cycles)"),
+            },
             checkpoint_path.display(),
-            out_dir.display()
         );
+        // Announced only when something will actually land there. A PNG is
+        // written when a cycle closes; flux closes none, so naming a directory
+        // it never even creates reads as a run that failed to write.
+        if drift.regime() == bat_building::PerpetualRegime::Flux {
+            println!("frames  → no PNG in flux (no cycle ever closes) — use --dump");
+        } else {
+            println!("frames  → {}", out_dir.display());
+        }
 
         let mut dump = match dump_path.as_ref() {
             Some(path) => Some(FrameDump::create(path, output_size)?),
@@ -797,8 +992,13 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         }
 
         let elapsed = started.elapsed().as_secs_f32();
+        // Both counts, because they differ and the difference is the point: a
+        // climb increment is closed-form arithmetic and never calls the model,
+        // so a run of N actions costs fewer than N reverse steps in every regime
+        // that climbs. Reporting only one of them reads as a miscount.
         println!(
-            "{steps} reverse steps in {elapsed:.2} s ({:.0} steps/s, unthrottled)",
+            "{actions} actions, {steps} of them reverse steps (model calls), in {elapsed:.2} s \
+             ({:.0} steps/s, unthrottled)",
             steps as f32 / elapsed.max(f32::EPSILON)
         );
         Ok::<(), String>(())
@@ -2774,5 +2974,78 @@ mod tests {
         let result = try_load_raw_dataset(&out, (2, 2, 1));
         let _ = std::fs::remove_file(&out);
         assert!(result.is_err(), "wrong magic should return an error");
+    }
+
+    fn argv(line: &str) -> Vec<String> {
+        std::iter::once("main".to_string())
+            .chain(line.split_whitespace().map(str::to_string))
+            .collect()
+    }
+
+    /// The three spellings of the level dial are one flag.
+    ///
+    /// Written against the blind test that caught the defect: the public
+    /// contract offered `--t-star` and `--t-r`, only `--depth` was parsed, and
+    /// nothing anywhere said so — the dumps came out byte-identical to a run
+    /// with no flag at all.
+    #[test]
+    fn every_spelling_of_the_level_dial_is_parsed() {
+        for line in [
+            "--headless-perpetual M --regime flux --t-star 30",
+            "--headless-perpetual M --regime flux --t-r 30",
+            "--headless-perpetual M --regime flux --depth 30",
+        ] {
+            assert_eq!(
+                dial_level(&argv(line)).expect("valid level"),
+                Some(30),
+                "not parsed: {line}"
+            );
+        }
+        assert_eq!(
+            dial_level(&argv("--headless-perpetual M --regime flux")).expect("no dial"),
+            None,
+            "absent dial must fall through to the caller's default"
+        );
+        assert!(
+            dial_level(&argv("--headless-perpetual M --t-star abc")).is_err(),
+            "a level that is not a number must be refused, not silently defaulted"
+        );
+    }
+
+    /// A flag nobody parses has to be an error, not a shrug.
+    ///
+    /// This is what made the dial defect invisible: passing `--t-star`, passing
+    /// `--t-r`, and passing a flag invented on the spot were three ways of
+    /// getting the same run, so no experiment could tell "ignored" from
+    /// "unimplemented".
+    #[test]
+    fn an_unknown_flag_is_refused_rather_than_ignored() {
+        let valued = ["--headless-perpetual", "--regime", "--t-star"];
+        let bare = ["--window"];
+
+        assert!(
+            reject_unknown_flags(
+                &argv("--headless-perpetual M --regime flux --t-star 30 --window"),
+                &valued,
+                &bare
+            )
+            .is_ok()
+        );
+        let refused = reject_unknown_flags(
+            &argv("--headless-perpetual M --flag-inexistant 30"),
+            &valued,
+            &bare,
+        )
+        .expect_err("an unknown flag must be refused");
+        assert!(
+            refused.contains("--flag-inexistant"),
+            "the message must name the offending flag, got: {refused}"
+        );
+        // A value that looks like a flag belongs to the flag before it: paths
+        // and negative numbers must not be mistaken for typos.
+        assert!(
+            reject_unknown_flags(&argv("--headless-perpetual --regime"), &valued, &bare).is_ok(),
+            "the token after a known flag is its value, whatever it looks like"
+        );
     }
 }
