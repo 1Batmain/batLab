@@ -1,6 +1,6 @@
 //! File purpose: Implements events behavior for the terminal user interface flow.
 
-use super::app::{App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen};
+use super::app::{App, HOME_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, Screen};
 use crossterm::event::KeyCode;
 
 #[derive(Debug)]
@@ -64,6 +64,16 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
 fn handle_home(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => {
+            if app.home.selected > 0 {
+                app.home.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.home.selected + 1 < HOME_CHOICES.len() {
+                app.home.selected += 1;
+            }
+        }
         KeyCode::Enter => app.finish_home(),
         _ => {}
     }
@@ -71,7 +81,7 @@ fn handle_home(app: &mut App, code: KeyCode) {
 
 fn handle_load_path(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::Home,
         KeyCode::Up => {
             if app.load_path.selected > 0 {
                 app.load_path.selected -= 1;
@@ -89,7 +99,8 @@ fn handle_load_path(app: &mut App, code: KeyCode) {
 
 fn handle_template_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::Home,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.template_selector.selected > 0 {
                 app.template_selector.selected -= 1;

@@ -1,8 +1,9 @@
 //! File purpose: Implements ui behavior for the terminal user interface flow.
 
 use super::app::{
-    App, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind,
-    MonitorImage, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
+    App, HOME_CHOICES, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode,
+    LayerKind, MonitorImage, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES,
+    TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
@@ -165,12 +166,12 @@ fn draw_form_screen(
 // Screen: Home
 // ---------------------------------------------------------------------------
 
-fn draw_home(f: &mut Frame, _app: &App) {
+fn draw_home(f: &mut Frame, app: &App) {
     draw_choice_screen(
         f,
         "batBuilder",
-        &["Select Model Template"],
-        0,
+        &HOME_CHOICES,
+        app.home.selected,
         "[arrow] select  [Enter] confirm  [q] quit",
     );
 }

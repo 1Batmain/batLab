@@ -728,6 +728,11 @@ pub struct InferenceConfig {
     pub denoising_paths: usize,
     #[serde(default = "InferenceConfig::default_denoise_magnitude")]
     pub denoise_magnitude: f32,
+    /// Weights to sample from. `None` falls back to the model's `latest.ckpt`,
+    /// which is what every config written before the weight choice was honoured
+    /// implicitly meant — so older files keep their behaviour.
+    #[serde(default)]
+    pub checkpoint: Option<String>,
 }
 
 impl InferenceConfig {
@@ -751,6 +756,7 @@ impl Default for InferenceConfig {
             seed: None,
             denoising_paths: Self::default_denoising_paths(),
             denoise_magnitude: Self::default_denoise_magnitude(),
+            checkpoint: None,
         }
     }
 }
@@ -826,6 +832,9 @@ pub enum Screen {
 pub struct HomeState {
     pub selected: usize, // 0 = Load saved, 1 = Use template
 }
+
+/// The two routes out of [`Screen::Home`], in the order they are drawn.
+pub const HOME_CHOICES: [&str; 2] = ["Load Saved Model", "Select Model Template"];
 
 pub struct LoadPathState {
     pub models: Vec<SavedModelEntry>,
@@ -1097,8 +1106,12 @@ impl App {
         let datasets = storage::list_datasets().unwrap_or_default();
         let dataset_path = datasets.first().cloned().unwrap_or_default();
         let mut app = Self {
-            screen: Screen::TemplateSelector,
-            home: HomeState { selected: 1 },
+            // Home, not TemplateSelector: the template route builds a *fresh*
+            // architecture and rewrites the target model's `config_file`, so
+            // starting there made every saved model unreachable and lossy to
+            // reach anyway. Home is the fork — load, or build new.
+            screen: Screen::Home,
+            home: HomeState { selected: 0 },
             load_path: LoadPathState {
                 models,
                 selected: 0,
@@ -1186,6 +1199,16 @@ impl App {
         app.sync_inference_params_from_config(&InferenceConfig::default());
         app.reset_layer_form();
         app
+    }
+
+    /// Re-scans `Models/` so the load list reflects the disk, not the snapshot
+    /// taken when the app was constructed.
+    fn refresh_load_path(&mut self) {
+        self.load_path.models = storage::list_models().unwrap_or_default();
+        if self.load_path.selected >= self.load_path.models.len() {
+            self.load_path.selected = 0;
+        }
+        self.load_path.error = None;
     }
 
     fn refresh_templates(&mut self) {
@@ -1316,8 +1339,8 @@ impl App {
         match config.run.mode {
             RunMode::Infer => {
                 self.mode_selector.selected = 0;
-                self.selected_checkpoint_path = None;
-                self.load_checkpoint_on_start = false;
+                self.selected_checkpoint_path = config.inference.checkpoint.clone();
+                self.load_checkpoint_on_start = config.inference.checkpoint.is_some();
             }
             RunMode::Train(train) => {
                 self.mode_selector.selected = 1;
@@ -1333,7 +1356,24 @@ impl App {
             }
         }
 
-        self.screen = Screen::ModeSelector;
+        // The weight list is the point of loading a saved model: its trained
+        // checkpoints live beside the config and are otherwise unreachable.
+        // Note what this path does *not* do — unlike `apply_template`, it never
+        // calls `write_model_config`, so the model's own `inference` block
+        // survives being opened.
+        self.refresh_weight_selector();
+        let preselected = self
+            .selected_checkpoint_path
+            .as_deref()
+            .and_then(|path| {
+                self.weight_selector
+                    .checkpoints
+                    .iter()
+                    .position(|entry| entry.path == path)
+            })
+            .map_or(0, |index| index + 1);
+        self.weight_selector.selected = preselected;
+        self.screen = Screen::WeightSelector;
     }
 
     fn sync_inference_params_from_config(&mut self, inference: &InferenceConfig) {
@@ -2088,8 +2128,13 @@ impl App {
     // --- Screen transitions ---
 
     pub fn finish_home(&mut self) {
-        self.refresh_templates();
-        self.screen = Screen::TemplateSelector;
+        if self.home.selected == 0 {
+            self.refresh_load_path();
+            self.screen = Screen::LoadPath;
+        } else {
+            self.refresh_templates();
+            self.screen = Screen::TemplateSelector;
+        }
     }
 
     pub fn finish_template_selector(&mut self) {
@@ -2237,6 +2282,7 @@ impl App {
             seed,
             denoising_paths,
             denoise_magnitude,
+            checkpoint: self.selected_checkpoint_path.clone(),
         };
 
         self.inference_params.error = None;
@@ -2434,10 +2480,62 @@ mod tests {
         assert_eq!(app.layer_builder.current_kind, LayerKind::UpsampleConv);
     }
 
+    /// `Screen::LoadPath` existed, was drawn, and handled its keys, but nothing
+    /// ever assigned it — the app opened straight on the template selector, so a
+    /// trained model under `Models/` could not be reached at all. Home is the
+    /// fork that makes it reachable, and it must default to the load route.
     #[test]
-    fn app_starts_on_template_selector() {
+    fn app_starts_on_home_with_the_load_route_selected() {
         let app = App::new();
+        assert!(matches!(app.screen, Screen::Home));
+        assert_eq!(app.home.selected, 0);
+    }
+
+    #[test]
+    fn home_routes_to_load_path_and_to_the_template_selector() {
+        let mut app = App::new();
+
+        app.home.selected = 0;
+        app.finish_home();
+        assert!(matches!(app.screen, Screen::LoadPath));
+
+        app.home.selected = 1;
+        app.finish_home();
         assert!(matches!(app.screen, Screen::TemplateSelector));
+    }
+
+    /// Opening a saved model must not touch what it says. The template route
+    /// calls `write_model_config` with `InferenceConfig::default()`, which is
+    /// how the previous mission silently reset two `config_file`s; the load
+    /// route has to carry the stored inference block into the form instead.
+    #[test]
+    fn loading_a_model_preserves_its_inference_block() {
+        let mut app = App::new();
+        let config = ModelConfig {
+            model_name: Some("unit-test-load".to_string()),
+            input_size: (32, 32, 5),
+            layers: Vec::new(),
+            inference: InferenceConfig {
+                random_seed: false,
+                seed: Some(4242),
+                denoising_paths: 7,
+                denoise_magnitude: 0.35,
+                checkpoint: None,
+            },
+            run: RunConfig {
+                mode: RunMode::Infer,
+            },
+        };
+
+        app.apply_loaded_model(config);
+
+        assert!(!app.inference_params.random_seed);
+        assert_eq!(app.inference_params.fields[0], "4242");
+        assert_eq!(app.inference_params.fields[1], "7");
+        assert_eq!(app.inference_params.fields[2], "0.35");
+        assert_eq!(app.active_model_name.as_deref(), Some("unit-test-load"));
+        // The weights of a loaded model are the point of loading it.
+        assert!(matches!(app.screen, Screen::WeightSelector));
     }
 
     #[test]

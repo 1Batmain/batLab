@@ -883,7 +883,8 @@ async fn run_inference(
     )
     .await?;
 
-    let checkpoint_path = resolve_inference_checkpoint_path(&config)?;
+    let checkpoint_path =
+        resolve_sampling_checkpoint_path(&config, config.inference.checkpoint.as_deref())?;
     model.load_checkpoint(&checkpoint_path).map_err(|err| {
         format!(
             "failed to load inference checkpoint {}: {err}",
@@ -1023,7 +1024,21 @@ fn denoising_progress_label(
     }
 }
 
-fn resolve_inference_checkpoint_path(config: &ModelConfig) -> Result<PathBuf, String> {
+/// Which weights a sampling run loads.
+///
+/// The weight selector lets the user pick any file in the model's
+/// `pretrained_weights/`; honouring that choice here is what makes the screen
+/// mean something for inference. `latest.ckpt` stays the fallback, so configs
+/// written before the choice was recorded behave exactly as they did.
+fn resolve_sampling_checkpoint_path(
+    config: &ModelConfig,
+    selected: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = selected.map(PathBuf::from)
+        && path.exists()
+    {
+        return Ok(path);
+    }
     let model_name = config
         .model_name
         .as_deref()

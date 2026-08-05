@@ -98,6 +98,7 @@ fn run_builder_loop(
                 },
                 denoising_paths,
                 denoise_magnitude,
+                checkpoint: app.selected_checkpoint_path.clone(),
             };
             return Ok(ModelConfig {
                 model_name: app.active_model_name.clone(),
