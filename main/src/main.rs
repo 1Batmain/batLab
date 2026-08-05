@@ -365,6 +365,89 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
     })
 }
 
+/// Every frame of a headless drift, both panes, as raw `f32`.
+///
+/// The measurements this exists for are frame-to-frame differences and
+/// correlations, and in flux those live at about **one 8-bit level per frame**.
+/// Reading them off PNGs would be measuring the quantiser: `CLIMB_COHERENCE.md`
+/// §6 records a grain correlation of 1.000 in `f32` that PNGs could not report
+/// above 0.87. So the frames come out unquantised, and every analysis of the
+/// flux regime is done on this file.
+///
+/// Layout — little-endian throughout, `len = w * h * c`:
+///
+/// ```text
+///   "BATFLUX1"  u32 w  u32 h  u32 c
+///   then per frame:  u8 phase (0 descent, 1 climb, 2 flux)  u32 t
+///                    f32[len] x_t        f32[len] x0_hat
+/// ```
+///
+/// The frame count is left for the reader to infer from the file size: a run
+/// that is killed mid-write then still parses up to its last whole frame.
+struct FrameDump {
+    path: PathBuf,
+    writer: std::io::BufWriter<std::fs::File>,
+    frames: usize,
+}
+
+impl FrameDump {
+    fn create(path: &Path, size: (u32, u32, u32)) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        }
+        let file = std::fs::File::create(path)
+            .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        let mut header = Vec::with_capacity(20);
+        header.extend_from_slice(b"BATFLUX1");
+        header.extend_from_slice(&size.0.to_le_bytes());
+        header.extend_from_slice(&size.1.to_le_bytes());
+        header.extend_from_slice(&size.2.to_le_bytes());
+        std::io::Write::write_all(&mut writer, &header)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            writer,
+            frames: 0,
+        })
+    }
+
+    fn record(
+        &mut self,
+        phase: bat_building::DriftPhase,
+        level: usize,
+        latent: &[f32],
+        x0: &[f32],
+    ) -> Result<(), String> {
+        let tag: u8 = match phase {
+            bat_building::DriftPhase::Descent => 0,
+            bat_building::DriftPhase::Climb => 1,
+            bat_building::DriftPhase::Flux => 2,
+        };
+        let mut head = Vec::with_capacity(5);
+        head.push(tag);
+        head.extend_from_slice(&(level as u32).to_le_bytes());
+        let mut body = Vec::with_capacity((latent.len() + x0.len()) * 4);
+        for value in latent.iter().chain(x0.iter()) {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        let write = |writer: &mut std::io::BufWriter<std::fs::File>, bytes: &[u8]| {
+            std::io::Write::write_all(writer, bytes).map_err(|err| err.to_string())
+        };
+        write(&mut self.writer, &head).and_then(|_| write(&mut self.writer, &body))
+            .map_err(|err| format!("failed to write {}: {err}", self.path.display()))?;
+        self.frames += 1;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<PathBuf, String> {
+        std::io::Write::flush(&mut self.writer)
+            .map_err(|err| format!("failed to flush {}: {err}", self.path.display()))?;
+        Ok(self.path)
+    }
+}
+
 /// See the DEV/CI note in `main`. Not reachable from the TUI.
 ///
 /// Walks the same drift the TUI mode walks and writes one PNG per completed
@@ -418,6 +501,16 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // gradual dissolve can be read as a contact sheet instead of being taken on
     // trust. It is the only way to see the climb without a window.
     let climb_frames = flag("--climb-frames").and_then(|v| v.parse::<usize>().ok());
+    // `--actions N` stops after N drift actions instead of after N closed
+    // cycles. Flux never closes one — that is the point of it — so it is the
+    // only way to bound a flux run, and it is also how the two regimes get
+    // compared over the same number of frames.
+    let action_budget = flag("--actions").and_then(|v| v.parse::<usize>().ok());
+    // `--dump <path>` writes every frame's two panes as raw f32, which is the
+    // only honest substrate for the frame-to-frame measurements: |Δ| in flux is
+    // of the order of one 8-bit level, so a PNG would quantise away the very
+    // quantity being measured (`CLIMB_COHERENCE.md` §6).
+    let dump_path = flag("--dump").map(PathBuf::from);
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
         tui::storage::project_root()
             .join("perpetual_samples")
@@ -477,10 +570,27 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             out_dir.display()
         );
 
+        let mut dump = match dump_path.as_ref() {
+            Some(path) => Some(FrameDump::create(path, output_size)?),
+            None => None,
+        };
+
         let started = std::time::Instant::now();
         let mut steps = 0usize;
         let mut written = 0usize;
-        while written < frames {
+        let mut actions = 0usize;
+        while match action_budget {
+            Some(budget) => actions < budget,
+            None => written < frames,
+        } {
+            actions += 1;
+            // The phase that *produced* this frame, and the level the latent
+            // lands on — the drift has already advanced past both by the time
+            // the frame is recorded.
+            let phase = drift.phase();
+            // Assigned by every arm, so the compiler is the one checking that
+            // no frame is recorded against a level nobody set.
+            let level;
             match drift.step() {
                 DriftAction::Descend {
                     diffusion_step,
@@ -502,6 +612,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                         last_x0 = x0_hat;
                     }
                     steps += 1;
+                    level = diffusion_step.saturating_sub(1);
 
                     // One mid-descent frame per cycle: the moment the panes are
                     // most unlike each other — x_t still visibly noisy, x̂₀
@@ -534,6 +645,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     cycle_seed,
                     opens_cycle,
                 } => {
+                    level = forward_step;
                     // Mid-climb: carry the departure up one level and, on
                     // request, write the frames that show the image dissolving.
                     // Sampled rather than exhaustive — a t_r = 64 climb is 65
@@ -566,6 +678,13 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                                 ),
                                 &out_dir.join(format!("climb_{written:03}_t{forward_step:03}.png")),
                             )?;
+                        }
+                        // Same record as the tail of the loop — this branch
+                        // leaves early, and a dump that skipped mid-climb
+                        // frames would be missing exactly the frames a climb is
+                        // judged on.
+                        if let Some(dump) = dump.as_mut() {
+                            dump.record(phase, forward_step, &latent, &last_x0)?;
                         }
                         continue;
                     }
@@ -644,7 +763,37 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                         )?;
                     }
                 }
+                DriftAction::Flux {
+                    diffusion_step,
+                    path_seed,
+                    renoise_seed,
+                } => {
+                    let stepped = reverse_step(
+                        &mut model,
+                        &schedule,
+                        input_dims.z as usize,
+                        output_dims.z as usize,
+                        &latent,
+                        diffusion_step,
+                        path_seed,
+                        magnitude,
+                        true,
+                    );
+                    latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
+                    if let Some(x0_hat) = stepped.x0_hat {
+                        last_x0 = x0_hat;
+                    }
+                    steps += 1;
+                    level = diffusion_step;
+                }
             }
+            if let Some(dump) = dump.as_mut() {
+                dump.record(phase, level, &latent, &last_x0)?;
+            }
+        }
+        if let Some(dump) = dump.take() {
+            let path = dump.finish()?;
+            println!("  dump → {}", path.display());
         }
 
         let elapsed = started.elapsed().as_secs_f32();
@@ -1428,9 +1577,11 @@ async fn run_perpetual(
             // time; unlabelled, it reads as a fault.
             phase: drift.phase().label().to_string(),
             depth: drift.depth(),
-            min_depth: bat_building::MIN_RENOISE_DEPTH,
+            depth_label: drift.regime().depth_label().to_string(),
+            min_depth: drift.min_depth(),
             max_depth: drift.max_depth(),
-            cycle: drift.cycle(),
+            cycle: drift.counter().1,
+            cycle_label: drift.counter().0.to_string(),
             diffusion_step: drift.current_step(),
             steps,
             steps_per_sec,
@@ -1588,6 +1739,37 @@ async fn run_perpetual(
                 // The turn of the cycle is worth a redraw of the panel; the
                 // rest of the climb rides the usual 100 ms refresh.
                 dirty |= opens_cycle;
+            }
+            DriftAction::Flux {
+                diffusion_step,
+                path_seed,
+                renoise_seed,
+            } => {
+                // One frame of the stationary churn: a step down the reverse
+                // chain, then exactly that one level put back on by the forward
+                // increment. The noise level never moves, so there is no phase
+                // to turn round — only the content drifts, by about
+                // sqrt(beta_t*) a frame.
+                let stepped = reverse_step(
+                    &mut model,
+                    &schedule,
+                    input_channels,
+                    signal_channels,
+                    &latent,
+                    diffusion_step,
+                    path_seed,
+                    cfg.denoise_magnitude,
+                    true,
+                );
+                latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
+                // Unlike the climb, the model *is* predicting on every frame
+                // here, so the right-hand pane is live too.
+                if let Some(x0_hat) = stepped.x0_hat {
+                    live.publish(&latent, &x0_hat);
+                    last_x0 = x0_hat;
+                }
+                steps += 1;
+                pace.tick();
             }
         }
 

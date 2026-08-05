@@ -19,8 +19,8 @@ pub use metrics::{
     reverse_step, reverse_step_seed, sample_diffusion,
 };
 pub use perpetual::{
-    CLIMB_TEMPO_RATIO, DriftAction, DriftPhase, MIN_RENOISE_DEPTH, PerpetualDrift, PerpetualRegime,
-    RENOISE_DEPTH_STEP,
+    CLIMB_TEMPO_RATIO, DriftAction, DriftPhase, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, PerpetualDrift,
+    PerpetualRegime, RENOISE_DEPTH_STEP,
 };
 pub use schedule::LinearNoiseSchedule;
 pub use weighting::{DEFAULT_SNR_GAMMA, LossWeighting};
