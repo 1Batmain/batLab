@@ -464,6 +464,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         let mut last_x0 = vec![0.0f32; output_len];
         let mut previous_frame: Option<Vec<f32>> = None;
         let mut mid_captured = false;
+        // The state the climb in progress departed from — snapshotted when a
+        // cycle closes and read by every level of that climb.
+        let mut climb_departure: Option<Vec<f32>> = None;
 
         println!(
             "headless perpetual '{model_name}': regime={} t_r={} frames={frames} \
@@ -527,15 +530,23 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                 }
                 DriftAction::Climb {
                     forward_step,
-                    seed,
+                    departure_step,
+                    cycle_seed,
                     opens_cycle,
                 } => {
-                    // Mid-climb: apply the increment and, on request, write the
-                    // frames that show the image dissolving. Sampled rather
-                    // than exhaustive — a t_r = 64 climb is 65 frames and a
-                    // contact sheet wants a handful.
+                    // Mid-climb: carry the departure up one level and, on
+                    // request, write the frames that show the image dissolving.
+                    // Sampled rather than exhaustive — a t_r = 64 climb is 65
+                    // frames and a contact sheet wants a handful.
                     if !opens_cycle {
-                        latent = schedule.forward_step(&latent, forward_step, seed);
+                        latent = schedule.forward_from(
+                            climb_departure
+                                .as_ref()
+                                .expect("a climb always opens with `opens_cycle`"),
+                            departure_step,
+                            forward_step,
+                            cycle_seed,
+                        );
                         if let Some(count) = climb_frames
                             && climb_stride(drift.ceiling(), count)
                                 .is_some_and(|stride| forward_step % stride == 0)
@@ -605,9 +616,17 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     written += 1;
                     mid_captured = false;
 
-                    // The first increment of the climb, from the latent the
-                    // descent left — the same call every later increment makes.
-                    latent = schedule.forward_step(&latent, forward_step, seed);
+                    // The departure of this climb: the latent as the descent
+                    // left it. Every level of the climb is formed from this
+                    // same snapshot and the same field, which is what stops
+                    // the ascent from crackling (`CLIMB_COHERENCE.md`).
+                    climb_departure = Some(latent.clone());
+                    latent = schedule.forward_from(
+                        climb_departure.as_ref().expect("just set"),
+                        departure_step,
+                        forward_step,
+                        cycle_seed,
+                    );
                     // Written here rather than above so the contact sheet opens
                     // on the first dissolved frame, not on the settled image
                     // (which `window_NNN.png` already holds).
@@ -1363,6 +1382,9 @@ async fn run_perpetual(
     // is a flat mid-grey — never the pure-noise latent, which `add_noise` would
     // take for a clean image (see the perpetual module's header).
     let mut last_x0 = vec![0.0f32; output_len];
+    // The state the climb in progress departed from — snapshotted when a cycle
+    // closes and read by every level of that climb.
+    let mut climb_departure: Option<Vec<f32>> = None;
 
     let mut live = LiveFrame::new(
         model.gpu_context(),
@@ -1443,6 +1465,9 @@ async fn run_perpetual(
                             drift.reseed(next_seed);
                             latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
                             last_x0 = vec![0.0f32; output_len];
+                            // The reseed restarts on a descent, so no climb can
+                            // read this — dropped so none ever could.
+                            climb_departure = None;
                         }
                         tui::TrainingControlCommand::NudgeTempo(delta) => {
                             let factor = PerpetualConfig::TEMPO_FACTOR.powi(delta);
@@ -1528,14 +1553,30 @@ async fn run_perpetual(
             }
             DriftAction::Climb {
                 forward_step,
-                seed,
+                departure_step,
+                cycle_seed,
                 opens_cycle,
             } => {
-                // One increment of the forward process, applied to the latent
-                // where the descent left it. The image dissolves over as many
-                // frames as it took to resolve instead of being replaced by
-                // noise between two of them.
-                latent = schedule.forward_step(&latent, forward_step, seed);
+                // The cycle just closed: the latent is the image it settled on,
+                // and it is the departure every level of this climb is formed
+                // from — one snapshot, one noise field, revealed progressively.
+                // Re-noising incrementally instead would draw an independent
+                // field per frame and make the ascent crackle
+                // (`CLIMB_COHERENCE.md`).
+                if opens_cycle {
+                    climb_departure = Some(latent.clone());
+                }
+                // One level of the forward process, carried from that departure.
+                // The image dissolves over as many frames as it took to resolve
+                // instead of being replaced by noise between two of them.
+                latent = schedule.forward_from(
+                    climb_departure
+                        .as_ref()
+                        .expect("a climb always opens with `opens_cycle`"),
+                    departure_step,
+                    forward_step,
+                    cycle_seed,
+                );
                 // x̂₀ stays put: the model is not predicting during the climb,
                 // and inventing a right-hand pane would be a lie. The frozen
                 // estimate beside the dissolving latent is also what makes the
