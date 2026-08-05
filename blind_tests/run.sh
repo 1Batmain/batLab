@@ -58,6 +58,11 @@ perp flux knob_tstar 400 --seed 7 --t-star 30
 perp flux knob_tr    400 --seed 7 --t-r 30
 perp flux knob_bogus 400 --seed 7 --flag-inexistant-de-controle 30
 
+# hygiène : les runs ci-dessus réécrivent perpetual_samples/ (et le binaire peut toucher
+# aux configs de Models/) — on remet l'arbre de travail dans l'état du dépôt.
+git checkout -- perpetual_samples Models 2>/dev/null || true
+git clean -fdq perpetual_samples 2>/dev/null || true
+
 if [ "${BLIND_BASELINE:-0}" = "1" ]; then
   echo "→ baseline pré-flux (P7)"
   bash blind_tests/baseline.sh || echo "  (baseline indisponible — P7 restera partiel)"
