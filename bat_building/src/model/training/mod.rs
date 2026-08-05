@@ -3,6 +3,7 @@
 pub mod dataset;
 pub mod diffusion;
 pub mod metrics;
+pub mod perpetual;
 pub mod schedule;
 pub mod weighting;
 
@@ -16,6 +17,9 @@ pub use metrics::{
     BucketStat, DenoiseFrame, DenoiseStepStat, MetricsLogger, ProbeConfig, ReverseStep, Stats,
     compose_diffusion_input, log_probe, log_train_loss, log_trajectory, probe_diffusion,
     reverse_step, reverse_step_seed, sample_diffusion,
+};
+pub use perpetual::{
+    DriftAction, MIN_RENOISE_DEPTH, PerpetualDrift, PerpetualRegime, RENOISE_DEPTH_STEP,
 };
 pub use schedule::LinearNoiseSchedule;
 pub use weighting::{DEFAULT_SNR_GAMMA, LossWeighting};
