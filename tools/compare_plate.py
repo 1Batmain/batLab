@@ -31,12 +31,16 @@ def load_row(pattern, limit):
 def load_dataset_row(path, limit, offset=0):
     with open(path, "rb") as fh:
         header = fh.read(24)
+        magic = header[:8].rstrip(b"\x00").decode("ascii", "replace")
         _, width, height, channels = struct.unpack("<IIII", header[8:24])
         per = width * height * channels
-        fh.seek(24 + per * offset)
-        raw = np.frombuffer(fh.read(per * limit), dtype=np.uint8)
-    imgs = raw.reshape(-1, height, width, channels)[..., 0]
-    return [Image.fromarray(a, mode="L") for a in imgs]
+        fh.seek(24 + per * offset * 4)
+        raw = np.frombuffer(fh.read(per * limit * 4), dtype="<f4")
+    # payload f32 (main.rs:941) ; BATRAW1 est en [0,1], BATRAW2 en [-1,1]
+    imgs = raw.reshape(-1, height, width, channels)[..., 0].astype(np.float64)
+    if magic != "BATRAW1":
+        imgs = (imgs + 1.0) / 2.0
+    return [Image.fromarray(np.clip(a * 255, 0, 255).astype(np.uint8)) for a in imgs]
 
 
 def main():

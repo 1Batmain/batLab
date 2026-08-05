@@ -39,15 +39,23 @@ def load_images(pattern):
 
 
 def load_dataset(path, n, size=32):
-    """Lit les n premières images d'un .batraw (magic BATRAW1/2)."""
+    """Lit les n premières images d'un .batraw.
+
+    Format (main.rs:936-941) : en-tête 24 o puis
+    `count*w*h*c` valeurs **f32 LE** — pas des u8. BATRAW1 est en [0,1] et le
+    chargeur de production le rééchelonne en `v*2-1` ; BATRAW2 est déjà en
+    [-1,1]. On ramène ensuite en [0,1] pour comparer aux PNG décodés.
+    """
     with open(path, "rb") as fh:
         header = fh.read(24)
         magic = header[:8].rstrip(b"\x00").decode("ascii", "replace")
         count, width, height, channels = struct.unpack("<IIII", header[8:24])
         per = width * height * channels
-        raw = np.frombuffer(fh.read(per * n), dtype=np.uint8)
-    imgs = raw.reshape(n, height, width, channels)[..., 0].astype(np.float64) / 255.0
-    return magic, count, imgs
+        raw = np.frombuffer(fh.read(per * n * 4), dtype="<f4")
+    imgs = raw.reshape(n, height, width, channels)[..., 0].astype(np.float64)
+    if magic == "BATRAW1":
+        imgs = imgs * 2.0 - 1.0
+    return magic, count, (imgs + 1.0) / 2.0
 
 
 def banding_ratio(imgs):
