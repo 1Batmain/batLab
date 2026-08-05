@@ -348,11 +348,20 @@ where
                 compose_diffusion_input(&latent, input_channels, signal_channels, &features);
             let predicted_noise = model.predict(&model_input);
             let latent_in_stats = Stats::of(&latent);
+            // The per-step seed mixes the timestep in by multiply-add, not by
+            // XOR: `path_seed ^ diffusion_step` collided with the XOR the noise
+            // field itself used to fold in the pixel index, so every step of
+            // the chain re-drew one single field under an `index ^ step`
+            // permutation. See `gaussian_at` in `schedule.rs`. The schedule-side
+            // fix already breaks the collision; this keeps the caller from
+            // relying on it.
+            let step_seed = path_seed
+                .wrapping_add((diffusion_step as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
             latent = schedule.denoise_step_with_magnitude(
                 &latent,
                 &predicted_noise,
                 diffusion_step,
-                path_seed ^ diffusion_step as u64,
+                step_seed,
                 denoise_magnitude,
             );
             if path_idx == 0 {
