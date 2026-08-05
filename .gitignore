@@ -11,4 +11,3 @@ datasets/*.batraw
 datasets/cifar-10-batches-bin/
 *_metrics.jsonl
 runs/
-color_samples/
