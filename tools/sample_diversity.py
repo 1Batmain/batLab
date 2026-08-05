@@ -33,7 +33,10 @@ def load_images(pattern):
         sys.exit(f"aucune image pour le motif {pattern!r}")
     arrs = []
     for p in paths:
-        img = Image.open(p).convert("L")
+        # RGB et non "L" : sur un PNG couleur, convertir en luminance melangeait
+        # les canaux avant de mesurer. Un PNG gris devient trois canaux egaux,
+        # donc toutes les statistiques restent celles d'avant.
+        img = Image.open(p).convert("RGB")
         arrs.append(np.asarray(img, dtype=np.float64) / 255.0)
     return paths, np.stack(arrs)
 
@@ -52,16 +55,23 @@ def load_dataset(path, n, size=32):
         count, width, height, channels = struct.unpack("<IIII", header[8:24])
         per = width * height * channels
         raw = np.frombuffer(fh.read(per * n * 4), dtype="<f4")
-    imgs = raw.reshape(n, height, width, channels)[..., 0].astype(np.float64)
+    # Tous les canaux, pas `[..., 0]` : sur un dataset RGB ce dernier ne gardait
+    # que le ROUGE, et le comparait a des PNG lus en luminance — deux grandeurs
+    # differentes. Un dataset gris a C=1 et retrouve exactement ses chiffres.
+    imgs = raw.reshape(n, height, width, channels).astype(np.float64)
     if magic == "BATRAW1":
         imgs = imgs * 2.0 - 1.0
     return magic, count, (imgs + 1.0) / 2.0
 
 
 def banding_ratio(imgs):
-    """Différences verticales (entre rangées) vs horizontales (entre colonnes)."""
-    dv = np.diff(imgs, axis=-2)  # rangée -> rangée
-    dh = np.diff(imgs, axis=-1)  # colonne -> colonne
+    """Différences verticales (entre rangées) vs horizontales (entre colonnes).
+
+    `imgs` est (n, hauteur, largeur, canaux) : les rangees sont l'axe -3 et les
+    colonnes l'axe -2, l'axe -1 portant les canaux.
+    """
+    dv = np.diff(imgs, axis=-3)  # rangée -> rangée
+    dh = np.diff(imgs, axis=-2)  # colonne -> colonne
     v = float(np.sqrt((dv**2).mean()))
     h = float(np.sqrt((dh**2).mean()))
     return v / h if h > 0 else float("inf"), v, h
@@ -75,19 +85,28 @@ def stats(imgs, label):
         for j in range(i + 1, n):
             pair.append(float(np.sqrt(((imgs[i] - imgs[j]) ** 2).mean())))
     ratio, v, h = banding_ratio(imgs)
-    return {
+    out = {
         "label": label,
         "n": n,
         "inter_seed_std": float(inter.mean()),
         "inter_seed_std_max": float(inter.max()),
         "mean_pairwise_rmse": float(np.mean(pair)) if pair else 0.0,
         "min_pairwise_rmse": float(np.min(pair)) if pair else 0.0,
-        "intra_image_std": float(imgs.std(axis=(-2, -1)).mean()),
+        "intra_image_std": float(imgs.std(axis=(-3, -2, -1)).mean()),
         "pixel_mean": float(imgs.mean()),
         "banding_ratio": ratio,
         "row_diff_rms": v,
         "col_diff_rms": h,
     }
+    # Un modele couleur peut converger vers du gris (les trois canaux egaux) tout
+    # en gardant d'excellentes stats monochromes : la saturation le dit, pas elles.
+    if imgs.shape[-1] == 3:
+        r, g, bl = imgs[..., 0], imgs[..., 1], imgs[..., 2]
+        out["per_channel_mean"] = [float(r.mean()), float(g.mean()), float(bl.mean())]
+        out["per_channel_std"] = [float(r.std()), float(g.std()), float(bl.std())]
+        # Ecart-type entre canaux d'un meme pixel : 0 = image grise.
+        out["chroma_std"] = float(imgs.std(axis=-1).mean())
+    return out
 
 
 def main():
