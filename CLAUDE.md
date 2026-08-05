@@ -15,6 +15,10 @@ Propriétés : ne réécrit jamais le `config_file` du modèle, écrit son check
 
 Pour piloter le vrai TUI malgré tout (test end-to-end) : le lancer dans un pane tmux dédié et le piloter via `tmux send-keys`.
 
+## Tests à l'aveugle (protocole projet)
+
+Pour tout jalon à invariants comportementaux, les tests de l'agent d'implémentation ne suffisent pas : un agent qui a lu/écrit le code produit des tests-miroirs (ils affirment ce que le code fait, pas ce qu'il devrait faire — le mutation testing ne protège pas de ce biais). L'architecte lance donc, après l'implémentation, un **agent de test aveugle** : spec + contrats publics fournis, **interdiction de lire l'implémentation** (il peut compiler, exécuter, observer les sorties). Un écart se signale en citant la spec, jamais en éditant un test. Les deux suites coexistent ; leur désaccord est le signal.
+
 ## Points d'attention
 
 - **Piège du workspace** : `cargo build --release` à la racine ne reconstruit PAS le binaire `main` (il ne bâtit que la lib racine). Toujours `cargo build/run --release -p main`. Après un changement de flag CLI, vérifier la bannière du run (le binaire réémet sa config parsée).
