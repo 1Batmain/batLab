@@ -1309,6 +1309,19 @@ mod tests {
                  would vibrate in place instead of drifting"
             );
         }
+        // And *within* a frame: the posterior draw and the re-noising field are
+        // two independent sources, not one counted twice. Comparing the seeds
+        // cannot see this — the sampler transforms its own before drawing, so a
+        // drift that handed out the same number twice would still show two
+        // different seeds here. Only the fields tell.
+        for (path, field) in paths.iter().zip(fields.iter()).take(16) {
+            let r = correlation(*path, *field);
+            assert!(
+                r.abs() < 0.05,
+                "a frame's two fields are the same one (r = {r:.3}): the churn \
+                 would push twice in a single direction instead of drawing twice"
+            );
+        }
     }
 
     /// **The noise level is stationary, measured rather than asserted.**
@@ -1343,7 +1356,17 @@ mod tests {
         let mut changes: Vec<f64> = Vec::new();
         let mut history: Vec<Vec<f32>> = Vec::new();
         let mut frames = 0;
+        let mut actions = 0;
         while frames < 400 {
+            // A drift that stopped yielding stationary frames — an approach
+            // that overshoots `t*` turns flux into a two-frame cycle — would
+            // spin here forever. A test that hangs reports nothing.
+            actions += 1;
+            assert!(
+                actions < STEPS + 4_000,
+                "the drift stopped holding its level: {frames} stationary frames \
+                 in {actions} actions"
+            );
             // The approach onto t* is walked by the caller with the same maths;
             // only the stationary part is measured, so it is skipped here.
             let DriftAction::Flux {
