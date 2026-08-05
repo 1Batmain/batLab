@@ -143,7 +143,7 @@ impl LinearNoiseSchedule {
         let mut noise = Vec::with_capacity(clean.len());
 
         for (index, value) in clean.iter().enumerate() {
-            let sample_noise = gaussian_from_seed(seed ^ index as u64);
+            let sample_noise = gaussian_at(seed, index);
             noise.push(sample_noise);
             noisy.push(signal_scale * *value + noise_scale * sample_noise);
         }
@@ -152,9 +152,7 @@ impl LinearNoiseSchedule {
     }
 
     pub fn sample_noise(&self, len: usize, seed: u64) -> Vec<f32> {
-        (0..len)
-            .map(|index| gaussian_from_seed(seed ^ index as u64))
-            .collect()
+        (0..len).map(|index| gaussian_at(seed, index)).collect()
     }
 
     pub fn denoise_step(
@@ -215,20 +213,66 @@ impl LinearNoiseSchedule {
                 if sigma == 0.0 {
                     mean
                 } else {
-                    mean + sigma * gaussian_from_seed(seed ^ index as u64)
+                    mean + sigma * gaussian_at(seed, index)
                 }
             })
             .collect()
     }
 }
 
-fn unit_from_seed(mut value: u64) -> f32 {
+/// Odd increment of the SplitMix64 stream (the golden-ratio constant).
+const STREAM_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Draws element `index` of the noise field identified by `seed`.
+///
+/// The index is folded in by **addition through an odd multiplier**, never by
+/// XOR. `gaussian_from_seed(seed ^ index)` reads as harmless — the murmur3
+/// finaliser downstream avalanches fine — but it is catastrophic as soon as the
+/// *caller* also derives its per-draw seed by XOR, which the reverse chain did
+/// (`path_seed ^ diffusion_step`):
+///
+/// ```text
+/// n(step, index) = g(base ^ step ^ index) = n(step', index ^ step ^ step')
+/// ```
+///
+/// i.e. every step of the chain draws the *same* field, merely permuted by
+/// `index -> index ^ step ^ step'`. Accumulated over the 256 reverse steps, the
+/// total injected noise at a pixel then depends on its index only through
+/// `sigma_{u ^ index}` — and `sigma` is smooth in `step`, so flipping a *low*
+/// bit of the index barely changes the sum. On a 32-wide image the low 5 bits
+/// are `x`: the injected noise came out all but constant along a row, and the
+/// sampler painted horizontal bands whatever the model predicted
+/// (`ANISOTROPY_HUNT.md`; guarded by
+/// `injected_noise_over_reverse_chain_is_isotropic`).
+///
+/// The seed is therefore **avalanched first** (`fmix64`), and only then does the
+/// index stream get added. Any relation between two caller seeds — XOR, or the
+/// `+ step * GAMMA` a caller might reasonably use — is destroyed by the mix
+/// before the index is folded in, so no two fields are reindexings of one
+/// another. Doing it the other way round is not enough: `seed + (index+1)*GAMMA`
+/// with a caller seed of `base + (step+1)*GAMMA` collapses to
+/// `base + (step+index+2)*GAMMA`, a field constant along the anti-diagonals —
+/// the same defect wearing a different hat, and the regression test catches it.
+fn gaussian_at(seed: u64, index: usize) -> f32 {
+    let field_key = fmix64(seed);
+    gaussian_from_seed(
+        field_key.wrapping_add((index as u64).wrapping_add(1).wrapping_mul(STREAM_GAMMA)),
+    )
+}
+
+/// murmur3's 64-bit finaliser: full avalanche, every input bit affecting every
+/// output bit.
+fn fmix64(mut value: u64) -> u64 {
     value ^= value >> 33;
     value = value.wrapping_mul(0xff51afd7ed558ccd);
     value ^= value >> 33;
     value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
     value ^= value >> 33;
-    let normalized = (value >> 40) as u32;
+    value
+}
+
+fn unit_from_seed(value: u64) -> f32 {
+    let normalized = (fmix64(value) >> 40) as u32;
     (normalized as f32 / ((1u32 << 24) - 1) as f32).clamp(1e-7, 1.0 - 1e-7)
 }
 
@@ -316,6 +360,77 @@ mod tests {
             max_abs < 5.0,
             "reverse chain exploded despite x0 clamping: max |x| = {max_abs}"
         );
+    }
+
+    /// Anisotropy hunt — the defect that made every generated image a stack of
+    /// horizontal bands.
+    ///
+    /// A single noise field was always isotropic, so per-field checks passed.
+    /// What collapsed was the field *summed over the reverse chain*: with the
+    /// old `gaussian_from_seed(seed ^ index)` fed a caller seed of
+    /// `base ^ step`, the 256 steps drew one field under XOR permutations of the
+    /// pixel index, and the sum stopped depending on the low bits of the index —
+    /// i.e. on `x`. This walks the real sampler recursion with a null model
+    /// (eps_hat = 0), so it exercises exactly the accumulation the sampler
+    /// performs, and asserts the accumulated field is isotropic on a 32x32 grid.
+    ///
+    /// Measured: 15.6 before the fix, 1.0 after (the assertion trips at 1.5).
+    #[test]
+    fn injected_noise_over_reverse_chain_is_isotropic() {
+        const W: usize = 32;
+        const H: usize = 32;
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let zero_eps = vec![0.0f32; W * H];
+
+        // Same seed derivation as `sample_diffusion`, for one path.
+        let base_seed = 0x5eed_u64;
+        let mut latent = vec![0.0f32; W * H]; // start at zero: isolate the injected noise
+        for step in (0..schedule.len()).rev() {
+            let step_seed =
+                base_seed.wrapping_add((step as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            latent = schedule.denoise_step_with_magnitude(&latent, &zero_eps, step, step_seed, 1.0);
+        }
+
+        let rms = |d: &[f32]| (d.iter().map(|v| (v * v) as f64).sum::<f64>() / d.len() as f64).sqrt();
+        let rows: Vec<f32> = (1..H)
+            .flat_map(|y| (0..W).map(move |x| (y, x)))
+            .map(|(y, x)| latent[y * W + x] - latent[(y - 1) * W + x])
+            .collect();
+        let cols: Vec<f32> = (0..H)
+            .flat_map(|y| (1..W).map(move |x| (y, x)))
+            .map(|(y, x)| latent[y * W + x] - latent[y * W + x - 1])
+            .collect();
+        let (row_rms, col_rms) = (rms(&rows), rms(&cols));
+        let ratio = row_rms / col_rms.max(f64::EPSILON);
+
+        assert!(
+            ratio < 1.5 && ratio > 1.0 / 1.5,
+            "injected sampler noise is anisotropic: row_diff_rms = {row_rms:.4e}, \
+             col_diff_rms = {col_rms:.4e}, ratio = {ratio:.2}. The reverse chain must not \
+             draw correlated fields across steps (see `gaussian_at`)."
+        );
+    }
+
+    /// The narrower invariant behind the one above: two noise fields whose seeds
+    /// differ must not be permutations of one another. Under `seed ^ index` the
+    /// field at `seed ^ delta` was *exactly* the field at `seed` reindexed by
+    /// `index ^ delta`, so this comparison was bit-for-bit equal.
+    #[test]
+    fn fields_of_xor_related_seeds_are_not_permutations_of_each_other() {
+        let schedule = LinearNoiseSchedule::new_linear(4, 1e-4, 0.02);
+        let seed = 0xabcd_1234_u64;
+        for delta in [1u64, 2, 8, 64, 255] {
+            let a = schedule.sample_noise(1024, seed);
+            let b = schedule.sample_noise(1024, seed ^ delta);
+            let permuted_matches = (0..1024)
+                .filter(|&i| a[i] == b[i ^ delta as usize])
+                .count();
+            assert!(
+                permuted_matches < 1024,
+                "field(seed ^ {delta}) is field(seed) permuted by `index ^ {delta}` \
+                 ({permuted_matches}/1024 elements identical)"
+            );
+        }
     }
 
     #[test]
