@@ -14,7 +14,7 @@ use bat_building::tui::{
 use bat_building::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
     DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
-    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
+    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting, compose_live_frame, live_frame_width,
     MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
     Stats, Trainer, UpsampleConvType, WeightInit, log_probe, log_train_loss, log_trajectory,
     model::Training, probe_diffusion, reverse_step, sample_diffusion,
@@ -398,6 +398,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     let magnitude = flag("--magnitude")
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(1.0);
+    // `--window` also writes the composed x_t | x̂₀ frame the live visualiser
+    // would be showing — the layout, out of the same function the window uses.
+    let window_frames = args.iter().any(|arg| arg == "--window");
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
         tui::storage::project_root()
             .join("perpetual_samples")
@@ -443,6 +446,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
         let mut last_x0 = vec![0.0f32; output_len];
         let mut previous_frame: Option<Vec<f32>> = None;
+        let mut mid_captured = false;
 
         println!(
             "headless perpetual '{model_name}': regime={} t_r={} frames={frames} \
@@ -478,6 +482,26 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                         last_x0 = x0_hat;
                     }
                     steps += 1;
+
+                    // One mid-descent frame per cycle: the moment the panes are
+                    // most unlike each other — x_t still visibly noisy, x̂₀
+                    // already an image. That contrast is what a user reads as
+                    // "the two halves are decorrelated", so it is the frame the
+                    // rule has to survive.
+                    if window_frames && !mid_captured && diffusion_step * 2 <= drift.depth() {
+                        write_tensor_png(
+                            &compose_live_frame(
+                                &latent,
+                                &last_x0,
+                                output_size.0,
+                                output_size.1,
+                                output_size.2,
+                            ),
+                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            &out_dir.join(format!("window_{:03}_mid_t{diffusion_step}.png", written)),
+                        )?;
+                        mid_captured = true;
+                    }
                 }
                 DriftAction::Renoise { to_step, seed } => {
                     // A cycle just closed: `last_x0` is the image it settled on.
@@ -486,6 +510,25 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                         output_size,
                         &out_dir.join(format!("{:03}.png", written)),
                     )?;
+                    // …and, on request, the frame the live window would be
+                    // showing at this instant. In errance the cycle closes at
+                    // t=0, where the sampler's output IS its x̂₀ estimate, so
+                    // the two panes must land on the same image — the visual
+                    // half of the check `identical_sources_produce_two_identical_panes`
+                    // makes on synthetic data.
+                    if window_frames {
+                        write_tensor_png(
+                            &compose_live_frame(
+                                &latent,
+                                &last_x0,
+                                output_size.0,
+                                output_size.1,
+                                output_size.2,
+                            ),
+                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            &out_dir.join(format!("window_{:03}.png", written)),
+                        )?;
+                    }
                     let change = previous_frame.as_ref().map(|prev| {
                         prev.iter()
                             .zip(last_x0.iter())
@@ -501,6 +544,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     );
                     previous_frame = Some(last_x0.clone());
                     written += 1;
+                    mid_captured = false;
 
                     let (noisy, _) = schedule.add_noise(&last_x0, to_step, seed);
                     latent = noisy;

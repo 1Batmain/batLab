@@ -21,4 +21,4 @@ pub use model::{
     FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, ModelError, OptimizerKind,
     PaddingMode, UpsampleConvType, WeightInit,
 };
-pub use visualiser::LiveFrame;
+pub use visualiser::{LiveFrame, compose_live_frame, live_frame_width};

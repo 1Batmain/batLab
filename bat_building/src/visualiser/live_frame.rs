@@ -131,6 +131,31 @@ impl LiveFrame {
     }
 }
 
+/// Composes the frame the visualiser would display, as a plain CPU tensor of
+/// `live_frame_width(width) × height × channels` — no GPU, no window.
+///
+/// The window is what users report on ("the image is cut in two"), so the
+/// headless path can write out exactly what it would have shown, through the
+/// same composition the live path uses. A screenshot proves what one screen
+/// did; this proves what the buffer holds.
+pub fn compose_live_frame(
+    latent: &[f32],
+    x0_hat: &[f32],
+    width: u32,
+    height: u32,
+    channels: u32,
+) -> Vec<f32> {
+    let (width, height, channels) = (width.max(1), height.max(1), channels.max(1));
+    let mut staging = vec![0.0f32; (frame_width_of(width) * height * channels) as usize];
+    compose_frame(&mut staging, latent, x0_hat, width, height, channels);
+    staging
+}
+
+/// Width of the frame [`compose_live_frame`] returns, for a given pane width.
+pub fn live_frame_width(pane_width: u32) -> u32 {
+    frame_width_of(pane_width.max(1))
+}
+
 /// Width of the composed frame for a given pane width. The `+ 3` is the rule:
 /// the visualiser is told this number, so the gutter is real pixels in the
 /// buffer rather than something the shader would have to know about.
