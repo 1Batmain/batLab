@@ -992,7 +992,10 @@ mod tests {
             for frame in [LIVE_FRAME, (32, 32), (1, 1)] {
                 let (x, y, w, h) = letterbox_viewport(surface, frame);
                 let (sw, sh) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
-                assert!(w > 0.0 && h > 0.0, "empty viewport for {surface:?}/{frame:?}");
+                assert!(
+                    w > 0.0 && h > 0.0,
+                    "empty viewport for {surface:?}/{frame:?}"
+                );
                 assert!(
                     x >= 0.0 && y >= 0.0 && x + w <= sw && y + h <= sh,
                     "viewport ({x},{y},{w},{h}) escapes {surface:?}"

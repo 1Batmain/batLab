@@ -439,8 +439,11 @@ mod tests {
                 .map(|(a, b)| *a as f64 - signal * *b as f64)
                 .collect();
             let mean = residual.iter().sum::<f64>() / N as f64;
-            let variance =
-                residual.iter().map(|r| (r - mean) * (r - mean)).sum::<f64>() / N as f64;
+            let variance = residual
+                .iter()
+                .map(|r| (r - mean) * (r - mean))
+                .sum::<f64>()
+                / N as f64;
             (mean, variance.sqrt())
         };
 
@@ -577,7 +580,8 @@ mod tests {
             latent = schedule.denoise_step_with_magnitude(&latent, &zero_eps, step, step_seed, 1.0);
         }
 
-        let rms = |d: &[f32]| (d.iter().map(|v| (v * v) as f64).sum::<f64>() / d.len() as f64).sqrt();
+        let rms =
+            |d: &[f32]| (d.iter().map(|v| (v * v) as f64).sum::<f64>() / d.len() as f64).sqrt();
         let rows: Vec<f32> = (1..H)
             .flat_map(|y| (0..W).map(move |x| (y, x)))
             .map(|(y, x)| latent[y * W + x] - latent[(y - 1) * W + x])
@@ -608,9 +612,7 @@ mod tests {
         for delta in [1u64, 2, 8, 64, 255] {
             let a = schedule.sample_noise(1024, seed);
             let b = schedule.sample_noise(1024, seed ^ delta);
-            let permuted_matches = (0..1024)
-                .filter(|&i| a[i] == b[i ^ delta as usize])
-                .count();
+            let permuted_matches = (0..1024).filter(|&i| a[i] == b[i ^ delta as usize]).count();
             assert!(
                 permuted_matches < 1024,
                 "field(seed ^ {delta}) is field(seed) permuted by `index ^ {delta}` \
