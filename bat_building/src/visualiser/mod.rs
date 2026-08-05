@@ -274,6 +274,9 @@ struct ActiveVisualiser {
     window: Arc<Window>,
     is_visible: bool,
     is_occluded: bool,
+    /// When the last redraw was asked for, used to hold the frame rate to
+    /// `FRAME_INTERVAL_MS` (see `about_to_wait`).
+    last_frame_request: Instant,
     state: RenderState,
 }
 
@@ -351,6 +354,7 @@ impl ActiveVisualiser {
                         window,
                         is_visible: req.initial_visible,
                         is_occluded: false,
+                        last_frame_request: Instant::now(),
                         state,
                     });
                 }
@@ -710,8 +714,18 @@ impl ApplicationHandler for VisualiserManagerApp {
         };
         let next = Instant::now() + Duration::from_millis(interval_ms);
         event_loop.set_control_flow(ControlFlow::WaitUntil(next));
-        if let Some(active) = &self.active {
-            if active.is_visible && !active.is_occluded {
+        if let Some(active) = self.active.as_mut() {
+            // `WaitUntil` only sets a deadline to wake up *by*; it does not stop
+            // the loop waking earlier, and on macOS the display link drives
+            // `about_to_wait` at the screen's refresh rate. Requesting a redraw
+            // on every pass therefore rendered at 120 fps here, not the 30 fps
+            // intended — and since the visualiser shares one GPU with the model,
+            // that cost inference two thirds of its sampling throughput
+            // (measured: 332 steps/s hidden vs 111 visible). Gating on elapsed
+            // time is what actually enforces the budget.
+            let due = active.last_frame_request.elapsed() >= Duration::from_millis(interval_ms);
+            if active.is_visible && !active.is_occluded && due {
+                active.last_frame_request = Instant::now();
                 active.window.request_redraw();
             }
         }
