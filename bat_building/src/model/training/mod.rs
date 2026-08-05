@@ -13,9 +13,9 @@ use std::fmt;
 pub use dataset::{GpuDataset, GpuDatasetError};
 pub use diffusion::DiffusionTask;
 pub use metrics::{
-    BucketStat, DenoiseFrame, DenoiseStepStat, MetricsLogger, ProbeConfig, Stats,
+    BucketStat, DenoiseFrame, DenoiseStepStat, MetricsLogger, ProbeConfig, ReverseStep, Stats,
     compose_diffusion_input, log_probe, log_train_loss, log_trajectory, probe_diffusion,
-    sample_diffusion,
+    reverse_step, reverse_step_seed, sample_diffusion,
 };
 pub use schedule::LinearNoiseSchedule;
 pub use weighting::{DEFAULT_SNR_GAMMA, LossWeighting};
