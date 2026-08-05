@@ -67,10 +67,15 @@ static VISUALISER_CMD_TX: OnceLock<Sender<ManagerCommand>> = OnceLock::new();
 /// Not black: the frame's own darkest pixel is black too, so black bands would
 /// merge with the image and hide where it actually ends. Not mid-grey either,
 /// which competes with the picture. This is the "outside the image" chrome.
+///
+/// **Values are linear, the surface is sRGB.** The clear colour is not passed
+/// through the transfer function, so an innocent-looking `0.08` came out at
+/// `sRGB 80/255` — a mid-grey that framed the image like a mount. Measured on a
+/// screenshot, not assumed: these three land near `sRGB 28/255`.
 const LETTERBOX_COLOUR: wgpu::Color = wgpu::Color {
-    r: 0.08,
-    g: 0.08,
-    b: 0.09,
+    r: 0.0115,
+    g: 0.0115,
+    b: 0.0135,
     a: 1.0,
 };
 
