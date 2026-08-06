@@ -5,7 +5,7 @@
 //! window from a worker thread, exactly the way the TUI does.
 
 use batlab_core::GpuContext;
-use batlab_core::visualiser::{run_on_main_thread, spawn_window};
+use batlab_ui::visualiser::{run_on_main_thread, spawn_window};
 use std::sync::Arc;
 use std::time::Duration;
 

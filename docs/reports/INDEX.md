@@ -12,10 +12,15 @@ Pour une lecture en une passe, commencer par [SYNTHESE_CAMPAGNE.md](SYNTHESE_CAM
 
 | Cité dans les rapports | Aujourd'hui |
 | --- | --- |
-| `bat_building/` | `crates/batlab-core/` |
+| `bat_building/` | scindé : `crates/batlab-core/` (moteur) et `crates/batlab-ui/` (TUI, visualiseur, storage) |
 | `bat_building/src/model/…` | `crates/batlab-core/src/model/…` |
+| `bat_building/src/tui/…` | `crates/batlab-ui/src/tui/…` |
+| `bat_building/src/tui/storage.rs` | `crates/batlab-ui/src/storage.rs` |
+| `bat_building/src/tui/app.rs` | scindé : schéma sérialisable → `crates/batlab-core/src/config.rs`, état d'écran → `crates/batlab-ui/src/tui/app.rs` |
+| `bat_building/src/visualiser/` | `crates/batlab-ui/src/visualiser/` |
+| `bat_building/src/visualiser/live_frame.rs` | `crates/batlab-core/src/live_frame.rs` (la couture reste côté moteur) |
 | `main/`, `main/src/main.rs` | `crates/batlab/`, `crates/batlab/src/main.rs` |
-| paquet `bat_building` (`-p bat_building`) | paquet `batlab_core` (`-p batlab_core`) |
+| paquet `bat_building` (`-p bat_building`) | paquets `batlab_core` et `batlab_ui` |
 | paquet `main` (`-p main`) | paquet `batlab` (`-p batlab`) |
 | binaire `target/release/main` | `target/release/batlab` |
 | paquet racine `batBuilder`, `src/lib.rs` | supprimé (la racine est un workspace pur) |

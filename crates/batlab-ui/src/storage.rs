@@ -1,6 +1,13 @@
-//! File purpose: Implements storage behavior for the terminal user interface flow.
+//! File purpose: The on-disk layout — where `Models/`, `datasets/` and the
+//! checkpoints live, and how a `config_file` is read and written.
+//!
+//! This is deliberately *not* in `batlab_core`. The engine takes bytes
+//! ([`ModelConfig::from_json_bytes`], [`batlab_core::Model::load_checkpoint_bytes`])
+//! and knows nothing of paths, so that the same inference chain can run in a
+//! browser where there is no filesystem at all. Deciding that a model's config
+//! sits at `Models/<name>/config_file` is a host decision, and it is made here.
 
-use super::app::ModelConfig;
+use batlab_core::config::ModelConfig;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,10 +35,11 @@ fn serde_to_io(err: serde_json::Error) -> io::Error {
 /// generated sample folders.
 ///
 /// Found by walking up until a `Cargo.toml` that declares `[workspace]`, not by
-/// a fixed number of `parent()` hops. The crate moved from `<root>/bat_building`
-/// to `<root>/crates/batlab-core` during the restructure, and a hard-coded hop
-/// count would have silently resolved `Models/` to `crates/Models/` — every
-/// model and dataset invisible, with no error until first use.
+/// a fixed number of `parent()` hops. This code moved twice during the
+/// restructure — `bat_building/` → `crates/batlab-core/` → `crates/batlab-ui/` —
+/// and each hop would have silently resolved `Models/` to `crates/Models/` with
+/// a hard-coded count: every model and dataset invisible, no error until first
+/// use.
 pub fn project_root() -> PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -41,7 +49,7 @@ pub fn project_root() -> PathBuf {
                 fs::read_to_string(dir.join("Cargo.toml"))
                     .is_ok_and(|manifest| manifest.contains("[workspace]"))
             })
-            .expect("batlab_core should live under a cargo workspace root")
+            .expect("batlab_ui should live under a cargo workspace root")
             .to_path_buf()
     })
     .clone()
@@ -95,14 +103,16 @@ pub fn write_model_config(model_name: &str, config: &ModelConfig) -> io::Result<
     let path = model_config_path(model_name)?;
     let mut persisted = config.clone();
     persisted.model_name = Some(model_name.to_string());
-    let bytes = serde_json::to_vec_pretty(&persisted).map_err(serde_to_io)?;
+    // Via l'API bytes du moteur, pas serde_json directement : c'est la même
+    // porte que prendra un build wasm, elle doit rester la seule.
+    let bytes = persisted.to_json_bytes().map_err(serde_to_io)?;
     fs::write(&path, bytes)?;
     Ok(path)
 }
 
 pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {
     let bytes = fs::read(path)?;
-    let mut config: ModelConfig = serde_json::from_slice(&bytes).map_err(serde_to_io)?;
+    let mut config = ModelConfig::from_json_bytes(&bytes).map_err(serde_to_io)?;
     if config.model_name.is_none() {
         config.model_name = path
             .parent()
@@ -219,9 +229,9 @@ pub fn list_datasets() -> io::Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// The restructure moved this crate one level deeper; nothing errors when
-    /// `project_root()` lands on the wrong directory, the TUI just reports an
-    /// empty `Models/`. Anchor it on the two directories that must be there.
+    /// Nothing errors when `project_root()` lands on the wrong directory — the
+    /// TUI just reports an empty `Models/`. Anchor it on the directories that
+    /// must be there, so a future move fails loudly instead of silently.
     #[test]
     fn project_root_is_the_workspace_that_holds_models_and_datasets() {
         let root = project_root();

@@ -1,4 +1,10 @@
-# File purpose: Cargo manifest for the batlab_core library crate (GPU context, model, training, TUI, visualiser).
+# File purpose: Cargo manifest for the batlab_core engine crate.
+#
+# INVARIANT: wgpu is the ONLY graphics dependency here. The engine is meant to
+# run in a browser on the visitor's own GPU (WebGPU via wgpu), so nothing that
+# assumes a terminal (ratatui, crossterm) or a native window (winit) belongs in
+# this crate — those live in batlab-ui. Adding one back would silently close the
+# web path, so treat this list as a contract, not a convenience.
 
 [package]
 name = "batlab_core"
@@ -8,13 +14,10 @@ edition = "2024"
 
 [dependencies]
 bytemuck = "1.25.0"
-crossterm = "0.28"
 encase = "0.12.0"
 enum_dispatch = "0.3.13"
 futures = "0.3.32"
 pollster = "0.4.0"
-ratatui = "0.29"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 wgpu = "28.0.0"
-winit = "0.30.12"

@@ -2,14 +2,16 @@
 
 pub mod app;
 pub mod events;
-pub mod storage;
 pub mod ui;
 pub mod visualiser_control;
 
-pub use app::{
-    ActivationMethod, App, InferenceConfig, LayerDraft, LayerKind, LossMethod, ModelConfig,
-    MonitorImage, PaddingMode, PerpetualConfig, PerpetualStatus, RunConfig, RunMode, Screen,
-    TrainingConfig, TrainingControlCommand,
+pub use app::{App, MonitorImage, PerpetualStatus, Screen};
+// Re-exported for call sites that already speak in terms of `tui::…`; the types
+// themselves are engine-side (`batlab_core::config`) because a model
+// description must survive without a terminal.
+pub use batlab_core::config::{
+    ActivationMethod, InferenceConfig, LayerDraft, LayerKind, LossMethod, ModelConfig, PaddingMode,
+    PerpetualConfig, RunConfig, RunMode, TrainingConfig, TrainingControlCommand,
 };
 pub use events::TrainingEvent;
 pub use visualiser_control::{

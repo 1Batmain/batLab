@@ -1,6 +1,6 @@
 //! File purpose: Owns visualiser lifecycle from TUI and provides a simple public control API.
 
-use crate::GpuContext;
+use batlab_core::GpuContext;
 use crate::visualiser::{VisualiserHandle, spawn_window_with_visibility, warmup_manager};
 use std::sync::{Arc, Mutex, OnceLock};
 

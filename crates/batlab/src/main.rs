@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use batlab_core::tui::{
+use batlab_ui::storage;
+use batlab_ui::tui::{
     self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, PerpetualConfig,
     RunMode, TrainingConfig,
 };
@@ -165,7 +166,7 @@ fn main() {
     // worker thread instead. `run_on_main_thread` returns once that worker does.
     // The headless path also runs inside it: the training path can warm the
     // visualiser, which needs the event loop to be available.
-    batlab_core::visualiser::run_on_main_thread(|| {
+    batlab_ui::visualiser::run_on_main_thread(|| {
         // -----------------------------------------------------------------
         // DEV/CI ONLY — headless training entry point.
         //
@@ -305,9 +306,9 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         None => LossWeighting::default(),
     };
 
-    let config_path = tui::storage::model_config_path(&model_name)
+    let config_path = storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
-    let mut config = tui::storage::load_model_config(&config_path)
+    let mut config = storage::load_model_config(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
 
     let dataset_path = flag("--dataset")
@@ -426,9 +427,9 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(1.0);
 
-    let config_path = tui::storage::model_config_path(&model_name)
+    let config_path = storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
-    let config = tui::storage::load_model_config(&config_path)
+    let config = storage::load_model_config(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
 
     let out_path = flag("--out").unwrap_or_else(|| {
@@ -699,14 +700,14 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // quantity being measured (`CLIMB_COHERENCE.md` §6).
     let dump_path = flag("--dump").map(PathBuf::from);
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
-        tui::storage::project_root()
+        storage::project_root()
             .join("perpetual_samples")
             .join(regime.label())
     });
 
-    let config_path = tui::storage::model_config_path(&model_name)
+    let config_path = storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
-    let config = tui::storage::load_model_config(&config_path)
+    let config = storage::load_model_config(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
     let checkpoint = flag("--checkpoint");
 
@@ -1061,7 +1062,7 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<(), St
     let model_name = match config.model_name.clone() {
         Some(name) => name,
         None => {
-            let generated = tui::storage::next_model_name()
+            let generated = storage::next_model_name()
                 .map_err(|err| format!("failed to allocate model name: {err}"))?;
             config.model_name = Some(generated.clone());
             generated
@@ -1072,14 +1073,14 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<(), St
         && train.checkpoint_path.is_none()
     {
         train.checkpoint_path = Some(
-            tui::storage::default_model_checkpoint_path(&model_name)
+            storage::default_model_checkpoint_path(&model_name)
                 .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?
                 .to_string_lossy()
                 .to_string(),
         );
     }
 
-    tui::storage::write_model_config(&model_name, config)
+    storage::write_model_config(&model_name, config)
         .map_err(|err| format!("failed to write model config for '{model_name}': {err}"))?;
     Ok(())
 }
@@ -1127,7 +1128,7 @@ async fn run_training(
         None => config
             .model_name
             .as_deref()
-            .map(tui::storage::default_model_checkpoint_path)
+            .map(storage::default_model_checkpoint_path)
             .transpose()
             .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?,
     };
@@ -1762,7 +1763,7 @@ async fn run_perpetual(
         ),
     );
 
-    let sample_dir = tui::storage::project_root().join("perpetual_samples");
+    let sample_dir = storage::project_root().join("perpetual_samples");
     let mut tempo = cfg
         .tempo
         .clamp(PerpetualConfig::MIN_TEMPO, PerpetualConfig::MAX_TEMPO);
@@ -2108,7 +2109,7 @@ fn resolve_sampling_checkpoint_path(
         .model_name
         .as_deref()
         .ok_or_else(|| "inference requires a named model configuration".to_string())?;
-    let checkpoint = tui::storage::default_model_checkpoint_path(model_name).map_err(|err| {
+    let checkpoint = storage::default_model_checkpoint_path(model_name).map_err(|err| {
         format!("failed to resolve inference checkpoint path for '{model_name}': {err}")
     })?;
     if !checkpoint.exists() {

@@ -11,6 +11,7 @@ image = "0.25.9"
 winit = "0.30.12"
 
 batlab_core = { path = "../batlab-core", default-features = false }
+batlab_ui = { path = "../batlab-ui" }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]

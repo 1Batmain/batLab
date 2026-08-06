@@ -216,6 +216,7 @@ name = "batlab"
 version = "0.1.0"
 dependencies = [
  "batlab_core",
+ "batlab_ui",
  "image",
  "tokio",
  "wgpu",
@@ -227,11 +228,22 @@ name = "batlab_core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "crossterm",
  "encase",
  "enum_dispatch",
  "futures",
  "pollster",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
+name = "batlab_ui"
+version = "0.1.0"
+dependencies = [
+ "batlab_core",
+ "bytemuck",
+ "crossterm",
  "ratatui",
  "serde",
  "serde_json",

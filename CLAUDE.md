@@ -7,8 +7,10 @@ Framework de deep learning from scratch en Rust + wgpu (compute shaders WGSL), a
 ```
 Cargo.toml          workspace pur (aucun code à la racine)
 crates/
-  batlab-core/      paquet `batlab_core` — gpu_context, model/layers/shaders, training, tui, visualiser
-  batlab/           paquet `batlab` — le binaire (TUI + modes headless DEV/CI)
+  batlab-core/      paquet `batlab_core` — LE MOTEUR : gpu_context, config, model/layers/shaders,
+                    training, inférence (sampler, perpetual), live_frame. wgpu et rien d'autre côté graphique.
+  batlab-ui/        paquet `batlab_ui` — TUI ratatui, fenêtre visualiseur winit, disposition sur disque (storage)
+  batlab/           paquet `batlab` — le binaire (CLI, modes headless DEV/CI, orchestration)
 Models/             un dossier par modèle : config_file + pretrained_weights/
 datasets/           .batraw (gitignorés) + cifar_to_raw.py
 tools/              analyse et planches (Python)
@@ -19,6 +21,26 @@ docs/gallery/       planches et figures des campagnes
 ```
 
 Le binaire écrit ses sorties de run à la racine : `perpetual_samples/` (`--headless-perpetual` sans `--out`) et `weighting_samples/` (banc de pondération). Ces deux répertoires sont **gitignorés** — les planches retenues sont commitées sous `docs/gallery/`.
+
+### La frontière moteur / interface — à ne pas franchir
+
+wgpu a été choisi pour une raison : le moteur doit tourner **dans le navigateur du visiteur, sur SA carte graphique** (WebGPU côté client, aucun GPU serveur). D'où la règle, vérifiable en une commande :
+
+```bash
+# batlab-core ne doit dépendre NI de ratatui, NI de crossterm, NI de winit
+awk '/^\[dependencies\]/{f=1;next}/^\[/{f=0}f' crates/batlab-core/Cargo.toml | grep -E '^(ratatui|crossterm|winit)' && echo ÉCHEC || echo OK
+cargo check -p batlab_core
+```
+
+Concrètement :
+
+- **Tout le chemin d'inférence vit dans `batlab_core`** : `config` (le schéma du `config_file`), le décodage de checkpoint, `compose_diffusion_input`, `reverse_step`/`sample_diffusion`, `PerpetualDrift`. L'entraînement y reste aussi, mais c'est l'inférence qui doit être irréprochablement découplée.
+- **Le moteur ne connaît pas le système de fichiers.** Il prend des octets : `ModelConfig::from_json_bytes(&[u8])`, `Model::load_checkpoint_bytes(&[u8])`. Les variantes `load_checkpoint(path)` / `save_checkpoint(path)` ne sont que de minces enveloppes `fs` pour le CLI — ne jamais réintroduire de lecture de fichier plus profond. (`MetricsLogger` écrit un JSONL : c'est de l'instrumentation d'entraînement, hors chemin d'inférence.)
+- **`LiveFrame` est la couture visualiseur ↔ sampler** : le moteur compose la frame dans un buffer GPU (`live_frame.rs`, wgpu seul) ; l'affichage — fenêtre winit aujourd'hui, canvas demain — se contente de lire ce buffer, côté `batlab_ui`.
+- **La disposition sur disque** (`Models/<name>/config_file`, `datasets/`, `project_root()`) est une décision d'hôte : elle vit dans `batlab_ui::storage`, pas dans le moteur.
+- La flèche de dépendance ne pointe que dans un sens : `batlab` → `batlab_ui` → `batlab_core`. Jamais l'inverse.
+
+Un vrai build `wasm32` est une mission future — aujourd'hui on veut seulement que la frontière soit propre.
 
 ## Lancer / valider un entraînement sans le TUI
 
@@ -41,7 +63,7 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 
 ## Points d'attention
 
-- **Toujours cibler le bon paquet** : `cargo build/run --release -p batlab` pour le binaire, `-p batlab_core` pour la lib. (Le piège historique « un build à la racine ne construit que la lib racine » a disparu avec le paquet racine `batBuilder`, mais un `-p` explicite reste plus sûr.) Après un changement de flag CLI, vérifier la bannière du run — le binaire réémet sa config parsée, et `bench/optimizer/lib.sh:assert_flag` en fait un test.
+- **Toujours cibler le bon paquet** : `cargo build/run --release -p batlab` pour le binaire, `-p batlab_core` pour le moteur, `-p batlab_ui` pour l'interface. (Le piège historique « un build à la racine ne construit que la lib racine » a disparu avec le paquet racine `batBuilder`, mais un `-p` explicite reste plus sûr.) Après un changement de flag CLI, vérifier la bannière du run — le binaire réémet sa config parsée, et `bench/optimizer/lib.sh:assert_flag` en fait un test.
 - **Optimiseur** : Adam (`--optimizer adam --lr 1e-3`) converge ~20x plus vite que SGD en nombre de pas, surcoût < 1 % (voir `docs/reports/OPTIMIZER_ADAM.md`). L'init He est disponible (`--weight-init he`) mais n'a pas montré de gain (GroupNorm neutralise l'échelle en aval).
 - **Lecture des métriques de diffusion** : la MSE sur ε inverse l'importance des tranches — convertir en erreur x₀ (facteur ᾱ/(1−ᾱ)) avant de conclure. Baselines triviales : `tools/trivial_baselines.py`. Attention, le « déséquilibre 1e5 » de `docs/reports/SCALE_UNET.md` est en unités x₀ ; **en unités ε, où le gradient est réellement calculé, il vaut ≈5,7×** — et pondérer la loss ne rend que ce que 5,7× peut rendre (`docs/reports/LOSS_WEIGHTING.md` : ×1,20 sur le haut-t, NO-GO).
 - **Pondération de la loss** : `--loss-weighting uniform|snr [--snr-gamma F]` (défaut `uniform`, bit-à-bit l'ancien tirage). Implémentée par biais du tirage de t, pas dans un shader. Sur ce schedule, **γ=5 (valeur de la littérature) ne redistribue presque rien** — `SNR(t) ≤ 5` dès t=33 ; utiliser γ≈1.
@@ -53,6 +75,6 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
 - Format dataset `.batraw` : magic `BATRAW2` = payload en [-1,1] ; les fichiers `BATRAW1` ([0,1]) restent lisibles et sont rééchelonnés au chargement.
 - Tests de non-régression du pipeline : `crates/batlab-core/src/model/audit_tests.rs` (`cargo test`). Ne pas les affaiblir pour les faire passer.
-- **`tui::storage::project_root()` est la racine de tous les chemins de données** (`Models/`, `datasets/`, `perpetual_samples/`). Il remonte jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.
+- **`batlab_ui::storage::project_root()` est la racine de tous les chemins de données** (`Models/`, `datasets/`, `perpetual_samples/`). Il remonte jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.
 - macOS : l'event loop winit du visualiseur doit vivre sur le main thread (le TUI et l'entraînement tournent sur un worker) — ne pas réintroduire de `EventLoop::new()` dans un thread secondaire.
-- Les rapports sous `docs/reports/` sont des **archives** : leur texte cite les anciens chemins (`bat_building/src/…`, `main/src/main.rs`, `perpetual_samples/…`) et n'a pas été réécrit. La table de correspondance est dans `docs/reports/INDEX.md`.
+- Les rapports sous `docs/reports/` sont des **archives** : leur texte cite les anciens chemins (`bat_building/src/…` — qui couvrait alors moteur ET interface —, `main/src/main.rs`, `perpetual_samples/…`) et n'a pas été réécrit. La table de correspondance est dans `docs/reports/INDEX.md`.
