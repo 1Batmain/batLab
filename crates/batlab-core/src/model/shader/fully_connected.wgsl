@@ -40,14 +40,18 @@ fn apply_activation(value: f32, method: u32) -> f32 {
 
 @compute @workgroup_size(64)
 fn fully_connected(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let neuron_idx = gid.x;
-    if neuron_idx >= layer_spec.nb_neurons { return; }
+    let idx = gid.x;
+    if idx >= arrayLength(&output) { return; }
+
+    let sample = idx / layer_spec.nb_neurons;
+    let neuron_idx = idx % layer_spec.nb_neurons;
+    let in_base = sample * layer_spec.input_len;
 
     var sum: f32 = bias[neuron_idx];
     for (var in_idx: u32 = 0u; in_idx < layer_spec.input_len; in_idx++) {
         let weight_idx = neuron_idx * layer_spec.input_len + in_idx;
-        sum += input[in_idx] * weights[weight_idx];
+        sum += input[in_base + in_idx] * weights[weight_idx];
     }
-    pre_activation[neuron_idx] = sum;
-    output[neuron_idx] = apply_activation(sum, layer_spec.activation_method);
+    pre_activation[idx] = sum;
+    output[idx] = apply_activation(sum, layer_spec.activation_method);
 }

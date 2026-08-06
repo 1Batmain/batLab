@@ -41,18 +41,26 @@ fn pad_x() -> i32 {
     return 0;
 }
 
-// One thread per output element, as before.
+// One thread per output element — of the whole batch.
+//
+// `input` and `output` hold `batch` tensors back to back, and the dispatch
+// covers all of them. The sample a thread belongs to is recovered by dividing
+// by the per-sample output length; the batch itself is never passed in, it is
+// read off the buffer (`arrayLength`). `weights` and `bias` are shared: they
+// have no batch axis, which is exactly what makes them parameters.
 //
 // Register-blocking this kernel (one thread producing a run of 2 or 4 adjacent
 // output pixels, so each weight load is reused across them) was tried and is
-// SLOWER on every layer of the model — see PERF_CONVOLUTION.md. The batch is
-// looped sample by sample on the CPU, so a convolution here works on a single
-// small tensor: conv4's forward has only 1024 output elements to begin with,
-// and dividing the thread count by 4 starves the GPU faster than the saved
-// bandwidth pays back. These dispatches are parallelism-bound, not
-// bandwidth-bound.
+// SLOWER on every layer of the model — see PERF_CONVOLUTION.md §3. That
+// measurement was taken when the batch was unrolled sample by sample on the
+// CPU, so a convolution worked on a single small tensor: conv4's forward had
+// only 1024 output elements, i.e. 16 workgroups, and dividing the thread count
+// by 4 starved the GPU faster than the saved bandwidth paid back. With the
+// batch axis in the dispatch that same forward has 16384 elements, so the
+// verdict is no longer established — the piste is worth RE-measuring, not
+// re-trying blind.
 //
-// What is left is the free part: hoist the padding offsets and the per-tap base
+// What is kept is the free part: hoist the padding offsets and the per-tap base
 // addresses out of the inner loop, and reject a kernel row that falls entirely
 // in the padding once per row instead of once per column. Same taps, same
 // order, same skips — bit-identical output, strictly less integer work.
@@ -63,11 +71,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
     let K  = layer_spec.dim_output.z;
-    if idx >= OH * OW * K { return; }
+    let out_len = OH * OW * K;
+    if idx >= arrayLength(&output) { return; }
 
-    let k  = idx % K;
-    let ox = (idx / K) % OW;
-    let oy = idx / (K * OW);
+    let sample = idx / out_len;
+    let local  = idx % out_len;
+
+    let k  = local % K;
+    let ox = (local / K) % OW;
+    let oy = local / (K * OW);
 
     let IH = layer_spec.dim_input.x;
     let IW = layer_spec.dim_input.y;
@@ -78,6 +90,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let py = pad_y();
     let px = pad_x();
     let kbase = k * KH * KW * IC;
+    let in_sample = sample * IH * IW * IC;
 
     var sum: f32 = bias[k];
     for (var ky: u32 = 0u; ky < KH; ky++) {
@@ -85,7 +98,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if sy < 0 || sy >= i32(IH) {
             continue; // whole kernel row sits in the zero padding
         }
-        let row = u32(sy) * IW * IC;
+        let row = in_sample + u32(sy) * IW * IC;
         for (var kx: u32 = 0u; kx < KW; kx++) {
             let sx = i32(ox * s) + i32(kx) - px;
             if sx < 0 || sx >= i32(IW) {

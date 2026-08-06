@@ -10,9 +10,21 @@
 //   [6] grad_bias    — bias gradient accumulator              (K)
 //
 // Three separate compute passes prevent write races:
-//   conv_back_input   dispatched over input  elements
-//   conv_back_weights dispatched over weight elements
-//   conv_back_bias    dispatched over kernel count
+//   conv_back_input   dispatched over input  elements  x batch
+//   conv_back_weights dispatched over weight elements   (NOT x batch)
+//   conv_back_bias    dispatched over kernel count      (NOT x batch)
+//
+// The batch axis splits these three in two, and the split IS the design (see
+// docs/reports/BATCH_DISPATCH_DESIGN.md §3.1). `conv_back_input` writes one
+// activation per thread, so it grows with the batch like any elementwise pass.
+// The other two write *parameters*: there are exactly as many sums as there are
+// weights whatever the batch, so their grid is unchanged and the batch enters
+// INSIDE the kernel, as `batch * OH * OW` positions to reduce instead of
+// `OH * OW`. One `+=` per weight and per step, instead of one per weight and
+// per sample.
+//
+// Neither kernel is told the batch: it is `arrayLength(&grad_output) / (OH*OW*K)`,
+// read off the buffer that carries it.
 
 @group(0) @binding(0) var<storage, read>       fwd_input:    array<f32>;
 @group(0) @binding(1) var<storage, read>       weights:      array<f32>;
@@ -64,15 +76,20 @@ fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
     let IH = layer_spec.dim_input.x;
     let IW = layer_spec.dim_input.y;
     let IC = layer_spec.dim_input.z;
-    if idx >= IH * IW * IC { return; }
+    let in_len = IH * IW * IC;
+    if idx >= arrayLength(&grad_input) { return; }
 
-    let iz = idx % IC;
-    let ix = (idx / IC) % IW;
-    let iy = idx / (IC * IW);
+    let sample = idx / in_len;
+    let local  = idx % in_len;
+
+    let iz = local % IC;
+    let ix = (local / IC) % IW;
+    let iy = local / (IC * IW);
 
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
     let K  = layer_spec.dim_output.z;
+    let go_sample = sample * OH * OW * K;
     let KH = layer_spec.dim_kernel.x;
     let KW = layer_spec.dim_kernel.y;
     let s  = layer_spec.stride;
@@ -103,7 +120,7 @@ fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
             let ox = dx / s;
             if oy >= OH || ox >= OW { continue; }
 
-            let go_base = oy * OW * K + ox * K;
+            let go_base = go_sample + oy * OW * K + ox * K;
             var w_i = ky * KW * IC + kx * IC + iz;
             for (var k: u32 = 0u; k < K; k++) {
                 g += grad_output[go_base + k] * weights[w_i];
@@ -174,6 +191,9 @@ fn conv_back_weights(
     let IW = layer_spec.dim_input.y;
     let s  = layer_spec.stride;
     let positions = OH * OW;
+    // The batch, straight off the buffer that carries it.
+    let batch = arrayLength(&grad_output) / (OH * OW * K);
+    let work = positions * batch;
 
     let lanes = layer_spec.reduction_lanes;
     let slots = WG_SIZE / lanes;
@@ -190,16 +210,22 @@ fn conv_back_weights(
         let k  = idx / (IC * KW * KH);
 
         // Same tap geometry and same zero-padding rule as the forward pass.
-        for (var p: u32 = lane; p < positions; p += lanes) {
-            let oy = p / OW;
-            let ox = p % OW;
+        // The position axis now runs over the whole batch: `p / positions` is
+        // the sample, `p % positions` the output position within it. A lane
+        // therefore strides across sample boundaries, which is what turns B
+        // sequential accumulations into one tree reduction.
+        for (var p: u32 = lane; p < work; p += lanes) {
+            let sample = p / positions;
+            let pos    = p % positions;
+            let oy = pos / OW;
+            let ox = pos % OW;
             let sy = i32(oy * s) + i32(ky) - pad_y();
             let sx = i32(ox * s) + i32(kx) - pad_x();
             if sy < 0 || sy >= i32(IH) || sx < 0 || sx >= i32(IW) {
                 continue; // padded position — contributes zero to the gradient
             }
-            let in_i = u32(sy) * IW * IC + u32(sx) * IC + kz;
-            let go_i = oy * OW * K + ox * K + k;
+            let in_i = sample * IH * IW * IC + u32(sy) * IW * IC + u32(sx) * IC + kz;
+            let go_i = sample * OH * OW * K + oy * OW * K + ox * K + k;
             g += grad_output[go_i] * fwd_input[in_i];
         }
     }
@@ -227,6 +253,8 @@ fn conv_back_bias(
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
     let positions = OH * OW;
+    let batch = arrayLength(&grad_output) / (OH * OW * K);
+    let work = positions * batch;
 
     let lanes = layer_spec.reduction_lanes;
     let slots = WG_SIZE / lanes;
@@ -237,10 +265,12 @@ fn conv_back_bias(
 
     var g: f32 = 0.0;
     if k < K {
-        for (var p: u32 = lane; p < positions; p += lanes) {
-            let oy = p / OW;
-            let ox = p % OW;
-            g += grad_output[oy * OW * K + ox * K + k];
+        for (var p: u32 = lane; p < work; p += lanes) {
+            let sample = p / positions;
+            let pos    = p % positions;
+            let oy = pos / OW;
+            let ox = pos % OW;
+            g += grad_output[sample * OH * OW * K + oy * OW * K + ox * K + k];
         }
     }
 

@@ -45,19 +45,25 @@ fn activation_grad(pre_activated: f32, method: u32) -> f32 {
 
 @compute @workgroup_size(64)
 fn fully_connected_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let in_idx = gid.x;
-    if in_idx >= layer_spec.input_len { return; }
+    let idx = gid.x;
+    if idx >= arrayLength(&grad_input) { return; }
+
+    let sample = idx / layer_spec.input_len;
+    let in_idx = idx % layer_spec.input_len;
+    let out_base = sample * layer_spec.nb_neurons;
 
     var grad: f32 = 0.0;
     for (var neuron_idx: u32 = 0u; neuron_idx < layer_spec.nb_neurons; neuron_idx++) {
+        let o = out_base + neuron_idx;
         let local_grad =
-            grad_output[neuron_idx] * activation_grad(pre_activation[neuron_idx], layer_spec.activation_method);
+            grad_output[o] * activation_grad(pre_activation[o], layer_spec.activation_method);
         let weight_idx = neuron_idx * layer_spec.input_len + in_idx;
         grad += local_grad * weights[weight_idx];
     }
-    grad_input[in_idx] = grad;
+    grad_input[idx] = grad;
 }
 
+// One thread per weight, whatever the batch — the batch is summed inside.
 @compute @workgroup_size(64)
 fn fully_connected_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
@@ -66,15 +72,28 @@ fn fully_connected_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let in_idx = idx % layer_spec.input_len;
     let neuron_idx = idx / layer_spec.input_len;
-    let local_grad =
-        grad_output[neuron_idx] * activation_grad(pre_activation[neuron_idx], layer_spec.activation_method);
-    grad_weights[idx] += local_grad * fwd_input[in_idx];
+    let batch = arrayLength(&grad_output) / layer_spec.nb_neurons;
+
+    var g: f32 = 0.0;
+    for (var b: u32 = 0u; b < batch; b++) {
+        let o = b * layer_spec.nb_neurons + neuron_idx;
+        let local_grad =
+            grad_output[o] * activation_grad(pre_activation[o], layer_spec.activation_method);
+        g += local_grad * fwd_input[b * layer_spec.input_len + in_idx];
+    }
+    grad_weights[idx] += g;
 }
 
 @compute @workgroup_size(64)
 fn fully_connected_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
     let neuron_idx = gid.x;
     if neuron_idx >= layer_spec.nb_neurons { return; }
-    grad_bias[neuron_idx] +=
-        grad_output[neuron_idx] * activation_grad(pre_activation[neuron_idx], layer_spec.activation_method);
+    let batch = arrayLength(&grad_output) / layer_spec.nb_neurons;
+
+    var g: f32 = 0.0;
+    for (var b: u32 = 0u; b < batch; b++) {
+        let o = b * layer_spec.nb_neurons + neuron_idx;
+        g += grad_output[o] * activation_grad(pre_activation[o], layer_spec.activation_method);
+    }
+    grad_bias[neuron_idx] += g;
 }
