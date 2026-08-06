@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing back fully connected operations for model forward/backward or optimizer passes.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Bindings match FullyConnectedType::get_back_buffers_specs():
 //   [0] fwd_input    — flattened input vector used during forward
@@ -44,8 +49,11 @@ fn activation_grad(pre_activated: f32, method: u32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn fully_connected_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn fully_connected_back_input(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
     if idx >= arrayLength(&grad_input) { return; }
 
     let sample = idx / layer_spec.input_len;
@@ -65,8 +73,11 @@ fn fully_connected_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // One thread per weight, whatever the batch — the batch is summed inside.
 @compute @workgroup_size(64)
-fn fully_connected_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn fully_connected_back_weights(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
     let total = layer_spec.input_len * layer_spec.nb_neurons;
     if idx >= total { return; }
 
@@ -85,8 +96,11 @@ fn fully_connected_back_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn fully_connected_back_bias(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let neuron_idx = gid.x;
+fn fully_connected_back_bias(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let neuron_idx = gid.y * nwg.x * 64u + gid.x;
     if neuron_idx >= layer_spec.nb_neurons { return; }
     let batch = arrayLength(&grad_output) / layer_spec.nb_neurons;
 

@@ -75,6 +75,34 @@ pub(crate) struct MergePass {
     pub(crate) num_workgroups: u32,
 }
 
+/// Split a 1-D workgroup count into a 2-D grid that respects
+/// `max_compute_workgroups_per_dimension` (65 535 in the WebGPU spec, and on
+/// this adapter).
+///
+/// Nothing in the graph needed this before the batch axis: the largest dispatch
+/// was one workgroup per 64 elements of a single tensor, which for the biggest
+/// layer of `Greyscale_Diffusion_L` is 1024. Multiply that by a batch of 64 and
+/// it is 65 536 — one over the limit.
+///
+/// The failure mode is what makes this worth a named function. wgpu reports the
+/// violation on the queue, the run does NOT stop, and the step simply computes
+/// nothing: the observed symptom was `loss 0.000000` scrolling by. A silent
+/// wrong answer at exactly the batch sizes the batching exists to enable.
+///
+/// The kernels recover their linear index as `gid.y * nwg.x * 64 + gid.x` (or
+/// `wid.y * nwg.x + wid.x` for the workgroup-per-unit passes), reading `nwg`
+/// from `@builtin(num_workgroups)` — so, like the batch itself, the split needs
+/// no uniform and cannot drift from what was dispatched. Trailing workgroups
+/// past the real count are absorbed by the bounds check every kernel already
+/// has.
+pub(crate) fn dispatch_grid(workgroups: u32) -> (u32, u32) {
+    const MAX_PER_DIMENSION: u32 = 65_535;
+    if workgroups <= MAX_PER_DIMENSION {
+        return (workgroups, 1);
+    }
+    (MAX_PER_DIMENSION, workgroups.div_ceil(MAX_PER_DIMENSION))
+}
+
 // ---------------------------------------------------------------------------
 // Layer
 // ---------------------------------------------------------------------------
@@ -334,7 +362,8 @@ impl Layer {
                 .expect("forward bind group not initialised"),
             &[],
         );
-        pass.dispatch_workgroups(workgroups, 1, 1);
+        let (x, y) = dispatch_grid(workgroups);
+        pass.dispatch_workgroups(x, y, 1);
     }
 
     // -----------------------------------------------------------------------
@@ -466,7 +495,8 @@ impl Layer {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bg, &[]);
-            pass.dispatch_workgroups(*num_wg, 1, 1);
+            let (x, y) = dispatch_grid(*num_wg);
+            pass.dispatch_workgroups(x, y, 1);
         }
     }
 
@@ -668,7 +698,8 @@ impl Layer {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(&opt.pipeline);
         pass.set_bind_group(0, &opt.bind_group, &[]);
-        pass.dispatch_workgroups(opt.num_workgroups, 1, 1);
+        let (x, y) = dispatch_grid(opt.num_workgroups);
+        pass.dispatch_workgroups(x, y, 1);
     }
 
     /// Refresh the optimiser uniform for the step about to be dispatched.
@@ -845,6 +876,7 @@ impl Layer {
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(&merge.pipeline);
         pass.set_bind_group(0, &merge.bind_group, &[]);
-        pass.dispatch_workgroups(merge.num_workgroups, 1, 1);
+        let (x, y) = dispatch_grid(merge.num_workgroups);
+        pass.dispatch_workgroups(x, y, 1);
     }
 }

@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing diffusion prepare preprocessing for diffusion training inputs.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // `specs` is an ARRAY, one entry per sample of the batch, and that is the whole
 // of how batching enters this kernel.
@@ -80,8 +85,11 @@ fn timestep_value(spec: DiffusionPrepareSpec, offset: u32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn diffusion_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let index = gid.x;
+fn diffusion_prepare(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let index = gid.y * nwg.x * 64u + gid.x;
     if index >= arrayLength(&model_input) {
         return;
     }

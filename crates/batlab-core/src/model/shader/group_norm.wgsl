@@ -1,5 +1,10 @@
 // File purpose: WGSL compute shader implementing group norm operations for model forward/backward or optimizer passes.
 //
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
+//
 // Dispatch convention: ONE WORKGROUP PER (SAMPLE, GROUP) (see
 // `GroupNormType::get_forward_workgroup_count`), not one thread per element.
 // The workgroup cooperates on two shared-memory reductions (sum, then sum of
@@ -73,10 +78,12 @@ fn workgroup_sum(tid: u32, value: f32) -> f32 {
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn group_norm(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
 ) {
-    let group = wid.x % layer_spec.num_groups;
-    let base = (wid.x / layer_spec.num_groups) * sample_len();
+    let unit = wid.y * nwg.x + wid.x;
+    let group = unit % layer_spec.num_groups;
+    let base = (unit / layer_spec.num_groups) * sample_len();
     let group_len = layer_spec.spatial_len * layer_spec.channels_per_group;
     let group_len_f = f32(group_len);
 

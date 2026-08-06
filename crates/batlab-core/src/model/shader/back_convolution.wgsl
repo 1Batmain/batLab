@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing back convolution operations for model forward/backward or optimizer passes.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Bindings match ConvolutionType::get_back_buffers_specs():
 //   [0] fwd_input    — input used in the forward pass  (HWC: iy*W*C + ix*C + iz)
@@ -71,8 +76,11 @@ fn pad_x() -> i32 {
 //   (only non-negative, divisible, in-range positions contribute)
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
-fn conv_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn conv_back_input(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
     let IH = layer_spec.dim_input.x;
     let IW = layer_spec.dim_input.y;
     let IC = layer_spec.dim_input.z;
@@ -177,6 +185,7 @@ fn reduce_slot(tid: u32, lane: u32, lanes: u32, slots: u32) {
 @compute @workgroup_size(64)
 fn conv_back_weights(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let K   = layer_spec.dim_output.z;
@@ -200,7 +209,7 @@ fn conv_back_weights(
     let tid   = lid.x;
     let slot  = tid % slots;
     let lane  = tid / slots;
-    let idx   = wid.x * slots + slot;
+    let idx   = (wid.y * nwg.x + wid.x) * slots + slot;
 
     var g: f32 = 0.0;
     if idx < total {
@@ -247,6 +256,7 @@ fn conv_back_weights(
 @compute @workgroup_size(64)
 fn conv_back_bias(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let K  = layer_spec.dim_output.z;
@@ -261,7 +271,7 @@ fn conv_back_bias(
     let tid   = lid.x;
     let slot  = tid % slots;
     let lane  = tid / slots;
-    let k     = wid.x * slots + slot;
+    let k     = (wid.y * nwg.x + wid.x) * slots + slot;
 
     var g: f32 = 0.0;
     if k < K {

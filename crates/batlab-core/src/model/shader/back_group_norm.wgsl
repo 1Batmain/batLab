@@ -1,5 +1,10 @@
 // File purpose: WGSL compute shader implementing back group norm operations for model forward/backward or optimizer passes.
 //
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
+//
 // The backward pass is split into five dispatches (see
 // `GroupNormType::get_back_entrypoints` / `get_back_workgroup_counts`), run in
 // order by `Layer::encode_back_pass`:
@@ -101,11 +106,12 @@ fn workgroup_sum(tid: u32, value: f32) -> f32 {
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn group_norm_stats(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
 ) {
-    let slot = wid.x;
-    let group = wid.x % layer_spec.num_groups;
-    let base = (wid.x / layer_spec.num_groups) * sample_len();
+    let slot = wid.y * nwg.x + wid.x;
+    let group = slot % layer_spec.num_groups;
+    let base = (slot / layer_spec.num_groups) * sample_len();
     let group_len = layer_spec.spatial_len * layer_spec.channels_per_group;
     let group_len_f = f32(group_len);
 
@@ -135,11 +141,12 @@ fn group_norm_stats(
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn group_norm_grad_stats(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
 ) {
-    let slot = wid.x;
-    let group = wid.x % layer_spec.num_groups;
-    let base = (wid.x / layer_spec.num_groups) * sample_len();
+    let slot = wid.y * nwg.x + wid.x;
+    let group = slot % layer_spec.num_groups;
+    let base = (slot / layer_spec.num_groups) * sample_len();
     let group_len = layer_spec.spatial_len * layer_spec.channels_per_group;
     let mean = stat(slot, STAT_MEAN);
     let inv_std = stat(slot, STAT_INV_STD);
@@ -169,8 +176,11 @@ fn group_norm_grad_stats(
 // 3. grad_input — now O(1) per element.
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
-fn group_norm_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let index = gid.x;
+fn group_norm_back_input(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let index = gid.y * nwg.x * 64u + gid.x;
     if index >= arrayLength(&fwd_input) { return; }
 
     let channel = index % layer_spec.dim_input.z;
@@ -200,9 +210,10 @@ fn group_norm_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn group_norm_back_gamma(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
 ) {
-    let channel = wid.x;
+    let channel = wid.y * nwg.x + wid.x;
     let group = channel / layer_spec.channels_per_group;
     let len = sample_len();
     let batch = arrayLength(&fwd_input) / len;
@@ -230,9 +241,10 @@ fn group_norm_back_gamma(
 @compute @workgroup_size(WORKGROUP_SIZE)
 fn group_norm_back_beta(
     @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_index) tid: u32,
 ) {
-    let channel = wid.x;
+    let channel = wid.y * nwg.x + wid.x;
     let len = sample_len();
     let batch = arrayLength(&fwd_input) / len;
     let work = layer_spec.spatial_len * batch;

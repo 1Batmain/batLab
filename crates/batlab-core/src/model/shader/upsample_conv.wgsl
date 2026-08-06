@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing upsample conv operations for model forward/backward or optimizer passes.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Bindings match UpsampleConvType::get_buffers_specs():
 //   [0] input   — original input tensor (HWC)
@@ -46,8 +51,11 @@ fn pad_x() -> i32 {
 }
 
 @compute @workgroup_size(64)
-fn upsample_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn upsample_conv(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
 
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;

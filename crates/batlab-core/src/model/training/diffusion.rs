@@ -654,7 +654,9 @@ impl DiffusionPreparePass {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups_per_sample * batch, 1, 1);
+        let (x, y) =
+            crate::model::layer::dispatch_grid(self.workgroups_per_sample * batch);
+        pass.dispatch_workgroups(x, y, 1);
     }
 }
 

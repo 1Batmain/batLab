@@ -261,7 +261,42 @@ et commentaire à l'appui. La leçon vaut au-delà de cette mission : la couche 
 loss est le seul endroit du dépôt où « la sortie de la couche » n'est pas son
 dernier tampon, et rien ne l'écrivait nulle part.
 
-### 3.7 Changer le batch en cours de run
+### 3.7 Le plafond de 65 535 workgroups — un vrai bug, trouvé tard
+
+WebGPU limite un dispatch à **65 535 workgroups par dimension**. Rien dans ce
+dépôt n'en approchait : le plus gros dispatch sur un tenseur unique est d'un
+workgroup pour 64 éléments, soit **1024** pour la plus grosse couche de
+`Greyscale_Diffusion_L`. Multiplié par un batch de 64, cela fait **65 536** —
+un de trop.
+
+**C'est le mode de défaillance qui rend ce point grave.** wgpu signale la
+violation sur la queue, mais **le run continue** : le symptôme observé au
+premier essai de `--batch 64` était `loss 0.000000` qui défile, c'est-à-dire un
+pas qui ne calcule **rien**. Une mauvaise réponse silencieuse, exactement aux
+tailles de batch que ce travail existe pour rendre possibles. Trouvé en
+préparant le balayage du §7.3, pas par un test — les tests tournaient tous à des
+batchs de 5 ou moins.
+
+Correction : le dispatch devient **2-D** au-delà du plafond (`dispatch_grid`
+dans `layer.rs`), et chaque kernel reconstruit son indice linéaire à partir de
+`@builtin(num_workgroups)` — `gid.y · nwg.x · 64 + gid.x` pour les passes
+élémentaires, `wid.y · nwg.x + wid.x` pour les passes à un workgroup par unité.
+Comme le batch lui-même (§2.1), le découpage ne passe par **aucun uniforme** et
+ne peut donc pas diverger de ce qui a été dispatché. Sous le plafond, la grille
+reste strictement 1-D : l'inférence et les petits batchs ne voient rien changer,
+et c'est vérifié — le PNG de `--headless-sample` et le dump de
+`--headless-perpetual` sont restés **octet pour octet** identiques après ce
+changement (§5).
+
+Gardé par deux tests, dont un end-to-end qui traverse réellement le plafond
+(65 600 workgroups, choisi à 64 éléments par échantillon pour que le batch
+*soit* le compte de workgroups), et vérifié par mutation : rendre `dispatch_grid`
+incapable de découper — le comportement d'avant — fait tomber les deux.
+
+Vérifié après correction : `--batch 16`, `--batch 64` et `--batch 128`
+convergent tous sur `Greyscale_Diffusion_L`.
+
+### 3.8 Changer le batch en cours de run
 
 Le TUI le permet. Comme le batch dimensionne les tampons, `Model::resize_batch`
 reconstruit le graphe **en préservant l'état** — poids, biais, moments Adam
@@ -664,6 +699,12 @@ _À compléter — voir §9._
 
 ## 8. Limites et pièges connus
 
+- **Le plafond de 65 535 workgroups est traité mais reste une contrainte.**
+  Un modèle dont une couche a `L` éléments par échantillon peut aller jusqu'à
+  `batch × L / 64 ≤ 65 535 × 65 535` workgroups au total — largement assez —
+  mais toute nouvelle passe de calcul ajoutée au graphe doit passer par
+  `dispatch_grid` et lire son indice via `num_workgroups`, sans quoi elle
+  échouera en silence au-delà du plafond. C'est le §3.7.
 - **La mémoire GPU croît linéairement avec le batch.** Tous les tampons
   d'activation, plus `clean_target`, sont multipliés par `B`. C'est ce qui
   touchera `max_storage_buffer_binding_size` en premier sur un gros modèle à

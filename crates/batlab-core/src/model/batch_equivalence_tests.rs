@@ -846,3 +846,97 @@ fn concat_and_upsample_conv_carry_the_batch_correctly() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// 8. The 65 535-workgroup ceiling
+// ---------------------------------------------------------------------------
+
+/// WebGPU caps a dispatch at 65 535 workgroups **per dimension**. Nothing in
+/// this repository came close before: the largest single-tensor dispatch is one
+/// workgroup per 64 elements, i.e. 1024 for the biggest layer of
+/// `Greyscale_Diffusion_L`. Multiply by a batch of 64 and it is 65 536 — one
+/// over.
+///
+/// The failure mode is why this test exists rather than a comment. wgpu reports
+/// the violation on the queue and the run CONTINUES: the observed symptom was
+/// `loss 0.000000` scrolling past at batch 64, a step that computed nothing at
+/// all. A silent wrong answer, at exactly the batch sizes the batching exists
+/// to make possible.
+///
+/// The shape here is chosen to cross the ceiling cheaply: 64 elements per
+/// sample is one workgroup per sample, so `batch` IS the workgroup count.
+#[test]
+fn a_dispatch_past_the_65535_workgroup_ceiling_is_still_correct() {
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        // 65 600 > 65 535, by enough that the second row of the grid is not
+        // just a rounding artefact.
+        let batch = 65_600usize;
+        let dim = Dim3::new((8, 8, 1));
+        let len = dim.length() as usize;
+        assert_eq!(len, 64, "one workgroup per sample is what makes this cheap");
+
+        let mut model = Model::new_training_with_optimizer(
+            gpu.clone(),
+            0.01,
+            batch as u32,
+            LossMethod::MeanSquared,
+            OptimizerKind::Sgd,
+        )
+        .await;
+        model
+            .add_layer(LayerTypes::Activation(ActivationType::new(
+                ActivationMethod::Linear,
+                dim,
+            )))
+            .unwrap();
+        model.build().unwrap();
+
+        // A value that identifies its own sample, so a thread landing in the
+        // wrong row of the grid is visible rather than plausible.
+        let inputs: Vec<f32> = (0..batch)
+            .flat_map(|sample| (0..len).map(move |i| (sample % 4096) as f32 + i as f32 / 128.0))
+            .collect();
+        write_input(&model, &inputs);
+        run_forward(&model, batch as u32);
+        let output = read_output(&model, batch * len);
+
+        let differing = output
+            .iter()
+            .zip(&inputs)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "\n{differing} of {} elements wrong across a {batch}-workgroup dispatch \
+             (the ceiling is 65 535 per dimension)\n",
+            output.len()
+        );
+
+        // And the tail specifically: the last row of the 2-D grid is the part a
+        // 1-D dispatch would have dropped entirely.
+        let tail = &output[(batch - 1) * len..];
+        assert!(
+            tail.iter().any(|v| *v != 0.0),
+            "the last sample is all zeros — the grid's second row never ran"
+        );
+    });
+}
+
+/// The split itself: below the ceiling it must stay 1-D (so nothing changes for
+/// inference and small batches), above it, it must cover the count exactly.
+#[test]
+fn dispatch_grid_covers_the_count_without_exceeding_the_ceiling() {
+    use crate::model::layer::dispatch_grid;
+    for count in [0u32, 1, 64, 65_534, 65_535, 65_536, 131_070, 131_071, 4_194_304] {
+        let (x, y) = dispatch_grid(count);
+        assert!(x <= 65_535 && y <= 65_535, "{count} -> ({x}, {y}) exceeds the ceiling");
+        assert!(
+            x as u64 * y as u64 >= count as u64,
+            "{count} -> ({x}, {y}) does not cover the count"
+        );
+        if count <= 65_535 {
+            assert_eq!((x, y), (count, 1), "{count} should stay a 1-D dispatch");
+        }
+    }
+}
