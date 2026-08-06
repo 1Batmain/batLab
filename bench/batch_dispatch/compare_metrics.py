@@ -102,7 +102,7 @@ def main():
     ]
     for old, new in losses[:: max(1, len(losses) // 12)]:
         step = old.get("step")
-        a, b = old.get("train_loss", old.get("loss")), new.get("train_loss", new.get("loss"))
+        a, b = old.get("loss"), new.get("loss")
         print(f"  step {step:>4}  {a:.8f} | {b:.8f}")
 
 
