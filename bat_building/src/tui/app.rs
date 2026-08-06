@@ -1050,9 +1050,17 @@ pub struct PerpetualStatus {
     /// is spent dissolving the image on purpose, and the panel has to say so.
     pub phase: String,
     pub depth: usize,
+    /// What the depth dial is called in this regime — `t_r` where it is a
+    /// renoise depth, `t*` in flux where it is the level the run lives on.
+    /// Published by the worker rather than derived in the UI, so the name and
+    /// the number on screen cannot disagree about which regime is running.
+    pub depth_label: String,
     pub min_depth: usize,
     pub max_depth: usize,
     pub cycle: usize,
+    /// What `cycle` counts in this regime — cycles, or stationary frames in
+    /// flux, which has none.
+    pub cycle_label: String,
     pub diffusion_step: usize,
     /// Reverse steps walked since the run started.
     pub steps: usize,

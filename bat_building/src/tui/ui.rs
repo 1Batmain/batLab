@@ -875,7 +875,7 @@ fn is_perpetual_mode(app: &App) -> bool {
 /// the regime on screen are the ones the sampler is using, not the ones the UI
 /// last asked for.
 fn perpetual_hint(app: &App) -> String {
-    const KEYS: &str = "[↑↓] t_r  [←→] tempo  [espace] pause  [r] re-seed  \
+    const KEYS: &str = "[↑↓] niveau  [←→] tempo  [espace] pause  [r] re-seed  \
                         [m] regime  [s] PNG  [v] visualise  [q] quit";
 
     // The last PNG write (or failure) is worth a word, but must not cost the
@@ -899,12 +899,14 @@ fn perpetual_hint(app: &App) -> String {
 
     let status = if state.paused { "en pause" } else { "en cours" };
     format!(
-        "{notice} perpetual · {} · {} · {status} · t_r={} (max {}) · t={} · cycle {} · {:.0}/{:.0} pas/s | {KEYS}",
+        "{notice} perpetual · {} · {} · {status} · {}={} (max {}) · t={} · {} {} · {:.0}/{:.0} pas/s | {KEYS}",
         state.regime,
         state.phase,
+        state.depth_label,
         state.depth,
         state.max_depth,
         state.diffusion_step,
+        state.cycle_label,
         state.cycle,
         state.steps_per_sec,
         state.tempo,
@@ -952,12 +954,12 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
         row("regime", state.regime.clone(), "[m]"),
         row("phase", state.phase.clone(), ""),
         row(
-            "renoise depth t_r",
+            &format!("niveau {}", state.depth_label),
             format!("{} / {}", state.depth, state.max_depth),
             "[↑ / ↓]",
         ),
         row("timestep t", state.diffusion_step.to_string(), ""),
-        row("cycle", state.cycle.to_string(), "[r] re-seed"),
+        row(&state.cycle_label, state.cycle.to_string(), "[r] re-seed"),
         row("reverse steps", state.steps.to_string(), ""),
         row(
             "pace",
@@ -980,6 +982,10 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(Span::styled(
             "  En remontée, x_t se dissout pas à pas — x̂₀ reste figé, le modèle ne prédit pas.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  En flux, le niveau t* ne bouge plus : un cran débruité, un cran rebruité par frame.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
