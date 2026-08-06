@@ -161,10 +161,21 @@ impl DiffusionTask {
         self.timestep_channels
     }
 
-    pub fn estimated_prepare_gpu_bytes(&self, output: Dim3) -> u64 {
-        let target_bytes = (output.length() as u64 * std::mem::size_of::<f32>() as u64).max(4);
-        let specs_bytes = (DiffusionPrepareUniform::SHADER_SIZE.get() as u64).max(4);
+    /// GPU bytes the prepass allocates on top of the model, for the resource
+    /// banner. Both buffers now carry the batch axis, so both scale with it —
+    /// which is the point the banner has to convey: raising the batch raises
+    /// GPU memory linearly, and it is the first thing that will hit
+    /// `max_storage_buffer_binding_size` on a large model.
+    pub fn estimated_prepare_gpu_bytes_for_batch(&self, output: Dim3, batch: u32) -> u64 {
+        let batch = batch.max(1) as u64;
+        let target_bytes =
+            (output.length() as u64 * std::mem::size_of::<f32>() as u64 * batch).max(4);
+        let specs_bytes = (DiffusionPrepareUniform::SHADER_SIZE.get() as u64 * batch).max(4);
         target_bytes.saturating_add(specs_bytes)
+    }
+
+    pub fn estimated_prepare_gpu_bytes(&self, output: Dim3) -> u64 {
+        self.estimated_prepare_gpu_bytes_for_batch(output, 1)
     }
 
     /// Encode the per-sample spec array the shader indexes by sample.

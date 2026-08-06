@@ -1229,7 +1229,11 @@ async fn run_training(
     let estimated_training_bytes = model
         .estimated_gpu_bytes()
         .saturating_add(gpu_dataset.gpu_buffer_bytes())
-        .saturating_add(trainer.task().estimated_prepare_gpu_bytes(output_dims));
+        .saturating_add(
+            trainer
+                .task()
+                .estimated_prepare_gpu_bytes_for_batch(output_dims, train_cfg.batch_size.max(1)),
+        );
     let _ = tx.send(tui::TrainingEvent::ResourceReport {
         max_buffer_bytes: limits.max_buffer_size,
         max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
