@@ -675,27 +675,59 @@ téléversements de chunk de 64 Mio deviennent ~3,96 (§5.2), soit environ
 de l'ancien bras — 1,05 s de noyau par pas — sont exactement la signature de ce
 trafic.
 
-### 7.3 L'échelle en batch — non mesurée
+### 7.3 L'échelle en batch
 
-C'est **la** mesure que la mission demandait (« le gain doit croître avec le
-batch », 1/4/16/64), et elle n'a pas pu être prise : avec un plancher de bruit
-à 29,6 %, un balayage sur quatre tailles de batch produirait quatre nombres
-dont aucun ne serait défendable, et le contrôle nul à batch 1 — celui qui doit
-sortir à 1,00× et qui valide l'instrument — serait le premier à mentir.
+C'est **la** mesure que la mission demandait, et la prédiction posée d'avance
+était réfutable : à batch 1 les deux chemins doivent être indiscernables (un
+échantillon, une soumission de chaque côté), et l'écart doit **croître** avec le
+batch.
 
-Le harnais est écrit, testé et prêt : `bench/batch_dispatch/timing.sh`,
-protocole du §5.1 de `PERF_CONVOLUTION.md` (appariement, entrelacement,
-minimum, contrôle nul, `--out` unique par bras, vérification que la bannière
-réémet bien le `--batch` demandé). Une demi-heure sur GPU libre suffit.
+_Balayage définitif en cours — voir le §7.4 pour ce que l'instrument a coûté
+avant d'être utilisable._
 
-La prédiction à vérifier est explicite, et elle est réfutable : **à batch 1 les
-deux chemins doivent être indiscernables** (un échantillon, une soumission de
-chaque côté), et l'écart doit croître avec le batch. Un gain à batch 1 voudrait
-dire que l'instrument mesure autre chose que ce que ce rapport prétend.
+Résultat préliminaire (1 ronde × 3 pas, donc **dominé par le démarrage du
+processus** et sans valeur quantitative — le contrôle nul est à 59 % au batch 1) :
 
-## 7. Benchmarks
+| batch | speedup apparent | contrôle nul |
+|---:|---:|---:|
+| 1 | 0,53× | 59,3 % |
+| 4 | 0,83× | 6,5 % |
+| 16 | 1,24× | 1,4 % |
+| 64 | **1,68×** | 8,9 % |
 
-_À compléter — voir §9._
+La **forme** est celle qui était prédite — le gain croît de façon monotone avec
+le batch — mais aucun de ces nombres n'est publiable : à 3 pas par run, le
+démarrage du processus (3 à 9 s) pèse plus que le calcul, et il pénalise le
+même bras des deux côtés. Le balayage sérieux tourne à 40 pas par run.
+
+### 7.4 Ce que l'instrument a coûté
+
+Trois défauts ont été trouvés dans le harnais de mesure au cours de cette
+mission, **zéro** dans le moteur batché par ces mêmes exécutions. C'est une
+donnée sur la difficulté de mesurer, et elle mérite d'être écrite :
+
+1. **Chemin de métriques partagé.** Sans `--out`, deux runs du même modèle
+   écrivent dans le même JSONL. Un test de fumée du banc a corrompu le run de
+   validation de 600 pas (§6.3).
+2. **`exit 1` depuis une substitution de commande.** `x=$(run_one …)` met la
+   fonction dans un sous-shell : l'arrêt sur erreur ne tuait que la
+   substitution, et chaque run raté rendait une chaîne vide qui ressortait
+   plusieurs tailles de batch plus loin en erreur de conversion.
+3. **L'horloge.** Les runs étaient encadrés par deux appels
+   `python3 -c 'time.monotonic()'`. Sur cette machine `monotonic()` repart de
+   près de zéro dans chaque processus : deux lectures à une seconde d'écart ont
+   donné 0,005501 et 0,005996. La soustraction mesurait la gigue de démarrage
+   de l'interpréteur, et sortait **négative** une fois sur deux — d'où un
+   « speedup −2,67× » avec un « contrôle nul −150 % ».
+
+Le troisième est le plus instructif : il n'a été attrapé que parce que le
+résultat était **absurde**. Une variante de la même erreur qui serait tombée du
+côté positif aurait produit un nombre plausible et faux, et serait entrée telle
+quelle dans ce rapport. C'est précisément l'argument du contrôle nul du §7.1 —
+un instrument dont on ne mesure pas le bruit propre ne mesure rien — appliqué à
+l'instrument lui-même.
+
+Le raisonnement des trois est écrit **dans** `timing.sh`, pas seulement ici.
 
 ## 8. Limites et pièges connus
 
