@@ -2230,6 +2230,7 @@ mod tests {
         TrainingControlCommand, WeightInit,
     };
     use crate::storage::TempRoot;
+    use batlab_core::config::{built_in_templates, compute_inferred_input};
 
     /// Every app under test lives on its own throwaway storage root. The
     /// template route writes a `config_file`, and rename/delete move and remove
@@ -2340,7 +2341,46 @@ mod tests {
 
         assert_eq!(app.screen, Screen::ModelActions);
         assert!(!app.layer_builder.layers.is_empty());
-        assert_eq!(app.layer_builder.model_input, (32, 32, 3));
+        // 3 signal channels + 4 carrying the time embedding.
+        assert_eq!(app.layer_builder.model_input, (32, 32, 7));
+    }
+
+    /// Every model the "New model (from template)" flow writes to disk must be
+    /// conditionable on the timestep — `input_size.z > output.z`.
+    ///
+    /// The invariant is checked on the **config_file as written**, not on the
+    /// template in memory, because that file is what training and inference
+    /// will read back. Both templates shipped a model that failed this (1→1 and
+    /// 3→3, the geometry of `Models/Greyscale_Diffusion_broken`); a blind test
+    /// caught it by reading the file, which is why the assertion lives here too
+    /// and not only in `batlab_core`.
+    #[test]
+    fn every_model_created_from_a_template_is_conditionable_on_the_timestep() {
+        for (index, template) in built_in_templates().into_iter().enumerate() {
+            let (temp, mut app) = test_app(&format!("template-geometry-{index}"));
+            app.template_selector.selected = index;
+
+            app.finish_template_selector();
+
+            assert_eq!(
+                app.template_selector.error, None,
+                "template '{}' failed to apply",
+                template.key
+            );
+            let written = temp
+                .storage()
+                .load_model_config_for_model(&template.key)
+                .unwrap_or_else(|err| panic!("template '{}' wrote no config: {err}", template.key));
+            let output = compute_inferred_input(&written.layers, written.input_size);
+            assert!(
+                written.input_size.2 > output.2,
+                "the model written for '{}' emits {} channels for {} in — it cannot be \
+                 conditioned on t, and sampling from it saturates to white",
+                template.key,
+                output.2,
+                written.input_size.2,
+            );
+        }
     }
 
     /// The weight choice sits between the action and its parameters, so which

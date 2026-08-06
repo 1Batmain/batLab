@@ -507,91 +507,125 @@ pub struct ModelTemplate {
     pub default_steps: usize,
 }
 
+/// Draft builder for the U-Net both templates share.
+///
+/// Every dimension is *derived* from the layer before it — in particular
+/// `dim_kernel.z`, which must equal the running channel count. This is the
+/// discipline of `tools/gen_unet_config.py`, ported here for the same reason it
+/// exists there: hand-kept dims drift silently. `Convolution` at least rejects a
+/// mismatched kernel depth at build time; `UpsampleConv` does **not** — its
+/// shader indexes the weights with `IC = dim_input.z` and quietly corrupts.
+struct UNetDraft {
+    dim: (u32, u32, u32),
+    layers: Vec<LayerDraft>,
+    skips: HashMap<String, (u32, u32, u32)>,
+}
+
+impl UNetDraft {
+    fn new(input: (u32, u32, u32)) -> Self {
+        Self {
+            dim: input,
+            layers: Vec::new(),
+            skips: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, layer: LayerDraft) {
+        self.dim = layer.output_dims();
+        if let Some(key) = layer.save_key() {
+            self.skips.insert(key.to_string(), self.dim);
+        }
+        self.layers.push(layer);
+    }
+
+    fn conv(&mut self, nb_kernel: u32, stride: u32, save_key: Option<&str>) {
+        self.push(LayerDraft::Convolution {
+            dim_input: self.dim,
+            nb_kernel,
+            dim_kernel: (3, 3, self.dim.2),
+            stride,
+            padding: PaddingMode::Same,
+            save_key: save_key.map(str::to_string),
+        });
+    }
+
+    fn group_norm(&mut self, num_groups: u32) {
+        self.push(LayerDraft::GroupNorm {
+            dim_input: self.dim,
+            num_groups,
+            save_key: None,
+        });
+    }
+
+    fn silu(&mut self) {
+        self.push(LayerDraft::Activation {
+            dim_input: self.dim,
+            method: ActivationMethod::Silu,
+            save_key: None,
+        });
+    }
+
+    fn upsample(&mut self, nb_kernel: u32, scale_factor: u32) {
+        self.push(LayerDraft::UpsampleConv {
+            dim_input: self.dim,
+            scale_factor,
+            nb_kernel,
+            dim_kernel: (3, 3, self.dim.2),
+            padding: PaddingMode::Same,
+            save_key: None,
+        });
+    }
+
+    fn concat(&mut self, skip_key: &str) {
+        let dim_skip = self.skips[skip_key];
+        self.push(LayerDraft::Concat {
+            dim_input: self.dim,
+            dim_skip,
+            skip_key: skip_key.to_string(),
+            save_key: None,
+        });
+    }
+}
+
+/// The 12-layer diffusion U-Net both templates share, given its channel budget.
+///
+/// `time_channels` is the whole point of the split: a diffusion model **must**
+/// be conditioned on the timestep, which it is by carrying more input channels
+/// than it emits — the excess receives the time embedding. With
+/// `time_channels = 0` the input and output depths match, ε̂ degenerates and
+/// sampling saturates to white. That is not hypothetical: it is the geometry
+/// the repository keeps as `Models/Greyscale_Diffusion_broken`, and it is what
+/// both templates shipped until a blind test read their config off disk.
+fn diffusion_unet(signal_channels: u32, time_channels: u32) -> ((u32, u32, u32), Vec<LayerDraft>) {
+    let input = (32, 32, signal_channels + time_channels);
+    let mut net = UNetDraft::new(input);
+    net.conv(16, 1, Some("enc1"));
+    net.group_norm(4);
+    net.silu();
+    net.conv(32, 2, None);
+    net.group_norm(8);
+    net.silu();
+    net.conv(32, 1, None);
+    net.upsample(16, 2);
+    net.concat("enc1");
+    net.group_norm(8);
+    net.silu();
+    // The head emits the signal alone: the time channels are an input, never an
+    // output. This is the asymmetry that makes the model conditionable.
+    net.conv(signal_channels, 1, None);
+    (input, net.layers)
+}
+
 pub fn diffusion_template() -> ModelTemplate {
+    let (input_size, layers) = diffusion_unet(3, 4);
     ModelTemplate {
         key: "Stable_Diffusion".to_string(),
         name: "Stable Diffusion".to_string(),
-        description: "RGB diffusion backbone (32x32x3) with optional pretrained checkpoints."
-            .to_string(),
-        input_size: (32, 32, 3),
-        layers: vec![
-            LayerDraft::Convolution {
-                dim_input: (32, 32, 3),
-                nb_kernel: 16,
-                dim_kernel: (3, 3, 3),
-                stride: 1,
-                padding: PaddingMode::Same,
-                save_key: Some("enc1".to_string()),
-            },
-            LayerDraft::GroupNorm {
-                dim_input: (32, 32, 16),
-                num_groups: 4,
-                save_key: None,
-            },
-            LayerDraft::Activation {
-                dim_input: (32, 32, 16),
-                method: ActivationMethod::Silu,
-                save_key: None,
-            },
-            LayerDraft::Convolution {
-                dim_input: (32, 32, 16),
-                nb_kernel: 32,
-                dim_kernel: (3, 3, 16),
-                stride: 2,
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-            LayerDraft::GroupNorm {
-                dim_input: (16, 16, 32),
-                num_groups: 8,
-                save_key: None,
-            },
-            LayerDraft::Activation {
-                dim_input: (16, 16, 32),
-                method: ActivationMethod::Silu,
-                save_key: None,
-            },
-            LayerDraft::Convolution {
-                dim_input: (16, 16, 32),
-                nb_kernel: 32,
-                dim_kernel: (3, 3, 32),
-                stride: 1,
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-            LayerDraft::UpsampleConv {
-                dim_input: (16, 16, 32),
-                scale_factor: 2,
-                nb_kernel: 16,
-                dim_kernel: (3, 3, 32),
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-            LayerDraft::Concat {
-                dim_input: (32, 32, 16),
-                dim_skip: (32, 32, 16),
-                skip_key: "enc1".to_string(),
-                save_key: None,
-            },
-            LayerDraft::GroupNorm {
-                dim_input: (32, 32, 32),
-                num_groups: 8,
-                save_key: None,
-            },
-            LayerDraft::Activation {
-                dim_input: (32, 32, 32),
-                method: ActivationMethod::Silu,
-                save_key: None,
-            },
-            LayerDraft::Convolution {
-                dim_input: (32, 32, 32),
-                nb_kernel: 3,
-                dim_kernel: (3, 3, 32),
-                stride: 1,
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-        ],
+        description:
+            "RGB diffusion backbone — 3 signal channels out, 7 in (4 carry the time embedding)."
+                .to_string(),
+        input_size,
+        layers,
         default_lr: 0.01,
         default_batch_size: 1,
         default_steps: 200,
@@ -599,90 +633,15 @@ pub fn diffusion_template() -> ModelTemplate {
 }
 
 pub fn greyscale_diffusion_template() -> ModelTemplate {
+    let (input_size, layers) = diffusion_unet(1, 2);
     ModelTemplate {
         key: "Greyscale_Diffusion".to_string(),
         name: "Greyscale Diffusion".to_string(),
-        description: "Greyscale diffusion backbone (32x32x1) — same U-Net structure as RGB, single channel in/out."
-            .to_string(),
-        input_size: (32, 32, 1),
-        layers: vec![
-            LayerDraft::Convolution {
-                dim_input: (32, 32, 1),
-                nb_kernel: 16,
-                dim_kernel: (3, 3, 1),
-                stride: 1,
-                padding: PaddingMode::Same,
-                save_key: Some("enc1".to_string()),
-            },
-            LayerDraft::GroupNorm {
-                dim_input: (32, 32, 16),
-                num_groups: 4,
-                save_key: None,
-            },
-            LayerDraft::Activation {
-                dim_input: (32, 32, 16),
-                method: ActivationMethod::Silu,
-                save_key: None,
-            },
-            LayerDraft::Convolution {
-                dim_input: (32, 32, 16),
-                nb_kernel: 32,
-                dim_kernel: (3, 3, 16),
-                stride: 2,
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-            LayerDraft::GroupNorm {
-                dim_input: (16, 16, 32),
-                num_groups: 8,
-                save_key: None,
-            },
-            LayerDraft::Activation {
-                dim_input: (16, 16, 32),
-                method: ActivationMethod::Silu,
-                save_key: None,
-            },
-            LayerDraft::Convolution {
-                dim_input: (16, 16, 32),
-                nb_kernel: 32,
-                dim_kernel: (3, 3, 32),
-                stride: 1,
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-            LayerDraft::UpsampleConv {
-                dim_input: (16, 16, 32),
-                scale_factor: 2,
-                nb_kernel: 16,
-                dim_kernel: (3, 3, 32),
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-            LayerDraft::Concat {
-                dim_input: (32, 32, 16),
-                dim_skip: (32, 32, 16),
-                skip_key: "enc1".to_string(),
-                save_key: None,
-            },
-            LayerDraft::GroupNorm {
-                dim_input: (32, 32, 32),
-                num_groups: 8,
-                save_key: None,
-            },
-            LayerDraft::Activation {
-                dim_input: (32, 32, 32),
-                method: ActivationMethod::Silu,
-                save_key: None,
-            },
-            LayerDraft::Convolution {
-                dim_input: (32, 32, 32),
-                nb_kernel: 1,
-                dim_kernel: (3, 3, 32),
-                stride: 1,
-                padding: PaddingMode::Same,
-                save_key: None,
-            },
-        ],
+        description:
+            "Greyscale diffusion backbone — 1 signal channel out, 3 in (2 carry the time embedding)."
+                .to_string(),
+        input_size,
+        layers,
         default_lr: 0.01,
         default_batch_size: 1,
         default_steps: 200,
@@ -916,5 +875,84 @@ impl ModelConfig {
     /// TUI has always written it).
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec_pretty(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A diffusion model must be conditionable on the timestep: it has to carry
+    /// more input channels than it emits, the excess receiving the time
+    /// embedding. Without it ε̂ degenerates and sampling saturates to white.
+    ///
+    /// Both built-in templates violated this — 1→1 and 3→3 — which is exactly
+    /// the geometry the repository preserves as
+    /// `Models/Greyscale_Diffusion_broken`. Found by a blind test reading the
+    /// config the "New model (from template)" flow writes to disk, not by
+    /// reading this file.
+    #[test]
+    fn every_template_is_conditionable_on_the_timestep() {
+        for template in built_in_templates() {
+            let output = compute_inferred_input(&template.layers, template.input_size);
+            assert!(
+                template.input_size.2 > output.2,
+                "template '{}' emits {} channels for {} in — a model that cannot be \
+                 conditioned on t (the geometry of Models/Greyscale_Diffusion_broken)",
+                template.key,
+                output.2,
+                template.input_size.2,
+            );
+            assert_eq!(
+                (template.input_size.0, template.input_size.1),
+                (output.0, output.1),
+                "template '{}' does not return to its input resolution",
+                template.key,
+            );
+        }
+    }
+
+    /// The kernel depth of every convolution must equal the channel count
+    /// reaching it. `Convolution` rejects a mismatch at build time, but
+    /// `UpsampleConv` does not — it indexes its weights with `dim_input.z` and
+    /// corrupts silently. This is why the templates derive their dims.
+    #[test]
+    fn every_template_kernel_is_as_deep_as_its_input() {
+        for template in built_in_templates() {
+            for (index, layer) in template.layers.iter().enumerate() {
+                let (dim_input, dim_kernel) = match layer {
+                    LayerDraft::Convolution {
+                        dim_input,
+                        dim_kernel,
+                        ..
+                    }
+                    | LayerDraft::UpsampleConv {
+                        dim_input,
+                        dim_kernel,
+                        ..
+                    } => (dim_input, dim_kernel),
+                    _ => continue,
+                };
+                assert_eq!(
+                    dim_kernel.2, dim_input.2,
+                    "template '{}', layer {index}: kernel depth {} for {} input channels",
+                    template.key, dim_kernel.2, dim_input.2,
+                );
+            }
+        }
+    }
+
+    /// The first layer must consume the model input itself: a template whose
+    /// stack starts on a different depth than `input_size` is inconsistent no
+    /// matter what the rest does.
+    #[test]
+    fn every_template_stack_starts_on_its_declared_input() {
+        for template in built_in_templates() {
+            let first = template.layers.first().expect("a template has layers");
+            let LayerDraft::Convolution { dim_input, .. } = first else {
+                panic!("template '{}' does not open on a convolution", template.key);
+            };
+            assert_eq!(*dim_input, template.input_size, "template '{}'", template.key);
+        }
     }
 }
