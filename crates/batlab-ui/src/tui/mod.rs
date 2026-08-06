@@ -202,11 +202,12 @@ fn run_monitor_session(
     if app.monitor.restart_training {
         // Back to the action menu with the same model in hand, so the user can
         // pick train/infer/perpetual again — or now rename or delete it, which
-        // the guard allowed the moment the run reported itself done.
-        app.screen = Screen::ModelActions;
+        // the guard allowed the moment the run reported itself done. The
+        // checkpoint list is re-read: the run may well have just written one.
         app.monitor = Default::default();
         app.running_model = None;
         app.should_quit = false;
+        app.enter_model_actions();
 
         match run_builder_loop(terminal, app) {
             Ok(new_config) => return Ok(MonitorOutcome::Restart(new_config)),

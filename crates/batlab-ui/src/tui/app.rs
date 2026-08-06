@@ -1614,6 +1614,19 @@ impl App {
         }
     }
 
+    /// Opens the action menu on the model already in hand, re-reading its
+    /// checkpoints from disk first.
+    ///
+    /// The host calls this on the restart path. Without the re-read the menu
+    /// showed "no checkpoints" for a model that plainly had some, because
+    /// `run_monitor` builds a fresh `App` and never fills the checkpoint list —
+    /// found by driving the real TUI, where a run had just been saved.
+    pub fn enter_model_actions(&mut self) {
+        self.refresh_weight_selector();
+        self.model_actions.error = None;
+        self.screen = Screen::ModelActions;
+    }
+
     /// The action currently highlighted in the action menu.
     pub fn selected_action(&self) -> Option<ModelAction> {
         ModelAction::from_index(self.model_actions.selected)
@@ -2680,6 +2693,36 @@ mod tests {
         app.model_actions.selected = ModelAction::Delete.index();
         app.finish_model_actions();
         assert_eq!(app.screen, Screen::DeleteConfirm);
+    }
+
+    /// Re-entering the action menu re-reads the model's checkpoints. On the
+    /// restart path the app is rebuilt from scratch, so a menu that trusted its
+    /// own state announced "no checkpoints" for a model that had just written
+    /// one.
+    #[test]
+    fn re_entering_the_action_menu_re_reads_the_checkpoints() {
+        let (_temp, mut app, name) = app_on_a_model("reenter-actions");
+        std::fs::write(
+            app.storage
+                .model_weights_dir(&name)
+                .expect("weights dir")
+                .join("latest.ckpt"),
+            b"weights written by the run that just finished",
+        )
+        .expect("checkpoint write");
+        app.weight_selector.checkpoints.clear();
+
+        app.enter_model_actions();
+
+        assert_eq!(app.screen, Screen::ModelActions);
+        assert_eq!(
+            app.weight_selector
+                .checkpoints
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["latest.ckpt"]
+        );
     }
 
     /// A run action is never blocked by the guard — only the two manager
