@@ -29,8 +29,12 @@ Trois résultats méritent d'être lus avant le reste :
   exactement son graphe d'avant.
 - **La clause « jamais moins précis » des missions de réduction précédentes ne
   s'applique pas telle quelle**, et la forcer aurait demandé de truquer un
-  seuil. Le §4.3 explique pourquoi, chiffres à l'appui, et donne la clause
-  correcte — dérivée de la forme, pas ajustée sur la mesure.
+  seuil. Le §4.4 explique pourquoi, chiffres à l'appui, et donne la clause
+  correcte — dérivée de la forme, pas ajustée sur la mesure. Le §4.3 raconte
+  au passage un faux positif de mesure : l'écart relatif **par élément** est
+  mal défini sur un tampon de gradients, et il a fallu changer de métrique
+  puis **rejouer les neuf mutations** pour vérifier que ça n'affaiblissait
+  rien.
 - Un **bug réel** a été attrapé par le compilateur wgpu au moment d'ajouter
   l'uniforme de la loss, et il en dit long sur la fragilité de la convention
   « la sortie d'une couche est son dernier tampon » (§3.6).
@@ -264,8 +268,8 @@ aller-retour de checkpoint.
 
 ## 4. Preuves d'équivalence
 
-`crates/batlab-core/src/model/batch_equivalence_tests.rs` (6 tests) et un
-septième dans `training/diffusion.rs`.
+`crates/batlab-core/src/model/batch_equivalence_tests.rs` (7 tests) et un
+huitième dans `training/diffusion.rs`.
 
 La référence n'est **pas** une fixture figée : le chemin séquentiel est conservé
 verbatim et exécutable (`DiffusionTask::train_step_batch_sequential` et les
@@ -296,27 +300,57 @@ donne sa force : un offset erroné qui tombe sur l'échantillon voisin produit d
 nombres du bon ordre de grandeur, qu'un seuil à 1e-5 n'attraperait que par
 chance. Mesuré : **0 élément divergent sur 5 échantillons**.
 
-### 4.3 Les gradients — et pourquoi la clause habituelle ne tient pas
+### 4.3 Le choix de la métrique — et pourquoi il a fallu le changer
 
-| grandeur | écart relatif max batché ↔ séquentiel | seuil |
-|---|---:|---:|
-| conv1 `grad_weights` | 1,97e-5 | 1e-4 |
-| conv1 `grad_bias` | 9,64e-7 | 1e-4 |
-| GroupNorm `grad_gamma` | 5,13e-7 | 1e-4 |
-| GroupNorm `grad_beta` | 4,34e-7 | 1e-4 |
-| conv2 `grad_weights` | 3,12e-6 | 1e-4 |
-| conv2 `grad_bias` | 7,04e-8 | 1e-4 |
+Avant les chiffres, la façon de les mesurer, parce que la première version de
+ces tests utilisait l'**écart relatif par élément** et qu'elle a produit un faux
+positif instructif.
+
+Sur le modèle en U (§4.5), l'entrée 100 du `grad_weights` de la première
+convolution vaut **7,12e-4** dans un tampon dont la plus grande entrée vaut
+**4,61**. Les deux chemins y diffèrent de **2,98e-7** — exactement le plancher
+d'arrondi f32 pour des termes de cette taille. L'écart relatif par élément
+annonce alors **4,2e-4** et le test tombe.
+
+Ce nombre ne mesure pas l'accord sur le gradient : il mesure **à quel point sa
+plus petite entrée se trouve proche de zéro**. Les petites entrées d'un tampon
+de gradients sont petites *parce que* ce sont des sommes presque exactement
+compensées de grands termes ; leur erreur relative est mal définie.
+
+La métrique retenue est donc l'erreur **relative à l'échelle du vecteur** :
+`max |a−b| / max(‖a‖∞, ‖b‖∞)`. C'est la réponse standard pour une grandeur
+vectorielle, et elle reste mordante là où il faut : une réduction tronquée ou un
+offset manqué déplacent les **grandes** entrées, celles-là mêmes dont ‖·‖∞ est
+fait. Ce n'est pas un argument, c'est vérifié par mutation (§4.8) : les neuf
+mutations sont attrapées avec la nouvelle métrique, et deux d'entre elles font
+tomber **plus** de tests qu'avec l'ancienne.
+
+### 4.4 Les gradients — et pourquoi la clause habituelle ne tient pas
+
+Batché contre séquentiel, erreur relative à l'échelle, seuil 1e-4 :
+
+| modèle | grandeur | écart |
+|---|---|---:|
+| conv → GN → SiLU → conv | conv1 `grad_weights` | 2,74e-7 |
+| | conv1 `grad_bias` | 6,43e-7 |
+| | GroupNorm `grad_gamma` | 1,21e-7 |
+| | GroupNorm `grad_beta` | 1,86e-7 |
+| | conv2 `grad_weights` | 3,91e-7 |
+| U-net (conv s2 → up-conv → concat → conv) | 8 tampons | 7,17e-8 … 3,10e-7 |
+
+Tout est au **plancher d'arrondi f32** (ε = 1,19e-7), deux à trois ordres de
+grandeur sous le seuil.
 
 Face à l'oracle f64 (convolution seule, batch 5) :
 
 | grandeur | batché ↔ f64 | séquentiel ↔ f64 |
 |---|---:|---:|
-| `grad_weights` | **3,50e-6** | 8,58e-6 |
-| `grad_bias` | **2,11e-6** | 5,34e-7 |
+| `grad_weights` | 1,51e-7 | 1,36e-7 |
+| `grad_bias` | **4,34e-7** | 1,58e-7 |
 
-**Le résultat honnête** : sur `grad_bias`, le batché est **4× moins précis** que
-le séquentiel. Ce n'est pas un bug, et ce n'est pas non plus une raison de
-tordre le seuil.
+**Le résultat honnête** : sur `grad_bias`, le batché est **2,75× moins précis**
+que le séquentiel. Les deux sont au plancher f32, mais le rapport est réel et il
+fait tomber la clause habituelle du dépôt.
 
 `PERF_GROUP_NORM.md` §3.2 et `PERF_CONVOLUTION.md` §4.2 pouvaient exiger
 `nouveau ≤ 1,5 × ancien` parce que là-bas seule l'**association** d'un ensemble
@@ -324,13 +358,15 @@ tordre le seuil.
 `positions` termes. Ici le **nombre de termes change** : une lane qui parcourait
 `positions` valeurs en parcourt `batch × positions` dans un seul accumulateur
 f32. Chaîne plus longue, plus d'arrondi. C'est l'arithmétique de l'opération
-demandée, pas un défaut d'implémentation.
+demandée, pas un défaut d'implémentation — et 4,34e-7 > 1,5 × 1,58e-7, donc
+écrire la clause telle quelle aurait demandé de truquer le seuil.
 
-La clause devient donc : soit le batché passe l'ancienne barre 1,5×, soit il
+La clause livrée est donc : soit le batché passe l'ancienne barre 1,5×, soit il
 tient dans un petit multiple du **plancher d'arrondi de la somme qu'il effectue
 désormais** — `sqrt(n)·ε` pour `n` termes accumulés, l'estimation en marche
-aléatoire. Le plancher est **dérivé de la forme**, pas ajusté sur la mesure, et
-une réduction réellement cassée est à O(1) relatif, quatre ordres de grandeur
+aléatoire. Le plancher est **dérivé de la forme**, pas ajusté sur la mesure
+(ici `sqrt(36 × 5) × 1,19e-7 = 1,6e-6`, et la mesure est à 4,34e-7). Une
+réduction réellement cassée est à O(1) relatif, quatre ordres de grandeur
 au-dessus : le test mord toujours. L'exigence dure — **< 1e-4 face à l'oracle** —
 est inchangée.
 
@@ -338,7 +374,18 @@ L'oracle f64 est écrit en **scatter** sur la carte des taps du forward
 (`(oy,ox,ky,kx) → (oy·s+ky−pad_y, ox·s+kx−pad_x)`, contribution nulle hors
 bornes) : il valide l'indexation des shaders au lieu de la répéter.
 
-### 4.4 L'isolation entre tranches
+### 4.5 Concat et UpsampleConv — la forme en U
+
+Un second modèle : `conv(s2) → up-conv(×2) → concat(skip) → conv`. Il mérite son
+test parce que **Concat est la seule couche dont les trois tenseurs ont des
+longueurs par échantillon différentes** (sortie = entrée + skip en canaux) : il
+lui faut **trois** offsets d'échantillon distincts là où tout autre kernel en a
+un seul. Un offset partagé y produirait des données plausibles et fausses.
+
+Forward **bit à bit** sur les 5 échantillons, gradients des 4 couches
+entraînables au plancher f32 (tableau ci-dessus).
+
+### 4.6 L'isolation entre tranches
 
 `a_batch_with_one_live_sample_equals_a_batch_of_one` : un batch dont tous les
 échantillons sauf un sont nuls doit donner exactement les gradients d'un batch
@@ -349,7 +396,7 @@ dans la vivante.
 L'échantillon vivant n'est **délibérément pas** le slot 0 : une implémentation
 qui ignore l'offset passerait s'il l'était.
 
-### 4.5 Différences finies
+### 4.7 Différences finies
 
 Les trois gradient checks d'`audit_tests.rs`
 (`conv_weight_gradients_match_finite_differences`, `…_same_padding`,
@@ -357,26 +404,36 @@ Les trois gradient checks d'`audit_tests.rs`
 sont des oracles qui ne connaissent aucune des deux implémentations. **Aucun
 test existant n'a été touché ni affaibli.**
 
-### 4.6 Les tests neufs ne sont pas vacuous — vérifié par mutation
+### 4.8 Les tests neufs ne sont pas vacuous — vérifié par mutation
 
-Sept mutations délibérées, toutes recompilées avec succès, toutes attrapées :
+**Neuf** mutations délibérées, toutes recompilées avec succès, toutes
+attrapées — et rejouées **après** le changement de métrique du §4.3, ce qui est
+le point : changer la façon de mesurer un écart peut affaiblir un test sans
+qu'aucun ne devienne rouge, et la seule façon de le savoir est de refaire tomber
+le code exprès.
 
 | mutation | tests en échec |
 |---|---|
-| conv forward : offset d'échantillon sur `input` supprimé | 6 |
+| conv forward : offset d'échantillon sur `input` supprimé | 7 |
 | group_norm forward : tous les échantillons sur la tranche 0 | 5 |
-| `conv_back_weights` : axe batch tronqué hors de la réduction | 3 |
-| loss : `N` relu sur `arrayLength` (donc `batch·N`) | 3 |
+| `conv_back_weights` : axe batch tronqué hors de la réduction | 4 |
+| loss : `N` relu sur `arrayLength` (donc `batch·N`) | 4 |
 | `group_norm_back_input` : stats indexées par groupe, pas par (échantillon, groupe) | 2 |
 | `group_norm_back_gamma` : batch retiré du balayage spatial | 2 |
+| `upsample_conv_back_weights` : batch tronqué hors de la réduction | 1 |
+| `back_concat` : offset d'échantillon du skip supprimé | 1 |
 | `diffusion_prepare` : tous les échantillons lisent `specs[0]` | 1 |
+
+Aucune n'est passée sous les mailles, et les deux mutations les plus larges en
+font tomber **plus** qu'avec l'ancienne métrique (7 contre 6, 4 contre 3), parce
+que le test du modèle en U s'est ajouté entre-temps.
 
 Chaque test porte en outre sa **garde anti-vacuité** (les échantillons doivent
 être assez différents, les gradients non nuls, les bruits distincts) : sans
 elles, « toutes les tranches concordent » pourrait être vrai pour la mauvaise
 raison.
 
-### 4.7 Suite complète
+### 4.9 Suite complète
 
 ```
 cargo test --workspace

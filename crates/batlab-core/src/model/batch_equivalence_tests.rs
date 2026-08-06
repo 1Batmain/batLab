@@ -20,7 +20,7 @@ use crate::gpu_context::GpuContext;
 use crate::model::debug::read_back_f32;
 use crate::model::layer_types::{
     ActivationMethod, ActivationType, ConvolutionType, GroupNormType, LayerType, LayerTypes,
-    LossMethod,
+    LossMethod, UpsampleConvType,
 };
 use crate::model::optimizer::OptimizerKind;
 use crate::model::{Dim3, Model, PaddingMode, Training};
@@ -87,6 +87,66 @@ async fn single_conv_model(gpu: Arc<GpuContext>, batch: u32) -> Model<Training> 
             Dim3::new(DIM_IN),
             KERNELS,
             Dim3::new((3, 3, DIM_IN.2)),
+            1,
+            PaddingMode::Same,
+        )))
+        .unwrap();
+    model.build().unwrap();
+    model
+}
+
+/// conv(s2) -> up-conv(x2) -> concat(skip) -> conv.
+///
+/// The U-net shape, and the one where the batch axis is easiest to get wrong:
+/// Concat is the only layer whose three tensors have DIFFERENT per-sample
+/// lengths (out = input + skip channels), so a single shared `sample * len`
+/// offset is wrong for it — and UpsampleConv reduces onto its weights over a
+/// tap map that is not the convolution's. Both are in every real model of the
+/// repository and in neither of the fixtures above.
+async fn skip_model(gpu: Arc<GpuContext>, batch: u32) -> Model<Training> {
+    let mut model = Model::new_training_with_optimizer(
+        gpu,
+        0.01,
+        batch,
+        LossMethod::MeanSquared,
+        OptimizerKind::Sgd,
+    )
+    .await;
+    model
+        .add_layer(LayerTypes::Convolution(ConvolutionType::new(
+            Dim3::new(DIM_IN),
+            KERNELS,
+            Dim3::new((3, 3, DIM_IN.2)),
+            1,
+            PaddingMode::Same,
+        )))
+        .unwrap();
+    model.mark_output("skip").unwrap();
+    // Stride 2: 6x6 -> 3x3, so the up-conv has real work to undo.
+    model
+        .add_layer(LayerTypes::Convolution(ConvolutionType::new(
+            Dim3::new((DIM_IN.0, DIM_IN.1, KERNELS)),
+            KERNELS,
+            Dim3::new((3, 3, KERNELS)),
+            2,
+            PaddingMode::Same,
+        )))
+        .unwrap();
+    model
+        .add_layer(LayerTypes::UpsampleConv(UpsampleConvType::new(
+            Dim3::default(),
+            2,
+            KERNELS,
+            Dim3::new((3, 3, KERNELS)),
+            PaddingMode::Same,
+        )))
+        .unwrap();
+    model.add_concat("skip").unwrap();
+    model
+        .add_layer(LayerTypes::Convolution(ConvolutionType::new(
+            Dim3::new((DIM_IN.0, DIM_IN.1, 2 * KERNELS)),
+            1,
+            Dim3::new((3, 3, 2 * KERNELS)),
             1,
             PaddingMode::Same,
         )))
@@ -207,26 +267,53 @@ fn sequential_gradients(
     read_parameter_gradients(model)
 }
 
+/// Largest disagreement between two gradient vectors, **relative to the scale
+/// of the vector** (`max |a-b| / max(||a||inf, ||b||inf)`).
+///
+/// Not the per-element relative error, and the difference is not cosmetic. A
+/// gradient buffer spans orders of magnitude, and its small entries are small
+/// because they are nearly-cancelled sums of large terms. On the U-net fixture
+/// below, entry 100 of the first convolution's `grad_weights` is 7.12e-4 in a
+/// buffer whose largest entry is 4.61: the two paths differ there by 2.98e-7,
+/// which is the f32 rounding floor for terms of that size — and which the
+/// per-element metric reports as a 4.2e-4 "relative error". That number does
+/// not measure agreement on the gradient; it measures how close to zero its
+/// smallest entry happens to fall.
+///
+/// The vector-relative error is the standard answer for a quantity like this,
+/// and it stays strict where it matters: a truncated batch reduction or a
+/// missed slice offset moves the LARGE entries, which are exactly the ones
+/// `||.||inf` is made of. That claim is checked by mutation (§4.6 of the
+/// report), not asserted.
 fn worst_relative_diff(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len(), "length mismatch");
+    let scale = a
+        .iter()
+        .chain(b)
+        .map(|v| v.abs() as f64)
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
     a.iter()
         .zip(b)
-        .map(|(x, y)| {
-            let scale = (x.abs().max(y.abs()) as f64).max(1e-6);
-            ((*x as f64) - (*y as f64)).abs() / scale
-        })
+        .map(|(x, y)| ((*x as f64) - (*y as f64)).abs())
         .fold(0.0f64, f64::max)
+        / scale
 }
 
+/// Same metric, against the f64 oracle.
 fn worst_relative_to_f64(a: &[f32], oracle: &[f64]) -> f64 {
     assert_eq!(a.len(), oracle.len(), "length mismatch");
+    let scale = a
+        .iter()
+        .map(|v| v.abs() as f64)
+        .chain(oracle.iter().map(|v| v.abs()))
+        .fold(0.0f64, f64::max)
+        .max(1e-12);
     a.iter()
         .zip(oracle)
-        .map(|(x, y)| {
-            let scale = ((*x as f64).abs().max(y.abs())).max(1e-6);
-            ((*x as f64) - y).abs() / scale
-        })
+        .map(|(x, y)| ((*x as f64) - y).abs())
         .fold(0.0f64, f64::max)
+        / scale
 }
 
 // ---------------------------------------------------------------------------
@@ -322,11 +409,11 @@ fn parameter_gradients_match_the_sequential_accumulation() {
                 ("grad_bias", new_b, old_b),
             ] {
                 let diff = worst_relative_diff(a, b);
-                println!("layer {layer} {name}: worst relative diff {diff:e}");
+                println!("layer {layer} {name}: worst error vs scale {diff:e}");
                 assert!(
                     diff < 1e-4,
                     "\nlayer {layer} {name} disagrees with the sequential accumulation \
-                     (worst relative diff {diff:e})\nbatched[..4]: {:?}\nsequential[..4]: {:?}\n",
+                     (worst error vs scale {diff:e})\nbatched[..4]: {:?}\nsequential[..4]: {:?}\n",
                     &a[..4.min(a.len())],
                     &b[..4.min(b.len())],
                 );
@@ -579,7 +666,7 @@ fn a_batch_with_one_live_sample_equals_a_batch_of_one() {
                     diff < 1e-4,
                     "\nlayer {layer} {name}: a live sample in slot {live} of a batch of \
                      {BATCH} does not reproduce the batch of one it should \
-                     (worst relative diff {diff:e}) — a slice offset is leaking\n"
+                     (worst error vs scale {diff:e}) — a slice offset is leaking\n"
                 );
             }
         }
@@ -628,7 +715,7 @@ fn group_norm_statistics_do_not_leak_across_the_batch() {
             assert!(
                 diff < 1e-5,
                 "\nsample {slot} changes when batched with a sample scaled 10 000x \
-                 differently (worst relative diff {diff:e}) — the group statistics are \
+                 differently (worst error vs scale {diff:e}) — the group statistics are \
                  being pooled across the batch\n"
             );
         }
@@ -689,5 +776,73 @@ fn reported_loss_is_the_last_sample_of_the_batch() {
             "the first and last samples have indistinguishable losses; \
              the offset assertion above proves nothing"
         );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 7. Concat and UpsampleConv — the U-net shape
+// ---------------------------------------------------------------------------
+
+/// The same two properties as tests 1 and 2, on the layers the fixtures above
+/// do not reach.
+///
+/// Concat earns its own test: it is the ONLY layer whose input, skip and output
+/// have different per-sample lengths, so it needs three distinct sample offsets
+/// where every other kernel needs one. A single shared offset there is exactly
+/// the mistake that produces plausible-looking, wrong data.
+#[test]
+fn concat_and_upsample_conv_carry_the_batch_correctly() {
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        let mut batched = skip_model(gpu.clone(), BATCH as u32).await;
+        let mut single = skip_model(gpu.clone(), 1).await;
+
+        let in_len = input_len(&batched);
+        let out_len = output_len(&batched);
+        let inputs: Vec<f32> = (0..BATCH).flat_map(|s| sample_data(s, in_len)).collect();
+        let targets: Vec<f32> = (0..BATCH)
+            .flat_map(|s| sample_data(s + 100, out_len))
+            .collect();
+
+        // Forward: bit for bit, sample by sample.
+        write_input(&batched, &inputs);
+        run_forward(&batched, BATCH as u32);
+        let batched_out = read_output(&batched, BATCH * out_len);
+        for sample in 0..BATCH {
+            write_input(&single, &inputs[sample * in_len..(sample + 1) * in_len]);
+            run_forward(&single, 1);
+            let alone = read_output(&single, out_len);
+            let slice = &batched_out[sample * out_len..(sample + 1) * out_len];
+            let differing = alone
+                .iter()
+                .zip(slice)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "\nsample {sample} of the skip/upsample model is not bit-identical to \
+                 the same sample run alone ({differing}/{out_len} elements differ)\n"
+            );
+        }
+
+        // Gradients, including the up-conv's and both convs' around the concat.
+        let new = batched_gradients(&mut batched, &inputs, &targets, BATCH);
+        let old = sequential_gradients(&mut single, &inputs, &targets, BATCH);
+        assert_eq!(new.len(), old.len());
+        for (layer, ((new_w, new_b), (old_w, old_b))) in new.iter().zip(&old).enumerate() {
+            for (name, a, b) in [("grad_weights", new_w, old_w), ("grad_bias", new_b, old_b)] {
+                let diff = worst_relative_diff(a, b);
+                println!("skip model, layer {layer} {name}: worst error vs scale {diff:e}");
+                assert!(
+                    diff < 1e-4,
+                    "\nskip model layer {layer} {name} disagrees with the sequential \
+                     accumulation (worst error vs scale {diff:e})\n"
+                );
+                assert!(
+                    a.iter().any(|v| v.abs() > 1e-6),
+                    "skip model layer {layer} {name} is all zeros — the test proves nothing"
+                );
+            }
+        }
     });
 }
