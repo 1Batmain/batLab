@@ -1,8 +1,8 @@
 //! File purpose: Implements events behavior for the terminal user interface flow.
 
 use super::app::{
-    App, HOME_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, PERPETUAL_PARAM_FIELD_NAMES,
-    PerpetualStatus, RUN_MODE_CHOICES, Screen, TrainingControlCommand,
+    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS, PERPETUAL_PARAM_FIELD_NAMES,
+    PerpetualStatus, Screen, TrainingControlCommand,
 };
 use crossterm::event::KeyCode;
 
@@ -53,13 +53,14 @@ pub enum TrainingEvent {
 
 pub fn handle_key(app: &mut App, code: KeyCode) {
     match app.screen {
-        Screen::Home => handle_home(app, code),
-        Screen::LoadPath => handle_load_path(app, code),
+        Screen::ModelList => handle_model_list(app, code),
         Screen::TemplateSelector => handle_template_selector(app, code),
+        Screen::ModelActions => handle_model_actions(app, code),
+        Screen::RenameModel => handle_rename_model(app, code),
+        Screen::DeleteConfirm => handle_delete_confirm(app, code),
         Screen::WeightSelector => handle_weight_selector(app, code),
         Screen::InputSize => handle_input_size(app, code),
         Screen::LayerBuilder => handle_layer_builder(app, code),
-        Screen::ModeSelector => handle_mode_selector(app, code),
         Screen::InferenceParams => handle_inference_params(app, code),
         Screen::PerpetualParams => handle_perpetual_params(app, code),
         Screen::TrainingParams => handle_training_params(app, code),
@@ -69,45 +70,91 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_home(app: &mut App, code: KeyCode) {
+/// The front door. `Esc` quits because there is nowhere above it to go.
+fn handle_model_list(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
-            if app.home.selected > 0 {
-                app.home.selected -= 1;
+            if app.model_list.selected > 0 {
+                app.model_list.selected -= 1;
             }
         }
         KeyCode::Down => {
-            if app.home.selected + 1 < HOME_CHOICES.len() {
-                app.home.selected += 1;
+            // Bounded on the row count, which includes the "new model" row —
+            // a bound taken from `models.len()` would leave the template flow
+            // drawn but unselectable, which is exactly the bug this codebase
+            // keeps producing.
+            if app.model_list.selected + 1 < app.model_list.entry_count() {
+                app.model_list.selected += 1;
             }
         }
-        KeyCode::Enter => app.finish_home(),
+        KeyCode::Char('r') => app.refresh_model_list(),
+        KeyCode::Enter => app.finish_model_list(),
         _ => {}
     }
 }
 
-fn handle_load_path(app: &mut App, code: KeyCode) {
+fn handle_model_actions(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => app.screen = Screen::Home,
+        KeyCode::Esc => {
+            app.model_actions.error = None;
+            app.refresh_model_list();
+            app.screen = Screen::ModelList;
+        }
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('e') => app.enter_layer_builder(),
         KeyCode::Up => {
-            if app.load_path.selected > 0 {
-                app.load_path.selected -= 1;
+            if app.model_actions.selected > 0 {
+                app.model_actions.selected -= 1;
             }
         }
         KeyCode::Down => {
-            if app.load_path.selected + 1 < app.load_path.models.len() {
-                app.load_path.selected += 1;
+            if app.model_actions.selected + 1 < MODEL_ACTIONS.len() {
+                app.model_actions.selected += 1;
             }
         }
-        KeyCode::Enter => app.finish_load_path(),
+        KeyCode::Enter => app.finish_model_actions(),
+        _ => {}
+    }
+}
+
+/// Every printable key is text here — a model name may contain a `q`, so `q`
+/// cannot also mean quit. `Esc` is the way back.
+fn handle_rename_model(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.rename_model.error = None;
+            app.screen = Screen::ModelActions;
+        }
+        KeyCode::Backspace => app.handle_backspace_rename(),
+        KeyCode::Enter => app.finish_rename(),
+        KeyCode::Char(c) => app.handle_char_rename(c),
+        _ => {}
+    }
+}
+
+/// Same rule as rename, and the same reason: what is typed here is compared
+/// against the model's name, so it has to be able to *be* the model's name.
+fn handle_delete_confirm(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.delete_confirm.typed.clear();
+            app.delete_confirm.error = None;
+            app.screen = Screen::ModelActions;
+        }
+        KeyCode::Backspace => app.handle_backspace_delete_confirm(),
+        KeyCode::Enter => app.finish_delete(),
+        KeyCode::Char(c) => app.handle_char_delete_confirm(c),
         _ => {}
     }
 }
 
 fn handle_template_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => app.screen = Screen::Home,
+        KeyCode::Esc => {
+            app.refresh_model_list();
+            app.screen = Screen::ModelList;
+        }
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.template_selector.selected > 0 {
@@ -126,7 +173,8 @@ fn handle_template_selector(app: &mut App, code: KeyCode) {
 
 fn handle_weight_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::ModelActions,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.weight_selector.selected > 0 {
                 app.weight_selector.selected -= 1;
@@ -146,7 +194,7 @@ fn handle_weight_selector(app: &mut App, code: KeyCode) {
 fn handle_input_size(app: &mut App, code: KeyCode) {
     let max_field = INPUT_SIZE_FIELD_NAMES.len() - 1;
     match code {
-        KeyCode::Esc => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::LayerBuilder,
         KeyCode::Up => {
             if app.input_size.field_idx > 0 {
                 app.input_size.field_idx -= 1;
@@ -182,10 +230,15 @@ fn handle_layer_builder(app: &mut App, code: KeyCode) {
 
 fn handle_lb_add(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::ModelActions,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('b') => app.finish_layer_builder(),
         KeyCode::Char('d') => app.delete_last_layer(),
         KeyCode::Char('e') => app.enter_browse_mode(),
+        // The model's input geometry — the one thing the layer form cannot
+        // express, and the screen that used to be drawn with nothing routing
+        // to it.
+        KeyCode::Char('i') => app.open_input_size(),
         KeyCode::Left => app.cycle_kind_backward(),
         KeyCode::Right => app.cycle_kind_forward(),
         KeyCode::Up => {
@@ -252,28 +305,10 @@ fn handle_lb_edit(app: &mut App, code: KeyCode) {
     }
 }
 
-fn handle_mode_selector(app: &mut App, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('e') => app.enter_layer_builder_from_mode(),
-        KeyCode::Up => {
-            if app.mode_selector.selected > 0 {
-                app.mode_selector.selected -= 1;
-            }
-        }
-        KeyCode::Down => {
-            if app.mode_selector.selected + 1 < RUN_MODE_CHOICES.len() {
-                app.mode_selector.selected += 1;
-            }
-        }
-        KeyCode::Enter => app.finish_mode_selector(),
-        _ => {}
-    }
-}
-
 fn handle_dataset_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::TrainingParams,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Left => app.cycle_dataset_backward(),
         KeyCode::Right => app.cycle_dataset_forward(),
         KeyCode::Up => {
@@ -300,7 +335,8 @@ fn handle_dataset_selector(app: &mut App, code: KeyCode) {
 fn handle_inference_params(app: &mut App, code: KeyCode) {
     let max_field = 3;
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::WeightSelector,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.inference_params.field_idx > 0 {
                 app.inference_params.field_idx -= 1;
@@ -335,7 +371,7 @@ fn handle_perpetual_params(app: &mut App, code: KeyCode) {
     let seed_toggle = 0;
     let regime_toggle = max_field;
     match code {
-        KeyCode::Esc => app.screen = Screen::ModeSelector,
+        KeyCode::Esc => app.screen = Screen::WeightSelector,
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.perpetual_params.field_idx > 0 {
@@ -373,7 +409,8 @@ fn handle_perpetual_params(app: &mut App, code: KeyCode) {
 fn handle_training_params(app: &mut App, code: KeyCode) {
     let max_field = 2;
     match code {
-        KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.screen = Screen::WeightSelector,
+        KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.training_params.field_idx > 0 {
                 app.training_params.field_idx -= 1;
@@ -471,12 +508,20 @@ fn handle_monitor(app: &mut App, code: KeyCode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::TempRoot;
     use crate::tui::app::{
-        InferenceConfig, ModelConfig, PerpetualConfig, RunConfig, RunMode, TrainingConfig,
+        InferenceConfig, ModelAction, ModelConfig, PerpetualConfig, RunConfig, RunMode,
+        TrainingConfig,
     };
 
-    fn monitor_app(mode: RunMode) -> App {
-        let mut app = App::new();
+    fn test_app(tag: &str) -> (TempRoot, App) {
+        let temp = TempRoot::new(tag);
+        let app = App::with_storage(temp.storage());
+        (temp, app)
+    }
+
+    fn monitor_app(mode: RunMode) -> (TempRoot, App) {
+        let (temp, mut app) = test_app("monitor");
         app.screen = Screen::Monitor;
         app.monitor.model_config = Some(ModelConfig {
             model_name: Some("unit-test-monitor".to_string()),
@@ -485,33 +530,99 @@ mod tests {
             inference: InferenceConfig::default(),
             run: RunConfig { mode },
         });
-        app
+        (temp, app)
     }
 
     /// Found by driving the real TUI: `Perpetual` was drawn as a third option
     /// but the cursor stopped at index 1, so it could never be selected. The
-    /// bound now comes from the choice list itself.
+    /// bound now comes from the choice list itself — and the list has since
+    /// grown the two manager actions, which the cursor must reach too.
     #[test]
-    fn the_mode_cursor_reaches_every_run_mode() {
-        let mut app = App::new();
-        app.screen = Screen::ModeSelector;
-        app.mode_selector.selected = 0;
+    fn the_action_cursor_reaches_every_action() {
+        let (_temp, mut app) = test_app("action-cursor");
+        app.screen = Screen::ModelActions;
+        app.model_actions.selected = 0;
 
-        for expected in 1..RUN_MODE_CHOICES.len() {
+        for expected in 1..MODEL_ACTIONS.len() {
             handle_key(&mut app, KeyCode::Down);
-            assert_eq!(app.mode_selector.selected, expected);
+            assert_eq!(app.model_actions.selected, expected);
         }
         handle_key(&mut app, KeyCode::Down);
         assert_eq!(
-            app.mode_selector.selected,
-            RUN_MODE_CHOICES.len() - 1,
-            "cursor ran past the last mode"
+            app.model_actions.selected,
+            MODEL_ACTIONS.len() - 1,
+            "cursor ran past the last action"
         );
+        assert_eq!(
+            ModelAction::from_index(app.model_actions.selected),
+            Some(ModelAction::Delete)
+        );
+    }
+
+    /// The cursor has to reach the "new model" row, which sits *after* the
+    /// models — a bound taken from `models.len()` would draw it and never let
+    /// it be selected.
+    #[test]
+    fn the_model_list_cursor_reaches_the_new_model_row() {
+        let (_temp, mut app) = test_app("list-cursor");
+        app.finish_template_selector();
+        app.refresh_model_list();
+        app.screen = Screen::ModelList;
+        app.model_list.selected = 0;
+        assert_eq!(app.model_list.models.len(), 1);
+
+        handle_key(&mut app, KeyCode::Down);
+
+        assert!(app.model_list.is_new_model_selected());
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(
+            app.model_list.selected,
+            app.model_list.entry_count() - 1,
+            "cursor ran past the last row"
+        );
+    }
+
+    /// A model name may contain any of these; on the two manager screens they
+    /// are text, not commands. `q` in particular quits everywhere else.
+    #[test]
+    fn the_manager_forms_treat_every_printable_key_as_text() {
+        let (_temp, mut app) = test_app("manager-typing");
+        app.screen = Screen::RenameModel;
+        for c in "q-model.2".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.rename_model.input, "q-model.2");
+        assert!(!app.should_quit, "[q] must be typable in a model name");
+
+        app.screen = Screen::DeleteConfirm;
+        for c in "quiet".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.delete_confirm.typed, "quiet");
+        assert!(!app.should_quit);
+
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.delete_confirm.typed, "quie");
+    }
+
+    /// Leaving the delete screen must not leave the typed confirmation behind:
+    /// coming back to it half-confirmed is one keystroke from a deletion the
+    /// user never asked for twice.
+    #[test]
+    fn leaving_the_delete_screen_clears_what_was_typed() {
+        let (_temp, mut app) = test_app("delete-esc");
+        app.screen = Screen::DeleteConfirm;
+        app.delete_confirm.typed = "almost".to_string();
+
+        handle_key(&mut app, KeyCode::Esc);
+
+        assert_eq!(app.screen, Screen::ModelActions);
+        assert!(app.delete_confirm.typed.is_empty());
     }
 
     #[test]
     fn perpetual_monitor_keys_steer_the_drift() {
-        let mut app = monitor_app(RunMode::Perpetual(PerpetualConfig::default()));
+        let (_temp, mut app) = monitor_app(RunMode::Perpetual(PerpetualConfig::default()));
 
         for (key, expected) in [
             (KeyCode::Up, TrainingControlCommand::NudgeRenoiseDepth(1)),
@@ -545,7 +656,7 @@ mod tests {
     /// on the run mode, and this is what proves the gate holds.
     #[test]
     fn a_training_monitor_keeps_its_own_bindings() {
-        let mut app = monitor_app(RunMode::Train(TrainingConfig {
+        let (_temp, mut app) = monitor_app(RunMode::Train(TrainingConfig {
             lr: 0.01,
             batch_size: 1,
             steps: 10,

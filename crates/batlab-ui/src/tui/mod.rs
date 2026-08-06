@@ -2,10 +2,12 @@
 
 pub mod app;
 pub mod events;
+#[cfg(test)]
+mod nav_tests;
 pub mod ui;
 pub mod visualiser_control;
 
-pub use app::{App, MonitorImage, PerpetualStatus, Screen};
+pub use app::{App, ModelAction, MonitorImage, PerpetualStatus, Screen};
 // Re-exported for call sites that already speak in terms of `tui::…`; the types
 // themselves are engine-side (`batlab_core::config`) because a model
 // description must survive without a terminal.
@@ -130,10 +132,14 @@ pub fn run_monitor(
     app.layer_builder.layers = config.layers.clone();
     app.layer_builder.model_input = config.input_size;
     app.active_model_name = config.model_name.clone();
+    // What the manager refuses to rename or delete for as long as this run is
+    // alive. Set here rather than in the builder: this is the moment a worker
+    // actually holds the model's directory.
+    app.running_model = config.model_name.clone();
     app.monitor.model_config = Some(config.clone());
     match &config.run.mode {
         RunMode::Infer => {
-            app.mode_selector.selected = 0;
+            app.model_actions.selected = ModelAction::Infer.index();
             app.inference_params.random_seed = config.inference.random_seed;
             app.inference_params.fields[0] = config.inference.seed.unwrap_or(0).to_string();
             app.inference_params.fields[1] = config.inference.denoising_paths.max(1).to_string();
@@ -142,7 +148,7 @@ pub fn run_monitor(
             app.inference_params.error = None;
         }
         RunMode::Perpetual(pc) => {
-            app.mode_selector.selected = 2;
+            app.model_actions.selected = ModelAction::Perpetual.index();
             app.perpetual_params.random_seed = pc.random_seed;
             app.perpetual_params.regime = pc.regime;
             app.perpetual_params.fields[0] = pc.seed.unwrap_or(0).to_string();
@@ -154,7 +160,7 @@ pub fn run_monitor(
             app.selected_checkpoint_path = pc.checkpoint.clone();
         }
         RunMode::Train(tc) => {
-            app.mode_selector.selected = 1;
+            app.model_actions.selected = ModelAction::Train.index();
             app.monitor.total_steps = tc.steps;
             app.monitor.current_lr = Some(tc.lr);
             app.monitor.current_batch_size = Some(tc.batch_size);
@@ -194,10 +200,12 @@ fn run_monitor_session(
     visualiser_control::clear_visualiser_source();
 
     if app.monitor.restart_training {
-        // Reset to mode selection with the same architecture so the user can
-        // quickly pick infer/train again and choose a dataset for training.
-        app.screen = Screen::ModeSelector;
+        // Back to the action menu with the same model in hand, so the user can
+        // pick train/infer/perpetual again — or now rename or delete it, which
+        // the guard allowed the moment the run reported itself done.
+        app.screen = Screen::ModelActions;
         app.monitor = Default::default();
+        app.running_model = None;
         app.should_quit = false;
 
         match run_builder_loop(terminal, app) {
