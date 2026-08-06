@@ -98,6 +98,23 @@ Ce point n'est **pas bloquant** pour la nuit : batch 32 donne le même débit pa
 Smoke train batch 16, 300 pas : loss **1,426 → 0,021**, les quatre tranches de t
 décroissent, **zéro valeur non finie** sur 49 152 échantillons par tranche.
 
+**Chaîne complète vérifiée** — entraînement avec attention → checkpoint →
+rechargement → 256 pas de débruitage → PNG 32×32 :
+
+```
+./target/release/batlab --headless-sample Color_Diffusion_XL \
+  --checkpoint <scratch>/Color_Diffusion_XL_headless.ckpt --paths 2 --out <fichier>.png
+final image stats: min=-0.9999 max=0.9999 mean=-0.1396 std=0.4054
+```
+
+Signature saine : valeurs dans [-1,1] sans saturation, écart-type non dégénéré.
+C'est l'inverse du mode d'échec « blanc saturé » (`INSIGHTS_TRAINING.md`), et
+l'image ne présente pas de bandes horizontales (`ANISOTROPY_HUNT.md`). Le
+contenu reste une texture — le checkpoint ne portait que 100 pas.
+
+> Le flag est `--checkpoint`, **pas** `--ckpt`, et `--out` attend un **fichier**,
+> pas un répertoire.
+
 ## 6. Deux bugs à échec silencieux trouvés en route
 
 1. **La limite WebGPU de 8 storage buffers** (j'en liais 12 au backward). Le bind
