@@ -12,3 +12,9 @@ datasets/cifar-10-batches-bin/
 *_metrics.jsonl
 runs/
 blind_tests/out/
+
+# Sorties de run, à la racine parce que le binaire et les bancs les écrivent là
+# (`--headless-perpetual` sans `--out`, `bench/loss_weighting/samples.sh`). Les
+# planches retenues de ces campagnes sont commitées sous docs/gallery/.
+/perpetual_samples/
+/weighting_samples/
