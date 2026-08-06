@@ -20,7 +20,7 @@ set -u
 cd "$(dirname "$0")/../.."
 . bench/optimizer/lib.sh
 DATASET=/Users/bat/development/lab/batLab/datasets/cifar10_grey.batraw
-BIN=./target/release/main
+BIN=./target/release/batlab
 SHORT=${SHORT:-50}
 LONG=${LONG:-250}
 REPS=${REPS:-3}

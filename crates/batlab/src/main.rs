@@ -43,7 +43,7 @@ const INFERENCE_RUNTIME_BATCH_SIZE: u32 = 1;
 /// does not exist. The dump layout is spelled out for the same reason — a reader
 /// written from a prose description of "raw f32" reads it shifted by five bytes.
 const HELP: &str = "\
-batBuilder — deep-learning framework (Rust + wgpu). Run with no arguments for
+batlab — deep-learning framework (Rust + wgpu). Run with no arguments for
 the interactive TUI. The flags below are the DEV/CI headless entry points; they
 are not reachable from the TUI and never write back a model's config_file.
 

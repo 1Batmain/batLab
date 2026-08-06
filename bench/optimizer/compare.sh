@@ -16,7 +16,7 @@ cd "$(dirname "$0")/../.."
 . bench/optimizer/lib.sh
 DATASET=/Users/bat/development/lab/batLab/datasets/cifar10_grey.batraw
 STEPS=${STEPS:-1500}
-BIN=./target/release/main
+BIN=./target/release/batlab
 mkdir -p runs
 ensure_binary
 

@@ -12,7 +12,7 @@ CKPT=Models/$MODEL/pretrained_weights/night_run.ckpt
 SRC_CKPT=/Users/bat/development/lab/batLab/Models/$MODEL/pretrained_weights/night_run.ckpt
 OUT=blind_tests/out
 ACTIONS=${ACTIONS:-3000}
-BIN=./target/release/main
+BIN=./target/release/batlab
 export ACTIONS
 
 mkdir -p "$OUT"
@@ -23,7 +23,7 @@ if [ ! -f "$CKPT" ]; then
 fi
 
 echo "→ build"
-cargo build --release -p main >/dev/null
+cargo build --release -p batlab >/dev/null
 
 perp() { # perp <regime> <sortie> <actions> [flags…]
   local regime=$1 out=$2 acts=$3; shift 3
@@ -80,10 +80,11 @@ cat > "$OUT/cli.json" <<JSON
  "dial": {$dial_json}}
 JSON
 
-# hygiène : les runs ci-dessus réécrivent perpetual_samples/ (et le binaire peut toucher
-# aux configs de Models/) — on remet l'arbre de travail dans l'état du dépôt.
-git checkout -- perpetual_samples Models 2>/dev/null || true
-git clean -fdq perpetual_samples 2>/dev/null || true
+# hygiène : les runs ci-dessus remplissent perpetual_samples/ (répertoire de sortie du
+# binaire, gitignoré depuis la restructuration — les planches retenues vivent sous
+# docs/gallery/perpetual/) et le binaire peut toucher aux configs de Models/.
+rm -rf perpetual_samples
+git checkout -- Models 2>/dev/null || true
 
 if [ "${BLIND_BASELINE:-0}" = "1" ]; then
   echo "→ baseline pré-flux (P7)"
