@@ -82,6 +82,12 @@ test à l'aveugle** — 9 propriétés, 9 PASS
 
 ### 4. La couleur
 
+![Couleur — 20 000 pas, magnitude 1,0, 8 seeds](docs/gallery/color/final_20k_plate.png)
+
+*Le run complet (20 000 pas, Adam) : diversité inter-seeds 0,252, structure interne
+0,217 et isotropie 1,12 — contre 0,232 / 0,206 / 1,07 pour le dataset CIFAR-10
+lui-même. Les trois statistiques de génération sont au niveau des vraies images.*
+
 ![Smoke test couleur — 600 pas](docs/gallery/color/smoke_plate.png)
 
 *Premier modèle RGB (`Color_Diffusion_L`), après **600 pas seulement** : la chaîne couleur
