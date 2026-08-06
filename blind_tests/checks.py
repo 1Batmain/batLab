@@ -108,52 +108,83 @@ def p0_format():
         L.append("  ✗ valeurs non finies dans le dump")
     L.append(f"x̂₀ borné dans [{d['x0'].min():.3f}, {d['x0'].max():.3f}]")
 
-    # phase : « u8 phase (0 descent, 1 climb, 2 flux) » — désormais documenté par --help.
-    # On n'impose pas où le contrat est muet (à quelle frame exacte la descente cède la
-    # main) : on vérifie que l'étiquette dit la vérité sur la DYNAMIQUE qui a produit la
-    # frame, en séparant pas inverse et churn par leur amplitude, qui diffèrent de ~40 %.
+    # phase : « u8 phase (0 descent, 1 climb, 2 flux) » — documenté par --help depuis la
+    # passe 2. La passe 3 dispose EN PLUS d'une règle de frontière, publiée par --help
+    # après le correctif de l'off-by-one, et qui n'existait pas quand ce test a été écrit :
+    #   « The phase names what the frame DID, so in flux the opening approach is
+    #     T-1-t* frames of 0 and every frame from the first churn on is 2 — cut a
+    #     prologue on that byte rather than on a count. »
+    # Le contrat est donc devenu testable sur DEUX plans, et on teste les deux :
+    #   (a) la dynamique — l'étiquette dit-elle la vérité sur ce qui a produit la frame ?
+    #       (critère de la passe 2, inchangé : pas inverse et churn diffèrent de ~40 %)
+    #   (b) la frontière — le bloc de 0 est-il un préfixe contigu de longueur T-1-t* ?
+    # `T` n'est pas défini par le contrat (défaut de spec mineur, cf. §D7) : on ne le
+    # suppose donc pas. On vérifie la LOI — longueur affine en t*, de pente exactement
+    # −1 — et on recoupe son ordonnée à l'origine avec le haut de chaîne lu dans le dump.
+    def phase_audit(d):
+        m = d["meta"].astype(int)
+        ph = d["phase"]
+        ts = int(m[-1])
+        dd = frame_abs_delta(d["xt"])  # dd[i-1] = amplitude ayant produit la frame i
+        churn = float(np.median(dd[np.where(ph[1:] == 2)[0]]))
+        # L'amplitude d'un pas inverse dépend de t : on ne compare qu'AU NIVEAU t*, où les
+        # deux dynamiques coexistent. Référence : les dernières frames de descente juste
+        # au-dessus de t*.
+        ref = float(np.median([dd[i - 1] for i in range(1, len(m))
+                               if ph[i] == 0 and ts < m[i] <= ts + 8]))
+        susp = [i for i in range(1, len(m))
+                if ph[i] == 0 and m[i] == ts
+                and abs(dd[i - 1] - churn) < abs(dd[i - 1] - ref)]
+        return dict(tstar=ts, churn=churn, ref=ref, susp=susp,
+                    n0=int((ph == 0).sum()), n1=int((ph == 1).sum()),
+                    first2=int(np.argmax(ph == 2)) if (ph == 2).any() else -1,
+                    top=int(m[0]) + 1, amps=[round(float(dd[i - 1]), 4) for i in susp])
+
     m = d["meta"].astype(int)
-    st = plateau_start(m)
     ph = d["phase"]
-    dd = frame_abs_delta(d["xt"])  # dd[i-1] = amplitude ayant produit la frame i
-    churn = float(np.median(dd[np.where(ph[1:] == 2)[0]]))
+    a = phase_audit(d)
     mono = bool(np.all(np.diff((ph == 2).astype(int)) >= 0))
     ok &= mono
     L.append(f"phases flux : {sorted(set(ph.tolist()))}, phase 2 jamais quittée une fois "
              f"prise → {'ok' if mono else 'ÉCART'}")
-    # L'amplitude d'un pas inverse dépend de t : on ne compare donc qu'AU NIVEAU t*, où
-    # les deux dynamiques coexistent. Référence du pas inverse : les dernières frames de
-    # descente juste au-dessus de t*, extrapolées au niveau t*.
-    ref = float(np.median([dd[i - 1] for i in range(1, len(m))
-                           if ph[i] == 0 and m[-1] < m[i] <= m[-1] + 8]))
-    suspects = [i for i in range(1, len(m))
-                if ph[i] == 0 and m[i] == m[-1] and abs(dd[i - 1] - churn) < abs(dd[i - 1] - ref)]
-    lbl_ok = not suspects
-    ok &= lbl_ok
-    if suspects:
-        L.append(f"  ✗ au niveau t*={m[-1]}, {len(suspects)} frame(s) étiquetée(s) "
-                 f"« 0 descent » ont l'amplitude du churn : frames {suspects}, "
-                 f"|Δ|={[round(float(dd[i - 1]), 4) for i in suspects]} — à comparer à "
-                 f"churn={churn:.4f} et pas inverse au même niveau≈{ref:.4f}")
-        L.append("    → la première frame produite par le churn est étiquetée descente")
-        # le même off-by-one se rejoue-t-il à tous les cadrans ?
-        tally = []
+
+    # (a) dynamique — sur le run principal ET sur tout le cadran (≥3 valeurs de t*)
+    dial = [(a["tstar"], a)] + [
+        (k, phase_audit(read_dump(os.path.join(OUT, f"ts_{k}.f32"))))
         for k in sorted(int(f[3:-4]) for f in os.listdir(OUT)
-                        if f.startswith("ts_") and f.endswith(".f32")):
-            e = read_dump(os.path.join(OUT, f"ts_{k}.f32"))
-            mm = e["meta"].astype(int)
-            pp = e["phase"]
-            ee = frame_abs_delta(e["xt"])
-            ch = float(np.median(ee[np.where(pp[1:] == 2)[0]]))
-            rf = float(np.median([ee[i - 1] for i in range(1, len(mm))
-                                  if pp[i] == 0 and mm[-1] < mm[i] <= mm[-1] + 8]))
-            tally.append((k, sum(1 for i in range(1, len(mm)) if pp[i] == 0 and mm[i] == mm[-1]
-                                 and abs(ee[i - 1] - ch) < abs(ee[i - 1] - rf))))
-        L.append("    reproductibilité sur le cadran (frames mal étiquetées par run) : " +
-                 "  ".join(f"t*={k}→{v}" for k, v in tally))
-    else:
-        L.append(f"amplitude ↔ étiquette au niveau t*={m[-1]} : les frames « descent » "
-                 f"valent ≈{ref:.4f} (pas inverse) et non {churn:.4f} (churn) → ok")
+                        if f.startswith("ts_") and f.endswith(".f32"))]
+    bad = [(k, e) for k, e in dial if e["susp"]]
+    ok &= not bad
+    L.append("amplitude ↔ étiquette, par cadran (frames « 0 descent » ayant l'amplitude "
+             "d'un churn) : " + "  ".join(f"t*={k}→{len(e['susp'])}" for k, e in dial) +
+             f" — sur {len(dial)} valeurs de t*")
+    for k, e in bad:
+        L.append(f"  ✗ t*={k} : {len(e['susp'])} frame(s) mal étiquetée(s) {e['susp']}, "
+                 f"|Δ|={e['amps']} — churn={e['churn']:.4f}, "
+                 f"pas inverse au même niveau≈{e['ref']:.4f}")
+    if not bad:
+        L.append(f"  au niveau t*={a['tstar']} : « descent » ≈{a['ref']:.4f} (pas inverse), "
+                 f"churn ={a['churn']:.4f} — les deux populations restent disjointes → ok")
+
+    # (b) frontière : préfixe contigu, aucun climb, longueur = T-1-t*
+    pref = all(e["first2"] == e["n0"] and e["n1"] == 0 for _, e in dial)
+    ok &= pref
+    L.append(f"le bloc de « 0 » est un préfixe contigu (première frame de phase 2 = nombre "
+             f"de frames de phase 0, aucun climb en flux) → {'ok' if pref else 'ÉCART'}")
+    tops = sorted({e["top"] for _, e in dial})
+    law = [(k, e["n0"], e["n0"] + k) for k, e in dial]           # n0 + t* doit être constant
+    const = sorted({s for _, _, s in law})
+    lin = len(const) == 1
+    ok &= lin
+    L.append("longueur du prologue vs cadran : " +
+             "  ".join(f"t*={k}→{n0}" for k, n0, _ in law))
+    L.append(f"  n0 + t* = {const} (constante ⇔ loi affine de pente −1) → "
+             f"{'ok' if lin else 'ÉCART'}")
+    coh = lin and tops == const
+    ok &= coh
+    L.append(f"  haut de chaîne lu dans le dump (t de la frame 0, +1) = {tops} ; le contrat "
+             f"annonce T−1−t* ⇒ T−1 = {const[0] if lin else '?'} → "
+             f"{'concordant' if coh else 'ÉCART'}")
     for reg in ("errance", "respiration"):
         e = load(reg)
         seen = sorted(set(e["phase"].tolist()))
