@@ -57,8 +57,16 @@ run_one() {
   local bin=$1 dir=$2 batch=$3 log=$4
   local start end
   start=$(python3 -c 'import time;print(time.monotonic())')
+  # `--out` is not optional here. Without it the run writes its metrics to a
+  # path derived from the model name alone, so two arms of the same model —
+  # which is exactly what a paired benchmark runs — write to the SAME file and
+  # interleave into each other. That happened during this mission: a smoke test
+  # of this very script corrupted a 600-step validation run's metrics, and the
+  # only reason it was caught is that the file no longer parsed. A unique
+  # checkpoint path per arm gives a unique metrics path per arm.
   ( cd "$dir" && "$bin" --headless-train "$MODEL" --steps "$STEPS" \
-      --dataset "$DATASET" --lr 1e-3 --optimizer adam --batch "$batch" ) \
+      --dataset "$DATASET" --lr 1e-3 --optimizer adam --batch "$batch" \
+      --out "$OUT/$(basename "$log" .log).ckpt" ) \
       > "$log" 2>&1
   end=$(python3 -c 'import time;print(time.monotonic())')
   grep -q "batch=$batch" "$log" || {

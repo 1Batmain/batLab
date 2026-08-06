@@ -25,12 +25,30 @@ from collections import defaultdict
 
 
 def load(path):
-    records = []
-    with open(path) as handle:
-        for line in handle:
+    """Parse a metrics JSONL, REPORTING what it could not parse.
+
+    A malformed line is not skipped quietly. During this mission a 600-step
+    validation run was silently corrupted because two `--headless-train` runs of
+    the same model wrote to the same default metrics path and interleaved; the
+    only reason it was noticed is that the file stopped parsing. A loader that
+    swallowed the bad line would have compared 539 records against 822 and
+    printed a confident, meaningless answer.
+    """
+    records, bad = [], []
+    with open(path, errors="replace") as handle:
+        for number, line in enumerate(handle, 1):
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 records.append(json.loads(line))
+            except json.JSONDecodeError as err:
+                bad.append((number, len(line), str(err)))
+    if bad:
+        print(f"!! {path}: {len(bad)} unparseable line(s) — the file is CORRUPT")
+        for number, length, err in bad[:5]:
+            print(f"   line {number} ({length} chars): {err}")
+        print("   most likely two runs shared a metrics path; pass a distinct --out")
     return records
 
 
@@ -57,11 +75,39 @@ def main():
     non_finite = 0
     shape_mismatch = 0
 
-    for old, new in zip(old_records, new_records):
-        kind = old.get("kind") or old.get("type") or "?"
-        if (new.get("kind") or new.get("type") or "?") != kind:
-            shape_mismatch += 1
+    # Aligned on (kind, step), not zipped by position: one dropped or extra
+    # record would otherwise shift every later comparison and turn a single
+    # missing line into thousands of spurious differences.
+    # The key must identify a record by its OWN coordinates, not by its
+    # position in the file. Two reasons, both met in practice:
+    #
+    #   - (kind, step) is not unique: a `sample` step emits one `denoise_step`
+    #     per point of the reverse chain, all sharing the same step. Keying on
+    #     the pair alone collapsed 256 of them onto one and compared diffusion
+    #     step 0 against 255 — a "255.0 divergence" that was pure bookkeeping;
+    #   - falling back to position within the group is no better as soon as one
+    #     record is missing (a corrupt file, an interrupted run): everything
+    #     after it shifts and every later comparison is between unrelated pairs.
+    #
+    # So the key is built from whichever identity fields a record carries.
+    # `denoise_step` uses `train_step`/`step_index`, the others use `step`.
+    IDENTITY = ("step", "train_step", "step_index", "diffusion_step", "seed", "bucket")
+
+    def key_of(record):
+        kind = record.get("kind") or record.get("type") or "?"
+        return (kind,) + tuple(record.get(field) for field in IDENTITY)
+
+    old_keys = [key_of(record) for record in old_records]
+    new_by_key = {key_of(record): record for record in new_records}
+    assert len(new_by_key) == len(new_records), "identity key is not unique — widen IDENTITY"
+
+    unmatched = 0
+    for old, key in zip(old_records, old_keys):
+        new = new_by_key.get(key)
+        if new is None:
+            unmatched += 1
             continue
+        kind = key[0]
         old_flat, new_flat = {}, {}
         flatten("", old, old_flat)
         flatten("", new, new_flat)
@@ -88,6 +134,7 @@ def main():
     print(f"worst relative diff : {worst_rel[1]:.3e}  ({worst_rel[0]})  [|v| > 1e-3]")
     print(f"non-finite values   : {non_finite}")
     print(f"structure mismatches: {shape_mismatch}")
+    print(f"unmatched (kind, step): {unmatched}")
 
     print("\nper record kind:      max abs      max rel")
     for kind, (a, r) in sorted(per_kind.items()):
@@ -96,9 +143,9 @@ def main():
     # The trajectory itself, side by side.
     print("\ntrain_loss trajectory (old | new):")
     losses = [
-        (o, n)
-        for o, n in zip(old_records, new_records)
-        if (o.get("kind") or o.get("type")) == "train_loss"
+        (o, new_by_key[k])
+        for o, k in zip(old_records, old_keys)
+        if (o.get("kind") or o.get("type")) == "train_loss" and k in new_by_key
     ]
     for old, new in losses[:: max(1, len(losses) // 12)]:
         step = old.get("step")
