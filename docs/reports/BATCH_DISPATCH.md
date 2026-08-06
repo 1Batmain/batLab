@@ -18,10 +18,25 @@ Le batch est passé de la boucle CPU aux dispatches. À batch 16, tout le calcul
 d'un pas d'entraînement tient désormais dans **une seule soumission** au lieu de
 **18**, et chaque kernel voit 16 fois plus de travail par lancement.
 
-Mesuré à batch 16 sur `Greyscale_Diffusion_L`, GPU partagé : **1,85×** sur le
-temps par pas et **13,1×** sur le temps CPU. Le §7.1 donne le plancher de bruit
-de la machine (29,6 %) avant de donner ces chiffres, et le §7.3 dit franchement
-quelle mesure manque.
+Mesuré sur `Greyscale_Diffusion_L`, GPU partagé, protocole du §5.1 de
+`PERF_CONVOLUTION.md` :
+
+| batch | speedup (ms/pas) | contrôle nul | rapport de temps CPU |
+|---:|---:|---:|---:|
+| 1 | 1,03× | 7,9 % | 0,9× |
+| 4 | 1,67× | 1,7 % | 3,5× |
+| 16 | **1,84×** | **0,3 %** | 13,9× |
+| 64 | (1,87×, non certifié) | 1965 % ⚠ | **43,3×** |
+
+**La prédiction posée d'avance tient** : à batch 1 les deux chemins sont
+indiscernables (1,03× à l'intérieur du contrôle nul), et le gain croît avec le
+batch. Le 1,84× à batch 16 reproduit indépendamment le 1,85× obtenu par les
+runs appariés de 600 pas (§7.2).
+
+Et le résultat le plus net n'est pas dans la colonne des speedups : **le coût
+CPU de l'ancien chemin est proportionnel au batch (×93 pour un batch ×64),
+celui du nouveau ne l'est pas (×2)**. C'est la thèse du §7 de
+`PERF_CONVOLUTION.md` démontrée directement (§7.4).
 
 Trois résultats méritent d'être lus avant le reste :
 
@@ -675,32 +690,73 @@ téléversements de chunk de 64 Mio deviennent ~3,96 (§5.2), soit environ
 de l'ancien bras — 1,05 s de noyau par pas — sont exactement la signature de ce
 trafic.
 
-### 7.3 L'échelle en batch
+### 7.3 L'échelle en batch — la mesure qui décide
 
-C'est **la** mesure que la mission demandait, et la prédiction posée d'avance
-était réfutable : à batch 1 les deux chemins doivent être indiscernables (un
-échantillon, une soumission de chaque côté), et l'écart doit **croître** avec le
-batch.
+C'est **la** mesure que la mission demandait, et la prédiction avait été posée
+d'avance, donc réfutable : à batch 1 les deux chemins doivent être
+**indiscernables** (un échantillon, une soumission de chaque côté), et l'écart
+doit **croître** avec le batch.
 
-_Balayage définitif en cours — voir le §7.4 pour ce que l'instrument a coûté
-avant d'être utilisable._
+`Greyscale_Diffusion_L`, Adam, 3 rondes × 40 pas par point, estimateur =
+minimum, contrôle nul = le binaire neuf contre lui-même :
 
-Résultat préliminaire (1 ronde × 3 pas, donc **dominé par le démarrage du
-processus** et sans valeur quantitative — le contrôle nul est à 59 % au batch 1) :
+| batch | ancien (ms/pas) | nouveau (ms/pas) | speedup | contrôle nul |
+|---:|---:|---:|---:|---:|
+| 1 | 207,25 | 200,25 | **1,03×** | 7,9 % |
+| 4 | 752,25 | 450,50 | **1,67×** | 1,7 % |
+| 16 | 3087,50 | 1679,00 | **1,84×** | 0,3 % |
+| 64 | 12212,50 | 6520,75 | (1,87×) | **1965 %** ⚠ |
 
-| batch | speedup apparent | contrôle nul |
-|---:|---:|---:|
-| 1 | 0,53× | 59,3 % |
-| 4 | 0,83× | 6,5 % |
-| 16 | 1,24× | 1,4 % |
-| 64 | **1,68×** | 8,9 % |
+**La prédiction tient.** À batch 1, 1,03× est *à l'intérieur* du contrôle nul de
+7,9 % : les deux chemins sont indiscernables, comme ils doivent l'être. C'est le
+contrôle interne, et c'est lui qui autorise à lire le reste de la colonne. Le
+gain croît ensuite de façon monotone, et le point à batch 16 est mesuré avec un
+contrôle nul de **0,3 %** — un effet de 84 % contre un bruit de 0,3 %.
 
-La **forme** est celle qui était prédite — le gain croît de façon monotone avec
-le batch — mais aucun de ces nombres n'est publiable : à 3 pas par run, le
-démarrage du processus (3 à 9 s) pèse plus que le calcul, et il pénalise le
-même bras des deux côtés. Le balayage sérieux tourne à 40 pas par run.
+Le 1,84× à batch 16 **reproduit indépendamment** le 1,85× dérivé au §7.2 des
+deux runs appariés de 600 pas. Deux instruments, deux protocoles, deux fenêtres
+de mesure, même nombre.
 
-### 7.4 Ce que l'instrument a coûté
+**Le point à batch 64 n'est pas certifiable, et il est marqué comme tel.** Son
+contrôle nul est à 1965 % : l'une des deux exécutions du binaire neuf a pris
+**7859 s** au lieu de 261 s. Le log dit pourquoi — cette exécution a consommé
+**1,75 s de temps utilisateur et 5,50 s de temps système**, soit exactement
+autant que les autres. Le processus n'a pas travaillé plus longtemps, il a
+**attendu** : deux heures et onze minutes bloqué sur un GPU monopolisé par le
+run couleur. Ce n'est donc pas une propriété du chemin batché, mais le
+protocole ne permet pas de trancher, et un chiffre dont le contrôle nul est à
+1965 % ne se publie pas comme un résultat.
+
+### 7.4 Le temps CPU — l'instrument que la contention n'atteint pas
+
+Le §7.3 laisse un point invalide et un plancher de bruit variable. Le temps CPU,
+lui, ne dépend presque pas de la charge GPU : un processus bloqué sur le GPU
+n'en consomme pas (le run à 7859 s ci-dessus n'a coûté que 7,25 s de CPU). Même
+balayage, même exécutions :
+
+| batch | CPU ancien | CPU nouveau | rapport |
+|---:|---:|---:|---:|
+| 1 | 2,08 s | 2,19 s | **0,9×** |
+| 4 | 10,22 s | 2,95 s | **3,5×** |
+| 16 | 47,75 s | 3,44 s | **13,9×** |
+| 64 | 194,22 s | 4,49 s | **43,3×** |
+
+Lire la table par **colonne** plutôt que par ligne, parce que c'est là qu'est le
+résultat :
+
+- le coût CPU de l'**ancien** chemin est **proportionnel au batch** : 2,08 →
+  194,22 s quand le batch fait ×64, soit ×93. C'est la signature exacte d'une
+  boucle CPU sur les échantillons — une soumission et son cortège de
+  téléversements **par échantillon** ;
+- le coût CPU du **nouveau** est **quasi indépendant du batch** : 2,19 → 4,49 s
+  pour le même ×64. Un pas, une soumission, quel que soit le nombre
+  d'échantillons qu'elle porte.
+
+C'est la thèse du §7 de `PERF_CONVOLUTION.md` démontrée directement, et sur la
+grandeur la moins contestable dont on dispose ici. Et à batch 1 le rapport est
+de 0,9× : les deux chemins font le même travail CPU, ce qu'ils doivent faire.
+
+### 7.5 Ce que l'instrument a coûté
 
 Trois défauts ont été trouvés dans le harnais de mesure au cours de cette
 mission, **zéro** dans le moteur batché par ces mêmes exécutions. C'est une
@@ -774,13 +830,14 @@ Le raisonnement des trois est écrit **dans** `timing.sh`, pas seulement ici.
 
 ## 9. Ce qui reste
 
-### D'abord : le balayage en batch, sur une machine libre
+### Refaire le point à batch 64 sur une machine libre
 
-C'est la mesure manquante du §7.3, et c'est celle qui décide si la thèse du §7
-de `PERF_CONVOLUTION.md` était juste. Le harnais est prêt ; il lui faut une
-demi-heure sans co-locataire. Tant qu'elle n'est pas prise, ce rapport établit
-que le chemin batché est **plus rapide** et **beaucoup moins coûteux côté CPU**,
-mais pas **de combien**, ni que le gain croît bien avec le batch.
+Le seul chiffre non certifié du rapport (§7.3) : son contrôle nul est à 1965 %
+parce qu'une exécution est restée deux heures bloquée sur un GPU monopolisé. La
+valeur obtenue (1,87×) s'inscrit dans la tendance et le rapport de temps CPU du
+même point (43,3×) est solide, mais le protocole ne certifie pas le premier.
+Une demi-heure sans co-locataire suffit. Tout le reste du balayage tient
+(contrôles nuls de 0,3 % à 7,9 %).
 
 ### Re-mesurer le register-blocking du forward
 
