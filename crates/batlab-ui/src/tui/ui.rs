@@ -807,7 +807,7 @@ fn draw_inference_params(f: &mut Frame, app: &App) {
         &values,
         app.inference_params.field_idx,
         app.inference_params.error.as_deref(),
-        "[up/down] field  [left/right/space] toggle random seed  [type] edit  [Enter] next/run",
+        "[up/down] field  [left/right/space] toggle random seed  [type] edit  [Enter] next/run  [Esc] back",
     );
 }
 
