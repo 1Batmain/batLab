@@ -9,6 +9,17 @@
 //   q,k,v = W·x + b ;  s = qᵀk·scale ;  p = softmax(s)
 //   ctx   = p·v     ;  out = x + W_o·ctx + b_o
 //
+// TWO SCRATCH BUFFERS, SAME LAYOUT. The forward saved q, k, v, ctx and probs in
+// one buffer because WebGPU guarantees only eight storage buffers per stage
+// (see the header of attention.wgsl — bound separately this pass needed twelve,
+// and the rejection is silent: the whole command buffer dies and the loss reads
+// zero). `grad_scratch` mirrors `fwd_scratch` block for block, so a block's
+// gradient always sits at the block's own offset:
+//
+//   fwd_scratch  [ q | k | v | ctx | probs ]
+//   grad_scratch [ gq| gk| gv| gctx| gscores ]     stride 4·N·C + N²
+//                  0  NC  2NC  3NC   4NC
+//
 // Backward, in the order the passes are dispatched. Each pass reads only what
 // an earlier pass has already written — that ordering IS the dependency graph,
 // since wgpu barriers between compute passes of one encoder:
@@ -28,24 +39,19 @@
 // W_o a harmless no-op rather than a dead end for the gradient.
 //
 // Bindings match AttentionType::get_back_buffers_specs():
-//   [0] fwd_input     [1] weights      [2] specs      [3] grad_output
-//   [4] grad_input    [5] grad_weights [6] grad_bias
-//   [7] qkv           [8] probs        [9] ctx            (saved forward scratch)
-//   [10] grad_qkv     [11] grad_ctx    [12] grad_scores   (backward scratch)
+//   [0] fwd_input   [1] weights      [2] specs        [3] grad_output
+//   [4] grad_input  [5] grad_weights [6] grad_bias
+//   [7] fwd_scratch (saved forward)  [8] grad_scratch (backward's own)
 
-@group(0) @binding(0)  var<storage, read>       fwd_input:    array<f32>;
-@group(0) @binding(1)  var<storage, read>       weights:      array<f32>;
-@group(0) @binding(2)  var<uniform>             layer_spec:   AttentionSpec;
-@group(0) @binding(3)  var<storage, read>       grad_output:  array<f32>;
-@group(0) @binding(4)  var<storage, read_write> grad_input:   array<f32>;
-@group(0) @binding(5)  var<storage, read_write> grad_weights: array<f32>;
-@group(0) @binding(6)  var<storage, read_write> grad_bias:    array<f32>;
-@group(0) @binding(7)  var<storage, read>       qkv:          array<f32>;
-@group(0) @binding(8)  var<storage, read>       probs:        array<f32>;
-@group(0) @binding(9)  var<storage, read>       ctx:          array<f32>;
-@group(0) @binding(10) var<storage, read_write> grad_qkv:     array<f32>;
-@group(0) @binding(11) var<storage, read_write> grad_ctx:     array<f32>;
-@group(0) @binding(12) var<storage, read_write> grad_scores:  array<f32>;
+@group(0) @binding(0) var<storage, read>       fwd_input:    array<f32>;
+@group(0) @binding(1) var<storage, read>       weights:      array<f32>;
+@group(0) @binding(2) var<uniform>             layer_spec:   AttentionSpec;
+@group(0) @binding(3) var<storage, read>       grad_output:  array<f32>;
+@group(0) @binding(4) var<storage, read_write> grad_input:   array<f32>;
+@group(0) @binding(5) var<storage, read_write> grad_weights: array<f32>;
+@group(0) @binding(6) var<storage, read_write> grad_bias:    array<f32>;
+@group(0) @binding(7) var<storage, read>       fwd_scratch:  array<f32>;
+@group(0) @binding(8) var<storage, read_write> grad_scratch: array<f32>;
 
 struct AttentionSpec {
     seq_len:   u32,
@@ -64,8 +70,15 @@ fn sample_len() -> u32 {
     return layer_spec.seq_len * layer_spec.channels;
 }
 
-fn qkv_sample_base(b: u32) -> u32 {
-    return b * 3u * sample_len();
+fn scratch_stride() -> u32 {
+    return 4u * sample_len() + layer_spec.seq_len * layer_spec.seq_len;
+}
+
+/// Start of block `block` (0=q, 1=k, 2=v, 3=ctx, 4=probs) for sample `b`.
+/// The same function addresses both scratch buffers — that is the point of
+/// giving them the same layout.
+fn block_base(b: u32, block: u32) -> u32 {
+    return b * scratch_stride() + block * sample_len();
 }
 
 /// How many samples the activation buffers carry. Read off the buffer, never
@@ -101,7 +114,7 @@ fn attn_back_ctx(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let idx = gid.y * nwg.x * 64u + gid.x;
-    if idx >= arrayLength(&grad_ctx) { return; }
+    if idx >= arrayLength(&fwd_input) { return; }
 
     let c_count = layer_spec.channels;
     let nc = sample_len();
@@ -117,7 +130,7 @@ fn attn_back_ctx(
     for (var c: u32 = 0u; c < c_count; c += 1u) {
         acc += grad_output[go_row + c] * weights[o_base + c * c_count + i];
     }
-    grad_ctx[idx] = acc;
+    grad_scratch[block_base(b, 3u) + inner] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -130,22 +143,24 @@ fn attn_back_v(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let idx = gid.y * nwg.x * 64u + gid.x;
-    let nc = sample_len();
-    if idx >= arrayLength(&grad_ctx) { return; }
+    if idx >= arrayLength(&fwd_input) { return; }
 
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
+    let nc = sample_len();
     let b = idx / nc;
     let inner = idx % nc;
     let m = inner / c_count;
     let i = inner % c_count;
 
-    let p_base = b * seq * seq;
+    let p_base = block_base(b, 4u);
+    let gctx_base = block_base(b, 3u);
+
     var acc: f32 = 0.0;
     for (var n: u32 = 0u; n < seq; n += 1u) {
-        acc += probs[p_base + n * seq + m] * grad_ctx[b * nc + n * c_count + i];
+        acc += fwd_scratch[p_base + n * seq + m] * grad_scratch[gctx_base + n * c_count + i];
     }
-    grad_qkv[qkv_sample_base(b) + 2u * nc + m * c_count + i] = acc;
+    grad_scratch[block_base(b, 2u) + inner] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,9 +172,9 @@ fn attn_back_v(
 // is the same for the whole row — it is what makes the gradient of a
 // probability distribution sum to zero.
 //
-// grad_p is staged in `grad_scores` and then overwritten in place: each thread
-// re-reads only the slots it wrote itself, so no cross-thread ordering is
-// involved beyond the reduction's own barriers.
+// grad_p is staged in the probs block of `grad_scratch` and then overwritten in
+// place: each thread re-reads only the slots it wrote itself, so no cross-thread
+// ordering is involved beyond the reduction's own barriers.
 
 @compute @workgroup_size(64)
 fn attn_back_scores(
@@ -169,33 +184,32 @@ fn attn_back_scores(
 ) {
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
-    let nc = sample_len();
-    let rows = arrayLength(&probs) / seq;
+    let rows = batch_count() * seq;
     let unit = min(wid.y * nwg.x + wid.x, rows - 1u);
 
     let b = unit / seq;
     let n = unit % seq;
 
-    let p_row = b * seq * seq + n * seq;
-    let gctx_row = b * nc + n * c_count;
-    let v_base = qkv_sample_base(b) + 2u * nc;
+    let p_row = block_base(b, 4u) + n * seq;
+    let gctx_row = block_base(b, 3u) + n * c_count;
+    let v_base = block_base(b, 2u);
 
     var local_dot: f32 = 0.0;
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
         var gp: f32 = 0.0;
         for (var i: u32 = 0u; i < c_count; i += 1u) {
-            gp += grad_ctx[gctx_row + i] * qkv[v_base + m * c_count + i];
+            gp += grad_scratch[gctx_row + i] * fwd_scratch[v_base + m * c_count + i];
         }
-        grad_scores[p_row + m] = gp;
-        local_dot += probs[p_row + m] * gp;
+        grad_scratch[p_row + m] = gp;
+        local_dot += fwd_scratch[p_row + m] * gp;
     }
     let dot = workgroup_sum(tid, local_dot);
 
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
         // The scale of the forward (`s = qᵀk · scale`) rides along here so the
         // q/k pass can use grad_scores as-is.
-        grad_scores[p_row + m] =
-            probs[p_row + m] * (grad_scores[p_row + m] - dot) * layer_spec.scale;
+        grad_scratch[p_row + m] =
+            fwd_scratch[p_row + m] * (grad_scratch[p_row + m] - dot) * layer_spec.scale;
     }
 }
 
@@ -215,28 +229,28 @@ fn attn_back_qk(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let idx = gid.y * nwg.x * 64u + gid.x;
-    let nc = sample_len();
-    if idx >= arrayLength(&grad_ctx) { return; }
+    if idx >= arrayLength(&fwd_input) { return; }
 
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
+    let nc = sample_len();
     let b = idx / nc;
     let inner = idx % nc;
     let n = inner / c_count;
     let i = inner % c_count;
 
-    let base = qkv_sample_base(b);
-    let k_base = base + nc;
-    let p_base = b * seq * seq;
+    let q_base = block_base(b, 0u);
+    let k_base = block_base(b, 1u);
+    let gs_base = block_base(b, 4u);
 
     var gq: f32 = 0.0;
     var gk: f32 = 0.0;
     for (var m: u32 = 0u; m < seq; m += 1u) {
-        gq += grad_scores[p_base + n * seq + m] * qkv[k_base + m * c_count + i];
-        gk += grad_scores[p_base + m * seq + n] * qkv[base + m * c_count + i];
+        gq += grad_scratch[gs_base + n * seq + m] * fwd_scratch[k_base + m * c_count + i];
+        gk += grad_scratch[gs_base + m * seq + n] * fwd_scratch[q_base + m * c_count + i];
     }
-    grad_qkv[base + n * c_count + i] = gq;
-    grad_qkv[k_base + n * c_count + i] = gk;
+    grad_scratch[q_base + inner] = gq;
+    grad_scratch[k_base + inner] = gk;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +272,7 @@ fn attn_back_input(
     let n = inner / c_count;
     let c = inner % c_count;
 
-    let base = qkv_sample_base(b) + n * c_count;
+    let base = block_base(b, 0u) + n * c_count;
     let cc = c_count * c_count;
 
     // The residual branch: out = x + …, so the incoming gradient reaches the
@@ -266,9 +280,9 @@ fn attn_back_input(
     var acc: f32 = grad_output[idx];
     for (var i: u32 = 0u; i < c_count; i += 1u) {
         let row = i * c_count + c;
-        acc += grad_qkv[base + i] * weights[row];
-        acc += grad_qkv[base + nc + i] * weights[cc + row];
-        acc += grad_qkv[base + 2u * nc + i] * weights[2u * cc + row];
+        acc += grad_scratch[base + i] * weights[row];
+        acc += grad_scratch[base + nc + i] * weights[cc + row];
+        acc += grad_scratch[base + 2u * nc + i] * weights[2u * cc + row];
     }
     grad_input[idx] = acc;
 }
@@ -306,17 +320,18 @@ fn attn_back_weights(
         // W_o[c, i]: the output projection sees the incoming gradient and the
         // context it multiplied.
         for (var b: u32 = 0u; b < samples; b += 1u) {
+            let ctx_base = block_base(b, 3u);
             for (var n: u32 = 0u; n < seq; n += 1u) {
-                let pos = b * nc + n * c_count;
-                acc += grad_output[pos + row] * ctx[pos + col];
+                acc += grad_output[b * nc + n * c_count + row]
+                     * fwd_scratch[ctx_base + n * c_count + col];
             }
         }
     } else {
         // W_q / W_k / W_v [i, c]: their own gradient against the layer input.
         for (var b: u32 = 0u; b < samples; b += 1u) {
-            let g_base = qkv_sample_base(b) + which * nc;
+            let g_base = block_base(b, which);
             for (var n: u32 = 0u; n < seq; n += 1u) {
-                acc += grad_qkv[g_base + n * c_count + row]
+                acc += grad_scratch[g_base + n * c_count + row]
                      * fwd_input[b * nc + n * c_count + col];
             }
         }
@@ -353,9 +368,9 @@ fn attn_back_bias(
         }
     } else {
         for (var b: u32 = 0u; b < samples; b += 1u) {
-            let g_base = qkv_sample_base(b) + which * nc;
+            let g_base = block_base(b, which);
             for (var n: u32 = 0u; n < seq; n += 1u) {
-                acc += grad_qkv[g_base + n * c_count + j];
+                acc += grad_scratch[g_base + n * c_count + j];
             }
         }
     }

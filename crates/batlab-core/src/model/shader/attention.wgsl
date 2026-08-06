@@ -5,7 +5,7 @@
 // linear thread index is recovered from `num_workgroups` rather than read
 // straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 //
-// THE LAYER IS RESIDUAL: `output = input + W_o · softmax(QᵀK / √d) · V`. The
+// THE LAYER IS RESIDUAL: `output = input + W_o · softmax(qᵀk/√d) · V`. The
 // residual lives inside the layer on purpose — the graph stays a chain, and
 // with `W_o` initialised to zero the layer starts life as the exact identity.
 //
@@ -19,6 +19,27 @@
 //   3. attn_context — ctx = probs · v              (one thread per ctx scalar)
 //   4. attn_out     — out = x + W_o·ctx + b_o      (one thread per output scalar)
 //
+// ---------------------------------------------------------------------------
+// WHY ONE SCRATCH BUFFER AND NOT FIVE
+// ---------------------------------------------------------------------------
+//
+// WebGPU guarantees only EIGHT storage buffers per shader stage
+// (`max_storage_buffers_per_shader_stage`), and this engine targets the
+// visitor's own GPU through a browser — raising the limit at `request_device`
+// would trade portability for convenience. The backward pass needs the layer
+// input, the weights, the incoming gradient, grad_input, grad_weights,
+// grad_bias, everything the forward saved, and its own scratch. Bound
+// separately that is twelve, and the failure is SILENT AND TOTAL: the bind
+// group layout is rejected, so the whole command buffer — forward included —
+// is dropped, the loss reads 0.000000, and nothing else says a word.
+//
+// So q, k, v, ctx and probs share ONE buffer, and their gradients share
+// another with THE SAME LAYOUT. Block `X`'s gradient sits at block `X`'s
+// offset in the twin buffer, which is what keeps the arithmetic legible:
+//
+//   [ q | k | v | ctx | probs ]   per sample, stride 4·N·C + N²
+//     0  NC  2NC  3NC   4NC
+//
 // Bindings match AttentionType::get_buffers_specs():
 //   [0] input   — HWC layout, N=H*W positions of C channels: index = n*C + c
 //   [1] weights — the FOUR projections concatenated, C*C each, in order
@@ -27,19 +48,15 @@
 //                 optimiser sees one weight tensor, exactly like a convolution.
 //   [2] bias    — 4*C: bq, bk, bv, bo back to back
 //   [3] specs   — AttentionSpec
-//   [4] qkv     — scratch, 3*N*C per sample: q block, k block, v block
-//   [5] probs   — scratch, N*N per sample (softmax rows)
-//   [6] ctx     — scratch, N*C per sample (probs·v, before W_o)
-//   [7] output  — HWC, same shape as input (LAST: the model chains .last())
+//   [4] scratch — the five blocks above, saved for the backward pass
+//   [5] output  — HWC, same shape as input (LAST: the model chains .last())
 
 @group(0) @binding(0) var<storage, read>       input:      array<f32>;
 @group(0) @binding(1) var<storage, read>       weights:    array<f32>;
 @group(0) @binding(2) var<storage, read>       bias:       array<f32>;
 @group(0) @binding(3) var<uniform>             layer_spec: AttentionSpec;
-@group(0) @binding(4) var<storage, read_write> qkv:        array<f32>;
-@group(0) @binding(5) var<storage, read_write> probs:      array<f32>;
-@group(0) @binding(6) var<storage, read_write> ctx:        array<f32>;
-@group(0) @binding(7) var<storage, read_write> output:     array<f32>;
+@group(0) @binding(4) var<storage, read_write> scratch:    array<f32>;
+@group(0) @binding(5) var<storage, read_write> output:     array<f32>;
 
 struct AttentionSpec {
     seq_len:   u32,  // N = H*W, the number of attending positions
@@ -59,9 +76,20 @@ fn sample_len() -> u32 {
     return layer_spec.seq_len * layer_spec.channels;
 }
 
-/// Base offset of sample `b` inside the q/k/v scratch (3 blocks of N*C).
-fn qkv_sample_base(b: u32) -> u32 {
-    return b * 3u * sample_len();
+/// Elements of one sample's scratch: q, k, v, ctx (N*C each) then probs (N*N).
+fn scratch_stride() -> u32 {
+    return 4u * sample_len() + layer_spec.seq_len * layer_spec.seq_len;
+}
+
+/// Start of block `block` (0=q, 1=k, 2=v, 3=ctx, 4=probs) for sample `b`.
+fn block_base(b: u32, block: u32) -> u32 {
+    return b * scratch_stride() + block * sample_len();
+}
+
+/// How many samples the activation buffers carry. Read off the buffer, never
+/// passed in — the batch axis has exactly one source of truth.
+fn batch_count() -> u32 {
+    return arrayLength(&input) / sample_len();
 }
 
 fn bias_at(index: u32) -> f32 {
@@ -115,8 +143,8 @@ fn workgroup_max(tid: u32, value: f32) -> f32 {
 // 1. q, k, v projections
 // ---------------------------------------------------------------------------
 //
-// One thread per scalar of the q/k/v scratch — of the whole batch. The sample
-// is recovered by dividing by the per-sample length, never passed in.
+// One thread per scalar of the q/k/v blocks — of the whole batch. The sample is
+// recovered by dividing by the per-sample length, never passed in.
 
 @compute @workgroup_size(64)
 fn attn_qkv(
@@ -124,14 +152,13 @@ fn attn_qkv(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let idx = gid.y * nwg.x * 64u + gid.x;
-    if idx >= arrayLength(&qkv) { return; }
+    if idx >= 3u * arrayLength(&input) { return; }
 
     let c_count = layer_spec.channels;
     let nc = sample_len();
-    let block = 3u * nc;
 
-    let b = idx / block;
-    let rest = idx % block;
+    let b = idx / (3u * nc);
+    let rest = idx % (3u * nc);
     let which = rest / nc;       // 0 = q, 1 = k, 2 = v
     let inner = rest % nc;
     let n = inner / c_count;     // position
@@ -144,7 +171,7 @@ fn attn_qkv(
     for (var c: u32 = 0u; c < c_count; c += 1u) {
         acc += weights[w_row + c] * input[x_row + c];
     }
-    qkv[idx] = acc;
+    scratch[block_base(b, which) + inner] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,25 +199,25 @@ fn attn_scores(
 ) {
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
-    let rows = arrayLength(&probs) / seq;   // batch * N
+    let rows = batch_count() * seq;
     let unit = min(wid.y * nwg.x + wid.x, rows - 1u);
 
     let b = unit / seq;
     let n = unit % seq;
 
-    let q_row = qkv_sample_base(b) + n * c_count;
-    let k_base = qkv_sample_base(b) + sample_len();
-    let p_row = b * seq * seq + n * seq;
+    let q_row = block_base(b, 0u) + n * c_count;
+    let k_base = block_base(b, 1u);
+    let p_row = block_base(b, 4u) + n * seq;
 
     // Pass 1 — raw scores, and the row max for the stable softmax.
     var local_max: f32 = -3.4028235e38;
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
         var s: f32 = 0.0;
         for (var i: u32 = 0u; i < c_count; i += 1u) {
-            s += qkv[q_row + i] * qkv[k_base + m * c_count + i];
+            s += scratch[q_row + i] * scratch[k_base + m * c_count + i];
         }
         s *= layer_spec.scale;
-        probs[p_row + m] = s;
+        scratch[p_row + m] = s;
         local_max = max(local_max, s);
     }
     let row_max = workgroup_max(tid, local_max);
@@ -201,15 +228,15 @@ fn attn_scores(
     // cross-thread ordering is involved.
     var local_sum: f32 = 0.0;
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
-        let e = exp(probs[p_row + m] - row_max);
-        probs[p_row + m] = e;
+        let e = exp(scratch[p_row + m] - row_max);
+        scratch[p_row + m] = e;
         local_sum += e;
     }
     let total = workgroup_sum(tid, local_sum);
 
     // Pass 3 — normalise.
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
-        probs[p_row + m] = probs[p_row + m] / total;
+        scratch[p_row + m] = scratch[p_row + m] / total;
     }
 }
 
@@ -223,7 +250,7 @@ fn attn_context(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let idx = gid.y * nwg.x * 64u + gid.x;
-    if idx >= arrayLength(&ctx) { return; }
+    if idx >= arrayLength(&input) { return; }
 
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
@@ -234,14 +261,14 @@ fn attn_context(
     let n = inner / c_count;
     let i = inner % c_count;
 
-    let v_base = qkv_sample_base(b) + 2u * nc;
-    let p_row = b * seq * seq + n * seq;
+    let v_base = block_base(b, 2u);
+    let p_row = block_base(b, 4u) + n * seq;
 
     var acc: f32 = 0.0;
     for (var m: u32 = 0u; m < seq; m += 1u) {
-        acc += probs[p_row + m] * qkv[v_base + m * c_count + i];
+        acc += scratch[p_row + m] * scratch[v_base + m * c_count + i];
     }
-    ctx[idx] = acc;
+    scratch[block_base(b, 3u) + inner] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,11 +292,11 @@ fn attn_out(
     let c = inner % c_count;
 
     let o_base = 3u * c_count * c_count;
-    let ctx_row = b * nc + n * c_count;
+    let ctx_row = block_base(b, 3u) + n * c_count;
 
     var acc = bias_at(3u * c_count + c);
     for (var i: u32 = 0u; i < c_count; i += 1u) {
-        acc += weights[o_base + c * c_count + i] * ctx[ctx_row + i];
+        acc += weights[o_base + c * c_count + i] * scratch[ctx_row + i];
     }
     // The residual. `input` and `output` share an index because the layer is
     // shape-preserving: with W_o = 0 (the initialisation) this is a copy.

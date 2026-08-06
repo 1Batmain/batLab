@@ -24,6 +24,8 @@ pub use weight_init::WeightInit;
 #[cfg(test)]
 mod adam_tests;
 #[cfg(test)]
+mod attention_tests;
+#[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
 mod batch_equivalence_tests;

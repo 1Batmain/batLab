@@ -105,12 +105,22 @@ impl AttentionType {
         batched_bytes(self.dim_input, batch)
     }
 
-    fn qkv_bytes(&self, batch: Batch) -> u32 {
-        (3 * self.sample_len() * batch * 4).max(4)
+    /// Elements of one sample's scratch: q, k, v and ctx (`N*C` each) followed
+    /// by the softmax rows (`N*N`).
+    ///
+    /// The five live in ONE buffer because WebGPU guarantees only eight storage
+    /// buffers per shader stage. Bound separately, the backward pass needed
+    /// twelve — and the rejection is silent and total: the bind group layout
+    /// fails, so the whole command buffer (forward included) is dropped and the
+    /// loss reads 0.000000 with no other symptom. Raising the limit at
+    /// `request_device` would have worked on this machine and broken the point
+    /// of wgpu, which is the visitor's GPU through a browser.
+    fn scratch_stride(&self) -> u32 {
+        4 * self.sample_len() + self.seq_len() * self.seq_len()
     }
 
-    fn probs_bytes(&self, batch: Batch) -> u32 {
-        (self.seq_len() * self.seq_len() * batch * 4).max(4)
+    fn scratch_bytes(&self, batch: Batch) -> u32 {
+        (self.scratch_stride() * batch * 4).max(4)
     }
 
     fn elementwise_workgroups(&self, batch: Batch) -> u32 {
@@ -275,11 +285,9 @@ impl LayerType for AttentionType {
                     1 => BackwardBufferSource::Forward(1), // weights
                     2 => BackwardBufferSource::Forward(3), // specs
                     3 => BackwardBufferSource::IncomingGradient,
-                    // The forward scratch the backward re-reads instead of
-                    // recomputing: q/k/v, the softmax rows, and the context.
+                    // What the forward saved — q/k/v, the context and the
+                    // softmax rows — re-read instead of recomputed.
                     7 => BackwardBufferSource::Forward(4),
-                    8 => BackwardBufferSource::Forward(5),
-                    9 => BackwardBufferSource::Forward(6),
                     _ => BackwardBufferSource::Allocate,
                 },
             })
@@ -332,19 +340,12 @@ impl LayerType for AttentionType {
             ),
             ("bias".to_string(), Self::read_storage(self.bias_count() * 4)),
             ("specs".to_string(), self.uniform_spec()),
-            // Forward scratch, kept for the backward pass. All three carry a
-            // batch axis: they are activations, not parameters.
+            // Forward scratch — q | k | v | ctx | probs, kept for the backward
+            // pass. It carries a batch axis: these are activations, not
+            // parameters.
             (
-                "qkv".to_string(),
-                Self::write_storage(self.qkv_bytes(batch)),
-            ),
-            (
-                "probs".to_string(),
-                Self::write_storage(self.probs_bytes(batch)),
-            ),
-            (
-                "ctx".to_string(),
-                Self::write_storage(self.activation_bytes(batch)),
+                "scratch".to_string(),
+                Self::write_storage(self.scratch_bytes(batch)),
             ),
             // LAST: `create_buffers` chains `.last()` as this layer's output.
             (
@@ -383,29 +384,15 @@ impl LayerType for AttentionType {
                 "grad_bias".to_string(),
                 Self::write_storage(self.bias_count() * 4),
             ),
+            // The two twins: what the forward saved, and the backward's own
+            // working set at the SAME block offsets.
             (
-                "qkv".to_string(),
-                Self::read_storage(self.qkv_bytes(batch)),
+                "fwd_scratch".to_string(),
+                Self::read_storage(self.scratch_bytes(batch)),
             ),
             (
-                "probs".to_string(),
-                Self::read_storage(self.probs_bytes(batch)),
-            ),
-            (
-                "ctx".to_string(),
-                Self::read_storage(self.activation_bytes(batch)),
-            ),
-            (
-                "grad_qkv".to_string(),
-                Self::write_storage(self.qkv_bytes(batch)),
-            ),
-            (
-                "grad_ctx".to_string(),
-                Self::write_storage(self.activation_bytes(batch)),
-            ),
-            (
-                "grad_scores".to_string(),
-                Self::write_storage(self.probs_bytes(batch)),
+                "grad_scratch".to_string(),
+                Self::write_storage(self.scratch_bytes(batch)),
             ),
         ]
     }
@@ -434,7 +421,7 @@ mod tests {
     use super::AttentionType;
     use crate::model::error::ModelError;
     use crate::model::layer_types::LayerType;
-    use crate::model::types::Dim3;
+    use crate::model::types::{BufferSpec, Dim3};
 
     #[test]
     fn attention_preserves_input_shape() {
@@ -473,7 +460,7 @@ mod tests {
         let layer = AttentionType::new(Dim3::new((4, 4, 8)));
         let one = layer.get_buffers_specs(1);
         let eight = layer.get_buffers_specs(8);
-        for (index, name) in [(0, "input"), (4, "qkv"), (5, "probs"), (6, "ctx"), (7, "output")] {
+        for (index, name) in [(0, "input"), (4, "scratch"), (5, "output")] {
             assert_eq!(one[index].0, name);
             assert_eq!(
                 eight[index].1.size,
@@ -488,6 +475,48 @@ mod tests {
                 "{name} is a parameter and must not scale with the batch"
             );
         }
+    }
+
+    /// WebGPU guarantees only EIGHT storage buffers per shader stage, and this
+    /// layer is the first in the repository to come near it.
+    ///
+    /// This is a guard and not a note because of HOW it fails. The bind group
+    /// layout is rejected at build time, which invalidates the whole command
+    /// buffer — the forward passes encoded alongside it never run either. The
+    /// observable symptom is a loss of exactly 0.000000 and gradients of
+    /// exactly zero, with nothing in the way of an exception; it cost this
+    /// layer's first backward implementation an hour. Adding a binding here
+    /// without merging another must fail in CI, not in a training run.
+    #[test]
+    fn neither_bind_group_exceeds_the_webgpu_storage_buffer_limit() {
+        const WEBGPU_MAX_STORAGE_BUFFERS_PER_STAGE: usize = 8;
+        let layer = AttentionType::new(Dim3::new((8, 8, 192)));
+
+        let storage_count = |specs: Vec<(String, BufferSpec)>| {
+            specs
+                .iter()
+                .filter(|(_, spec)| {
+                    matches!(
+                        spec.ty,
+                        wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { .. },
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+
+        let forward = storage_count(layer.get_buffers_specs(1));
+        let backward = storage_count(layer.get_back_buffers_specs(1));
+        assert!(
+            forward <= WEBGPU_MAX_STORAGE_BUFFERS_PER_STAGE,
+            "forward binds {forward} storage buffers, WebGPU guarantees {WEBGPU_MAX_STORAGE_BUFFERS_PER_STAGE}"
+        );
+        assert!(
+            backward <= WEBGPU_MAX_STORAGE_BUFFERS_PER_STAGE,
+            "backward binds {backward} storage buffers, WebGPU guarantees {WEBGPU_MAX_STORAGE_BUFFERS_PER_STAGE}"
+        );
     }
 
     /// The parameter reductions do not scale with the batch; the elementwise
