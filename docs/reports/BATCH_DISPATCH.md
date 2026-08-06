@@ -18,7 +18,10 @@ Le batch est passé de la boucle CPU aux dispatches. À batch 16, tout le calcul
 d'un pas d'entraînement tient désormais dans **une seule soumission** au lieu de
 **18**, et chaque kernel voit 16 fois plus de travail par lancement.
 
-_(Tableau de speedup : §7.)_
+Mesuré à batch 16 sur `Greyscale_Diffusion_L`, GPU partagé : **1,85×** sur le
+temps par pas et **13,1×** sur le temps CPU. Le §7.1 donne le plancher de bruit
+de la machine (29,6 %) avant de donner ces chiffres, et le §7.3 dit franchement
+quelle mesure manque.
 
 Trois résultats méritent d'être lus avant le reste :
 
@@ -525,7 +528,135 @@ un changement d'ordre de sommation.
 
 ### 6.2 Run apparié complet — `Greyscale_Diffusion_L`, 600 pas, batch 16, Adam
 
-_À compléter._
+Le modèle de la campagne, avec ses deux `UpsampleConv` et ses deux `Concat`.
+**821 enregistrements de chaque côté, 0 non apparié, 0 différence de structure,
+0 valeur non finie.**
+
+```
+step   0  1.07258594 | 1.07258594     step 350  0.04927786 | 0.04927786
+step  50  0.04364759 | 0.04364757     step 400  0.02125878 | 0.02125876
+step 100  0.02259401 | 0.02259401     step 450  0.01172543 | 0.01172546
+step 150  0.05139169 | 0.05139172     step 500  0.00380219 | 0.00380219
+step 200  0.10766626 | 0.10766631     step 550  0.04990207 | 0.04990207
+step 250  0.01142664 | 0.01142664     step 599  0.00370164 | 0.00370165
+step 300  0.00503387 | 0.00503387              (ancien | nouveau)
+```
+
+| grandeur | écart absolu max | écart relatif max (\|v\| > 1e-3) |
+|---|---:|---:|
+| `train_loss` | 1,64e-7 | **7,59e-6** |
+| `train_probe` (loss par tranche de `t`) | 1,05e-5 | 2,49e-4 |
+| `sample` | 2,62e-6 | 7,39e-6 |
+| `denoise_step` | 9,54e-6 | 3,07e-4 |
+
+Le profil attendu par `INSIGHTS_TRAINING.md` — loss élevée à `t` bas, faible à
+`t` haut, c'est-à-dire un modèle qui utilise bien `t` — est identique des deux
+côtés. Le champ le plus divergent reste `denoise_step.eps_hat.mean`, une
+moyenne proche de zéro sur laquelle l'arrondi accumulé s'exprime en relatif :
+même champ et même ordre de grandeur que `PERF_CONVOLUTION.md` §6 (4,8e-5)
+pour un changement d'ordre de sommation, ici sur une chaîne 16 fois plus
+longue (§4.4).
+
+### 6.3 Une remarque de méthode : ce run a dû être refait
+
+La première exécution de ce run apparié est **inexploitable**, et la raison
+mérite d'être écrite parce qu'elle n'a rien à voir avec le code testé.
+
+`--headless-train` dérive le chemin de ses métriques du checkpoint, et sans
+`--out` celui-ci ne dépend **que du nom du modèle**. Deux runs du même modèle —
+ce qu'un banc apparié fait par définition — écrivent donc dans **le même
+fichier**. Un test de fumée de `bench/batch_dispatch/timing.sh`, lancé pendant
+que le bras « ancien » tournait, s'y est entrelacé : 537 enregistrements
+exploitables contre 821, dont une ligne de 152 051 caractères illisible.
+
+Ce qui l'a sauvé est un accident : le fichier ne parsait plus. Trois défenses
+ont donc été ajoutées, et elles valent pour tout banc futur du dépôt :
+
+- `timing.sh` passe un `--out` unique par bras ;
+- `compare_metrics.py` **signale** les lignes illisibles au lieu de les sauter —
+  un chargeur silencieux aurait comparé 537 enregistrements à 821 et imprimé
+  une réponse confiante et creuse ;
+- l'appariement se fait sur les **coordonnées propres** de l'enregistrement
+  (`step` / `train_step` / `step_index` / `diffusion_step` / `seed`), avec une
+  assertion d'unicité, et non sur la position. Deux tentatives intermédiaires
+  ont produit de fausses divergences spectaculaires : la clé `(kind, step)`
+  n'est pas unique (un pas de `sample` émet un `denoise_step` par point de la
+  chaîne inverse), et elle a fait comparer le pas de diffusion 0 au 255 — un
+  « écart de 255,0 » purement comptable.
+
+## 7. Benchmarks
+
+### 7.1 La machine n'était pas libre, et voici de combien
+
+Un run couleur de 20 000 pas a occupé le GPU pendant toute la mission. Ce n'est
+pas une excuse posée en fin de rapport : c'est mesuré, et par accident très
+proprement.
+
+Le bras « ancien » du §6.2 a été exécuté **deux fois**, même binaire, mêmes
+arguments, à 45 minutes d'écart. C'est un **contrôle nul** non planifié :
+
+| | exécution 1 | exécution 2 | étendue |
+|---|---:|---:|---:|
+| ancien, temps réel | 1798,6 s | 2330,8 s | **+29,6 %** |
+| ancien, temps CPU | 695,7 s | 804,4 s | +15,6 % |
+| **nouveau, temps réel** | 980,4 s | 972,0 s | **+0,9 %** |
+
+Deux enseignements :
+
+1. **Le temps réel a un plancher de bruit de 29,6 % sur cette machine.** Tout
+   effet plus petit que ça, mesuré ici, n'est pas un effet — et c'est
+   exactement l'ordre de grandeur (±1 %) que `PERF_CONVOLUTION.md` §5.3
+   cherchait à trancher. Sa conclusion « peut-être ~1 % plus lent » n'aurait
+   pas survécu à cette fenêtre-ci.
+2. **Le nouveau chemin est stable à 0,9 %, l'ancien varie de 29,6 %.** Ce n'est
+   pas un hasard : le coût de l'ancien est dominé par du travail **côté CPU**
+   (18 soumissions et ~12 téléversements de 64 Mio par pas), qui se dispute la
+   bande passante mémoire avec le voisin. Le nouveau est court et
+   majoritairement GPU.
+
+### 7.2 Ce qui est mesuré, à batch 16
+
+Estimateur = **minimum** des deux exécutions par bras (la contention ne peut
+qu'ajouter du temps), `Greyscale_Diffusion_L`, 600 pas, Adam :
+
+| | ancien | nouveau | rapport |
+|---|---:|---:|---:|
+| ms/pas (temps réel) | 2997,6 | 1620,0 | **1,85×** |
+| temps CPU total | 695,7 s | 53,2 s | **13,1×** |
+| dont temps système | 630,6 s | 41,8 s | 15,1× |
+
+**Sur le 1,85×** : l'effet (+85 %) est environ trois fois le plancher de bruit
+du §7.1 (29,6 %), donc le **sens et l'ordre de grandeur sont établis** ; le
+chiffre exact ne l'est pas. Il faut le refaire sur une machine libre. Noter
+aussi que 2997,6 ms/pas n'est pas comparable aux ~1270 ms/pas cités par l'ordre
+de mission : c'est la même contention qui gonfle les deux bras.
+
+**Sur le 13,1× de temps CPU** : c'est la mesure la plus solide du lot, parce
+que le temps CPU d'un processus dépend beaucoup moins de la charge GPU que son
+temps réel (15,6 % d'étendue contre 29,6 %). Et il a une explication mécanique
+directe, pas une corrélation : 18 soumissions par pas deviennent ~5, et ~12,25
+téléversements de chunk de 64 Mio deviennent ~3,96 (§5.2), soit environ
+**800 Mio par pas** de trafic hôte→GPU en moins. Les 630,6 s de temps *système*
+de l'ancien bras — 1,05 s de noyau par pas — sont exactement la signature de ce
+trafic.
+
+### 7.3 L'échelle en batch — non mesurée
+
+C'est **la** mesure que la mission demandait (« le gain doit croître avec le
+batch », 1/4/16/64), et elle n'a pas pu être prise : avec un plancher de bruit
+à 29,6 %, un balayage sur quatre tailles de batch produirait quatre nombres
+dont aucun ne serait défendable, et le contrôle nul à batch 1 — celui qui doit
+sortir à 1,00× et qui valide l'instrument — serait le premier à mentir.
+
+Le harnais est écrit, testé et prêt : `bench/batch_dispatch/timing.sh`,
+protocole du §5.1 de `PERF_CONVOLUTION.md` (appariement, entrelacement,
+minimum, contrôle nul, `--out` unique par bras, vérification que la bannière
+réémet bien le `--batch` demandé). Une demi-heure sur GPU libre suffit.
+
+La prédiction à vérifier est explicite, et elle est réfutable : **à batch 1 les
+deux chemins doivent être indiscernables** (un échantillon, une soumission de
+chaque côté), et l'écart doit croître avec le batch. Un gain à batch 1 voudrait
+dire que l'instrument mesure autre chose que ce que ce rapport prétend.
 
 ## 7. Benchmarks
 
@@ -570,18 +701,48 @@ _À compléter — voir §9._
 
 ## 9. Ce qui reste
 
-- **Re-mesurer le register-blocking du forward.** Le §3 de
-  `PERF_CONVOLUTION.md` l'a rejeté sur une mesure prise quand `conv4` avait
-  1024 éléments de sortie, soit 16 workgroups ; avec l'axe batch il en a 16384.
-  **Le verdict n'est plus établi** — la note en tête de `convolution.wgsl` a été
-  corrigée en ce sens, pour que la piste ne soit ni retentée à l'aveugle ni
-  abandonnée sur un argument périmé.
-- **Rendre la sonde de coût fixe utilisable** (§7 de `PERF_CONVOLUTION.md`) :
-  minimum sur N rondes au lieu d'un échantillon unique. C'est ce qui dira si les
-  kernels sont encore optimisables ou collés au plancher.
-- **Recalibrer `reduction_lanes` avec l'axe batch**, sur des formes où ça change
-  quelque chose.
-- **Le batch dans l'inférence.** Le sampler et le mode Perpetual tournent à
-  `B = 1` par construction ; le graphe sait maintenant faire mieux. Générer
-  plusieurs chemins de débruitage en parallèle est devenu un changement d'appel,
-  plus un changement de moteur.
+### D'abord : le balayage en batch, sur une machine libre
+
+C'est la mesure manquante du §7.3, et c'est celle qui décide si la thèse du §7
+de `PERF_CONVOLUTION.md` était juste. Le harnais est prêt ; il lui faut une
+demi-heure sans co-locataire. Tant qu'elle n'est pas prise, ce rapport établit
+que le chemin batché est **plus rapide** et **beaucoup moins coûteux côté CPU**,
+mais pas **de combien**, ni que le gain croît bien avec le batch.
+
+### Re-mesurer le register-blocking du forward
+
+Le §3 de `PERF_CONVOLUTION.md` l'a rejeté sur une mesure prise quand `conv4`
+avait 1024 éléments de sortie, soit **16 workgroups** ; avec l'axe batch il en a
+**16384**. Le raisonnement qui le condamnait — « diviser le nombre de threads
+par 4 affame un GPU qui n'en a déjà pas assez » — ne tient plus. **Le verdict
+n'est plus établi**, et la note en tête de `convolution.wgsl` a été corrigée en
+ce sens, pour que la piste ne soit ni retentée à l'aveugle ni abandonnée sur un
+argument périmé.
+
+### Rendre la sonde de coût fixe utilisable
+
+`profile_convolution` estime déjà le « per-compute-pass floor », mais sur un
+échantillon unique, ce qui l'a fait sortir au-dessus de passes qui font
+strictement plus de travail. Minimum sur N rondes, comme partout ailleurs. Sans
+elle on ne sait toujours pas si les kernels sont encore optimisables ou déjà
+collés au plancher — et le batching a justement déplacé ce plancher.
+
+### Recalibrer `reduction_lanes` avec l'axe batch
+
+Sans effet sur les quatre convolutions de `Greyscale_Diffusion` (vérifié à la
+main, §8), mais la règle raisonne encore en positions **par échantillon** alors
+que chaque somme en couvre `batch ×` plus. À faire sur des formes où ça change
+quelque chose, avec `bench_conv_reduction_lanes`.
+
+### Le batch dans l'inférence
+
+Le sampler et le mode Perpetual tournent à `B = 1` par construction ; le graphe
+sait maintenant faire mieux. Générer plusieurs chemins de débruitage en
+parallèle est devenu un changement d'appel, plus un changement de moteur —
+`--headless-sample --paths N` en est le premier candidat.
+
+### Faire remonter le compteur `chunk_loads`
+
+Il existe (§5.2) mais rien ne l'affiche. Un dataset plus gros que quelques
+chunks coûte des centaines de Mio de trafic par pas, et rien dans la sortie
+d'un run ne le laisse voir.
