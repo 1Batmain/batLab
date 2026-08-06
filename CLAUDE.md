@@ -42,6 +42,59 @@ Concrètement :
 
 Un vrai build `wasm32` est une mission future — aujourd'hui on veut seulement que la frontière soit propre.
 
+## Le flow du TUI : le modèle d'abord, l'action ensuite
+
+```
+Ouverture → LISTE DES MODÈLES              (l'écran d'accueil)
+  chaque entrée : nom · géométrie · nb de couches · checkpoints
+  dernière ligne : « New model (from template) » → flux template
+  → Entrée sur un modèle → MENU D'ACTIONS
+       Train / Infer / Perpetual  → choix des poids → formulaire du mode → Monitor
+       Rename / Delete            → le manager
+```
+
+`Esc` remonte d'exactement un cran depuis chaque écran, et ne quitte que depuis
+les deux racines : la liste (rien au-dessus) et le moniteur (un run en cours, que
+quitter termine). `[e]` depuis le menu d'actions ouvre le constructeur de
+couches, `[i]` dedans ouvre la géométrie d'entrée.
+
+Le manager, côté contrat observable :
+
+- **Renommer** déplace `Models/<ancien>/` → `Models/<nouveau>/` **et** réécrit le
+  `config_file` — `model_name` plus tout chemin de checkpoint qui pointait dans
+  le dossier du modèle. Si la réécriture échoue, le renommage est défait.
+- **Supprimer** exige le nom retapé à l'identique, puis efface le dossier entier.
+  Le chemin visé doit être un **enfant direct** de `Models/` (les deux côtés
+  canonicalisés) : un lien symbolique est refusé, pas suivi.
+- Les deux **refusent un modèle dont ce processus tient un run**. Ce garde-fou est
+  de l'état TUI : **il ne franchit pas la frontière de processus** — un second
+  batlab ou un `--headless-train` dans un autre shell reste invisible. Non résolu,
+  documenté sur `App::model_run_in_progress`.
+- Sur les deux écrans du manager, **toute touche imprimable est du texte**, `q`
+  compris (un modèle peut s'appeler `q-experiment`) ; `Esc` est la sortie.
+- **Tout modèle créé par un template est conditionnable sur t** (`input_size.z >
+  output.z`). Les deux templates ont livré l'inverse (1→1 et 3→3, la géométrie de
+  `Models/Greyscale_Diffusion_broken`) jusqu'à ce qu'un test aveugle lise le
+  `config_file` écrit. Ils dérivent maintenant leurs dims d'un seul
+  `diffusion_unet(signal, temporel)` — ne pas y réintroduire de dims à la main.
+  Gardé des deux côtés : `config::tests` sur `built_in_templates()`, et
+  `every_model_created_from_a_template_is_conditionable_on_the_timestep` sur le
+  fichier réellement écrit.
+- **Un checkpoint est un `.ckpt`**, non caché, dans `pretrained_weights/` — le
+  `latest_metrics.jsonl` que tout entraînement dépose à côté n'en est pas un.
+  Les deux listages (compteur de la liste, sélecteur de poids) passent par
+  `is_checkpoint_file` ; le comptaient tous les deux avant. Ne pas relâcher en
+  « tout fichier », ni retirer l'exclusion des fichiers cachés par-dessus
+  l'extension (les AppleDouble macOS `._latest.ckpt` la passeraient).
+
+Un écran dessiné mais jamais assigné est le bug récurrent de ce dépôt (trois fois :
+`LoadPath`, le mode `Perpetual`, `InputSize`). `crates/batlab-ui/src/tui/nav_tests.rs`
+parcourt tous les écrans à la touche depuis la porte d'entrée et exige d'avoir vu
+`Screen::ALL` — ajouter une variante sans la câbler fait échouer la suite.
+
+Le rapport de mission, avec le contrat observable complet et le parcours e2e
+déroulé : `docs/reports/MODEL_MANAGER.md`.
+
 ## Lancer / valider un entraînement sans le TUI
 
 Le binaire est un TUI interactif plein écran — impossible à scripter directement. Pour toute validation automatisée (agents, CI, tests de convergence), utiliser le chemin headless, qui réutilise `run_training` de production à l'identique :
@@ -75,6 +128,8 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
 - Format dataset `.batraw` : magic `BATRAW2` = payload en [-1,1] ; les fichiers `BATRAW1` ([0,1]) restent lisibles et sont rééchelonnés au chargement.
 - Tests de non-régression du pipeline : `crates/batlab-core/src/model/audit_tests.rs` (`cargo test`). Ne pas les affaiblir pour les faire passer.
-- **`batlab_ui::storage::project_root()` est la racine de tous les chemins de données** (`Models/`, `datasets/`, `perpetual_samples/`). Il remonte jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.
+- **La racine de stockage s'injecte, elle ne se déduit pas.** `batlab_ui::storage::Storage` porte la racine de tous les chemins de données (`Models/`, `datasets/`, `perpetual_samples/`) ; `Storage::at(chemin)` en construit une ailleurs, et `App::with_storage` la fait descendre dans tout le TUI. **Tout test qui touche au stockage passe par `TempRoot`** — c'est ce qui a fait tomber la limite « `cargo test` réécrit `Models/Stable_Diffusion/config_file` » de `docs/reports/PERPETUAL_INFERENCE.md` §5. Critère de recette permanent : `cargo test --workspace` puis `git status` **propre**.
+  Le défaut (`Storage::default()`, et les fonctions libres du module que le CLI utilise) reste le workspace, trouvé en remontant jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.
+  **`BATLAB_ROOT=<dir>`** force cette racine par défaut pour tout le processus — c'est la façon de dérouler le vrai TUI end-to-end sans écrire dans le `Models/` du dépôt.
 - macOS : l'event loop winit du visualiseur doit vivre sur le main thread (le TUI et l'entraînement tournent sur un worker) — ne pas réintroduire de `EventLoop::new()` dans un thread secondaire.
 - Les rapports sous `docs/reports/` sont des **archives** : leur texte cite les anciens chemins (`bat_building/src/…` — qui couvrait alors moteur ET interface —, `main/src/main.rs`, `perpetual_samples/…`) et n'a pas été réécrit. La table de correspondance est dans `docs/reports/INDEX.md`.

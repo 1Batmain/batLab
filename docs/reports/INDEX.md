@@ -100,6 +100,13 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   32×32) : dataset RGB, configs `Color_Diffusion_L`/`XL`, chemin couleur validé
   bout-en-bout.
 
+### Interface
+
+- **[MODEL_MANAGER.md](MODEL_MANAGER.md)** — navigation modèle-centrée (la liste des
+  modèles en écran d'accueil, un menu d'actions par modèle), renommage et suppression,
+  racine de stockage injectable (`BATLAB_ROOT`) — et la fin de « `cargo test` réécrit
+  un fichier suivi ». Contient le contrat observable du manager.
+
 ### Restructuration
 
 - **[RESTRUCTURE.md](RESTRUCTURE.md)** — ce qui a bougé, la table ci-dessus, et les pièges

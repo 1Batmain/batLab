@@ -1,21 +1,22 @@
 //! File purpose: Implements ui behavior for the terminal user interface flow.
 
 use super::app::{
-    App, HOME_CHOICES, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode,
-    LayerKind, MonitorImage, PERPETUAL_PARAM_FIELD_NAMES, RUN_MODE_CHOICES, RunMode, Screen,
-    TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
+    App, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind,
+    MODEL_ACTIONS, ModelAction, MonitorImage, NEW_MODEL_ENTRY, PERPETUAL_PARAM_FIELD_NAMES, RunMode,
+    Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
 pub fn draw(f: &mut Frame, app: &App) {
     match app.screen {
-        Screen::Home => draw_home(f, app),
-        Screen::LoadPath => draw_load_path(f, app),
+        Screen::ModelList => draw_model_list(f, app),
         Screen::TemplateSelector => draw_template_selector(f, app),
+        Screen::ModelActions => draw_model_actions(f, app),
+        Screen::RenameModel => draw_rename_model(f, app),
+        Screen::DeleteConfirm => draw_delete_confirm(f, app),
         Screen::WeightSelector => draw_weight_selector(f, app),
         Screen::InputSize => draw_input_size(f, app),
         Screen::LayerBuilder => draw_layer_builder(f, app),
-        Screen::ModeSelector => draw_mode_selector(f, app),
         Screen::InferenceParams => draw_inference_params(f, app),
         Screen::PerpetualParams => draw_perpetual_params(f, app),
         Screen::TrainingParams => draw_training_params(f, app),
@@ -68,45 +69,6 @@ fn focused_value(focused: bool) -> Style {
     } else {
         Style::default()
     }
-}
-
-/// Generic "choose one of N options" screen.
-fn draw_choice_screen(f: &mut Frame, title: &str, choices: &[&str], selected: usize, hint: &str) {
-    let area = f.area();
-    let popup = centered_rect(44, 50, area);
-    f.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {title} "))
-        .title_alignment(Alignment::Center);
-    let inner = block.inner(popup);
-    f.render_widget(block, popup);
-
-    let mut lines: Vec<Line> = vec![Line::from("")];
-    for (i, choice) in choices.iter().enumerate() {
-        let (prefix, style) = if i == selected {
-            (
-                "  > ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            ("    ", Style::default().fg(Color::Gray))
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {}{}", prefix, choice),
-            style,
-        )));
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("  {hint}"),
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Generic form screen (text fields).
@@ -164,69 +126,92 @@ fn draw_form_screen(
 }
 
 // ---------------------------------------------------------------------------
-// Screen: Home
+// Screen: Model List — the front door
 // ---------------------------------------------------------------------------
 
-fn draw_home(f: &mut Frame, app: &App) {
-    draw_choice_screen(
-        f,
-        "batlab",
-        &HOME_CHOICES,
-        app.home.selected,
-        "[arrow] select  [Enter] confirm  [q] quit",
-    );
+fn selected_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Screen: Load Path
-// ---------------------------------------------------------------------------
+/// How a model's checkpoints are summarised in the list. The count first,
+/// because "does this model have trained weights at all" is the question; the
+/// names after it, because picking between them is the next one.
+fn checkpoint_summary(checkpoints: &[String]) -> String {
+    match checkpoints.len() {
+        0 => "no checkpoints".to_string(),
+        1 => format!("1 checkpoint: {}", checkpoints[0]),
+        n if n <= 3 => format!("{n} checkpoints: {}", checkpoints.join(", ")),
+        n => format!(
+            "{n} checkpoints: {}, …",
+            checkpoints[..2].join(", ")
+        ),
+    }
+}
 
-fn draw_load_path(f: &mut Frame, app: &App) {
+fn draw_model_list(f: &mut Frame, app: &App) {
     let area = f.area();
-    let popup = centered_rect(60, 55, area);
+    let popup = centered_rect(72, 66, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Load Model ")
+        .title(" batlab — Models ")
         .title_alignment(Alignment::Center);
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let mut lines = vec![Line::from("")];
-    if app.load_path.models.is_empty() {
+    if app.model_list.models.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No model configs found in Models/",
+            "  No models yet in Models/ — start from a template below.",
             Style::default().fg(Color::DarkGray),
         )));
-    } else {
-        for (index, model) in app.load_path.models.iter().enumerate() {
-            let style = if index == app.load_path.selected {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {} {}  ({}x{}x{}, {} layers)",
-                    if index == app.load_path.selected {
-                        ">"
-                    } else {
-                        " "
-                    },
-                    model.name,
-                    model.input_size.0,
-                    model.input_size.1,
-                    model.input_size.2,
-                    model.layer_count
-                ),
-                style,
-            )));
-        }
+        lines.push(Line::from(""));
     }
-    if let Some(error) = &app.load_path.error {
+    for (index, model) in app.model_list.models.iter().enumerate() {
+        let selected = index == app.model_list.selected;
+        lines.push(Line::from(Span::styled(
+            format!("  {} {}", if selected { ">" } else { " " }, model.name),
+            selected_style(selected),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!(
+                "      {}x{}x{} · {} layers · {}",
+                model.input_size.0,
+                model.input_size.1,
+                model.input_size.2,
+                model.layer_count,
+                checkpoint_summary(&model.checkpoints),
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    let new_selected = app.model_list.is_new_model_selected();
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {} {}",
+            if new_selected { ">" } else { " " },
+            NEW_MODEL_ENTRY
+        ),
+        selected_style(new_selected),
+    )));
+
+    if let Some(status) = app.model_list.status.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✓ {status}"),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    if let Some(error) = app.model_list.error.as_deref() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("  ✗ {error}"),
@@ -235,7 +220,197 @@ fn draw_load_path(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] select  [Enter] load  [Esc] quit",
+        "  [arrow] select  [Enter] open  [r] refresh  [Esc/q] quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Model Actions — what to do with the model that was just picked
+// ---------------------------------------------------------------------------
+
+fn draw_model_actions(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup = centered_rect(56, 62, area);
+    f.render_widget(Clear, popup);
+
+    let model_name = app.active_model_name.as_deref().unwrap_or("(no model)");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" {model_name} "))
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  {}x{}x{} · {} layers · {}",
+                app.layer_builder.model_input.0,
+                app.layer_builder.model_input.1,
+                app.layer_builder.model_input.2,
+                app.layer_builder.layers.len(),
+                checkpoint_summary(
+                    &app.weight_selector
+                        .checkpoints
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>()
+                ),
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    for (index, label) in MODEL_ACTIONS.iter().enumerate() {
+        let selected = index == app.model_actions.selected;
+        // The destructive half of the menu is coloured as such even when it is
+        // not under the cursor.
+        let destructive = ModelAction::from_index(index) == Some(ModelAction::Delete);
+        let style = if selected {
+            selected_style(true)
+        } else if destructive {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        if index == 3 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {} {}", if selected { ">" } else { " " }, label),
+            style,
+        )));
+    }
+
+    if let Some(error) = app.model_actions.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [arrow] select  [Enter] confirm  [e] edit layers  [Esc] back  [q] quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Screens: the manager — rename and delete
+// ---------------------------------------------------------------------------
+
+fn draw_rename_model(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup = centered_rect(60, 40, area);
+    f.render_widget(Clear, popup);
+
+    let current = app.active_model_name.as_deref().unwrap_or("(no model)");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Rename Model ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Current name : {current}"),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  New name     : ", focused_label(true)),
+            Span::styled(
+                format!("{}\u{2588}", app.rename_model.input),
+                focused_value(true),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Renames Models/<name>/ and rewrites the config_file to match.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    if let Some(error) = app.rename_model.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [type] edit  [Backspace] del  [Enter] rename  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_delete_confirm(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let popup = centered_rect(64, 46, area);
+    f.render_widget(Clear, popup);
+
+    let current = app.active_model_name.as_deref().unwrap_or("(no model)");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Delete Model ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let matches = app.delete_confirm.typed == current;
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  This deletes Models/{current}/ and everything in it —"),
+            Style::default().fg(Color::Red),
+        )),
+        Line::from(Span::styled(
+            "  config, checkpoints, metrics. It cannot be undone.",
+            Style::default().fg(Color::Red),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Type '{current}' to confirm:"),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(vec![
+            Span::styled("  > ", focused_label(true)),
+            Span::styled(
+                format!("{}\u{2588}", app.delete_confirm.typed),
+                if matches {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else {
+                    focused_value(true)
+                },
+            ),
+        ]),
+    ];
+
+    if let Some(error) = app.delete_confirm.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if matches {
+            "  [Enter] DELETE — no further prompt  [Esc] cancel"
+        } else {
+            "  [type] the name  [Backspace] del  [Esc] cancel"
+        },
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -291,7 +466,7 @@ fn draw_template_selector(f: &mut Frame, app: &App) {
     }
 
     lines.push(Line::from(Span::styled(
-        "  [arrow] select  [Enter] continue  [Esc] quit",
+        "  [arrow] select  [Enter] create  [Esc] back",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -365,7 +540,7 @@ fn draw_weight_selector(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] select  [Enter] continue  [Esc] quit",
+        "  [arrow] select  [Enter] continue  [Esc] back  [q] quit",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -383,7 +558,7 @@ fn draw_input_size(f: &mut Frame, app: &App) {
         &app.input_size.fields,
         app.input_size.field_idx,
         app.input_size.error.as_deref(),
-        "[arrow] field  [0-9] type  [Enter] next/confirm  [Backspace] del  [Esc] quit",
+        "[arrow] field  [0-9] type  [Enter] next/confirm (clears layers)  [Backspace] del  [Esc] back",
     );
 }
 
@@ -439,7 +614,7 @@ fn draw_lb_add_edit_mode(f: &mut Frame, app: &App, area: Rect) {
     let hint = if app.layer_builder.mode == LayerBuilderMode::Edit {
         " [left/right] type  [up/down] field  [Space] toggle  [type] value  [Enter] save  [Esc] cancel  [q] quit"
     } else {
-        " [left/right] type  [up/down] field  [Space] toggle  [type] value  [Enter] add  [d] del last  [e] edit layers  [b] done  [q] quit"
+        " [left/right] type  [up/down] field  [Space] toggle  [Enter] add  [d] del last  [e] edit layers  [i] input size  [b] done  [Esc] back  [q] quit"
     };
     f.render_widget(hint_bar(hint), inner);
 }
@@ -597,20 +772,6 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Screen: Mode Selector
-// ---------------------------------------------------------------------------
-
-fn draw_mode_selector(f: &mut Frame, app: &App) {
-    draw_choice_screen(
-        f,
-        "Run Mode",
-        &RUN_MODE_CHOICES,
-        app.mode_selector.selected,
-        "[arrow] select  [Enter] configure/run  [e] edit layers  [q] quit",
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Screen: Training Params
 // ---------------------------------------------------------------------------
 
@@ -623,7 +784,7 @@ fn draw_training_params(f: &mut Frame, app: &App) {
         training_fields,
         app.training_params.field_idx,
         app.training_params.error.as_deref(),
-        "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] quit",
+        "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] back",
     );
 }
 
@@ -646,7 +807,7 @@ fn draw_inference_params(f: &mut Frame, app: &App) {
         &values,
         app.inference_params.field_idx,
         app.inference_params.error.as_deref(),
-        "[up/down] field  [left/right/space] toggle random seed  [type] edit  [Enter] next/run",
+        "[up/down] field  [left/right/space] toggle random seed  [type] edit  [Enter] next/run  [Esc] back",
     );
 }
 
@@ -754,7 +915,7 @@ fn draw_dataset_selector(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] select dataset  [<- / ->] cycle  [Enter] start training  [Esc] quit",
+        "  [arrow] select dataset  [<- / ->] cycle  [Enter] start training  [Esc] back  [q] quit",
         Style::default().fg(Color::DarkGray),
     )));
 

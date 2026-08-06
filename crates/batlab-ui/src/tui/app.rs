@@ -6,7 +6,7 @@
 //! describe a model without a terminal anywhere in sight. What is left here is
 //! genuinely terminal state.
 
-use crate::storage::{self, SavedModelEntry};
+use crate::storage::{self, SavedModelEntry, Storage};
 pub use batlab_core::config::*;
 use batlab_core::model::training::{LossWeighting, MIN_RENOISE_DEPTH, PerpetualRegime};
 use batlab_core::model::{OptimizerKind, WeightInit};
@@ -16,14 +16,24 @@ use std::collections::HashMap;
 // Screens
 // ---------------------------------------------------------------------------
 
+/// The screens of the terminal UI.
+///
+/// The flow is model-first: you open batlab onto [`Screen::ModelList`], you pick
+/// a model, and only then do you pick what to do with it
+/// ([`Screen::ModelActions`]). Every screen below has exactly one parent, and
+/// `Esc` walks back to it — `nav_tests.rs` holds the executable copy of that
+/// claim, because a screen that is drawn and handled but never *assigned* is
+/// this codebase's recurring bug (`docs/reports/PERPETUAL_INFERENCE.md` §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Screen {
-    Home,
-    LoadPath,
+    ModelList,
     TemplateSelector,
+    ModelActions,
+    RenameModel,
+    DeleteConfirm,
     WeightSelector,
     InputSize,
     LayerBuilder,
-    ModeSelector,
     InferenceParams,
     PerpetualParams,
     TrainingParams,
@@ -32,20 +42,125 @@ pub enum Screen {
     TrainingControl,
 }
 
+impl Screen {
+    /// Every screen there is. A test walks the whole flow and asserts it visited
+    /// all of these, so a new variant stays failing until something actually
+    /// routes to it.
+    pub const ALL: [Screen; 14] = [
+        Screen::ModelList,
+        Screen::TemplateSelector,
+        Screen::ModelActions,
+        Screen::RenameModel,
+        Screen::DeleteConfirm,
+        Screen::WeightSelector,
+        Screen::InputSize,
+        Screen::LayerBuilder,
+        Screen::InferenceParams,
+        Screen::PerpetualParams,
+        Screen::TrainingParams,
+        Screen::DatasetSelector,
+        Screen::Monitor,
+        Screen::TrainingControl,
+    ];
+}
+
 // ---------------------------------------------------------------------------
 // Per-screen state
 // ---------------------------------------------------------------------------
 
-pub struct HomeState {
-    pub selected: usize, // 0 = Load saved, 1 = Use template
+/// The front door: every saved model, plus one row that opens the template
+/// flow.
+pub struct ModelListState {
+    pub models: Vec<SavedModelEntry>,
+    /// Index into the rows. `models.len()` is the "new model" row — it moves
+    /// with the list rather than sitting at a fixed index, so deleting the last
+    /// model cannot strand the cursor past the end.
+    pub selected: usize,
+    pub error: Option<String>,
+    /// What the last manager operation did. Kept on screen so a rename or a
+    /// delete is acknowledged where its effect is visible.
+    pub status: Option<String>,
 }
 
-/// The two routes out of [`Screen::Home`], in the order they are drawn.
-pub const HOME_CHOICES: [&str; 2] = ["Load Saved Model", "Select Model Template"];
+/// Label of the row that leads to the template flow.
+pub const NEW_MODEL_ENTRY: &str = "New model (from template)";
 
-pub struct LoadPathState {
-    pub models: Vec<SavedModelEntry>,
+impl ModelListState {
+    pub fn entry_count(&self) -> usize {
+        self.models.len() + 1
+    }
+
+    pub fn is_new_model_selected(&self) -> bool {
+        self.selected >= self.models.len()
+    }
+
+    pub fn selected_model(&self) -> Option<&SavedModelEntry> {
+        self.models.get(self.selected)
+    }
+}
+
+/// What can be done to the model that was just picked. The three run modes and
+/// the two manager operations, in one menu — the model is chosen first, the
+/// action second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAction {
+    Train,
+    Infer,
+    Perpetual,
+    Rename,
+    Delete,
+}
+
+/// The actions, in the order they are drawn. The key handler bounds its cursor
+/// on this list, so adding an action here is enough to make it selectable.
+pub const MODEL_ACTIONS: [&str; 5] = ["Train", "Infer", "Perpetual", "Rename", "Delete"];
+
+impl ModelAction {
+    pub const fn index(self) -> usize {
+        match self {
+            ModelAction::Train => 0,
+            ModelAction::Infer => 1,
+            ModelAction::Perpetual => 2,
+            ModelAction::Rename => 3,
+            ModelAction::Delete => 4,
+        }
+    }
+
+    pub const fn from_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(ModelAction::Train),
+            1 => Some(ModelAction::Infer),
+            2 => Some(ModelAction::Perpetual),
+            3 => Some(ModelAction::Rename),
+            4 => Some(ModelAction::Delete),
+            _ => None,
+        }
+    }
+
+    /// Whether the action starts a run (as opposed to managing the model).
+    pub const fn is_run(self) -> bool {
+        matches!(
+            self,
+            ModelAction::Train | ModelAction::Infer | ModelAction::Perpetual
+        )
+    }
+}
+
+pub struct ModelActionsState {
     pub selected: usize,
+    pub error: Option<String>,
+}
+
+pub struct RenameModelState {
+    pub input: String,
+    pub error: Option<String>,
+}
+
+/// Deleting is irreversible, so the confirmation is not a keystroke: the model's
+/// name has to be typed back exactly. A `[y]` on a menu is one fat finger away
+/// from a lost training run.
+pub struct DeleteConfirmState {
+    pub typed: String,
     pub error: Option<String>,
 }
 
@@ -89,15 +204,6 @@ pub enum LayerBuilderMode {
     Browse,
     Edit,
 }
-
-pub struct ModeSelectorState {
-    pub selected: usize, // index into RUN_MODE_CHOICES
-}
-
-/// The run modes offered, in the order they are drawn. The key handler bounds
-/// its cursor on this, so adding a mode here is enough to make it reachable —
-/// the third one was drawn but unselectable while the bound was hard-coded.
-pub const RUN_MODE_CHOICES: [&str; 3] = ["Inference", "Training", "Perpetual"];
 
 pub struct TrainingParamsState {
     pub fields: Vec<String>, // [lr, batch_size, steps, dataset_path]
@@ -238,13 +344,18 @@ pub struct MonitorState {
 
 pub struct App {
     pub screen: Screen,
-    pub home: HomeState,
-    pub load_path: LoadPathState,
+    /// Where `Models/` and `datasets/` live for this session. Injected rather
+    /// than deduced, so a test — or a throwaway `BATLAB_ROOT` session — can
+    /// rename and delete models without any of it landing in the repository.
+    pub storage: Storage,
+    pub model_list: ModelListState,
     pub template_selector: TemplateSelectorState,
+    pub model_actions: ModelActionsState,
+    pub rename_model: RenameModelState,
+    pub delete_confirm: DeleteConfirmState,
     pub weight_selector: WeightSelectorState,
     pub input_size: InputSizeState,
     pub layer_builder: LayerBuilderState,
-    pub mode_selector: ModeSelectorState,
     pub inference_params: InferenceParamsState,
     pub perpetual_params: PerpetualParamsState,
     pub training_params: TrainingParamsState,
@@ -252,6 +363,10 @@ pub struct App {
     pub monitor: MonitorState,
     pub run_config: Option<RunConfig>,
     pub active_model_name: Option<String>,
+    /// The model this process currently has a run on, if any. The manager
+    /// refuses to rename or delete it — see [`App::model_run_in_progress`] for
+    /// what that does and does not cover.
+    pub running_model: Option<String>,
     pub selected_checkpoint_path: Option<String>,
     pub load_checkpoint_on_start: bool,
     pub should_quit: bool,
@@ -356,8 +471,16 @@ fn normalize_key(value: &str) -> Option<String> {
 }
 
 impl App {
+    /// An app on the default storage root (the workspace, or `BATLAB_ROOT`).
     pub fn new() -> Self {
-        let models = storage::list_models().unwrap_or_default();
+        Self::with_storage(Storage::default())
+    }
+
+    /// An app on an explicit storage root. This is the constructor tests use:
+    /// the flow writes, renames and deletes model directories, and none of that
+    /// belongs in the repository's own `Models/`.
+    pub fn with_storage(storage: Storage) -> Self {
+        let models = storage.list_models().unwrap_or_default();
         let templates = built_in_templates();
         let (default_lr, default_batch, default_steps) = templates
             .first()
@@ -369,23 +492,37 @@ impl App {
                 )
             })
             .unwrap_or((0.01, 1, 50));
-        let datasets = storage::list_datasets().unwrap_or_default();
+        let datasets = storage.list_datasets().unwrap_or_default();
         let dataset_path = datasets.first().cloned().unwrap_or_default();
         let mut app = Self {
-            // Home, not TemplateSelector: the template route builds a *fresh*
-            // architecture and rewrites the target model's `config_file`, so
-            // starting there made every saved model unreachable and lossy to
-            // reach anyway. Home is the fork — load, or build new.
-            screen: Screen::Home,
-            home: HomeState { selected: 0 },
-            load_path: LoadPathState {
+            // The model list is the front door: open batlab, choose a model,
+            // then choose what to do with it. Opening on the template selector
+            // (as this once did) made every saved model unreachable, and
+            // opening on a fork between "load" and "new" made the common case
+            // — I have models, show me them — cost a keystroke and a decision.
+            screen: Screen::ModelList,
+            storage,
+            model_list: ModelListState {
                 models,
                 selected: 0,
                 error: None,
+                status: None,
             },
             template_selector: TemplateSelectorState {
                 templates,
                 selected: 0,
+                error: None,
+            },
+            model_actions: ModelActionsState {
+                selected: ModelAction::Train.index(),
+                error: None,
+            },
+            rename_model: RenameModelState {
+                input: String::new(),
+                error: None,
+            },
+            delete_confirm: DeleteConfirmState {
+                typed: String::new(),
                 error: None,
             },
             weight_selector: WeightSelectorState {
@@ -408,7 +545,6 @@ impl App {
                 mode: LayerBuilderMode::Add,
                 browse_selected: 0,
             },
-            mode_selector: ModeSelectorState { selected: 1 },
             inference_params: InferenceParamsState {
                 random_seed: true,
                 fields: vec!["0".into(), "1".into(), "1.0".into()],
@@ -469,6 +605,7 @@ impl App {
             },
             run_config: None,
             active_model_name: None,
+            running_model: None,
             selected_checkpoint_path: None,
             load_checkpoint_on_start: false,
             should_quit: false,
@@ -480,14 +617,28 @@ impl App {
         app
     }
 
-    /// Re-scans `Models/` so the load list reflects the disk, not the snapshot
-    /// taken when the app was constructed.
-    fn refresh_load_path(&mut self) {
-        self.load_path.models = storage::list_models().unwrap_or_default();
-        if self.load_path.selected >= self.load_path.models.len() {
-            self.load_path.selected = 0;
+    /// Re-scans `Models/` so the list reflects the disk, not the snapshot taken
+    /// when the app was constructed — a rename or a delete has to be visible
+    /// the moment it lands. Leaves `error`/`status` alone: the caller owns what
+    /// the screen is saying.
+    pub fn refresh_model_list(&mut self) {
+        self.model_list.models = self.storage.list_models().unwrap_or_default();
+        let last_row = self.model_list.entry_count() - 1;
+        if self.model_list.selected > last_row {
+            self.model_list.selected = last_row;
         }
-        self.load_path.error = None;
+    }
+
+    /// Puts the cursor on a model by name, if it is still there.
+    fn select_model_in_list(&mut self, name: &str) {
+        if let Some(index) = self
+            .model_list
+            .models
+            .iter()
+            .position(|model| model.name == name)
+        {
+            self.model_list.selected = index;
+        }
     }
 
     fn refresh_templates(&mut self) {
@@ -506,7 +657,7 @@ impl App {
             self.weight_selector.error = Some("No model selected.".to_string());
             return;
         };
-        match storage::list_model_checkpoints(&model_name) {
+        match self.storage.list_model_checkpoints(&model_name) {
             Ok(checkpoints) => {
                 self.weight_selector.checkpoints = checkpoints;
                 if self.weight_selector.selected > self.weight_selector.checkpoints.len() {
@@ -524,7 +675,7 @@ impl App {
     }
 
     fn refresh_datasets(&mut self) {
-        self.training_params.datasets = storage::list_datasets().unwrap_or_default();
+        self.training_params.datasets = self.storage.list_datasets().unwrap_or_default();
         if self.training_params.datasets.is_empty() {
             self.training_params.selected_dataset = 0;
             return;
@@ -548,11 +699,23 @@ impl App {
         }
     }
 
+    /// The checkpoint a run defaults to for the model currently open —
+    /// `Models/<name>/pretrained_weights/latest.ckpt`. `None` only when no model
+    /// is open, or when the folder cannot be prepared.
+    fn default_checkpoint_for_active_model(&self) -> Option<String> {
+        let model_name = self.active_model_name.as_deref()?;
+        self.storage
+            .default_model_checkpoint_path(model_name)
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+    }
+
     fn apply_template(&mut self, template: &ModelTemplate) -> Result<(), String> {
         self.active_model_name = Some(template.key.clone());
         self.load_checkpoint_on_start = false;
         self.selected_checkpoint_path = Some(
-            storage::default_model_checkpoint_path(&template.key)
+            self.storage
+                .default_model_checkpoint_path(&template.key)
                 .map_err(|err| format!("Failed to prepare model folder: {err}"))?
                 .to_string_lossy()
                 .to_string(),
@@ -583,7 +746,8 @@ impl App {
             self.training_params.fields[3] = self.training_params.datasets[0].clone();
         }
 
-        self.mode_selector.selected = 1;
+        self.model_actions.selected = ModelAction::Train.index();
+        self.model_actions.error = None;
         let config = ModelConfig {
             model_name: Some(template.key.clone()),
             input_size: template.input_size,
@@ -593,11 +757,16 @@ impl App {
                 mode: RunMode::Infer,
             },
         };
-        storage::write_model_config(&template.key, &config)
+        self.storage
+            .write_model_config(&template.key, &config)
             .map_err(|err| format!("Failed to write template config_file: {err}"))?;
         self.refresh_weight_selector();
         self.weight_selector.selected = 0;
-        self.screen = Screen::WeightSelector;
+        // The template *created* a model; the flow rejoins the common path —
+        // model in hand, now pick what to do with it.
+        self.refresh_model_list();
+        self.select_model_in_list(&template.key);
+        self.screen = Screen::ModelActions;
         Ok(())
     }
 
@@ -617,12 +786,12 @@ impl App {
 
         match config.run.mode {
             RunMode::Infer => {
-                self.mode_selector.selected = 0;
+                self.model_actions.selected = ModelAction::Infer.index();
                 self.selected_checkpoint_path = config.inference.checkpoint.clone();
                 self.load_checkpoint_on_start = config.inference.checkpoint.is_some();
             }
             RunMode::Train(train) => {
-                self.mode_selector.selected = 1;
+                self.model_actions.selected = ModelAction::Train.index();
                 self.training_params.fields = vec![
                     train.lr.to_string(),
                     train.batch_size.to_string(),
@@ -634,15 +803,15 @@ impl App {
                 self.sync_selected_dataset_from_field();
             }
             RunMode::Perpetual(perpetual) => {
-                self.mode_selector.selected = 2;
+                self.model_actions.selected = ModelAction::Perpetual.index();
                 self.selected_checkpoint_path = perpetual.checkpoint.clone();
                 self.load_checkpoint_on_start = perpetual.checkpoint.is_some();
                 self.sync_perpetual_params_from_config(&perpetual);
             }
         }
 
-        // The weight list is the point of loading a saved model: its trained
-        // checkpoints live beside the config and are otherwise unreachable.
+        // The checkpoint list is prepared here even though the weight screen
+        // comes later, so the action menu can say how many there are.
         // Note what this path does *not* do — unlike `apply_template`, it never
         // calls `write_model_config`, so the model's own `inference` block
         // survives being opened.
@@ -658,7 +827,8 @@ impl App {
             })
             .map_or(0, |index| index + 1);
         self.weight_selector.selected = preselected;
-        self.screen = Screen::WeightSelector;
+        self.model_actions.error = None;
+        self.screen = Screen::ModelActions;
     }
 
     fn sync_inference_params_from_config(&mut self, inference: &InferenceConfig) {
@@ -841,11 +1011,7 @@ impl App {
         let draft = self.build_draft_from_form(inferred, None)?;
         self.layer_builder.layers.push(draft);
         self.load_checkpoint_on_start = false;
-        if let Some(model_name) = self.active_model_name.as_deref() {
-            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
-                .ok()
-                .map(|path| path.to_string_lossy().to_string());
-        }
+        self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
         self.layer_builder.error = None;
         self.reset_layer_form();
         Ok(())
@@ -854,11 +1020,7 @@ impl App {
     pub fn delete_last_layer(&mut self) {
         self.layer_builder.layers.pop();
         self.load_checkpoint_on_start = false;
-        if let Some(model_name) = self.active_model_name.as_deref() {
-            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
-                .ok()
-                .map(|path| path.to_string_lossy().to_string());
-        }
+        self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
         self.reset_layer_form();
     }
 
@@ -1157,11 +1319,7 @@ impl App {
         let draft = self.build_draft_from_form(inferred, existing_key.as_deref())?;
         self.layer_builder.layers[idx] = draft;
         self.load_checkpoint_on_start = false;
-        if let Some(model_name) = self.active_model_name.as_deref() {
-            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
-                .ok()
-                .map(|path| path.to_string_lossy().to_string());
-        }
+        self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
         self.rebuild_layer_dims_from(idx + 1);
         self.layer_builder.error = None;
         self.layer_builder.mode = LayerBuilderMode::Browse;
@@ -1191,11 +1349,7 @@ impl App {
         let idx = self.layer_builder.browse_selected;
         self.layer_builder.layers.remove(idx);
         self.load_checkpoint_on_start = false;
-        if let Some(model_name) = self.active_model_name.as_deref() {
-            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
-                .ok()
-                .map(|path| path.to_string_lossy().to_string());
-        }
+        self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
         self.rebuild_layer_dims_from(idx);
         if self.layer_builder.layers.is_empty() {
             self.exit_browse_mode();
@@ -1217,15 +1371,17 @@ impl App {
             .clone()
             .or_else(|| self.active_model_name.clone())
             .unwrap_or_else(|| {
-                storage::next_model_name().unwrap_or_else(|_| "model-001".to_string())
+                self.storage
+                    .next_model_name()
+                    .unwrap_or_else(|_| "model-001".to_string())
             });
         config.model_name = Some(model_name.clone());
-        let config_path = storage::write_model_config(&model_name, &config)
+        let config_path = self
+            .storage
+            .write_model_config(&model_name, &config)
             .map_err(|err| format!("failed to save model config: {err}"))?;
         self.active_model_name = Some(model_name.clone());
-        self.selected_checkpoint_path = storage::default_model_checkpoint_path(&model_name)
-            .ok()
-            .map(|path| path.to_string_lossy().to_string());
+        self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
         self.load_checkpoint_on_start = false;
         self.monitor.model_config = Some(config);
         self.monitor.error = None;
@@ -1412,13 +1568,33 @@ impl App {
 
     // --- Screen transitions ---
 
-    pub fn finish_home(&mut self) {
-        if self.home.selected == 0 {
-            self.refresh_load_path();
-            self.screen = Screen::LoadPath;
-        } else {
+    /// Enter on the model list: open the selected model, or take the last row
+    /// into the template flow.
+    pub fn finish_model_list(&mut self) {
+        self.model_list.status = None;
+        if self.model_list.is_new_model_selected() {
+            self.model_list.error = None;
             self.refresh_templates();
             self.screen = Screen::TemplateSelector;
+            return;
+        }
+        let Some(model) = self.model_list.selected_model() else {
+            self.model_list.error = Some("No model configs found in Models/".into());
+            return;
+        };
+        let (name, path) = (model.name.clone(), model.path.clone());
+        match storage::load_model_config(&path) {
+            Ok(mut config) => {
+                // The directory is the name. Rename keeps the two in step, and
+                // if a hand-edited `config_file` disagrees the directory wins —
+                // it is what the manager and every checkpoint path key off.
+                config.model_name = Some(name);
+                self.model_list.error = None;
+                self.apply_loaded_model(config);
+            }
+            Err(err) => {
+                self.model_list.error = Some(format!("Failed to load {name}: {err}"));
+            }
         }
     }
 
@@ -1438,6 +1614,152 @@ impl App {
         }
     }
 
+    /// Opens the action menu on the model already in hand, re-reading its
+    /// checkpoints from disk first.
+    ///
+    /// The host calls this on the restart path. Without the re-read the menu
+    /// showed "no checkpoints" for a model that plainly had some, because
+    /// `run_monitor` builds a fresh `App` and never fills the checkpoint list —
+    /// found by driving the real TUI, where a run had just been saved.
+    pub fn enter_model_actions(&mut self) {
+        self.refresh_weight_selector();
+        self.model_actions.error = None;
+        self.screen = Screen::ModelActions;
+    }
+
+    /// The action currently highlighted in the action menu.
+    pub fn selected_action(&self) -> Option<ModelAction> {
+        ModelAction::from_index(self.model_actions.selected)
+    }
+
+    /// Whether this process is running the named model right now.
+    ///
+    /// The state consulted is the TUI's own: `running_model` is set when a run
+    /// starts and stays set until the run reports itself done. **It does not
+    /// cross the process boundary** — a second batlab, or a `--headless-train`
+    /// in another shell, is invisible here, and renaming a model out from under
+    /// one of those will send its next checkpoint write to a directory that no
+    /// longer exists. A lockfile under the model directory is the fix, and is
+    /// deliberately not in this mission.
+    pub fn model_run_in_progress(&self, model_name: &str) -> bool {
+        self.running_model.as_deref() == Some(model_name) && !self.monitor.done
+    }
+
+    fn guard_model_not_running(&self, model_name: &str) -> Result<(), String> {
+        if self.model_run_in_progress(model_name) {
+            return Err(format!(
+                "'{model_name}' has a run in progress in this session — stop it first."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enter on the action menu. The three run modes go on to pick weights; the
+    /// two manager operations open their own screen, and refuse outright while
+    /// the model is running.
+    pub fn finish_model_actions(&mut self) {
+        let Some(action) = self.selected_action() else {
+            return;
+        };
+        let Some(model_name) = self.active_model_name.clone() else {
+            self.model_actions.error = Some("No model selected.".to_string());
+            return;
+        };
+        if !action.is_run()
+            && let Err(err) = self.guard_model_not_running(&model_name)
+        {
+            self.model_actions.error = Some(err);
+            return;
+        }
+        self.model_actions.error = None;
+
+        match action {
+            ModelAction::Train | ModelAction::Infer | ModelAction::Perpetual => {
+                self.refresh_weight_selector();
+                self.screen = Screen::WeightSelector;
+            }
+            ModelAction::Rename => {
+                self.rename_model.input = model_name;
+                self.rename_model.error = None;
+                self.screen = Screen::RenameModel;
+            }
+            ModelAction::Delete => {
+                self.delete_confirm.typed.clear();
+                self.delete_confirm.error = None;
+                self.screen = Screen::DeleteConfirm;
+            }
+        }
+    }
+
+    /// Renames the open model on disk, then returns to the list with the
+    /// renamed entry selected — the list is where the new name is visible, so
+    /// it is where the operation reports back.
+    pub fn finish_rename(&mut self) {
+        let Some(current) = self.active_model_name.clone() else {
+            self.rename_model.error = Some("No model selected.".to_string());
+            return;
+        };
+        if let Err(err) = self.guard_model_not_running(&current) {
+            self.rename_model.error = Some(err);
+            return;
+        }
+        let target = self.rename_model.input.trim().to_string();
+        match self.storage.rename_model(&current, &target) {
+            Ok(_) => {
+                self.active_model_name = Some(target.clone());
+                // The weights moved with the directory; whatever the forms were
+                // pointing at is stale until the model is opened again.
+                self.selected_checkpoint_path = None;
+                self.load_checkpoint_on_start = false;
+                self.weight_selector.checkpoints.clear();
+                self.weight_selector.selected = 0;
+                self.rename_model.error = None;
+                self.refresh_model_list();
+                self.select_model_in_list(&target);
+                self.model_list.error = None;
+                self.model_list.status = Some(format!("Renamed '{current}' → '{target}'"));
+                self.screen = Screen::ModelList;
+            }
+            Err(err) => self.rename_model.error = Some(err.to_string()),
+        }
+    }
+
+    /// Deletes the open model, but only once its name has been typed back
+    /// exactly. Anything else leaves the directory alone and says so.
+    pub fn finish_delete(&mut self) {
+        let Some(current) = self.active_model_name.clone() else {
+            self.delete_confirm.error = Some("No model selected.".to_string());
+            return;
+        };
+        if let Err(err) = self.guard_model_not_running(&current) {
+            self.delete_confirm.error = Some(err);
+            return;
+        }
+        if self.delete_confirm.typed != current {
+            self.delete_confirm.error = Some(format!(
+                "Type the model name exactly — '{current}' — to confirm."
+            ));
+            return;
+        }
+        match self.storage.delete_model(&current) {
+            Ok(()) => {
+                self.active_model_name = None;
+                self.selected_checkpoint_path = None;
+                self.load_checkpoint_on_start = false;
+                self.weight_selector.checkpoints.clear();
+                self.weight_selector.selected = 0;
+                self.delete_confirm.typed.clear();
+                self.delete_confirm.error = None;
+                self.refresh_model_list();
+                self.model_list.selected = 0;
+                self.model_list.error = None;
+                self.model_list.status = Some(format!("Deleted '{current}'"));
+                self.screen = Screen::ModelList;
+            }
+            Err(err) => self.delete_confirm.error = Some(err.to_string()),
+        }
+    }
+
     pub fn finish_weight_selector(&mut self) {
         let Some(model_name) = self.active_model_name.clone() else {
             self.weight_selector.error = Some("No model selected.".to_string());
@@ -1446,11 +1768,11 @@ impl App {
 
         if self.weight_selector.selected == 0 {
             self.load_checkpoint_on_start = false;
-            match storage::default_model_checkpoint_path(&model_name) {
+            match self.storage.default_model_checkpoint_path(&model_name) {
                 Ok(path) => {
                     self.selected_checkpoint_path = Some(path.to_string_lossy().to_string());
                     self.weight_selector.error = None;
-                    self.screen = Screen::ModeSelector;
+                    self.enter_params_for_selected_action();
                 }
                 Err(err) => {
                     self.weight_selector.error =
@@ -1468,20 +1790,44 @@ impl App {
         self.load_checkpoint_on_start = true;
         self.selected_checkpoint_path = Some(entry.path.clone());
         self.weight_selector.error = None;
-        self.screen = Screen::ModeSelector;
+        self.enter_params_for_selected_action();
     }
 
-    pub fn finish_load_path(&mut self) {
-        let Some(model) = self.load_path.models.get(self.load_path.selected) else {
-            self.load_path.error = Some("No model configs found in Models/".into());
-            return;
-        };
-        match storage::load_model_config(&model.path) {
-            Ok(config) => self.apply_loaded_model(config),
-            Err(err) => {
-                self.load_path.error = Some(format!("Failed to load {}: {err}", model.name));
+    /// Opens the parameter form of whichever run mode was chosen in the action
+    /// menu. Only reached from the weight selector, which only run actions
+    /// reach — a manager action never lands here.
+    fn enter_params_for_selected_action(&mut self) {
+        match self.selected_action() {
+            Some(ModelAction::Infer) => {
+                self.inference_params.error = None;
+                self.inference_params.field_idx = 0;
+                self.screen = Screen::InferenceParams;
+            }
+            Some(ModelAction::Perpetual) => {
+                self.perpetual_params.error = None;
+                self.perpetual_params.field_idx = 0;
+                self.screen = Screen::PerpetualParams;
+            }
+            _ => {
+                self.training_params.error = None;
+                self.training_params.field_idx = 0;
+                self.screen = Screen::TrainingParams;
             }
         }
+    }
+
+    /// Opens the input-size form from the layer builder. Confirming it clears
+    /// the layer list — the geometry is the chain's first link, and the layers
+    /// after it were sized against the old one.
+    pub fn open_input_size(&mut self) {
+        self.input_size.fields = vec![
+            self.layer_builder.model_input.0.to_string(),
+            self.layer_builder.model_input.1.to_string(),
+            self.layer_builder.model_input.2.to_string(),
+        ];
+        self.input_size.field_idx = 0;
+        self.input_size.error = None;
+        self.screen = Screen::InputSize;
     }
 
     pub fn finish_input_size(&mut self) -> Result<(), String> {
@@ -1498,11 +1844,7 @@ impl App {
             return Err("Dimensions must be > 0".into());
         }
         self.load_checkpoint_on_start = false;
-        if let Some(model_name) = self.active_model_name.as_deref() {
-            self.selected_checkpoint_path = storage::default_model_checkpoint_path(model_name)
-                .ok()
-                .map(|path| path.to_string_lossy().to_string());
-        }
+        self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
         self.layer_builder.model_input = (w, h, c);
         self.layer_builder.layers.clear();
         self.reset_layer_form();
@@ -1517,27 +1859,7 @@ impl App {
             return;
         }
         self.layer_builder.error = None;
-        self.screen = Screen::ModeSelector;
-    }
-
-    pub fn finish_mode_selector(&mut self) {
-        match self.mode_selector.selected {
-            0 => {
-                self.inference_params.error = None;
-                self.inference_params.field_idx = 0;
-                self.screen = Screen::InferenceParams;
-            }
-            1 => {
-                self.training_params.error = None;
-                self.training_params.field_idx = 0;
-                self.screen = Screen::TrainingParams;
-            }
-            _ => {
-                self.perpetual_params.error = None;
-                self.perpetual_params.field_idx = 0;
-                self.screen = Screen::PerpetualParams;
-            }
-        }
+        self.screen = Screen::ModelActions;
     }
 
     pub fn toggle_inference_seed_mode(&mut self) {
@@ -1709,7 +2031,7 @@ impl App {
         self.send_perpetual_command(TrainingControlCommand::SetPaused(next));
     }
 
-    pub fn enter_layer_builder_from_mode(&mut self) {
+    pub fn enter_layer_builder(&mut self) {
         self.layer_builder.error = None;
         if self.layer_builder.layers.is_empty() {
             self.layer_builder.mode = LayerBuilderMode::Add;
@@ -1871,19 +2193,58 @@ impl App {
         let idx = self.training_control.field_idx;
         self.training_control.fields[idx].pop();
     }
+
+    /// Both manager forms take a model name, so every printable key is text —
+    /// including `q`, which quits on most other screens. `Esc` is the only way
+    /// out, or a model called `q-experiment` could not be typed at all.
+    pub fn handle_char_rename(&mut self, c: char) {
+        if !c.is_control() {
+            self.rename_model.input.push(c);
+            self.rename_model.error = None;
+        }
+    }
+
+    pub fn handle_backspace_rename(&mut self) {
+        self.rename_model.input.pop();
+        self.rename_model.error = None;
+    }
+
+    pub fn handle_char_delete_confirm(&mut self, c: char) {
+        if !c.is_control() {
+            self.delete_confirm.typed.push(c);
+            self.delete_confirm.error = None;
+        }
+    }
+
+    pub fn handle_backspace_delete_confirm(&mut self) {
+        self.delete_confirm.typed.pop();
+        self.delete_confirm.error = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        App, InferenceConfig, LayerKind, LossMethod, LossWeighting, MIN_RENOISE_DEPTH, ModelConfig,
-        OptimizerKind, PerpetualRegime, RunConfig, RunMode, Screen, TrainingConfig,
+        App, InferenceConfig, LayerKind, LossMethod, LossWeighting, MIN_RENOISE_DEPTH, ModelAction,
+        ModelConfig, OptimizerKind, PerpetualRegime, RunConfig, RunMode, Screen, TrainingConfig,
         TrainingControlCommand, WeightInit,
     };
+    use crate::storage::TempRoot;
+    use batlab_core::config::{built_in_templates, compute_inferred_input};
+
+    /// Every app under test lives on its own throwaway storage root. The
+    /// template route writes a `config_file`, and rename/delete move and remove
+    /// directories: on the deduced root all of that landed in the repository's
+    /// own `Models/` (`docs/reports/PERPETUAL_INFERENCE.md` §5).
+    fn test_app(tag: &str) -> (TempRoot, App) {
+        let temp = TempRoot::new(tag);
+        let app = App::with_storage(temp.storage());
+        (temp, app)
+    }
 
     #[test]
     fn cycle_kind_backward_moves_in_reverse_order() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("cycle-kind");
         app.layer_builder.current_kind = LayerKind::Convolution;
 
         app.cycle_kind_backward();
@@ -1893,28 +2254,47 @@ mod tests {
         assert_eq!(app.layer_builder.current_kind, LayerKind::UpsampleConv);
     }
 
-    /// `Screen::LoadPath` existed, was drawn, and handled its keys, but nothing
-    /// ever assigned it — the app opened straight on the template selector, so a
-    /// trained model under `Models/` could not be reached at all. Home is the
-    /// fork that makes it reachable, and it must default to the load route.
+    /// The front door is the model list. `Screen::LoadPath` — its ancestor —
+    /// existed, was drawn, and handled its keys while nothing ever assigned it,
+    /// so a trained model under `Models/` could not be reached at all. Opening
+    /// straight onto the list is what makes "I have models, show me them" cost
+    /// nothing.
     #[test]
-    fn app_starts_on_home_with_the_load_route_selected() {
-        let app = App::new();
-        assert!(matches!(app.screen, Screen::Home));
-        assert_eq!(app.home.selected, 0);
+    fn app_opens_on_the_model_list() {
+        let (_temp, app) = test_app("opens-on-list");
+        assert_eq!(app.screen, Screen::ModelList);
+        assert_eq!(app.model_list.selected, 0);
     }
 
+    /// The last row of the list is the template flow, and its index moves with
+    /// the list — on an empty root it is row 0, which is why a fresh install is
+    /// not a dead end.
     #[test]
-    fn home_routes_to_load_path_and_to_the_template_selector() {
-        let mut app = App::new();
+    fn the_last_row_of_an_empty_list_opens_the_template_flow() {
+        let (_temp, mut app) = test_app("empty-list");
+        assert!(app.model_list.models.is_empty());
+        assert!(app.model_list.is_new_model_selected());
 
-        app.home.selected = 0;
-        app.finish_home();
-        assert!(matches!(app.screen, Screen::LoadPath));
+        app.finish_model_list();
 
-        app.home.selected = 1;
-        app.finish_home();
-        assert!(matches!(app.screen, Screen::TemplateSelector));
+        assert_eq!(app.screen, Screen::TemplateSelector);
+    }
+
+    /// Opening a model goes straight to the action menu: model first, action
+    /// second. Nothing in between.
+    #[test]
+    fn opening_a_saved_model_lands_on_the_action_menu() {
+        let (_temp, mut app) = test_app("open-model");
+        app.finish_template_selector();
+        let created = app.active_model_name.clone().expect("template made a model");
+        app.refresh_model_list();
+        app.screen = Screen::ModelList;
+        app.select_model_in_list(&created);
+
+        app.finish_model_list();
+
+        assert_eq!(app.screen, Screen::ModelActions);
+        assert_eq!(app.active_model_name.as_deref(), Some(created.as_str()));
     }
 
     /// Opening a saved model must not touch what it says. The template route
@@ -1923,7 +2303,7 @@ mod tests {
     /// route has to carry the stored inference block into the form instead.
     #[test]
     fn loading_a_model_preserves_its_inference_block() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("preserve-inference");
         let config = ModelConfig {
             model_name: Some("unit-test-load".to_string()),
             input_size: (32, 32, 5),
@@ -1947,43 +2327,95 @@ mod tests {
         assert_eq!(app.inference_params.fields[1], "7");
         assert_eq!(app.inference_params.fields[2], "0.35");
         assert_eq!(app.active_model_name.as_deref(), Some("unit-test-load"));
-        // The weights of a loaded model are the point of loading it.
-        assert!(matches!(app.screen, Screen::WeightSelector));
+        // The model's own run mode preselects the action, so re-opening a model
+        // offers what it was last used for.
+        assert_eq!(app.model_actions.selected, ModelAction::Infer.index());
+        assert_eq!(app.screen, Screen::ModelActions);
     }
 
     #[test]
-    fn selecting_template_prefills_architecture_and_advances_to_weight_selector() {
-        let mut app = App::new();
+    fn selecting_template_prefills_architecture_and_advances_to_the_action_menu() {
+        let (_temp, mut app) = test_app("template-prefill");
 
         app.finish_template_selector();
 
-        assert!(matches!(app.screen, Screen::WeightSelector));
+        assert_eq!(app.screen, Screen::ModelActions);
         assert!(!app.layer_builder.layers.is_empty());
-        assert_eq!(app.layer_builder.model_input, (32, 32, 3));
+        // 3 signal channels + 4 carrying the time embedding.
+        assert_eq!(app.layer_builder.model_input, (32, 32, 7));
     }
 
+    /// Every model the "New model (from template)" flow writes to disk must be
+    /// conditionable on the timestep — `input_size.z > output.z`.
+    ///
+    /// The invariant is checked on the **config_file as written**, not on the
+    /// template in memory, because that file is what training and inference
+    /// will read back. Both templates shipped a model that failed this (1→1 and
+    /// 3→3, the geometry of `Models/Greyscale_Diffusion_broken`); a blind test
+    /// caught it by reading the file, which is why the assertion lives here too
+    /// and not only in `batlab_core`.
     #[test]
-    fn selecting_random_weights_advances_to_mode_selector() {
-        let mut app = App::new();
+    fn every_model_created_from_a_template_is_conditionable_on_the_timestep() {
+        for (index, template) in built_in_templates().into_iter().enumerate() {
+            let (temp, mut app) = test_app(&format!("template-geometry-{index}"));
+            app.template_selector.selected = index;
+
+            app.finish_template_selector();
+
+            assert_eq!(
+                app.template_selector.error, None,
+                "template '{}' failed to apply",
+                template.key
+            );
+            let written = temp
+                .storage()
+                .load_model_config_for_model(&template.key)
+                .unwrap_or_else(|err| panic!("template '{}' wrote no config: {err}", template.key));
+            let output = compute_inferred_input(&written.layers, written.input_size);
+            assert!(
+                written.input_size.2 > output.2,
+                "the model written for '{}' emits {} channels for {} in — it cannot be \
+                 conditioned on t, and sampling from it saturates to white",
+                template.key,
+                output.2,
+                written.input_size.2,
+            );
+        }
+    }
+
+    /// The weight choice sits between the action and its parameters, so which
+    /// parameter form comes next is decided by the action that was picked.
+    #[test]
+    fn the_weight_choice_leads_to_the_form_of_the_chosen_action() {
+        let (_temp, mut app) = test_app("weights-route");
         app.finish_template_selector();
-        app.weight_selector.selected = 0;
 
-        app.finish_weight_selector();
+        for (action, expected) in [
+            (ModelAction::Train, Screen::TrainingParams),
+            (ModelAction::Infer, Screen::InferenceParams),
+            (ModelAction::Perpetual, Screen::PerpetualParams),
+        ] {
+            app.model_actions.selected = action.index();
+            app.finish_model_actions();
+            assert_eq!(app.screen, Screen::WeightSelector, "{action:?}");
 
-        assert!(matches!(app.screen, Screen::ModeSelector));
-        assert!(!app.load_checkpoint_on_start);
-        assert!(app.selected_checkpoint_path.is_some());
+            app.weight_selector.selected = 0;
+            app.finish_weight_selector();
+
+            assert_eq!(app.screen, expected, "{action:?}");
+            assert!(!app.load_checkpoint_on_start);
+            assert!(app.selected_checkpoint_path.is_some());
+        }
     }
 
     #[test]
     fn inference_selection_builds_infer_run_config() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("infer-run-config");
         app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Infer.index();
+        app.finish_model_actions();
         app.finish_weight_selector();
-        app.mode_selector.selected = 0;
-
-        app.finish_mode_selector();
-        assert!(matches!(app.screen, Screen::InferenceParams));
+        assert_eq!(app.screen, Screen::InferenceParams);
 
         app.inference_params.random_seed = false;
         app.inference_params.fields[0] = "123".to_string();
@@ -2000,13 +2432,12 @@ mod tests {
 
     #[test]
     fn perpetual_selection_builds_a_perpetual_run_config() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("perpetual-run-config");
         app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Perpetual.index();
+        app.finish_model_actions();
         app.finish_weight_selector();
-        app.mode_selector.selected = 2;
-
-        app.finish_mode_selector();
-        assert!(matches!(app.screen, Screen::PerpetualParams));
+        assert_eq!(app.screen, Screen::PerpetualParams);
 
         app.perpetual_params.random_seed = false;
         app.perpetual_params.fields[0] = "99".to_string();
@@ -2037,30 +2468,19 @@ mod tests {
     /// silently clamp something the user cannot see.
     #[test]
     fn perpetual_params_reject_a_depth_below_the_drift_minimum() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("perpetual-min-depth");
         app.perpetual_params.fields[2] = (MIN_RENOISE_DEPTH - 1).to_string();
         assert!(app.finish_perpetual_params().is_err());
     }
 
-    #[test]
-    fn training_selection_advances_to_training_params() {
-        let mut app = App::new();
-        app.finish_template_selector();
-        app.finish_weight_selector();
-        app.mode_selector.selected = 1;
-
-        app.finish_mode_selector();
-
-        assert!(matches!(app.screen, Screen::TrainingParams));
-    }
 
     #[test]
     fn dataset_selector_requires_available_dataset() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("dataset-required");
         app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
         app.finish_weight_selector();
-        app.mode_selector.selected = 1;
-        app.finish_mode_selector();
         app.training_params.fields[0] = "0.01".to_string();
         app.training_params.fields[1] = "1".to_string();
         app.training_params.fields[2] = "10".to_string();
@@ -2076,11 +2496,11 @@ mod tests {
 
     #[test]
     fn training_params_and_dataset_build_train_run_config() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("train-run-config");
         app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
         app.finish_weight_selector();
-        app.mode_selector.selected = 1;
-        app.finish_mode_selector();
 
         app.training_params.fields[0] = "0.005".to_string();
         app.training_params.fields[1] = "3".to_string();
@@ -2114,7 +2534,7 @@ mod tests {
 
     #[test]
     fn toggle_training_pause_enqueues_set_paused_command() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("toggle-pause");
         app.monitor.current_lr = Some(0.01);
         app.monitor.current_batch_size = Some(1);
 
@@ -2127,7 +2547,7 @@ mod tests {
 
     #[test]
     fn finishing_training_control_enqueues_update_command() {
-        let mut app = App::new();
+        let (_temp, mut app) = test_app("training-control");
         app.monitor.current_lr = Some(0.01);
         app.monitor.current_batch_size = Some(2);
         app.monitor.total_steps = 100;
@@ -2173,5 +2593,188 @@ mod tests {
         assert_eq!(app.monitor.current_lr, Some(0.005));
         assert_eq!(app.monitor.current_batch_size, Some(4));
         assert_eq!(app.monitor.total_steps, 250);
+    }
+
+    // -----------------------------------------------------------------------
+    // The manager: rename and delete, as the UI drives them
+    // -----------------------------------------------------------------------
+
+    /// Puts the app on the action menu of a freshly created template model.
+    fn app_on_a_model(tag: &str) -> (TempRoot, App, String) {
+        let (temp, mut app) = test_app(tag);
+        app.finish_template_selector();
+        let name = app
+            .active_model_name
+            .clone()
+            .expect("the template route names the model it creates");
+        assert_eq!(app.screen, Screen::ModelActions);
+        (temp, app, name)
+    }
+
+    #[test]
+    fn rename_moves_the_directory_updates_the_config_and_reports_in_the_list() {
+        let (_temp, mut app, original) = app_on_a_model("ui-rename");
+        app.model_actions.selected = ModelAction::Rename.index();
+        app.finish_model_actions();
+        assert_eq!(app.screen, Screen::RenameModel);
+        assert_eq!(
+            app.rename_model.input, original,
+            "the form should open on the current name, so a small edit is a small edit"
+        );
+
+        app.rename_model.input = "renamed-model".to_string();
+        app.finish_rename();
+
+        assert_eq!(app.screen, Screen::ModelList);
+        assert_eq!(app.active_model_name.as_deref(), Some("renamed-model"));
+        assert!(!app.storage.models_root().join(&original).exists());
+        assert!(app.storage.models_root().join("renamed-model").is_dir());
+        assert_eq!(
+            app.storage
+                .load_model_config_for_model("renamed-model")
+                .expect("the renamed config should load")
+                .model_name
+                .as_deref(),
+            Some("renamed-model")
+        );
+        assert!(
+            app.model_list
+                .models
+                .iter()
+                .any(|model| model.name == "renamed-model"),
+            "the list must show the rename it just performed"
+        );
+        assert!(app.model_list.status.is_some(), "the rename went unreported");
+    }
+
+    #[test]
+    fn rename_refuses_an_unsafe_name_and_changes_nothing() {
+        let (_temp, mut app, original) = app_on_a_model("ui-rename-unsafe");
+        app.model_actions.selected = ModelAction::Rename.index();
+        app.finish_model_actions();
+
+        for bad in ["", "../escape", "with/slash", "."] {
+            app.rename_model.input = bad.to_string();
+            app.finish_rename();
+
+            assert_eq!(
+                app.screen,
+                Screen::RenameModel,
+                "rename to {bad:?} left the form"
+            );
+            assert!(
+                app.rename_model.error.is_some(),
+                "rename to {bad:?} was silent"
+            );
+            assert!(app.storage.models_root().join(&original).is_dir());
+            assert_eq!(app.active_model_name.as_deref(), Some(original.as_str()));
+        }
+    }
+
+    #[test]
+    fn delete_requires_the_name_typed_back_exactly() {
+        let (_temp, mut app, original) = app_on_a_model("ui-delete-confirm");
+        app.model_actions.selected = ModelAction::Delete.index();
+        app.finish_model_actions();
+        assert_eq!(app.screen, Screen::DeleteConfirm);
+        assert!(
+            app.delete_confirm.typed.is_empty(),
+            "the confirmation must start empty — a prefilled name is not a confirmation"
+        );
+
+        for wrong in ["", "y", "yes", &original.to_lowercase(), &original[..2]] {
+            if wrong == original {
+                continue;
+            }
+            app.delete_confirm.typed = wrong.to_string();
+            app.finish_delete();
+
+            assert_eq!(app.screen, Screen::DeleteConfirm, "{wrong:?} got through");
+            assert!(app.delete_confirm.error.is_some());
+            assert!(
+                app.storage.models_root().join(&original).is_dir(),
+                "{wrong:?} deleted the model"
+            );
+        }
+
+        app.delete_confirm.typed = original.clone();
+        app.finish_delete();
+
+        assert_eq!(app.screen, Screen::ModelList);
+        assert!(!app.storage.models_root().join(&original).exists());
+        assert!(app.active_model_name.is_none());
+        assert!(app.model_list.status.is_some(), "the delete went unreported");
+    }
+
+    /// Both manager operations refuse a model this process is running. The guard
+    /// is TUI state and stops at the process boundary — see
+    /// [`App::model_run_in_progress`].
+    #[test]
+    fn the_manager_refuses_a_model_with_a_run_in_progress() {
+        let (_temp, mut app, original) = app_on_a_model("ui-running-guard");
+        app.running_model = Some(original.clone());
+        app.monitor.done = false;
+
+        for action in [ModelAction::Rename, ModelAction::Delete] {
+            app.model_actions.selected = action.index();
+            app.finish_model_actions();
+
+            assert_eq!(
+                app.screen,
+                Screen::ModelActions,
+                "{action:?} opened while the model was running"
+            );
+            assert!(app.model_actions.error.is_some(), "{action:?} was silent");
+        }
+        assert!(app.storage.models_root().join(&original).is_dir());
+
+        // A run that has reported itself finished no longer holds the model.
+        app.monitor.done = true;
+        app.model_actions.selected = ModelAction::Delete.index();
+        app.finish_model_actions();
+        assert_eq!(app.screen, Screen::DeleteConfirm);
+    }
+
+    /// Re-entering the action menu re-reads the model's checkpoints. On the
+    /// restart path the app is rebuilt from scratch, so a menu that trusted its
+    /// own state announced "no checkpoints" for a model that had just written
+    /// one.
+    #[test]
+    fn re_entering_the_action_menu_re_reads_the_checkpoints() {
+        let (_temp, mut app, name) = app_on_a_model("reenter-actions");
+        std::fs::write(
+            app.storage
+                .model_weights_dir(&name)
+                .expect("weights dir")
+                .join("latest.ckpt"),
+            b"weights written by the run that just finished",
+        )
+        .expect("checkpoint write");
+        app.weight_selector.checkpoints.clear();
+
+        app.enter_model_actions();
+
+        assert_eq!(app.screen, Screen::ModelActions);
+        assert_eq!(
+            app.weight_selector
+                .checkpoints
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["latest.ckpt"]
+        );
+    }
+
+    /// A run action is never blocked by the guard — only the two manager
+    /// operations are.
+    #[test]
+    fn a_run_in_progress_does_not_block_starting_another_run() {
+        let (_temp, mut app, original) = app_on_a_model("ui-running-run");
+        app.running_model = Some(original);
+
+        app.model_actions.selected = ModelAction::Infer.index();
+        app.finish_model_actions();
+
+        assert_eq!(app.screen, Screen::WeightSelector);
     }
 }
