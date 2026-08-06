@@ -312,3 +312,12 @@ Trois pièges rencontrés, notés pour la suite :
    d'actions et `Add Layer`) : le marqueur qui distingue le menu d'actions est
    `[Enter] confirm  [e] edit layers`. Un marqueur ambigu fait passer un `Esc`
    qui saute un cran pour un `Esc` correct.
+
+## Contre-passe après `6b91485` (exécutée mécaniquement par l'architecte — suite inchangée, aucune ligne de test modifiée)
+
+`./blind_tests_manager/run.sh` sur le binaire rebâti depuis `646b254` :
+**9/9 PASS** — t01 flow, t02 rename, t03 delete, t04 navigation, t05 checkpoints,
+t06 hygiène, t07 inférence (1 écart de spec, inchangé), t08 sondes hostiles
+(1 écart de spec, inchangé), et **t09 géométrie des templates : 6 ok, 0 FAIL**
+(FAIL → PASS après le correctif). Verdict final : le contrat du gestionnaire de
+modèles est tenu.
