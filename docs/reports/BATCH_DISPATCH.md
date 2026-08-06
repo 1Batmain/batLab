@@ -36,7 +36,22 @@ runs appariés de 600 pas (§7.2).
 Et le résultat le plus net n'est pas dans la colonne des speedups : **le coût
 CPU de l'ancien chemin est proportionnel au batch (×93 pour un batch ×64),
 celui du nouveau ne l'est pas (×2)**. C'est la thèse du §7 de
-`PERF_CONVOLUTION.md` démontrée directement (§7.4).
+`PERF_CONVOLUTION.md` démontrée directement (### §7.3-bis — le point batch 64, re-certifié sur GPU libre
+
+Transcription mécanique par l'architecte (harnais de la mission inchangé, restreint
+au point manquant ; 3 rondes × 40 pas, run couleur terminé) :
+
+    batch 64 | ancien 5014,75 ms/pas (étendue 0,8 %) | nouveau 3983,50 ms/pas
+    (étendue 1,7 %) | speedup 1,26x | contrôle nul 0,2 %
+
+Lecture : le speedup temps réel CULMINE à batch 16 (1,84×) et redescend à 64 —
+à cette taille le GPU est saturé de calcul réel des deux côtés, et l'orchestration
+économisée pèse relativement moins. C'est le comportement attendu d'un fix
+d'orchestration, pas une déception : la métrique de débit continue de progresser —
+193 ms/échantillon (ancien, b16) → 105 (nouveau, b16) → 62 (nouveau, b64).
+Le temps CPU (§7.4) reste l'écart structurel : ×43 à batch 64.
+
+§7.4).
 
 Trois résultats méritent d'être lus avant le reste :
 
