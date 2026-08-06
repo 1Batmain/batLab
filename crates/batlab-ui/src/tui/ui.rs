@@ -466,7 +466,7 @@ fn draw_template_selector(f: &mut Frame, app: &App) {
     }
 
     lines.push(Line::from(Span::styled(
-        "  [arrow] select  [Enter] continue  [Esc] quit",
+        "  [arrow] select  [Enter] create  [Esc] back",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -540,7 +540,7 @@ fn draw_weight_selector(f: &mut Frame, app: &App) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] select  [Enter] continue  [Esc] quit",
+        "  [arrow] select  [Enter] continue  [Esc] back  [q] quit",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
@@ -558,7 +558,7 @@ fn draw_input_size(f: &mut Frame, app: &App) {
         &app.input_size.fields,
         app.input_size.field_idx,
         app.input_size.error.as_deref(),
-        "[arrow] field  [0-9] type  [Enter] next/confirm  [Backspace] del  [Esc] quit",
+        "[arrow] field  [0-9] type  [Enter] next/confirm (clears layers)  [Backspace] del  [Esc] back",
     );
 }
 
@@ -614,7 +614,7 @@ fn draw_lb_add_edit_mode(f: &mut Frame, app: &App, area: Rect) {
     let hint = if app.layer_builder.mode == LayerBuilderMode::Edit {
         " [left/right] type  [up/down] field  [Space] toggle  [type] value  [Enter] save  [Esc] cancel  [q] quit"
     } else {
-        " [left/right] type  [up/down] field  [Space] toggle  [type] value  [Enter] add  [d] del last  [e] edit layers  [b] done  [q] quit"
+        " [left/right] type  [up/down] field  [Space] toggle  [Enter] add  [d] del last  [e] edit layers  [i] input size  [b] done  [Esc] back  [q] quit"
     };
     f.render_widget(hint_bar(hint), inner);
 }
@@ -784,7 +784,7 @@ fn draw_training_params(f: &mut Frame, app: &App) {
         training_fields,
         app.training_params.field_idx,
         app.training_params.error.as_deref(),
-        "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] quit",
+        "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] back",
     );
 }
 
@@ -915,7 +915,7 @@ fn draw_dataset_selector(f: &mut Frame, app: &App) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] select dataset  [<- / ->] cycle  [Enter] start training  [Esc] quit",
+        "  [arrow] select dataset  [<- / ->] cycle  [Enter] start training  [Esc] back  [q] quit",
         Style::default().fg(Color::DarkGray),
     )));
 
