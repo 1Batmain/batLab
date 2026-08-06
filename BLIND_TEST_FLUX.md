@@ -10,6 +10,110 @@ regime flux`) pour comparer ses sorties — build et exécution, jamais lecture.
 Suite exécutable : `blind_tests/run.sh` (`BLIND_BASELINE=1` pour la comparaison avec le
 binaire pré-flux). PASS/FAIL par propriété, code de retour non nul si FAIL.
 
+## Passe 3 — contre-vérification après `419a96e` + `ccb5a15`
+
+**Verdict : 9/9 PASS, 0 FAIL.** Le défaut P0 de la passe 2 est corrigé, et corrigé
+exactement — pas approximativement.
+
+| # | Propriété | Passe 1 | Passe 2 | **Passe 3** |
+|---|---|---|---|---|
+| P0 | format du dump / sanité | PASS | **FAIL** | **PASS** |
+| P1 | stationnarité du niveau de bruit (ligne 15) | PASS | PASS | **PASS** |
+| P2 | aucun saut image-à-image (ligne 16) | PASS | PASS | **PASS** |
+| P3 | continuité locale + dérive longue (ligne 17) | PASS | PASS | **PASS** |
+| P4 | amplitude par frame ~ √β(t\*) (ligne 18) | **FAIL** | PASS | **PASS** |
+| P5 | graines : reproductibilité, divergence, décorrélation (ligne 19) | PASS | PASS | **PASS** |
+| P6 | isotropie (ligne 20) | PASS | PASS | **PASS** |
+| P7 | non-régression errance / respiration (ligne 21) | PASS | PASS | **PASS** |
+| P8 | bornes et diagnostics du CLI (contrat `--help`) | *OBS* | PASS | **PASS** |
+
+### La spec a bougé, et elle a bougé dans le bon sens
+
+`--help` publie une phrase qui **n'existait pas** en passe 2 :
+
+> « The phase names what the frame DID, so in flux the opening approach is
+> **T-1-t\* frames of 0** and every frame from the first churn on is 2 — cut a
+> prologue on that byte rather than on a count. »
+
+C'est exactement l'arbitrage que la passe 2 demandait, et il tranche dans le sens de la
+convention de l'errance (la frame qui *commence* une phase porte l'étiquette de cette
+phase). L'implémenteur n'a pas amendé la spec pour coller au code : il a corrigé le code
+**et** publié la règle qui le rend vérifiable. J'ai donc durci P0 en conséquence — c'est
+la seule chose que j'ai changée dans la suite, et je la cite plutôt que de la supposer.
+
+**Je n'ai supposé nulle part la valeur de `T`** : le contrat l'emploie sans le définir
+(*défaut de spec mineur*, cf. D7 ci-dessous). Je teste la **loi** — longueur du prologue
+affine en t\*, de pente exactement −1 — puis je recoupe son ordonnée à l'origine avec le
+haut de chaîne lu **dans le dump lui-même** (t de la frame 0, +1). Les deux tombent sur
+255, indépendamment :
+
+```
+longueur du prologue : t*=8→247  16→239  32→223  64→191  96→159  160→95  224→31  250→5
+n0 + t* = {255}  (constante ⇔ pente −1 exacte, sur 9 valeurs de t*)
+haut de chaîne lu dans le dump = {255}     → concordant
+```
+
+### P0 — la frontière tombe où le contrat l'annonce
+
+Le test que la passe 2 avait écrit **échouait** ; le même test, seuils inchangés, passe
+désormais. Comme en passe 2, je ne juge pas sur l'étiquette mais sur la **dynamique** :
+au niveau t\*, pas inverse et churn diffèrent de ~40 %, ce qui les sépare sans ambiguïté.
+
+```
+frames « 0 descent » ayant l'amplitude d'un churn :
+  t*=8→0  16→0  32→0  64→0  96→0  160→0  224→0  250→0   (+ run principal t*=64→0)
+  au niveau t*=64 : « descent » ≈0,1187 (pas inverse)  vs  churn = 0,1601
+```
+
+**0 frame mal étiquetée sur 9 valeurs du cadran** — la mission en demandait 3. Le bloc de
+`0` est en outre un **préfixe contigu** (première frame de phase 2 = nombre de frames de
+phase 0) et aucun `1 climb` n'apparaît jamais en flux.
+
+### Ce que j'ai vérifié que l'implémenteur affirmait sans le prouver
+
+L'ordre de mission annonçait « le sha256 de référence a changé d'un octet par approche ».
+Ma suite ne **pinne** aucun sha256 de dump (elle n'en calcule que pour comparer deux runs
+de même graine entre eux, P5) : rien à mettre à jour de ce côté. Mais l'affirmation elle-
+même est un auto-contrôle de l'implémenteur, et elle porte un enjeu réel — **un correctif
+d'étiquette qui déplacerait aussi la trajectoire serait une régression silencieuse**, et
+P1–P7 ne la verraient pas nécessairement. Je l'ai donc vérifiée en construisant et en
+exécutant le binaire de la passe 2 (`be42c27`, build + exécution, **jamais lecture**) et
+en comparant les dumps **octet à octet**, à graine et paramètres identiques :
+
+| t\* | octets différents | position | valeur | frame attendue (255−t\*) |
+|---|---|---|---|---|
+| 64 | **1** / 24 591 020 | frame 191, champ `phase` | `0` → `2` | 191 ✓ |
+| 32 | **1** / 12 295 520 | frame 223, champ `phase` | `0` → `2` | 223 ✓ |
+| 224 | **1** / 12 295 520 | frame 31, champ `phase` | `0` → `2` | 31 ✓ |
+
+Exactement un octet, toujours le champ `phase`, toujours à la frame que la passe 2 avait
+désignée, et toujours au rang que le contrat prédit. **Tous les pixels et tous les `t`
+sont bit-à-bit identiques** : le correctif est prouvé *label-only*, il n'a pas effleuré la
+dynamique. C'est aussi ce que disent les chiffres de P1–P6, inchangés à l'affichage près
+(std plateau 0,7367 ; max/médiane 1,10 ; corr(k,k+1) 0,9627 ; c\* = 1,980 ; rapport
+d'isotropie 1,0003).
+
+La suite a également été rejouée avec `BLIND_BASELINE=1`, qui rétablit la non-régression
+forte de P7 : contre le binaire **pré-flux** (`12acad8`), à graine identique, **8/8 PNG
+strictement identiques en errance et 8/8 en respiration**. Les deux régimes préexistants
+n'ont pas bougé d'un pixel depuis avant l'introduction du flux.
+
+### Défauts de spec restant ouverts
+
+- **D7 (neuf, mineur)** — `--help` énonce « T-1-t\* frames » sans définir `T` nulle part
+  dans le contrat public. Un lecteur qui veut *prédire* la longueur du prologue (plutôt
+  que la constater) doit deviner que T = 256. Mesuré : T−1 = 255. À écrire dans `--help`.
+- **A1, A2** (passe 1, inchangés) — la descente initiale n'est couverte par aucune ligne
+  de la spec, et « images des cycles successifs différentes » n'a pas de seuil. Ces deux
+  points relèvent de l'auteur de la spec, pas de l'implémenteur. *Note* : le contrat
+  reconnaît désormais explicitement le prologue et donne le moyen de le découper
+  (« cut a prologue on that byte »), ce qui **outille** A1 sans le trancher — la question
+  « le flux doit-il pouvoir démarrer *à* t\* ? » reste ouverte.
+- **D2 (réserve de la passe 2, toujours ouverte)** — `MISSION_BLIND_TEST.md` ligne 9 porte
+  encore la forme d'invocation fautive, sans le modèle positionnel.
+
+---
+
 ## Passe 2 — contre-vérification après `be42c27`
 
 État à l'issue de la première passe : 7/8 PASS, **P4 FAIL** (le cadran t\* était annoncé au
@@ -213,6 +317,15 @@ l'emporte sur `--frames` ; le cadran répond à ses trois orthographes.
 BLIND_BASELINE=1 ./blind_tests/run.sh    # + comparaison bit-à-bit avec le binaire pré-flux
 ACTIONS=20000 ./blind_tests/run.sh       # horizon long (stationnarité)
 TSTARS="8 24 48 96 192 250" ./blind_tests/run.sh   # autre échantillonnage du cadran
+```
+
+Comparaison octet à octet avec le binaire de la passe 2 (§ passe 3), à refaire au besoin :
+
+```bash
+git worktree add worktrees/blind-p2-phase be42c27 --detach
+cargo build --release -p main --manifest-path worktrees/blind-p2-phase/Cargo.toml
+# puis même invocation flux, même --seed, et cmp des deux dumps
+git worktree remove worktrees/blind-p2-phase
 ```
 
 Le runner copie `night_run.ckpt` s'il est absent, écrit ses dumps dans `blind_tests/out/`
