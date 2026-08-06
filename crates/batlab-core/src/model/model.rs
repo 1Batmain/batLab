@@ -1,7 +1,7 @@
 //! File purpose: Implements model functionality for model execution, state, or diagnostics.
 
 use crate::gpu_context::GpuContext;
-use crate::model::debug::{LayerDebugView, read_back_f32};
+use crate::model::debug::{LayerDebugView, read_back_f32, read_back_f32_at};
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
 use crate::model::layer_types::{ConcatType, LayerType, LayerTypes, LossMethod, LossType};
@@ -75,6 +75,12 @@ pub struct Model<State = Infer> {
     pending_loss_readback: Option<PendingLossReadback>,
     last_reported_loss: Option<f32>,
     loss_readback_disabled: bool,
+    /// Samples the built graph carries at once.
+    ///
+    /// Fixed at `build()` time, because it sizes every activation buffer.
+    /// Inference and every non-batched entry point leave it at 1, which
+    /// reproduces the pre-batching graph exactly.
+    batch: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +166,7 @@ impl Model<Training> {
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
+            batch: 1,
         }
     }
 
@@ -177,10 +184,19 @@ impl Model<Training> {
     }
 
     /// Build all forward + backward + SGD passes in the correct order.
+    ///
+    /// The training batch size is baked in here: it sizes every activation
+    /// buffer and every dispatch. Changing it afterwards therefore means
+    /// rebuilding — see [`Model::resize_batch`].
     pub fn build(&mut self) -> Result<(), ModelError> {
         if self.state.is_build {
             self.clear();
         }
+        self.batch = self
+            .training
+            .as_ref()
+            .map(|t| t.batch_size.max(1))
+            .unwrap_or(1);
 
         // 1. Forward passes for all network layers.
         self.build_forwards()?;
@@ -202,17 +218,29 @@ impl Model<Training> {
         let loss_spec = LossType::new(loss_method, last_dim);
         let mut loss_layer = Layer::new(&self.gpu.device, LayerTypes::Loss(loss_spec), None)
             .expect("failed to create loss layer");
+        loss_layer.batch = self.batch;
 
-        // create_buffers shares last_fwd_output as binding 0 (model_result),
-        // allocates binding 1 (target) and binding 2 (grad_output), returns grad_output.
+        // create_buffers shares last_fwd_output as binding 0 (model_result) and
+        // allocates [1] target, [2] loss_terms, [3] grad_output, [4] specs.
+        //
+        // The loss layer is the one place where "the layer's output" is NOT its
+        // last buffer: what feeds the backward chain is `grad_output`, at the
+        // fixed index 3. Taking `create_buffers`' return value here would have
+        // chained whatever binding happens to sit last — which, since the specs
+        // uniform was appended, is a UNIFORM buffer. It fails loudly at bind
+        // group creation ("does not contain required usage flags STORAGE"), but
+        // only because the usages differ; a storage buffer added last would
+        // have been wired in silently.
+        const LOSS_GRAD_OUTPUT_INDEX: usize = 3;
         let empty_saved_outputs = HashMap::new();
-        let loss_grad_out = loss_layer.create_buffers(
+        loss_layer.create_buffers(
             &self.gpu,
             Some(last_fwd_output),
             &empty_saved_outputs,
             WeightInit::default(),
             self.layers.len(),
         )?;
+        let loss_grad_out = Arc::clone(&loss_layer.buffers.forward[LOSS_GRAD_OUTPUT_INDEX]);
         loss_layer.set_pipeline(&self.gpu.device);
         loss_layer.set_bind_group(&self.gpu.device);
 
@@ -270,11 +298,41 @@ impl Model<Training> {
             .lr = lr;
     }
 
+    /// Record a new batch size. Only takes effect on the next [`Model::build`];
+    /// use [`Model::resize_batch`] on an already-built model.
     pub fn set_batch_size(&mut self, batch_size: u32) {
         self.training
             .as_mut()
             .expect("training config unavailable")
             .batch_size = batch_size;
+    }
+
+    /// Change the batch size of a *built* model, preserving its training state.
+    ///
+    /// The batch axis lives in the size of every activation buffer, so a new
+    /// batch size means new buffers, new bind groups and new dispatch counts —
+    /// i.e. a rebuild. What must survive the rebuild is everything that *is*
+    /// the run: weights, biases, Adam's first and second moments, and the
+    /// global step counter `t` (Adam's bias correction is a function of `t`
+    /// alone, so losing it would make the first step after a resize a full
+    /// +/-lr on every weight). A checkpoint round-trip carries exactly that
+    /// set, which is why it is used rather than a hand-rolled copy.
+    ///
+    /// Called from a user keystroke in the TUI, i.e. rarely.
+    pub fn resize_batch(&mut self, batch_size: u32) -> Result<(), ModelError> {
+        let batch_size = batch_size.max(1);
+        if self.state.is_build && self.batch == batch_size {
+            self.set_batch_size(batch_size);
+            return Ok(());
+        }
+        if !self.state.is_build {
+            self.set_batch_size(batch_size);
+            return Ok(());
+        }
+        let checkpoint = self.checkpoint_bytes()?;
+        self.set_batch_size(batch_size);
+        self.build()?;
+        self.load_checkpoint_bytes(&checkpoint)
     }
 
     pub fn training_hyperparameters(&self) -> (f32, u32) {
@@ -445,6 +503,7 @@ impl<State> Model<State> {
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
+            batch: 1,
         }
     }
 
@@ -458,6 +517,11 @@ impl<State> Model<State> {
         self.pending_loss_readback = None;
         self.last_reported_loss = None;
         self.loss_readback_disabled = false;
+    }
+
+    /// Samples the built graph carries at once (1 for inference).
+    pub fn batch(&self) -> u32 {
+        self.batch
     }
 
     pub fn training_mode(&mut self, training: Option<State>) {
@@ -816,7 +880,12 @@ impl<State> Model<State> {
 
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         for layer in &self.layers {
-            layer.encode_pass(&mut encoder);
+            // One sample: `predict` writes the first slice and reads the first
+            // slice back. On a training model whose buffers are sized for a
+            // full batch (this is what `probe_diffusion` does), dispatching the
+            // whole grid would compute 15 more samples out of stale memory and
+            // throw them away.
+            layer.encode_pass_with_batch(&mut encoder, 1);
         }
         self.gpu.queue.submit([encoder.finish()]);
 
@@ -827,7 +896,10 @@ impl<State> Model<State> {
         let mut last_output: Option<Arc<Buffer>> = None;
         let mut saved_output_buffers: HashMap<String, Arc<Buffer>> = HashMap::new();
         let init = self.weight_init;
+        let batch = self.batch;
         for (layer_index, layer) in self.layers.iter_mut().enumerate() {
+            // Before create_buffers: it is what sizes the activation buffers.
+            layer.batch = batch;
             last_output = Some(layer.create_buffers(
                 &self.gpu,
                 last_output,
@@ -981,10 +1053,21 @@ impl<State> Model<State> {
             .loss_layer
             .as_ref()
             .expect("loss layer is only available in training mode");
-        let Some(loss_terms) = read_back_f32(
+        // The LAST sample of the batch, not the first.
+        //
+        // Before batching, the reported loss was the one left in the buffer by
+        // the last sample submitted (`is_last && report_last_loss` in
+        // diffusion.rs). Keeping that exact definition is what makes the paired
+        // old-vs-new loss trajectories comparable at all — and since the
+        // forward pass contains no reduction over the batch axis, the number
+        // must come out bit-identical.
+        let per_sample = loss_layer.ty.get_dim_output().bytes_size() as u64;
+        let offset = per_sample * (self.batch.saturating_sub(1)) as u64;
+        let Some(loss_terms) = read_back_f32_at(
             self.gpu.as_ref(),
             &loss_layer.buffers.forward[2],
-            loss_layer.ty.get_dim_output().bytes_size() as u64,
+            offset,
+            per_sample,
         ) else {
             self.disable_loss_readback("failed to read loss buffer");
             return self.last_reported_loss;
@@ -1024,6 +1107,8 @@ impl<State> Model<State> {
         if size_bytes == 0 {
             return false;
         }
+        // Same slice as the blocking path: the batch's last sample.
+        let source_offset = size_bytes * (self.batch.saturating_sub(1)) as u64;
 
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         let staging = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1032,7 +1117,13 @@ impl<State> Model<State> {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        encoder.copy_buffer_to_buffer(loss_terms_buf.as_ref(), 0, &staging, 0, size_bytes);
+        encoder.copy_buffer_to_buffer(
+            loss_terms_buf.as_ref(),
+            source_offset,
+            &staging,
+            0,
+            size_bytes,
+        );
         self.gpu.queue.submit([encoder.finish()]);
 
         let slice = staging.slice(..);

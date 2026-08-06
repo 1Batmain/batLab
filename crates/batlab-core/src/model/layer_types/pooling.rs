@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding,
     ForwardBufferSource, LayerType, ShaderDescriptor,
 };
@@ -70,8 +71,8 @@ impl LayerType for PoolingType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| ForwardBufferBinding {
                 init: match name.as_str() {
@@ -90,8 +91,8 @@ impl LayerType for PoolingType {
             .collect()
     }
 
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
-        self.get_back_buffers_specs()
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs(batch)
             .into_iter()
             .enumerate()
             .map(|(index, (name, spec))| BackwardBufferBinding {
@@ -120,9 +121,9 @@ impl LayerType for PoolingType {
         vec!["conv_back_input", "conv_back_weights", "conv_back_bias"]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
         vec![
-            self.dim_input.length().div_ceil(64),
+            (self.dim_input.length() * batch).div_ceil(64),
             (self.dim_kernel.length() * self.nb_kernel).div_ceil(64),
             self.nb_kernel.div_ceil(64),
         ]
@@ -169,13 +170,13 @@ impl LayerType for PoolingType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         vec![
             // [0] input — shared with previous layer's output
             (
                 "input".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -234,7 +235,7 @@ impl LayerType for PoolingType {
             (
                 "output".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -247,7 +248,7 @@ impl LayerType for PoolingType {
         ]
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         // Backward bind group layout (all three sub-passes share this layout):
         //   [0] fwd_input    — shared from forward[0]
         //   [1] weights      — shared from forward[1]
@@ -279,7 +280,7 @@ impl LayerType for PoolingType {
         vec![
             (
                 "fwd_input".to_string(),
-                read_storage(self.dim_input.bytes_size()),
+                read_storage(batched_bytes(self.dim_input, batch)),
             ),
             ("weights".to_string(), read_storage(self.kernel_bytes())),
             (
@@ -300,11 +301,11 @@ impl LayerType for PoolingType {
             ),
             (
                 "grad_output".to_string(),
-                read_storage(self.dim_output.bytes_size()),
+                read_storage(batched_bytes(self.dim_output, batch)),
             ),
             (
                 "grad_input".to_string(),
-                write_storage(self.dim_input.bytes_size()),
+                write_storage(batched_bytes(self.dim_input, batch)),
             ),
             (
                 "grad_weights".to_string(),

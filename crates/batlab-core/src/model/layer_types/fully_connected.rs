@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     ActivationMethod, BackwardBufferBinding, BackwardBufferSource, BufferInit,
     ForwardBufferBinding, ForwardBufferSource, LayerType, OptimizerBindings, ShaderDescriptor,
 };
@@ -69,9 +70,11 @@ impl LayerType for FullyConnectedType {
         ]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
+        // grad_input is per-activation; grad_weights / grad_bias reduce onto
+        // parameters and fold the batch into their own loop.
         vec![
-            self.dim_input.length().div_ceil(64),
+            (self.dim_input.length() * batch).div_ceil(64),
             self.weight_count().div_ceil(64),
             self.nb_neurons.div_ceil(64),
         ]
@@ -89,8 +92,8 @@ impl LayerType for FullyConnectedType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| ForwardBufferBinding {
                 init: match name.as_str() {
@@ -109,8 +112,8 @@ impl LayerType for FullyConnectedType {
             .collect()
     }
 
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
-        self.get_back_buffers_specs()
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs(batch)
             .into_iter()
             .enumerate()
             .map(|(index, (name, spec))| BackwardBufferBinding {
@@ -156,12 +159,12 @@ impl LayerType for FullyConnectedType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         vec![
             (
                 "input".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -216,7 +219,7 @@ impl LayerType for FullyConnectedType {
             (
                 "pre_activation".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -229,7 +232,7 @@ impl LayerType for FullyConnectedType {
             (
                 "output".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -242,7 +245,7 @@ impl LayerType for FullyConnectedType {
         ]
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         let read_storage = |size: u32| BufferSpec {
             size: size.max(4),
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
@@ -267,12 +270,12 @@ impl LayerType for FullyConnectedType {
         vec![
             (
                 "fwd_input".to_string(),
-                read_storage(self.dim_input.bytes_size()),
+                read_storage(batched_bytes(self.dim_input, batch)),
             ),
             ("weights".to_string(), read_storage(self.weight_count() * 4)),
             (
                 "pre_activation".to_string(),
-                read_storage(self.dim_output.bytes_size()),
+                read_storage(batched_bytes(self.dim_output, batch)),
             ),
             (
                 "specs".to_string(),
@@ -292,11 +295,11 @@ impl LayerType for FullyConnectedType {
             ),
             (
                 "grad_output".to_string(),
-                read_storage(self.dim_output.bytes_size()),
+                read_storage(batched_bytes(self.dim_output, batch)),
             ),
             (
                 "grad_input".to_string(),
-                write_storage(self.dim_input.bytes_size()),
+                write_storage(batched_bytes(self.dim_input, batch)),
             ),
             (
                 "grad_weights".to_string(),

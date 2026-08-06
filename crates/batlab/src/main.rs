@@ -1537,7 +1537,12 @@ fn apply_training_control_command(
             *current_batch_size = batch_size.max(1);
             *total_steps = new_total_steps.max(1);
             model.set_learning_rate(*current_lr);
-            model.set_batch_size(*current_batch_size);
+            // Rebuilds the graph when the batch actually changes: the batch
+            // axis is baked into every activation buffer. Weights, Adam moments
+            // and the step counter survive the rebuild (see `resize_batch`).
+            if let Err(err) = model.resize_batch(*current_batch_size) {
+                eprintln!("[training] could not resize the batch: {err}");
+            }
         }
         // Perpetual-only controls. The monitor gates them on the run mode, so
         // reaching one here means a stale command from a previous run's

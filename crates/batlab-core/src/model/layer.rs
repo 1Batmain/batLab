@@ -3,7 +3,7 @@
 use crate::gpu_context::GpuContext;
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
-    BackwardBufferSource, BufferInit, ForwardBufferSource, LayerType, LayerTypes,
+    Batch, BackwardBufferSource, BufferInit, ForwardBufferSource, LayerType, LayerTypes,
 };
 use crate::model::optimizer::{AdamHyperparameters, AdamSpecs, OptimizerKind};
 use crate::model::types::Dim3;
@@ -91,6 +91,13 @@ pub(crate) struct Layer {
     pub(crate) opt_pass: Option<OptPass>,
     pub(crate) merge_pass: Option<MergePass>,
     pub(crate) saved_output_key: Option<String>,
+    /// How many samples this layer's activation buffers hold.
+    ///
+    /// Set by the model before `create_buffers`, and from then on the single
+    /// authority on every size and dispatch count of this layer. A layer built
+    /// for `batch` and encoded for a different one is not an error — see
+    /// `encode_pass_with_batch` — but a layer *allocated* for the wrong one is.
+    pub(crate) batch: Batch,
 }
 
 impl Layer {
@@ -104,7 +111,9 @@ impl Layer {
             ty.set_dim_input(input);
         }
         ty.set_dim_output()?;
-        let num_workgroups = ty.get_forward_workgroup_count();
+        // Batch 1 until the model says otherwise: `add_layer` runs long before
+        // `build()`, which is where the batch is known.
+        let num_workgroups = ty.get_forward_workgroup_count(1);
         let shader = Shaders {
             forward: Self::create_shader(device, &ty),
             backward: None,
@@ -119,6 +128,7 @@ impl Layer {
             opt_pass: None,
             merge_pass: None,
             saved_output_key: None,
+            batch: 1,
         })
     }
 
@@ -174,7 +184,8 @@ impl Layer {
         init: WeightInit,
         layer_index: usize,
     ) -> Result<Arc<Buffer>, ModelError> {
-        let bindings = self.ty.get_forward_buffer_bindings();
+        self.num_workgroups = self.ty.get_forward_workgroup_count(self.batch);
+        let bindings = self.ty.get_forward_buffer_bindings(self.batch);
         for binding in bindings.iter() {
             match &binding.source {
                 ForwardBufferSource::PreviousOutput => {
@@ -233,7 +244,7 @@ impl Layer {
     }
 
     pub(crate) fn set_pipeline(&mut self, device: &Device) {
-        let specs = self.ty.get_buffers_specs();
+        let specs = self.ty.get_buffers_specs(self.batch);
         let entries: Vec<_> = specs
             .iter()
             .enumerate()
@@ -291,6 +302,23 @@ impl Layer {
     }
 
     pub(crate) fn encode_pass(&self, encoder: &mut CommandEncoder) {
+        self.encode_pass_with_batch(encoder, self.batch);
+    }
+
+    /// Encode the forward pass for the first `batch` samples only.
+    ///
+    /// Truncating the dispatch is sound because every batched kernel recovers
+    /// its sample as `global_index / per_sample_length`: dispatching a prefix
+    /// of the grid computes a prefix of the samples and touches nothing else.
+    /// `predict()` uses it to run a single image through a graph whose buffers
+    /// are sized for a full training batch — the probe would otherwise pay 16x
+    /// the work for one result.
+    pub(crate) fn encode_pass_with_batch(&self, encoder: &mut CommandEncoder, batch: Batch) {
+        let workgroups = if batch == self.batch {
+            self.num_workgroups
+        } else {
+            self.ty.get_forward_workgroup_count(batch.min(self.batch))
+        };
         let mut pass = encoder.begin_compute_pass(&Default::default());
         pass.set_pipeline(
             self.pipeline
@@ -306,7 +334,7 @@ impl Layer {
                 .expect("forward bind group not initialised"),
             &[],
         );
-        pass.dispatch_workgroups(self.num_workgroups, 1, 1);
+        pass.dispatch_workgroups(workgroups, 1, 1);
     }
 
     // -----------------------------------------------------------------------
@@ -321,7 +349,7 @@ impl Layer {
         gpu: &GpuContext,
         grad_output: Option<Arc<Buffer>>,
     ) -> Arc<Buffer> {
-        let bindings = self.ty.get_back_buffer_bindings();
+        let bindings = self.ty.get_back_buffer_bindings(self.batch);
         let incoming_grad = grad_output
             .as_ref()
             .expect("backward pass requires an incoming grad_output buffer");
@@ -352,7 +380,7 @@ impl Layer {
     }
 
     pub(crate) fn set_back_pipeline(&mut self, device: &Device) {
-        let specs = self.ty.get_back_buffers_specs();
+        let specs = self.ty.get_back_buffers_specs(self.batch);
         if specs.is_empty() {
             return;
         }
@@ -385,7 +413,7 @@ impl Layer {
             .expect("init_back_shader must be called before set_back_pipeline");
 
         let entry_points = self.ty.get_back_entrypoints();
-        let workgroup_counts = self.ty.get_back_workgroup_counts();
+        let workgroup_counts = self.ty.get_back_workgroup_counts(self.batch);
 
         self.pipeline.backward = entry_points
             .iter()
@@ -715,7 +743,8 @@ impl Layer {
     ) -> Arc<Buffer> {
         let merged = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
             label: Some("grad_merge"),
-            size: self.ty.get_dim_output().bytes_size() as u64,
+            // An activation-shaped buffer: one slot per sample.
+            size: (self.ty.get_dim_output().bytes_size() * self.batch) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
             mapped_at_creation: false,
         }));
@@ -804,7 +833,7 @@ impl Layer {
         self.merge_pass = Some(MergePass {
             pipeline,
             bind_group,
-            num_workgroups: self.ty.get_dim_output().length().div_ceil(64),
+            num_workgroups: (self.ty.get_dim_output().length() * self.batch).div_ceil(64),
         });
         merged
     }
