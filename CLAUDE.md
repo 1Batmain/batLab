@@ -72,11 +72,20 @@ Le manager, côté contrat observable :
   documenté sur `App::model_run_in_progress`.
 - Sur les deux écrans du manager, **toute touche imprimable est du texte**, `q`
   compris (un modèle peut s'appeler `q-experiment`) ; `Esc` est la sortie.
+- **Un checkpoint est un `.ckpt`**, non caché, dans `pretrained_weights/` — le
+  `latest_metrics.jsonl` que tout entraînement dépose à côté n'en est pas un.
+  Les deux listages (compteur de la liste, sélecteur de poids) passent par
+  `is_checkpoint_file` ; le comptaient tous les deux avant. Ne pas relâcher en
+  « tout fichier », ni retirer l'exclusion des fichiers cachés par-dessus
+  l'extension (les AppleDouble macOS `._latest.ckpt` la passeraient).
 
 Un écran dessiné mais jamais assigné est le bug récurrent de ce dépôt (trois fois :
 `LoadPath`, le mode `Perpetual`, `InputSize`). `crates/batlab-ui/src/tui/nav_tests.rs`
 parcourt tous les écrans à la touche depuis la porte d'entrée et exige d'avoir vu
 `Screen::ALL` — ajouter une variante sans la câbler fait échouer la suite.
+
+Le rapport de mission, avec le contrat observable complet et le parcours e2e
+déroulé : `docs/reports/MODEL_MANAGER.md`.
 
 ## Lancer / valider un entraînement sans le TUI
 
