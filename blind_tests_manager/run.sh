@@ -23,7 +23,8 @@ if [ ! -x "$BT_BIN" ]; then
 fi
 command -v tmux >/dev/null || { echo "tmux est requis (pilotage du TUI)"; exit 2; }
 
-ALL=(t01_flow t02_rename t03_delete t04_navigation t05_checkpoints t06_test_hygiene t07_infer t08_hostile)
+ALL=(t01_flow t02_rename t03_delete t04_navigation t05_checkpoints t06_test_hygiene t07_infer
+     t08_hostile t09_template_geometry)
 SEL=()
 if [ "$#" -gt 0 ]; then
   for a in "$@"; do
