@@ -25,7 +25,9 @@ TITLE_H = 22
 
 def load_row(pattern, limit):
     paths = sorted(globmod.glob(pattern))[:limit]
-    return [Image.open(p).convert("L") for p in paths]
+    # "RGB" et non "L" : une planche censee montrer un modele couleur ne doit pas
+    # decolorer ses rangees. Un PNG gris passe en trois canaux egaux, inchange.
+    return [Image.open(p).convert("RGB") for p in paths]
 
 
 def load_dataset_row(path, limit, offset=0):
@@ -37,10 +39,15 @@ def load_dataset_row(path, limit, offset=0):
         fh.seek(24 + per * offset * 4)
         raw = np.frombuffer(fh.read(per * limit * 4), dtype="<f4")
     # payload f32 (main.rs:941) ; BATRAW1 est en [0,1], BATRAW2 en [-1,1]
-    imgs = raw.reshape(-1, height, width, channels)[..., 0].astype(np.float64)
+    # Tous les canaux : `[..., 0]` affichait le seul ROUGE d'un dataset RGB.
+    imgs = raw.reshape(-1, height, width, channels).astype(np.float64)
     if magic != "BATRAW1":
         imgs = (imgs + 1.0) / 2.0
-    return [Image.fromarray(np.clip(a * 255, 0, 255).astype(np.uint8)) for a in imgs]
+    out = []
+    for a in imgs:
+        a = np.clip(a * 255, 0, 255).astype(np.uint8)
+        out.append(Image.fromarray(a[..., 0] if channels == 1 else a[..., :3]))
+    return out
 
 
 def main():

@@ -2261,6 +2261,28 @@ fn try_load_raw_dataset(
             ));
         }
 
+        // The geometry mismatch below is silently repaired by a u8 round-trip
+        // (`raw_floats_to_dynamic_image` + `image_to_tensor`). That is convenient for
+        // rescaling, but it also means feeding a 1-channel dataset to a 3-channel model
+        // "works": every sample is grey replicated over R, G and B, and a whole overnight
+        // run trains on colourless data without a single error. Say it out loud.
+        if (width, height, channels) != output_size {
+            eprintln!(
+                "[dataset] WARNING {}: file is {width}x{height}x{channels}, model expects \
+                 {}x{}x{} — samples are converted through an 8-bit image round-trip\
+                 {}",
+                raw_file.display(),
+                output_size.0,
+                output_size.1,
+                output_size.2,
+                if channels != output_size.2 {
+                    " (CHANNEL COUNT DIFFERS: check you passed the right .batraw)"
+                } else {
+                    ""
+                }
+            );
+        }
+
         for _ in 0..count {
             let raw: Vec<f32> = bytes[offset..offset + sample_floats * 4]
                 .chunks_exact(4)
@@ -3013,6 +3035,47 @@ mod tests {
         assert_eq!(dataset.len(), 1);
         for (a, b) in dataset[0].target.iter().zip(sample.iter()) {
             assert!((a - b).abs() < 1e-6, "value mismatch: {a} vs {b}");
+        }
+    }
+
+    /// Colour path — a dataset sample must reach the PNG with its channels intact.
+    ///
+    /// The whole pipeline is HWC/z-fastest (`convolution.wgsl`: `iy*W*C + ix*C + iz`),
+    /// which a 1-channel model can never exercise: with C=1 an interleaved and a planar
+    /// layout are the same bytes. This pins the convention on C=3 from the `.batraw`
+    /// header all the way to the encoded pixels, so a planar/interleaved slip shows up
+    /// as a failing test rather than as plausible-looking garbage in a sample.
+    #[test]
+    fn rgb_dataset_sample_survives_to_png_with_channels_unswapped() {
+        let raw = tmp_path("rgb_png_path.batraw");
+        // 2×2, one saturated primary per pixel: red, green, blue, white.
+        let sample: Vec<f32> = vec![
+            1.0, -1.0, -1.0, // pixel (0,0) rouge
+            -1.0, 1.0, -1.0, // pixel (1,0) vert
+            -1.0, -1.0, 1.0, // pixel (0,1) bleu
+            1.0, 1.0, 1.0, // pixel (1,1) blanc
+        ];
+        write_batraw(&raw, 1, 2, 2, 3, &[sample]);
+
+        let dataset = try_load_raw_dataset(&raw, (2, 2, 3))
+            .expect("load should succeed")
+            .expect("should detect .batraw file");
+        let _ = std::fs::remove_file(&raw);
+
+        let png = tmp_path("rgb_png_path.png");
+        write_tensor_png(&dataset[0].target, (2, 2, 3), &png).expect("png should be written");
+        let decoded = image::open(&png).expect("png should decode").to_rgb8();
+        let _ = std::fs::remove_file(&png);
+
+        assert_eq!(decoded.dimensions(), (2, 2));
+        let expected = [
+            [255u8, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 255],
+        ];
+        for (pixel, want) in decoded.pixels().zip(expected.iter()) {
+            assert_eq!(&pixel.0, want, "channel layout changed on the colour path");
         }
     }
 

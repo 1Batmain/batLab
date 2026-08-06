@@ -9,16 +9,21 @@ shader indexe les poids avec `IC = dim_input.z`). Ce script rend l'erreur
 impossible en dérivant `dim_kernel.z` de la dim courante.
 
 Usage : python3 tools/gen_unet_config.py > Models/<name>/config_file
+        python3 tools/gen_unet_config.py --name Color_Diffusion_L --signal-channels 3 \
+                                         --widths 32 64 128 > Models/Color_Diffusion_L/config_file
+
+Les valeurs par défaut reproduisent `Greyscale_Diffusion_L` à l'octet près.
 """
+import argparse
 import json
 import sys
 
-MODEL_NAME = "Greyscale_Diffusion_L"
-SIGNAL_CHANNELS = 1  # niveaux de gris
+DEFAULT_NAME = "Greyscale_Diffusion_L"
+DEFAULT_SIGNAL_CHANNELS = 1  # niveaux de gris ; 3 pour RGB
 TIME_CHANNELS = 4  # canaux d'embedding temporel (input.z - output.z)
 
 # Largeurs par étage : 32x32 -> 16x16 -> 8x8
-C1, C2, C3 = 32, 64, 128
+DEFAULT_WIDTHS = (32, 64, 128)
 GROUPS = 8
 
 
@@ -65,7 +70,8 @@ class Builder:
         return self
 
     def norm(self, groups=GROUPS, save_key=None):
-        assert self.dim[2] % groups == 0, f"{self.dim[2]} % {groups} != 0"
+        assert self.dim[2] % groups == 0, (
+            f"GroupNorm : {self.dim[2]} canaux non divisibles par {groups} groupes")
         self.layers.append({
             "GroupNorm": {
                 "dim_input": list(self.dim),
@@ -109,8 +115,9 @@ class Builder:
         return self.norm(groups).silu().conv(nb_kernel, stride)
 
 
-def build():
-    b = Builder(32, SIGNAL_CHANNELS + TIME_CHANNELS)
+def build(signal_channels=DEFAULT_SIGNAL_CHANNELS, widths=DEFAULT_WIDTHS):
+    C1, C2, C3 = widths
+    b = Builder(32, signal_channels + TIME_CHANNELS)
 
     # --- stem : 32x32, C1 ---------------------------------------------------
     b.conv(C1)                        # [32,32,32]
@@ -138,9 +145,9 @@ def build():
 
     # --- tête : retour au signal -------------------------------------------
     b.norm().silu()
-    b.conv(SIGNAL_CHANNELS)           # [32,32,1]
+    b.conv(signal_channels)           # [32,32,C_signal]
 
-    assert b.dim == [32, 32, SIGNAL_CHANNELS], b.dim
+    assert b.dim == [32, 32, signal_channels], b.dim
     return b
 
 
@@ -162,10 +169,20 @@ def macs(layers):
 
 
 if __name__ == "__main__":
-    b = build()
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--name", default=DEFAULT_NAME, help="model_name du config")
+    p.add_argument("--signal-channels", type=int, default=DEFAULT_SIGNAL_CHANNELS,
+                   help="canaux image : 1 (grey) ou 3 (RGB)")
+    p.add_argument("--widths", type=int, nargs=3, default=list(DEFAULT_WIDTHS),
+                   metavar=("C1", "C2", "C3"),
+                   help="largeurs des trois étages 32x32 / 16x16 / 8x8")
+    args = p.parse_args()
+
+    b = build(args.signal_channels, args.widths)
     config = {
-        "model_name": MODEL_NAME,
-        "input_size": [32, 32, SIGNAL_CHANNELS + TIME_CHANNELS],
+        "model_name": args.name,
+        "input_size": [32, 32, args.signal_channels + TIME_CHANNELS],
         "layers": b.layers,
         "inference": {
             "random_seed": False,
