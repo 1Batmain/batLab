@@ -786,6 +786,140 @@ mod tests {
         });
     }
 
+    /// The batched prepass must give every sample bit-for-bit the noise and the
+    /// timestep embedding the sequential prepass gave it.
+    ///
+    /// This is the invariant the whole validation plan rests on: if sample i of
+    /// a batch draws different noise than it used to, an old-path/new-path
+    /// training comparison measures nothing, because the two runs are no longer
+    /// solving the same problem.
+    ///
+    /// The comparison is between two *code paths*, with no duplicated formula:
+    /// the batched step is run once, then `train_step_batch_sequential` — the
+    /// pre-batching loop, kept executable — is run with batch sizes 1, 2, ... B,
+    /// each leaving slot 0 holding the prepass output of its last sample. At
+    /// `step = 0` the counter is `0 * batch_size + offset == offset`, so slot j
+    /// of the batch of B and the last slot of the batch of j+1 are the same
+    /// (sample, timestep, batch_offset) triple — and must therefore produce the
+    /// same bits.
+    #[test]
+    fn batched_prepass_gives_each_sample_the_noise_it_had_alone() {
+        pollster::block_on(async {
+            const BATCH: usize = 4;
+            let gpu = Arc::new(GpuContext::new_headless().await);
+
+            // input z > output z: a diffusion model must be conditioned on t.
+            let build = |batch: u32| {
+                let gpu = gpu.clone();
+                async move {
+                    let mut model =
+                        Model::new_training(gpu, 0.01, batch, LossMethod::MeanSquared).await;
+                    model
+                        .add_layer(LayerTypes::Convolution(
+                            crate::model::layer_types::ConvolutionType::new(
+                                Dim3::new((4, 4, 3)),
+                                1,
+                                Dim3::new((3, 3, 3)),
+                                1,
+                                crate::model::PaddingMode::Same,
+                            ),
+                        ))
+                        .unwrap();
+                    model.build().unwrap();
+                    model
+                }
+            };
+            let mut batched = build(BATCH as u32).await;
+            let mut single = build(1).await;
+
+            let sample_len = 4 * 4;
+            let samples: Vec<Vec<f32>> = (0..BATCH)
+                .map(|s| {
+                    (0..sample_len)
+                        .map(|i| (s as f32 + 1.0) * 0.37 - i as f32 * 0.011)
+                        .collect()
+                })
+                .collect();
+            let mut dataset_batched =
+                GpuDataset::from_samples(gpu.as_ref(), samples.clone(), sample_len).unwrap();
+            let mut dataset_single =
+                GpuDataset::from_samples(gpu.as_ref(), samples, sample_len).unwrap();
+
+            let schedule = LinearNoiseSchedule::new_linear(64, 1e-4, 0.02);
+            let seed = 0xC0FFEE_u64;
+            let mut task_batched = DiffusionTask::new(schedule.clone());
+            let mut task_single = DiffusionTask::new(schedule);
+
+            task_batched
+                .train_step_report_batch(&mut batched, &mut dataset_batched, 0, BATCH, seed)
+                .unwrap();
+            let all_input = read_forward(&batched, 0, 0);
+            let all_noise = read_loss_forward(&batched, 1);
+
+            let input_len = 4 * 4 * 3;
+            for j in 0..BATCH {
+                task_single
+                    .train_step_batch_sequential(
+                        &mut single,
+                        &mut dataset_single,
+                        0,
+                        j + 1,
+                        seed,
+                    )
+                    .unwrap();
+                let alone_input = read_forward(&single, 0, 0);
+                let alone_noise = read_loss_forward(&single, 1);
+
+                let batched_slice = &all_input[j * input_len..(j + 1) * input_len];
+                let differing = alone_input[..input_len]
+                    .iter()
+                    .zip(batched_slice)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "\nx_t of sample {j} differs between the batched and the sequential \
+                     prepass ({differing}/{input_len} elements)\n\
+                     sequential[..6]: {:?}\nbatched[..6]:    {:?}\n",
+                    &alone_input[..6],
+                    &batched_slice[..6],
+                );
+
+                let batched_noise = &all_noise[j * sample_len..(j + 1) * sample_len];
+                let differing = alone_noise[..sample_len]
+                    .iter()
+                    .zip(batched_noise)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "\ntarget noise of sample {j} differs between the batched and the \
+                     sequential prepass ({differing}/{sample_len} elements)\n"
+                );
+            }
+
+            // Not vacuous: the samples must actually have drawn different noise,
+            // otherwise "every slice matches" is true for the wrong reason.
+            let first = &all_noise[..sample_len];
+            let last = &all_noise[(BATCH - 1) * sample_len..BATCH * sample_len];
+            assert!(
+                first.iter().zip(last).any(|(a, b)| (a - b).abs() > 1e-3),
+                "every sample of the batch drew the same noise — the per-sample seed \
+                 is not reaching the shader"
+            );
+        });
+    }
+
+    fn read_forward(model: &Model<crate::model::Training>, layer: usize, binding: usize) -> Vec<f32> {
+        let buffer = &model.layers[layer].buffers.forward[binding];
+        crate::model::debug::read_back_f32(model.gpu.as_ref(), buffer, buffer.size()).unwrap()
+    }
+
+    fn read_loss_forward(model: &Model<crate::model::Training>, binding: usize) -> Vec<f32> {
+        let buffer = &model.loss_layer.as_ref().unwrap().buffers.forward[binding];
+        crate::model::debug::read_back_f32(model.gpu.as_ref(), buffer, buffer.size()).unwrap()
+    }
+
     /// Kept from PR #6: consecutive draws within a batch must not collapse onto
     /// a single timestep. Strengthened — the draw is now random, so the property
     /// is "spread across the schedule", not "the identity sequence".
