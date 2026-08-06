@@ -154,7 +154,31 @@ passait 15/15 alors que le backward ne s'exécutait pas du tout**. Analytique = 
 et numérique = 0 (la loss ne bougeait plus avec les poids) donnent une erreur
 relative de 0. Une suite verte du premier coup méritait cette vérification.
 
-### 4.6 Deux pièges de méthode, pour la suite
+### 4.6 La grille 2-D, franchie pour de vrai
+
+Les passes de lignes sont dispatchées **un workgroup par (échantillon, ligne)**,
+donc elles atteignent la limite de 65 535 quand `seq · batch > 65 535` — au
+goulot 8×8, à partir d'un batch de 1 024.
+
+La première implémentation « repliait » les workgroups excédentaires sur la
+dernière ligne, en pensant que la passe était idempotente. **Elle ne l'est pas** :
+la softmax écrit le score, le relit pour l'exponentier, relit pour normaliser.
+Deux workgroups sur la même ligne s'entrelacent et l'un lit une valeur que
+l'autre a déjà transformée. Ce n'est pas « le même travail fait deux fois »,
+c'est de la corruption — et uniquement au-delà de 65 535 workgroups, là où
+personne ne regarde.
+
+Corrigé en **retour anticipé**, légal précisément parce que la condition est
+*uniforme au workgroup* (`unit` vient de `wid` et `nwg`, identiques pour toutes
+les invocations) : toutes prennent la même branche et les barrières restent en
+flot de contrôle uniforme. Une condition par thread ne pourrait pas.
+
+`the_row_passes_survive_the_two_dimensional_dispatch_grid` construit un batch de
+1 024 à 8×8 — **65 536 workgroups, un de trop** — et compare cinq échantillons
+sonde (dont le premier et le dernier) à la référence f64. Rien en dessous de
+cette taille de batch ne l'aurait attrapé.
+
+### 4.7 Deux pièges de méthode, pour la suite
 
 1. **`cargo` ne suit pas les `.wgsl` inclus par `include_str!`** dans ce dépôt :
    modifier un shader seul ne déclenche PAS de recompilation. Toute campagne de

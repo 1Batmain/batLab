@@ -861,3 +861,89 @@ fn a_checkpoint_round_trip_restores_all_four_projections() {
         }
     });
 }
+
+/// The 2-D dispatch grid, crossed for real.
+///
+/// `dispatch_grid` splits a workgroup count past 65 535 into a 2-D grid, and
+/// the row passes of attention are dispatched ONE WORKGROUP PER (sample, row) —
+/// so they reach the limit at `seq * batch > 65 535`. At the 8×8 bottleneck
+/// that is a batch of 1 024, which this test uses to land on 65 536: one over.
+///
+/// Two things are being checked at once, and both are invisible below the
+/// boundary:
+///
+/// 1. the kernels recover their unit as `wid.y * nwg.x + wid.x` rather than
+///    from `wid.x` alone — get that wrong and, per `dispatch_grid`'s own
+///    comment, "the step simply computes nothing";
+/// 2. the trailing workgroups of the split RETURN instead of folding onto the
+///    last row. The softmax passes read back what they wrote, so two workgroups
+///    sharing a row corrupt it. Folding was the first implementation here, and
+///    nothing below this batch size would have caught it.
+#[test]
+fn the_row_passes_survive_the_two_dimensional_dispatch_grid() {
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        // 8×8 = 64 positions; 64 * 1024 = 65 536 row-workgroups, one past the
+        // 65 535-per-dimension limit.
+        let dim = (8u32, 8u32, 4u32);
+        let (seq, channels) = ((dim.0 * dim.1) as usize, dim.2 as usize);
+        let sample_len = seq * channels;
+        let batch = 1024usize;
+        assert!(seq * batch > 65_535, "this test must cross the limit");
+
+        let params = Params::pseudo_random(channels, 1717);
+
+        let mut model =
+            Model::<Training>::new_training(gpu.clone(), 0.0, batch as u32, LossMethod::MeanSquared)
+                .await;
+        model
+            .add_layer(LayerTypes::Attention(AttentionType::new(Dim3::new(dim))))
+            .unwrap();
+        model.build().unwrap();
+        {
+            let layer = model.layers.first().unwrap();
+            write_params(
+                gpu.as_ref(),
+                (&layer.buffers.forward[1], &layer.buffers.forward[2]),
+                &params,
+            );
+        }
+
+        // Distinct data in a handful of probe samples, including the last one
+        // (the row a folding bug would have piled onto) and the first.
+        let probes = [0usize, 1, batch / 2, batch - 2, batch - 1];
+        let mut data = vec![0.0f32; sample_len * batch];
+        for (n, &s) in probes.iter().enumerate() {
+            let sample = pseudo_random_input(sample_len, 900 + n as u32, 1.0 + n as f32);
+            data[s * sample_len..(s + 1) * sample_len].copy_from_slice(&sample);
+        }
+        model.gpu.queue.write_buffer(
+            model.layers.first().unwrap().buffers.forward[0].as_ref(),
+            0,
+            bytemuck::cast_slice(&data),
+        );
+
+        let mut encoder = model.gpu.device.create_command_encoder(&Default::default());
+        for layer in &model.layers {
+            layer.encode_pass(&mut encoder);
+        }
+        model.gpu.queue.submit([encoder.finish()]);
+
+        let buffer = model.layers.last().unwrap().buffers.forward.last().unwrap();
+        let all = read_back_f32(gpu.as_ref(), buffer, buffer.size()).unwrap();
+
+        for (n, &s) in probes.iter().enumerate() {
+            let input = &data[s * sample_len..(s + 1) * sample_len];
+            let want = reference_attention(input, seq, channels, &params);
+            let got = &all[s * sample_len..(s + 1) * sample_len];
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                let error = (*g as f64 - w).abs() / w.abs().max(1e-3);
+                assert!(
+                    error < 2e-4,
+                    "probe {n} (sample {s}), element {i}: GPU {g} vs f64 reference {w} \
+                     — the 2-D dispatch grid is not handled"
+                );
+            }
+        }
+    });
+}

@@ -68,6 +68,13 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
 - **[PERF_CONVOLUTION.md](PERF_CONVOLUTION.md)** — optimisation de la convolution ; le
   gain local qui ne se transmet pas au pas complet.
 
+### Architecture du modèle
+
+- **[ATTENTION.md](ATTENTION.md)** — self-attention spatiale au goulot 8×8 : les quatre
+  projections en un seul tenseur (pour que l'optimiseur la traite comme une
+  convolution), le forward multi-passes, et **la limite WebGPU de 8 storage buffers**
+  — qui échoue de façon totale et silencieuse, loss et gradients à zéro.
+
 ### La génération
 
 - **[ANISOTROPY_HUNT.md](ANISOTROPY_HUNT.md)** — pourquoi les images générées étaient des

@@ -187,9 +187,18 @@ fn attn_qkv(
 // not change either one's output — that is the whole contract of the batch
 // axis, and it is the specific failure mode this layer is exposed to.
 //
-// Trailing workgroups from the 2-D grid split are clamped onto the last real
-// row rather than returned early: they then recompute that row identically
-// (the pass is idempotent), which keeps every barrier in uniform control flow.
+// Trailing workgroups from the 2-D grid split RETURN. They must not be folded
+// onto the last real row instead: this pass is a read-modify-write on that row
+// (write the score, read it back to exponentiate, read that back to normalise),
+// so two workgroups sharing a row would interleave — one reading a value the
+// other has already transformed. The result is not "the same work done twice",
+// it is corruption, and only above 65 535 row-workgroups, which is where nobody
+// is looking.
+//
+// The early return is legal precisely because the condition is WORKGROUP-
+// UNIFORM: `unit` comes from `wid` and `nwg`, identical for every invocation of
+// the workgroup, so all of them take the same branch and the barriers below
+// stay in uniform control flow. A per-thread condition could not do this.
 
 @compute @workgroup_size(64)
 fn attn_scores(
@@ -200,7 +209,8 @@ fn attn_scores(
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
     let rows = batch_count() * seq;
-    let unit = min(wid.y * nwg.x + wid.x, rows - 1u);
+    let unit = wid.y * nwg.x + wid.x;
+    if unit >= rows { return; }
 
     let b = unit / seq;
     let n = unit % seq;

@@ -184,8 +184,14 @@ fn attn_back_scores(
 ) {
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
+    // Trailing workgroups of the 2-D grid RETURN rather than fold onto the last
+    // row: this pass stages grad_p in the row and then overwrites it in place,
+    // so two workgroups sharing a row would read each other's half-finished
+    // work. The condition is workgroup-uniform (`wid`, `nwg`), so the barriers
+    // below stay in uniform control flow. See attn_scores in attention.wgsl.
     let rows = batch_count() * seq;
-    let unit = min(wid.y * nwg.x + wid.x, rows - 1u);
+    let unit = wid.y * nwg.x + wid.x;
+    if unit >= rows { return; }
 
     let b = unit / seq;
     let n = unit % seq;
