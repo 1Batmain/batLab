@@ -788,3 +788,76 @@ fn batched_parameter_gradients_sum_the_per_sample_gradients() {
     });
 }
 
+
+// ---------------------------------------------------------------------------
+// Checkpoints
+// ---------------------------------------------------------------------------
+
+/// A checkpoint round-trip must carry all four projections.
+///
+/// The checkpoint path is generic — it walks `get_optimizer_bindings` and knows
+/// nothing about attention — which is exactly the argument for testing it here:
+/// the packing of Q|K|V|O into one tensor is what makes that genericity work,
+/// and a future change that split them would break saving and loading silently
+/// (the layer would keep training, and reloading would restore a quarter of it).
+/// The night run's samples come from a reloaded checkpoint.
+#[test]
+fn a_checkpoint_round_trip_restores_all_four_projections() {
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        let dim = (4u32, 4u32, 8u32);
+        let (seq, channels) = ((dim.0 * dim.1) as usize, dim.2 as usize);
+
+        let mut trained = training_model(gpu.clone(), dim, 1).await;
+        let params = Params::pseudo_random(channels, 6060);
+        {
+            let layer = trained.layers.first().unwrap();
+            write_params(
+                gpu.as_ref(),
+                (&layer.buffers.forward[1], &layer.buffers.forward[2]),
+                &params,
+            );
+        }
+        let bytes = trained.checkpoint_bytes().expect("checkpoint");
+
+        // A second model, built from scratch: its W_o is zero and its Q/K/V are
+        // the initialisation draw, so it cannot accidentally already agree.
+        let mut restored = training_model(gpu.clone(), dim, 1).await;
+        restored.load_checkpoint_bytes(&bytes).expect("load");
+
+        let layer = restored.layers.first().unwrap();
+        let got_w = read_back_f32(
+            gpu.as_ref(),
+            &layer.buffers.forward[1],
+            layer.buffers.forward[1].size(),
+        )
+        .unwrap();
+        let got_b = read_back_f32(
+            gpu.as_ref(),
+            &layer.buffers.forward[2],
+            layer.buffers.forward[2].size(),
+        )
+        .unwrap();
+        assert_eq!(got_w, params.weights, "the four projections must round-trip");
+        assert_eq!(got_b, params.bias, "the four biases must round-trip");
+
+        // And the restored model computes what the trained one computes.
+        let input = pseudo_random_input(seq * channels, 4040, 1.4);
+        let want = reference_attention(&input, seq, channels, &params);
+        let mut infer = infer_model(gpu.clone(), dim).await;
+        {
+            let l = infer.layers.first().unwrap();
+            write_params(
+                gpu.as_ref(),
+                (&l.buffers.forward[1], &l.buffers.forward[2]),
+                &Params {
+                    weights: got_w,
+                    bias: got_b,
+                },
+            );
+        }
+        for (got, expect) in infer.predict(&input).iter().zip(want.iter()) {
+            assert!((*got as f64 - expect).abs() / expect.abs().max(1e-3) < 2e-4);
+        }
+    });
+}
