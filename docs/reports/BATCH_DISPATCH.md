@@ -387,6 +387,42 @@ Aucune tolérance n'a été nécessaire, et c'est le résultat attendu : à `B =
 `arrayLength / longueur == 1`, `sample == 0`, et chaque kernel retrouve
 littéralement son dispatch d'avant.
 
+## 5.1 La suite à l'aveugle du régime flux
+
+`./blind_tests/run.sh` (ACTIONS=800) — la suite écrite par un agent aveugle,
+depuis la spec, sans lire l'implémentation :
+
+```
+résumé : 9/9 propriétés PASS, 0 FAIL (+ 0 observation hors spec numérotée)
+```
+
+Dont **P7 — non-régression errance / respiration** (5 cycles atteignent t=0,
+corrélation inter-cycles 0,80–0,94, la respiration ne se résout jamais) et la
+propriété d'isotropie qui couvre explicitement « le piège anti-diagonale
+documenté dans `ANISOTROPY_HUNT.md` » : autocorrélation spatiale du bruit
+ajouté au décalage (1,−1) = −0,00064. C'est la garde qui aurait attrapé une
+graine composée par XOR, et elle tient.
+
+## 5.2 Le trafic dataset a baissé au passage — et ce n'est pas du batching
+
+Effet de bord réel du §3.5, qu'il serait malhonnête de laisser compter comme un
+gain de dispatch : `ensure_chunk_loaded` téléverse un **chunk entier** par
+`queue.write_buffer`, et sur cette machine
+(`max_storage_buffer_binding_size` = 128 MiB) un chunk fait **64 MiB**.
+CIFAR-10 gris, c'est 50 000 échantillons de 4 KiB, soit **4 chunks**.
+
+Les indices d'un batch étant tirés d'une permutation de tout le dataset,
+l'ancien chemin (un `ensure_chunk_loaded` par échantillon, dans l'ordre du
+batch) rechargeait à chaque fois que l'échantillon suivant tombait dans un
+autre chunk : **≈ 12,25 téléversements de 64 MiB par pas** à batch 16. Groupés
+par chunk, il en reste **≈ 3,96** — le nombre de chunks distincts touchés.
+
+C'est de l'arithmétique, pas une mesure (les deux espérances se calculent
+exactement : `1 + 15·(3/4)` et `4·(1 − (3/4)^16)`), mais le comportement est
+verrouillé par deux tests : `a_batch_uploads_each_chunk_at_most_once` et
+`samples_land_in_the_slot_they_were_asked_for`. `GpuDataset::chunk_loads()`
+expose le compteur, parce que ce coût n'apparaît nulle part ailleurs.
+
 ## 6. Validation en conditions réelles
 
 Deux entraînements identiques, ancien binaire puis nouveau, tout le reste égal.

@@ -18,6 +18,15 @@ pub struct GpuDataset {
     staging_cpu: Vec<f32>,
     sample_count: usize,
     sample_len: usize,
+    /// How many times a chunk has been uploaded to the GPU.
+    ///
+    /// Each load is a `queue.write_buffer` of the WHOLE chunk (64 MiB on this
+    /// machine), so this counter is the single most expensive thing the dataset
+    /// does. It exists because the cost is invisible otherwise: nothing in the
+    /// training loop mentions it, and a shuffled sampler makes it depend on the
+    /// batch size and on the dataset/chunk ratio rather than on anything the
+    /// caller wrote.
+    chunk_loads: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +158,7 @@ impl GpuDataset {
             staging_cpu: Vec::new(),
             sample_count,
             sample_len,
+            chunk_loads: 0,
         })
     }
 
@@ -162,6 +172,17 @@ impl GpuDataset {
 
     pub fn gpu_buffer_bytes(&self) -> u64 {
         self.chunk_buffer.size()
+    }
+
+    /// Whole-chunk uploads performed so far. See the field's comment.
+    pub fn chunk_loads(&self) -> u64 {
+        self.chunk_loads
+    }
+
+    /// Samples one chunk holds — the quantity that decides, together with the
+    /// dataset size, how much of the above a shuffled batch costs.
+    pub fn chunk_sample_capacity(&self) -> usize {
+        self.chunk_sample_capacity
     }
 
     pub fn copy_sample_to(
@@ -285,5 +306,101 @@ impl GpuDataset {
         );
         self.loaded_chunk_start = Some(chunk_start);
         self.loaded_chunk_count = chunk_count;
+        self.chunk_loads += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A batch must upload each chunk it needs AT MOST ONCE.
+    ///
+    /// `copy_sample_to` in a loop did not guarantee this: with a shuffled
+    /// sampler, consecutive samples of a batch land in unrelated chunks, so the
+    /// old path re-uploaded a whole chunk on most samples. On CIFAR-10 grey
+    /// (50 000 samples of 4 KiB, 64 MiB chunks => 4 chunks) a batch of 16 costs
+    /// ~12.25 whole-chunk uploads that way, against ~3.96 when grouped — and a
+    /// chunk upload is 64 MiB of host-to-device traffic, i.e. by far the most
+    /// expensive thing the dataset does.
+    #[test]
+    fn a_batch_uploads_each_chunk_at_most_once() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let sample_len = 8;
+            let samples: Vec<Vec<f32>> = (0..32)
+                .map(|s| (0..sample_len).map(|i| (s * sample_len + i) as f32).collect())
+                .collect();
+            let mut dataset = GpuDataset::from_samples(gpu.as_ref(), samples, sample_len).unwrap();
+            let destination = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("test_batch_destination"),
+                size: (8 * sample_len * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+
+            // Deliberately out of order and spread out: the grouping must not
+            // depend on the indices arriving sorted.
+            let batch = [31usize, 3, 17, 0, 28, 9, 22, 5];
+            dataset
+                .copy_samples_to(gpu.as_ref(), &batch, &destination)
+                .unwrap();
+            let after_first = dataset.chunk_loads();
+            assert!(
+                after_first <= batch.len().div_ceil(dataset.chunk_sample_capacity()).max(1) as u64,
+                "a batch of {} uploaded {after_first} chunks",
+                batch.len()
+            );
+
+            // A second batch over already-resident data must upload nothing.
+            dataset
+                .copy_samples_to(gpu.as_ref(), &batch, &destination)
+                .unwrap();
+            assert_eq!(
+                dataset.chunk_loads(),
+                after_first,
+                "a second batch over a resident chunk re-uploaded it"
+            );
+        });
+    }
+
+    /// Slot order follows the CALLER's order, not the chunk grouping.
+    #[test]
+    fn samples_land_in_the_slot_they_were_asked_for() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let sample_len = 4;
+            let samples: Vec<Vec<f32>> = (0..16)
+                .map(|s| vec![s as f32; sample_len])
+                .collect();
+            let mut dataset = GpuDataset::from_samples(gpu.as_ref(), samples, sample_len).unwrap();
+            let batch = [11usize, 2, 7];
+            let destination = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("test_slot_destination"),
+                size: (batch.len() * sample_len * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            dataset
+                .copy_samples_to(gpu.as_ref(), &batch, &destination)
+                .unwrap();
+
+            let values = crate::model::debug::read_back_f32(
+                gpu.as_ref(),
+                &destination,
+                destination.size(),
+            )
+            .unwrap();
+            for (slot, &sample_index) in batch.iter().enumerate() {
+                for offset in 0..sample_len {
+                    assert_eq!(
+                        values[slot * sample_len + offset],
+                        sample_index as f32,
+                        "slot {slot} does not hold sample {sample_index}"
+                    );
+                }
+            }
+        });
     }
 }
