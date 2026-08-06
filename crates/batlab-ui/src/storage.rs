@@ -288,9 +288,8 @@ impl Storage {
         };
         let mut names: Vec<String> = entries
             .flatten()
-            .filter(|entry| entry.path().is_file())
+            .filter(|entry| is_checkpoint_file(&entry.path()))
             .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .filter(|name| !name.starts_with('.'))
             .collect();
         names.sort();
         names
@@ -302,14 +301,7 @@ impl Storage {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
-            {
+            if !is_checkpoint_file(&path) {
                 continue;
             }
             let display_name = path
@@ -527,6 +519,26 @@ impl Storage {
         fs::remove_dir_all(path)?;
         Ok(())
     }
+}
+
+/// Whether a file in `pretrained_weights/` is weights someone can load.
+///
+/// The extension is the whole test, and it has to be: every training run drops
+/// a `*_metrics.jsonl` next to its checkpoint, so a listing that takes any file
+/// offers that JSONL as loadable weights and counts it in "N checkpoints".
+/// Observed end-to-end — a 40-step run turned one checkpoint into two.
+///
+/// Dot-files stay excluded on top of the extension: macOS writes AppleDouble
+/// siblings (`._latest.ckpt`) whose extension passes the test but whose bytes
+/// are not a checkpoint.
+fn is_checkpoint_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    !name.starts_with('.') && path.extension().is_some_and(|ext| ext == "ckpt")
 }
 
 /// If `stored` sits inside `old_dir`, return it rebased onto `new_dir`.
@@ -786,6 +798,32 @@ mod tests {
         assert_eq!(models[0].input_size, (8, 8, 1));
         assert_eq!(models[0].layer_count, 0);
         assert_eq!(models[0].checkpoints, vec!["latest.ckpt".to_string()]);
+    }
+
+    /// Training writes `latest_metrics.jsonl` beside `latest.ckpt`, so both
+    /// listings see it on every trained model. Neither may call it weights: the
+    /// list would say "2 checkpoints" and the weight selector would offer the
+    /// JSONL as something to load.
+    #[test]
+    fn the_metrics_journal_beside_the_weights_is_not_a_checkpoint() {
+        let temp = TempRoot::new("metrics-sibling");
+        let storage = temp.storage();
+        seed_model(&storage, "alpha");
+        let weights = storage.model_weights_dir("alpha").expect("weights dir");
+        fs::write(weights.join("latest.ckpt"), b"weights").expect("checkpoint write");
+        fs::write(weights.join("latest_metrics.jsonl"), b"{}\n").expect("metrics write");
+        fs::write(weights.join("._latest.ckpt"), b"apple double").expect("sibling write");
+
+        let models = storage.list_models().expect("listing should work");
+        assert_eq!(models[0].checkpoints, vec!["latest.ckpt".to_string()]);
+
+        let offered = storage
+            .list_model_checkpoints("alpha")
+            .expect("checkpoint listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(offered, vec!["latest.ckpt".to_string()]);
     }
 
     // --- Name validation ---
