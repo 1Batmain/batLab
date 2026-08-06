@@ -297,6 +297,29 @@ pub enum DriftAction {
     },
 }
 
+impl DriftAction {
+    /// The phase this action **is** — as opposed to the phase the drift was in
+    /// before it was asked for one.
+    ///
+    /// The two differ by exactly one frame wherever [`PerpetualDrift::settle_phase`]
+    /// has work to do, because it reconciles *inside* [`PerpetualDrift::step`]:
+    /// a caller that reads `phase()` first and steps second labels the frame
+    /// with the phase that was just left. In flux that mislabels the first churn
+    /// frame of every approach as a descent — caught from outside by a black-box
+    /// test that saw a frame tagged `descent` moving with churn amplitude, 40 %
+    /// above the reverse step at the same level.
+    ///
+    /// Anything that names a frame — a dump tag, the TUI's phase read-out —
+    /// takes it from here, so the name and the deed cannot come apart again.
+    pub fn phase(&self) -> DriftPhase {
+        match self {
+            DriftAction::Descend { .. } => DriftPhase::Descent,
+            DriftAction::Climb { .. } => DriftPhase::Climb,
+            DriftAction::Flux { .. } => DriftPhase::Flux,
+        }
+    }
+}
+
 /// Where an endless run currently is on the schedule.
 #[derive(Debug, Clone)]
 pub struct PerpetualDrift {
@@ -354,7 +377,15 @@ impl PerpetualDrift {
         self.regime
     }
 
-    /// Whether the run is currently resolving the image or dissolving it.
+    /// Whether the run is currently resolving the image or dissolving it — the
+    /// phase it *intends* for its next action.
+    ///
+    /// **Not the name of a frame.** [`Self::step`] reconciles the phase against
+    /// the regime and the level on its way in, so this can be overruled by the
+    /// very next call: in flux it reads `Descent` right up to the first frame of
+    /// the churn, and `Descent` again for one frame at the top of an upward
+    /// approach. Whatever files a frame — a dump tag, a status panel — takes its
+    /// name from [`DriftAction::phase`], which is what actually happened.
     pub fn phase(&self) -> DriftPhase {
         self.phase
     }
@@ -1092,12 +1123,16 @@ mod tests {
     /// flux frames distinguishable from the approach that led to them.
     fn walk_tagged(drift: &mut PerpetualDrift, count: usize) -> Vec<(DriftPhase, usize)> {
         (0..count)
-            .map(|_| match drift.step() {
-                DriftAction::Descend { diffusion_step, .. } => {
-                    (DriftPhase::Descent, diffusion_step)
-                }
-                DriftAction::Climb { forward_step, .. } => (DriftPhase::Climb, forward_step),
-                DriftAction::Flux { diffusion_step, .. } => (DriftPhase::Flux, diffusion_step),
+            .map(|_| {
+                let action = drift.step();
+                let level = match action {
+                    DriftAction::Descend { diffusion_step, .. } => diffusion_step,
+                    DriftAction::Climb { forward_step, .. } => forward_step,
+                    DriftAction::Flux { diffusion_step, .. } => diffusion_step,
+                };
+                // Through the same accessor the dump and the TUI file frames
+                // under, so a mutation of it cannot leave these tests green.
+                (action.phase(), level)
             })
             .collect()
     }
@@ -1495,6 +1530,85 @@ mod tests {
             far.abs() < 0.2,
             "the frame 300 later is the same one (r = {far:.3}): the run vibrates in \
              place instead of wandering"
+        );
+    }
+
+    /// A frame is filed under the name of what it did.
+    ///
+    /// Found from outside the code: a black-box run measured a frame tagged
+    /// `descent` that was moving with **churn** amplitude — some 40 % more than
+    /// a reverse step at the same level — at the first frame of every plateau,
+    /// on all eight settings of the dial it tried. The sequencing was right; the
+    /// name was one frame stale, because the caller read `phase()` before
+    /// `step()` and `settle_phase` reconciles inside it.
+    ///
+    /// The whole test battery missed it: every one of these tests already reads
+    /// the phase off the action, which is the *correct* notion, while the dump
+    /// recorded the other one. Nothing that agrees with itself can catch that,
+    /// which is why [`DriftAction::phase`] now exists and everything that names
+    /// a frame goes through it.
+    #[test]
+    fn a_frame_is_named_after_the_action_it_performed_not_the_phase_it_left() {
+        let level = 40;
+        let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Flux, level, 7);
+
+        // Read both notions on every frame: the phase standing before the step,
+        // and the phase of what the step turned out to be.
+        let mut walked = Vec::new();
+        for _ in 0..STEPS - level + 3 {
+            let standing = drift.phase();
+            let action = drift.step();
+            walked.push((standing, action.phase()));
+        }
+
+        let approach = STEPS - 1 - level;
+        assert!(
+            walked[..approach]
+                .iter()
+                .all(|(_, done)| *done == DriftPhase::Descent),
+            "the approach is a descent, frame by frame"
+        );
+        assert_eq!(
+            walked[approach].1,
+            DriftPhase::Flux,
+            "the first frame of the churn is a churn frame, and has to be filed as one —              this is the frame that was going out labelled `descent`"
+        );
+        assert!(
+            walked[approach..]
+                .iter()
+                .all(|(_, done)| *done == DriftPhase::Flux),
+            "and every frame after it, too"
+        );
+
+        // The trap itself, pinned so the next caller cannot walk into it: at
+        // that frame the phase standing beforehand is the one just *left*.
+        // Whoever changes when `settle_phase` runs will see this line and can
+        // delete it knowingly — what must never come back is a frame filed
+        // under a phase it did not perform.
+        assert_ne!(
+            walked[approach].0, walked[approach].1,
+            "if these ever agree, `settle_phase` moved and the comment above is stale"
+        );
+
+        // The same seam on the way up: raising `t*` mid-flux walks a climb, and
+        // the frame that resumes the churn is a churn frame. This is where the
+        // TUI used to flash one `descente` at the top of the approach.
+        drift.set_depth(level + 4);
+        let resumed = walk_tagged(&mut drift, 6);
+        assert_eq!(
+            resumed
+                .iter()
+                .map(|(phase, _)| *phase)
+                .collect::<Vec<_>>(),
+            vec![
+                DriftPhase::Climb,
+                DriftPhase::Climb,
+                DriftPhase::Climb,
+                DriftPhase::Climb,
+                DriftPhase::Flux,
+                DriftPhase::Flux,
+            ],
+            "four levels climbed, then the churn resumes — and not one frame of it              is filed as the descent the reconciliation happens to leave behind"
         );
     }
 }

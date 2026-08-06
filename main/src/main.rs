@@ -78,6 +78,10 @@ Perpetual notes:
                      u32 t (the level this frame landed on)
                      f32[w*h*c] x_t        f32[w*h*c] x0_hat
 
+The phase names what the frame DID, so in flux the opening approach is
+T-1-t* frames of 0 and every frame from the first churn on is 2 — cut a
+prologue on that byte rather than on a count.
+
 The frame count is left to be inferred from the file size, so a run killed
 mid-write still parses up to its last whole frame. Read it with
 `tools/flux_analysis.py`.
@@ -559,14 +563,19 @@ impl FrameDump {
         })
     }
 
+    /// Takes the **action** rather than a phase, so the tag can only ever be the
+    /// one of the deed the frame records. Handed a phase, a caller reads it off
+    /// `drift.phase()` before stepping and files the frame under the phase it
+    /// just left — which is exactly how the first churn frame of every approach
+    /// went out labelled `descent` (see [`bat_building::DriftAction::phase`]).
     fn record(
         &mut self,
-        phase: bat_building::DriftPhase,
+        action: bat_building::DriftAction,
         level: usize,
         latent: &[f32],
         x0: &[f32],
     ) -> Result<(), String> {
-        let tag: u8 = match phase {
+        let tag: u8 = match action.phase() {
             bat_building::DriftPhase::Descent => 0,
             bat_building::DriftPhase::Climb => 1,
             bat_building::DriftPhase::Flux => 2,
@@ -779,14 +788,14 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             None => written < frames,
         } {
             actions += 1;
-            // The phase that *produced* this frame, and the level the latent
-            // lands on — the drift has already advanced past both by the time
-            // the frame is recorded.
-            let phase = drift.phase();
             // Assigned by every arm, so the compiler is the one checking that
             // no frame is recorded against a level nobody set.
             let level;
-            match drift.step() {
+            // Handed whole to `record` below, which names the frame from it —
+            // never from `drift.phase()` read beforehand, which `step`
+            // reconciles on its way in and so names the phase just *left*.
+            let action = drift.step();
+            match action {
                 DriftAction::Descend {
                     diffusion_step,
                     path_seed,
@@ -879,7 +888,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                         // frames would be missing exactly the frames a climb is
                         // judged on.
                         if let Some(dump) = dump.as_mut() {
-                            dump.record(phase, forward_step, &latent, &last_x0)?;
+                            dump.record(action, forward_step, &latent, &last_x0)?;
                         }
                         continue;
                     }
@@ -983,7 +992,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                 }
             }
             if let Some(dump) = dump.as_mut() {
-                dump.record(phase, level, &latent, &last_x0)?;
+                dump.record(action, level, &latent, &last_x0)?;
             }
         }
         if let Some(dump) = dump.take() {
@@ -1766,6 +1775,7 @@ async fn run_perpetual(
 
     let publish = |tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
                    drift: &PerpetualDrift,
+                   phase: bat_building::DriftPhase,
                    steps: usize,
                    steps_per_sec: f32,
                    tempo: f32,
@@ -1774,8 +1784,12 @@ async fn run_perpetual(
         tx.send(tui::TrainingEvent::PerpetualState(tui::PerpetualStatus {
             regime: drift.regime().label().to_string(),
             // An image coming apart on screen is the nominal behaviour half the
-            // time; unlabelled, it reads as a fault.
-            phase: drift.phase().label().to_string(),
+            // time; unlabelled, it reads as a fault. It names the phase of the
+            // action just taken, not the one the drift intends next: `step`
+            // reconciles the phase on its way in and can overrule that intent,
+            // which used to show as one stray `descente` at the top of every
+            // upward approach in flux.
+            phase: phase.label().to_string(),
             depth: drift.depth(),
             depth_label: drift.regime().depth_label().to_string(),
             min_depth: drift.min_depth(),
@@ -1790,7 +1804,9 @@ async fn run_perpetual(
         }))
         .is_ok()
     };
-    if !publish(tx, &drift, steps, 0.0, tempo, paused) {
+    // Nothing has been stepped yet, so the opening read is the drift's own.
+    let mut phase = drift.phase();
+    if !publish(tx, &drift, phase, steps, 0.0, tempo, paused) {
         tui::clear_visualiser_source();
         return Ok(());
     }
@@ -1870,7 +1886,7 @@ async fn run_perpetual(
         }
 
         if paused {
-            if dirty && !publish(tx, &drift, steps, 0.0, tempo, paused) {
+            if dirty && !publish(tx, &drift, phase, steps, 0.0, tempo, paused) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1878,7 +1894,9 @@ async fn run_perpetual(
         }
 
         let mut climbing = false;
-        match drift.step() {
+        let action = drift.step();
+        phase = action.phase();
+        match action {
             DriftAction::Descend {
                 diffusion_step,
                 path_seed,
@@ -1992,7 +2010,7 @@ async fn run_perpetual(
 
         if dirty || last_published.elapsed() >= Duration::from_millis(100) {
             last_published = std::time::Instant::now();
-            if !publish(tx, &drift, steps, pace.per_second(), tempo, paused) {
+            if !publish(tx, &drift, phase, steps, pace.per_second(), tempo, paused) {
                 break;
             }
         }
@@ -2877,6 +2895,89 @@ mod tests {
         let mut dir = std::env::temp_dir();
         dir.push(format!("batlab_test_{name}"));
         dir
+    }
+
+    /// Reads a `BATFLUX1` dump back as `(phase tag, t)` per frame — the same way
+    /// `tools/flux_analysis.py` does, and deliberately not through any of the
+    /// writing code, so a mistake in the layout cannot cancel itself out.
+    fn read_dump_tags(path: &std::path::Path) -> Vec<(u8, u32)> {
+        let bytes = std::fs::read(path).expect("dump should exist");
+        assert_eq!(&bytes[..8], b"BATFLUX1", "magic");
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        let (w, h, c) = (u32_at(8), u32_at(12), u32_at(16));
+        // One frame: the tag, the level, then x_t and x̂₀ back to back.
+        let frame = 1 + 4 + (w * h * c) as usize * 4 * 2;
+        let mut tags = Vec::new();
+        let mut at = 20;
+        while at + frame <= bytes.len() {
+            tags.push((bytes[at], u32_at(at + 1)));
+            at += frame;
+        }
+        assert_eq!(at, bytes.len(), "the file should hold whole frames only");
+        tags
+    }
+
+    /// The frontier a reader of the dump sees between the approach and the churn
+    /// must be the frontier the drift actually walks — the first frame *produced
+    /// by* the churn is a churn frame.
+    ///
+    /// This is the check that was missing when the regime shipped: the drift's
+    /// own tests all read the phase off the action and were green, while the
+    /// dump — the only thing any analysis of flux ever looks at — recorded
+    /// `drift.phase()` sampled *before* the step and so ran one frame late. A
+    /// black-box run caught it from the outside by amplitude (the frame tagged
+    /// `descent` moved like a churn frame, some 40 % above a reverse step at the
+    /// same level); this pins it by name, on the bytes themselves.
+    #[test]
+    fn the_dump_files_the_first_churn_frame_as_flux() {
+        let out = tmp_path("flux_phase_frontier.batflux");
+        let (steps, t_star) = (32usize, 8usize);
+        let mut drift =
+            PerpetualDrift::new(steps, bat_building::PerpetualRegime::Flux, t_star, 7);
+
+        // 2×2×1 frames: the payload is irrelevant here, the header is not.
+        let pixels = vec![0.0_f32; 4];
+        let mut dump = FrameDump::create(&out, (2, 2, 1)).expect("dump should open");
+        for _ in 0..steps {
+            let action = drift.step();
+            let level = match action {
+                DriftAction::Descend { diffusion_step, .. } => diffusion_step.saturating_sub(1),
+                DriftAction::Climb { forward_step, .. } => forward_step,
+                DriftAction::Flux { diffusion_step, .. } => diffusion_step,
+            };
+            dump.record(action, level, &pixels, &pixels).expect("record");
+        }
+        dump.finish().expect("flush");
+
+        let tags = read_dump_tags(&out);
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(tags.len(), steps, "one frame recorded per action");
+
+        // The descent runs t = steps-1 down to t*+1; the level below t*+1 *is*
+        // t*, so the very next action is already the churn.
+        let approach = steps - 1 - t_star;
+        let phases: Vec<u8> = tags.iter().map(|(tag, _)| *tag).collect();
+        assert_eq!(
+            phases.iter().filter(|tag| **tag == 0).count(),
+            approach,
+            "descent frames counted in the dump — one too many means the tag is \
+             lagging a frame behind the deed: {phases:?}"
+        );
+        assert_eq!(phases[approach - 1], 0, "the last approach frame descends");
+        assert_eq!(
+            phases[approach], 2,
+            "and the one after it is churn, not a twenty-fourth descent"
+        );
+        assert!(
+            phases[approach..].iter().all(|tag| *tag == 2),
+            "the churn never stops on a fixed dial: {phases:?}"
+        );
+        assert!(
+            tags[approach..].iter().all(|(_, t)| *t as usize == t_star),
+            "and it holds t* throughout: {tags:?}"
+        );
     }
 
     #[test]
