@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Suite de tests BOÎTE NOIRE du régime « flux » (mode Perpetual).
 
-Écrite depuis MISSION_BLIND_TEST.md seul — aucune lecture de bat_building/src
-ni de main/src. Tout ce qui est mesuré ici provient du binaire et de ses sorties
-(dumps f32, PNG, stdout).
+Écrite depuis docs/reports/MISSION_BLIND_TEST.md seul — aucune lecture de
+crates/batlab-core/src ni de crates/batlab/src. Tout ce qui est mesuré ici
+provient du binaire et de ses sorties (dumps f32, PNG, stdout).
 
 Usage : python3 blind_tests/checks.py <dossier_de_dumps>
 Sortie : une ligne PASS/FAIL/AMBIGU par propriété + un résumé. Code de retour
@@ -456,7 +456,7 @@ def p6_isotropie():
         L.append(f"autocorr spatiale du bruit ajouté, décalage {s_} : {v:+.5f}"
                  f"{'  ← ÉCART' if bad else ''}")
     L.append("le décalage (1,-1) couvre le piège anti-diagonale documenté dans "
-             "ANISOTROPY_HUNT.md (champ constant sur les anti-diagonales)")
+             "docs/reports/ANISOTROPY_HUNT.md (champ constant sur les anti-diagonales)")
     report("P6", "isotropie", "PASS" if ok else "FAIL", L,
            "ligne 20 : « les différences rangée-à-rangée et colonne-à-colonne du bruit "
            "ajouté sont du même ordre »")

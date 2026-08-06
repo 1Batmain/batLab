@@ -1,0 +1,18 @@
+# File purpose: Cargo manifest for the batlab binary crate (TUI entry point and headless DEV/CI modes).
+
+[package]
+name = "batlab"
+version = "0.1.0"
+edition = "2024"
+
+
+[dependencies]
+image = "0.25.9"
+winit = "0.30.12"
+
+batlab_core = { path = "../batlab-core", default-features = false }
+batlab_ui = { path = "../batlab-ui" }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+wgpu = "28.0.0"

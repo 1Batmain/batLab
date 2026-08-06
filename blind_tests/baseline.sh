@@ -18,17 +18,25 @@ WT=$REPO/worktrees/blind-baseline-preflux
 if [ ! -d "$WT" ]; then
   git -C "$REPO" worktree add "$WT" "$REV" --detach >/dev/null
 fi
+# La baseline reconstruit une arborescence ANTÉRIEURE à la restructuration, où le
+# paquet binaire s'appelait encore `main` (il est sous crates/batlab depuis). On le
+# déduit de l'arborescence plutôt que de le figer, pour que le script reste valable
+# des deux côtés de la bascule et pour tout BLIND_BASELINE_REV.
+pkg_of() { # pkg_of <racine> → nom du paquet/binaire de cette arborescence
+  if [ -d "$1/crates/batlab" ]; then echo batlab; else echo main; fi
+}
+
 mkdir -p "$WT/Models/$MODEL/pretrained_weights"
 cp -n "$CKPT_SRC" "$WT/Models/$MODEL/pretrained_weights/" 2>/dev/null || true
-( cd "$WT" && cargo build --release -p main >/dev/null )
+( cd "$WT" && cargo build --release -p "$(pkg_of "$WT")" >/dev/null )
 
 # le binaire pré-flux ignore --actions et s'arrête après --frames cycles (8 par défaut) ;
 # le binaire courant honore --actions : on lui en donne assez pour dépasser 8 cycles.
 gen() { # gen <racine> <regime>
   local root=$1 regime=$2
   rm -rf "$root/perpetual_samples/$regime"
-  ( cd "$root" && ./target/release/main --headless-perpetual "$MODEL" --regime "$regime" \
-      --actions 5000 --seed 7 --frames 8 \
+  ( cd "$root" && "./target/release/$(pkg_of "$root")" --headless-perpetual "$MODEL" \
+      --regime "$regime" --actions 5000 --seed 7 --frames 8 \
       --checkpoint "Models/$MODEL/pretrained_weights/night_run.ckpt" >/dev/null 2>&1 )
 }
 
@@ -54,6 +62,6 @@ done
 python_json+='}}'
 echo "$python_json" > "$OUT/baseline.json"
 
-# hygiène : les runs viennent de réécrire perpetual_samples/ du worktree courant
-git -C "$HERE" checkout -- perpetual_samples 2>/dev/null || true
-git -C "$HERE" clean -fdq perpetual_samples 2>/dev/null || true
+# hygiène : les runs viennent de remplir perpetual_samples/ du worktree courant
+# (répertoire de sortie, gitignoré — cf. blind_tests/run.sh)
+rm -rf "$HERE/perpetual_samples"

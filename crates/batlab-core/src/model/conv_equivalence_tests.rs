@@ -728,7 +728,7 @@ fn time_dispatches(
 /// Where does the convolution time actually go? Times each pass of each real
 /// layer separately, on the current implementation. Ignored by default:
 ///
-///   cargo test --release -p bat_building --lib profile_convolution \
+///   cargo test --release -p batlab_core --lib profile_convolution \
 ///       -- --ignored --nocapture
 ///
 /// Every pipeline is warmed before any timing starts (on Metal the first
@@ -838,7 +838,7 @@ fn profile_convolution() {
 /// Times the legacy kernels against the current ones, **interleaved in the same
 /// process and on the same buffers**:
 ///
-///   cargo test --release -p bat_building --lib bench_convolution_isolated \
+///   cargo test --release -p batlab_core --lib bench_convolution_isolated \
 ///       -- --ignored --nocapture
 ///
 /// The GPU is shared with other work (a second agent trains a larger model on
@@ -965,7 +965,7 @@ fn bench_convolution_isolated() {
 /// layer, so `ConvolutionType::reduction_lanes` is calibrated on measurement
 /// rather than on intuition:
 ///
-///   cargo test --release -p bat_building --lib bench_conv_reduction_lanes \
+///   cargo test --release -p batlab_core --lib bench_conv_reduction_lanes \
 ///       -- --ignored --nocapture
 ///
 /// The lane count lives in the uniform, so a sweep only has to rewrite that one

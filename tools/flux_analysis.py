@@ -6,7 +6,7 @@ holds does not drift, and whether what is left over is a drift or a shiver.
 The dump holds both panes of every frame as raw f32 — see `FrameDump` in
 `main/src/main.rs`. That matters: in flux the frame-to-frame change of the x̂₀
 pane is of the order of three 8-bit levels, so measuring off PNGs would be
-measuring the quantiser (`CLIMB_COHERENCE.md` §6).
+measuring the quantiser (`docs/reports/CLIMB_COHERENCE.md` §6).
 
     python3 tools/flux_analysis.py stats   flux.bin [--floor flux_seed8.bin]
     python3 tools/flux_analysis.py compare flux.bin wander.bin breathe.bin

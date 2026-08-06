@@ -9,7 +9,7 @@
 # the earlier reports.
 set -u
 cd "$(dirname "$0")/../.."
-BIN=./target/release/main
+BIN=./target/release/batlab
 MODEL=${MODEL:-Greyscale_Diffusion_L}
 OUT=${OUT:-weighting_samples}
 

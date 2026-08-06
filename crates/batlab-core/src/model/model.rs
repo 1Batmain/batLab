@@ -473,7 +473,10 @@ impl<State> Model<State> {
         self.layers.last().map(|layer| layer.ty.get_dim_output())
     }
 
-    pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<(), ModelError> {
+    /// Encode the checkpoint the model would write, without touching a
+    /// filesystem. This is the portable half: a wasm build has weights and no
+    /// `fs`, and gets its bytes from the network.
+    pub fn checkpoint_bytes(&self) -> Result<Vec<u8>, ModelError> {
         if !self.state.is_build {
             return Err(ModelError::InvalidCheckpointFormat {
                 message: "model must be built before saving checkpoint".to_string(),
@@ -550,6 +553,13 @@ impl<State> Model<State> {
         // the 4-byte tag.
         self.append_optimizer_state(&mut bytes)?;
 
+        Ok(bytes)
+    }
+
+    /// Write [`Model::checkpoint_bytes`] to disk, creating the parent directory.
+    /// The filesystem lives in this wrapper and nowhere deeper.
+    pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<(), ModelError> {
+        let bytes = self.checkpoint_bytes()?;
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| ModelError::CheckpointIo {
@@ -667,18 +677,27 @@ impl<State> Model<State> {
         Ok(())
     }
 
+    /// Read a checkpoint from disk. Thin wrapper over
+    /// [`Model::load_checkpoint_bytes`]: `fs` is used here and nowhere deeper,
+    /// so the inference path stays usable where there is no filesystem.
     pub fn load_checkpoint<P: AsRef<Path>>(&mut self, path: P) -> Result<(), ModelError> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|err| ModelError::CheckpointIo {
+            path: path.display().to_string(),
+            message: err.to_string(),
+        })?;
+        self.load_checkpoint_bytes(&bytes)
+    }
+
+    /// Restore weights (and the optimiser trailer, if present) from checkpoint
+    /// bytes — the entry point a browser build uses, handed a `fetch` body.
+    pub fn load_checkpoint_bytes(&mut self, bytes: &[u8]) -> Result<(), ModelError> {
         if !self.state.is_build {
             return Err(ModelError::InvalidCheckpointFormat {
                 message: "model must be built before loading checkpoint".to_string(),
             });
         }
 
-        let path = path.as_ref();
-        let bytes = fs::read(path).map_err(|err| ModelError::CheckpointIo {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })?;
         let has_optimizer_trailer = match bytes.get(..CHECKPOINT_MAGIC_LEN) {
             Some(magic) if magic == CHECKPOINT_MAGIC_V2 => true,
             Some(magic) if magic == CHECKPOINT_MAGIC_V1 => false,

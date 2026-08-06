@@ -10,8 +10,8 @@
 //! # Usage
 //! ```ignore
 //! use std::sync::Arc;
-//! use bat_building::GpuContext;
-//! use bat_building::visualiser::spawn_window;
+//! use batlab_core::GpuContext;
+//! use batlab_core::visualiser::spawn_window;
 //!
 //! // (during training, after model.build())
 //! let gpu: Arc<GpuContext> = model.gpu_context();
@@ -26,17 +26,13 @@
 //! drop(handle);
 //! ```
 
-mod live_frame;
-
-pub use live_frame::{LiveFrame, compose_live_frame, live_frame_width};
-
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use crate::GpuContext;
+use batlab_core::GpuContext;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;

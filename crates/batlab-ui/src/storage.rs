@@ -1,9 +1,17 @@
-//! File purpose: Implements storage behavior for the terminal user interface flow.
+//! File purpose: The on-disk layout — where `Models/`, `datasets/` and the
+//! checkpoints live, and how a `config_file` is read and written.
+//!
+//! This is deliberately *not* in `batlab_core`. The engine takes bytes
+//! ([`ModelConfig::from_json_bytes`], [`batlab_core::Model::load_checkpoint_bytes`])
+//! and knows nothing of paths, so that the same inference chain can run in a
+//! browser where there is no filesystem at all. Deciding that a model's config
+//! sits at `Models/<name>/config_file` is a host decision, and it is made here.
 
-use super::app::ModelConfig;
+use batlab_core::config::ModelConfig;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct SavedModelEntry {
@@ -23,11 +31,28 @@ fn serde_to_io(err: serde_json::Error) -> io::Error {
     io::Error::other(err)
 }
 
+/// Workspace root: the directory holding `Models/`, `datasets/` and the
+/// generated sample folders.
+///
+/// Found by walking up until a `Cargo.toml` that declares `[workspace]`, not by
+/// a fixed number of `parent()` hops. This code moved twice during the
+/// restructure — `bat_building/` → `crates/batlab-core/` → `crates/batlab-ui/` —
+/// and each hop would have silently resolved `Models/` to `crates/Models/` with
+/// a hard-coded count: every model and dataset invisible, no error until first
+/// use.
 pub fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("bat_building crate should live under workspace root")
-        .to_path_buf()
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|dir| {
+                fs::read_to_string(dir.join("Cargo.toml"))
+                    .is_ok_and(|manifest| manifest.contains("[workspace]"))
+            })
+            .expect("batlab_ui should live under a cargo workspace root")
+            .to_path_buf()
+    })
+    .clone()
 }
 
 pub fn datasets_dir() -> io::Result<PathBuf> {
@@ -78,14 +103,16 @@ pub fn write_model_config(model_name: &str, config: &ModelConfig) -> io::Result<
     let path = model_config_path(model_name)?;
     let mut persisted = config.clone();
     persisted.model_name = Some(model_name.to_string());
-    let bytes = serde_json::to_vec_pretty(&persisted).map_err(serde_to_io)?;
+    // Via l'API bytes du moteur, pas serde_json directement : c'est la même
+    // porte que prendra un build wasm, elle doit rester la seule.
+    let bytes = persisted.to_json_bytes().map_err(serde_to_io)?;
     fs::write(&path, bytes)?;
     Ok(path)
 }
 
 pub fn load_model_config(path: &Path) -> io::Result<ModelConfig> {
     let bytes = fs::read(path)?;
-    let mut config: ModelConfig = serde_json::from_slice(&bytes).map_err(serde_to_io)?;
+    let mut config = ModelConfig::from_json_bytes(&bytes).map_err(serde_to_io)?;
     if config.model_name.is_none() {
         config.model_name = path
             .parent()
@@ -196,4 +223,32 @@ pub fn list_datasets() -> io::Result<Vec<String>> {
 
     datasets.sort();
     Ok(datasets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing errors when `project_root()` lands on the wrong directory — the
+    /// TUI just reports an empty `Models/`. Anchor it on the directories that
+    /// must be there, so a future move fails loudly instead of silently.
+    #[test]
+    fn project_root_is_the_workspace_that_holds_models_and_datasets() {
+        let root = project_root();
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "project_root() = {} has no Cargo.toml",
+            root.display()
+        );
+        assert!(
+            root.join("Models").is_dir(),
+            "project_root() = {} does not hold Models/",
+            root.display()
+        );
+        assert!(
+            root.join("crates").is_dir(),
+            "project_root() = {} does not hold crates/",
+            root.display()
+        );
+    }
 }

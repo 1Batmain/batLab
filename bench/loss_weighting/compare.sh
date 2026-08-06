@@ -11,14 +11,14 @@
 # The two arms run in PARALLEL: the deadline is a fixed wall-clock (the night
 # training run), and the loss curves are unaffected by GPU contention. The
 # per-step TIMINGS from this script are therefore meaningless — see
-# OPTIMIZER_ADAM.md §2.3 for the same caveat.
+# docs/reports/OPTIMIZER_ADAM.md §2.3 for the same caveat.
 set -u
 cd "$(dirname "$0")/../.."
 . bench/optimizer/lib.sh
 DATASET=${DATASET:-datasets/cifar10_grey.batraw}
 MODEL=${MODEL:-Greyscale_Diffusion_L}
 STEPS=${STEPS:-1500}
-BIN=./target/release/main
+BIN=./target/release/batlab
 mkdir -p runs
 ensure_binary
 

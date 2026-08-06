@@ -170,7 +170,7 @@ fn draw_form_screen(
 fn draw_home(f: &mut Frame, app: &App) {
     draw_choice_screen(
         f,
-        "batBuilder",
+        "batlab",
         &HOME_CHOICES,
         app.home.selected,
         "[arrow] select  [Enter] confirm  [q] quit",
