@@ -147,6 +147,7 @@ impl fmt::Debug for LayerDebugView<'_> {
         let ty_name = match &layer.ty {
             LayerTypes::Convolution(_) => "Convolution",
             LayerTypes::Activation(_) => "Activation",
+            LayerTypes::Attention(_) => "Attention",
             LayerTypes::Concat(_) => "Concat",
             LayerTypes::FullyConnected(_) => "FullyConnected",
             LayerTypes::GroupNorm(_) => "GroupNorm",

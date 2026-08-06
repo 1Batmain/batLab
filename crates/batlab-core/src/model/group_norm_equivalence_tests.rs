@@ -261,7 +261,7 @@ fn forward_matches_naive_implementation() {
 
             // Same buffers, same input, legacy kernel: one thread per element.
             let layer = model.layers.first().unwrap();
-            let pipeline = layer.pipeline.forward.as_ref().unwrap();
+            let pipeline = &layer.pipeline.forward[0].0;
             dispatch_legacy(
                 gpu.as_ref(),
                 LEGACY_FORWARD,
@@ -719,7 +719,7 @@ fn bench_group_norm_isolated() {
             let layer = model.layers.first().unwrap();
 
             // --- forward
-            let fwd_pipeline = layer.pipeline.forward.as_ref().unwrap();
+            let fwd_pipeline = &layer.pipeline.forward[0].0;
             let fwd_bgl = fwd_pipeline.get_bind_group_layout(0);
             let fwd_bg = layer.bind_group.forward.as_ref().unwrap();
             let fwd_legacy = legacy_pipeline(gpu.as_ref(), LEGACY_FORWARD, "group_norm", &fwd_bgl);

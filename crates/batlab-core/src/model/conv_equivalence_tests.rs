@@ -517,7 +517,7 @@ fn forward_matches_naive_implementation() {
             let optimised = model.predict(&input);
 
             let layer = model.layers.first().unwrap();
-            let pipeline = layer.pipeline.forward.as_ref().unwrap();
+            let pipeline = &layer.pipeline.forward[0].0;
             dispatch_legacy(
                 gpu.as_ref(),
                 LEGACY_FORWARD,
@@ -758,7 +758,7 @@ fn profile_convolution() {
                 time_dispatches(
                     gpu.as_ref(),
                     &[(
-                        layer.pipeline.forward.as_ref().unwrap(),
+                        &layer.pipeline.forward[0].0,
                         layer.ty.get_forward_workgroup_count(layer.batch),
                     )],
                     fwd_bg,
@@ -776,7 +776,7 @@ fn profile_convolution() {
         let tiny_model = infer_conv(gpu.clone(), tiny).await;
         let tiny_layer = tiny_model.layers.first().unwrap();
         let tiny_bg = tiny_layer.bind_group.forward.as_ref().unwrap();
-        let tiny_pipe = tiny_layer.pipeline.forward.as_ref().unwrap();
+        let tiny_pipe = &tiny_layer.pipeline.forward[0].0;
         time_dispatches(gpu.as_ref(), &[(tiny_pipe, 1)], tiny_bg, 64);
         let floor = time_dispatches(gpu.as_ref(), &[(tiny_pipe, 1)], tiny_bg, iters);
         println!(
@@ -796,7 +796,7 @@ fn profile_convolution() {
                 let fwd = time_dispatches(
                     gpu.as_ref(),
                     &[(
-                        layer.pipeline.forward.as_ref().unwrap(),
+                        &layer.pipeline.forward[0].0,
                         layer.ty.get_forward_workgroup_count(layer.batch),
                     )],
                     fwd_bg,
@@ -882,7 +882,7 @@ fn bench_convolution_isolated() {
             let layer = model.layers.first().unwrap();
 
             let fwd_bg = layer.bind_group.forward.as_ref().unwrap();
-            let fwd_new = layer.pipeline.forward.as_ref().unwrap();
+            let fwd_new = &layer.pipeline.forward[0].0;
             let fwd_bgl = fwd_new.get_bind_group_layout(0);
             let fwd_old = legacy_pipeline(gpu.as_ref(), LEGACY_FORWARD, "main", &fwd_bgl);
 
@@ -1049,12 +1049,7 @@ fn legacy_fixtures_still_match_the_current_bind_group_layout() {
         let shape = &SHAPES[0];
         let model = infer_conv(gpu.clone(), shape).await;
         let layer = model.layers.first().unwrap();
-        let bgl = layer
-            .pipeline
-            .forward
-            .as_ref()
-            .unwrap()
-            .get_bind_group_layout(0);
+        let bgl = layer.pipeline.forward[0].0.get_bind_group_layout(0);
         // Creating the pipeline is the check: a mismatched binding fails here.
         let _ = legacy_pipeline(gpu.as_ref(), LEGACY_FORWARD, "main", &bgl);
 
