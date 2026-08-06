@@ -130,7 +130,7 @@ un offset par échantillon manquant laisserait l'image 3 attendre l'image 4.
 qu'elle est réellement **construite** : Q/K/V non nuls (une couche toute à zéro
 passerait aussi le test d'identité et serait morte), W_o exactement nul.
 
-### 4.5 Validation par mutation — 14 mutations, 14 attrapées
+### 4.5 Validation par mutation — 16 mutations, 16 attrapées
 
 | Mutation | Test qui l'attrape |
 |---|---|
@@ -148,6 +148,8 @@ passerait aussi le test d'identité et serait morte), W_o exactement nul.
 | résiduel absent de grad_input | différences finies entrée |
 | réduction du batch tronquée | somme des gradients batchés |
 | grad_v : probs non transposé | différences finies |
+| repli des workgroups excédentaires (course sur la ligne) | grille 2-D |
+| `unit` lu depuis `wid.x` seul | grille 2-D |
 
 Les trois « sanity » sont là pour une raison : **la première version de la suite
 passait 15/15 alors que le backward ne s'exécutait pas du tout**. Analytique = 0
@@ -209,8 +211,30 @@ qu'un « Save As ».
 
 ## 7. Mesures
 
-Voir `GO_NOGO.md` à la racine du worktree pour le verdict, le ms/pas mesuré et
-la commande de run recommandée.
+`Color_Diffusion_XL` (48/96/192) contre le même sans les deux couches
+`GroupNorm + Attention`. Adam, lr 1e-3, CIFAR-10 RGB, 100 pas, médiane des
+intervalles en régime établi.
+
+| batch | sans attention | avec attention | surcoût |
+|---:|---:|---:|---:|
+| 16 | 2 240 ms/pas — 140,0 ms/éch. | 2 240 ms/pas — 140,0 ms/éch. | 0 % (sous la résolution) |
+| 32 | *(non mesuré)* | 4 417 ms/pas — 138,0 ms/éch. | ≈ 0 % |
+| 64 | 8 792 ms/pas — 137,4 ms/éch. | 17 360 ms/pas — 271,2 ms/éch. | **+97 %** |
+
+**L'attention est gratuite jusqu'à batch 32 et double le pas à batch 64.** Le
+U-Net seul est parfaitement linéaire (140,0 → 137,4 ms/éch. de 16 à 64) ; seule
+l'attention décroche, et d'un coup — c'est une falaise entre 32 et 64, pas une
+croissance.
+
+Non expliqué. L'attention pèse ~11 MMACs/échantillon sur les 238 du réseau
+(~5 %), toutes ses passes sont linéaires en batch, aucun compte de workgroups
+n'approche 65 535 (36 864 au plus), et le calcul reste juste (loss identique aux
+deux configurations). Hypothèse non vérifiée : un seuil d'occupation ou de
+pression mémoire franchi entre 32 et 64. Premières cibles à profiler :
+`attn_back_weights` (147 456 threads sommant chacun sur `batch·N`) et
+`attn_back_bias` (768 threads — 12 workgroups, occupation très faible).
+
+Verdict et commande de run : `GO_NOGO.md` à la racine du worktree.
 
 ## 8. Ce qui n'a pas été fait
 

@@ -10,7 +10,7 @@ Nuit du 6 au 7 août 2026. Branche `attention`, worktree `worktrees/attention`.
 
 La couche est **prouvée** (référence f64 indépendante, différences finies sur
 les cinq tenseurs, équivalence batchée, anti-fuite inter-échantillons, identité
-résiduelle bit à bit, round-trip de checkpoint — et 14 mutations sur 14
+résiduelle bit à bit, round-trip de checkpoint — et 16 mutations sur 16
 attrapées). Elle est **intégrée** et s'entraîne bout en bout.
 
 Elle est **gratuite jusqu'à batch 32** et **coûte le double à batch 64**. Le run
@@ -93,7 +93,7 @@ Ce point n'est **pas bloquant** pour la nuit : batch 32 donne le même débit pa
 | Round-trip de checkpoint sur les 4 projections | idem |
 | Grille de dispatch 2-D franchie pour de vrai (65 536 workgroups) | idem |
 | Les deux bind groups sous la limite WebGPU de 8 storage buffers | `layer_types/attention.rs` |
-| **14 mutations sur 14 attrapées**, dont 3 « sanity » | §4.5 du rapport |
+| **16 mutations sur 16 attrapées**, dont 3 « sanity » | §4.5 du rapport |
 
 Smoke train batch 16, 300 pas : loss **1,426 → 0,021**, les quatre tranches de t
 décroissent, **zéro valeur non finie** sur 49 152 échantillons par tranche.
