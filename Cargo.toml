@@ -1,16 +1,5 @@
-# File purpose: Workspace Cargo manifest defining member crates and shared dependency configuration.
-
-[package]
-name = "batBuilder"
-version = "0.1.0"
-edition = "2024"
+# File purpose: Pure workspace manifest — the root holds no code, only the member crates.
 
 [workspace]
-members = ["bat_building", "main"]
-
-[dependencies]
-bat_building = { path = "bat_building" }
-
-[lib]
-name = "bat_builder"
-path = "src/lib.rs"
+resolver = "3"
+members = ["crates/batlab-core", "crates/batlab"]

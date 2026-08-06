@@ -10,8 +10,8 @@
 //! # Usage
 //! ```ignore
 //! use std::sync::Arc;
-//! use bat_building::GpuContext;
-//! use bat_building::visualiser::spawn_window;
+//! use batlab_core::GpuContext;
+//! use batlab_core::visualiser::spawn_window;
 //!
 //! // (during training, after model.build())
 //! let gpu: Arc<GpuContext> = model.gpu_context();

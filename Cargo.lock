@@ -212,14 +212,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "batBuilder"
+name = "batlab"
 version = "0.1.0"
 dependencies = [
- "bat_building",
+ "batlab_core",
+ "image",
+ "tokio",
+ "wgpu",
+ "winit",
 ]
 
 [[package]]
-name = "bat_building"
+name = "batlab_core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
@@ -1369,17 +1373,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
 dependencies = [
  "hashbrown 0.15.5",
-]
-
-[[package]]
-name = "main"
-version = "0.1.0"
-dependencies = [
- "bat_building",
- "image",
- "tokio",
- "wgpu",
- "winit",
 ]
 
 [[package]]

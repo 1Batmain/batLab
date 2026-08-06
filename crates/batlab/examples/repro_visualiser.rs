@@ -4,8 +4,8 @@
 //! the main thread!" as soon as a window was requested. It now opens a real
 //! window from a worker thread, exactly the way the TUI does.
 
-use bat_building::GpuContext;
-use bat_building::visualiser::{run_on_main_thread, spawn_window};
+use batlab_core::GpuContext;
+use batlab_core::visualiser::{run_on_main_thread, spawn_window};
 use std::sync::Arc;
 use std::time::Duration;
 

@@ -638,7 +638,7 @@ fn input_gradients_match_finite_differences() {
 /// process and on the same buffers. Ignored by default (it is a measurement,
 /// not an assertion):
 ///
-///   cargo test --release -p bat_building --lib bench_group_norm_isolated \
+///   cargo test --release -p batlab_core --lib bench_group_norm_isolated \
 ///       -- --ignored --nocapture
 #[test]
 #[ignore]

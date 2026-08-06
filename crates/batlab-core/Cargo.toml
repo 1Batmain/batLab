@@ -1,7 +1,7 @@
-# File purpose: Cargo manifest for the bat_building crate and its build/dependency settings.
+# File purpose: Cargo manifest for the batlab_core library crate (GPU context, model, training, TUI, visualiser).
 
 [package]
-name = "bat_building"
+name = "batlab_core"
 version = "0.1.0"
 edition = "2024"
 

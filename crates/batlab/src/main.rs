@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use bat_building::tui::{
+use batlab_core::tui::{
     self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, PerpetualConfig,
     RunMode, TrainingConfig,
 };
-use bat_building::{
+use batlab_core::{
     ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
     DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
     GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
@@ -165,7 +165,7 @@ fn main() {
     // worker thread instead. `run_on_main_thread` returns once that worker does.
     // The headless path also runs inside it: the training path can warm the
     // visualiser, which needs the event loop to be available.
-    bat_building::visualiser::run_on_main_thread(|| {
+    batlab_core::visualiser::run_on_main_thread(|| {
         // -----------------------------------------------------------------
         // DEV/CI ONLY — headless training entry point.
         //
@@ -567,18 +567,18 @@ impl FrameDump {
     /// one of the deed the frame records. Handed a phase, a caller reads it off
     /// `drift.phase()` before stepping and files the frame under the phase it
     /// just left — which is exactly how the first churn frame of every approach
-    /// went out labelled `descent` (see [`bat_building::DriftAction::phase`]).
+    /// went out labelled `descent` (see [`batlab_core::DriftAction::phase`]).
     fn record(
         &mut self,
-        action: bat_building::DriftAction,
+        action: batlab_core::DriftAction,
         level: usize,
         latent: &[f32],
         x0: &[f32],
     ) -> Result<(), String> {
         let tag: u8 = match action.phase() {
-            bat_building::DriftPhase::Descent => 0,
-            bat_building::DriftPhase::Climb => 1,
-            bat_building::DriftPhase::Flux => 2,
+            batlab_core::DriftPhase::Descent => 0,
+            batlab_core::DriftPhase::Climb => 1,
+            batlab_core::DriftPhase::Flux => 2,
         };
         let mut head = Vec::with_capacity(5);
         head.push(tag);
@@ -662,9 +662,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         .max(1);
     let depth = dial_level(args)?.unwrap_or_else(PerpetualConfig::default_renoise_depth);
     let regime = match flag("--regime") {
-        Some(value) => bat_building::PerpetualRegime::parse(&value)
+        Some(value) => batlab_core::PerpetualRegime::parse(&value)
             .ok_or_else(|| format!("invalid --regime: {value} (want wander|breathe|flux)"))?,
-        None => bat_building::PerpetualRegime::default(),
+        None => batlab_core::PerpetualRegime::default(),
     };
     let seed = flag("--seed")
         .and_then(|v| v.parse::<u64>().ok())
@@ -687,7 +687,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // Refused rather than defaulted: `--frames` counts *closed cycles*, and flux
     // closes none. The old code would have spun on `written < frames` with
     // `written` stuck at zero — a run that never ends and never says why.
-    if regime == bat_building::PerpetualRegime::Flux && action_budget.is_none() {
+    if regime == batlab_core::PerpetualRegime::Flux && action_budget.is_none() {
         return Err(
             "--regime flux never closes a cycle, so --frames cannot bound it: pass --actions N"
                 .to_string(),
@@ -768,7 +768,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         // Announced only when something will actually land there. A PNG is
         // written when a cycle closes; flux closes none, so naming a directory
         // it never even creates reads as a run that failed to write.
-        if drift.regime() == bat_building::PerpetualRegime::Flux {
+        if drift.regime() == batlab_core::PerpetualRegime::Flux {
             println!("frames  → no PNG in flux (no cycle ever closes) — use --dump");
         } else {
             println!("frames  → {}", out_dir.display());
@@ -1775,7 +1775,7 @@ async fn run_perpetual(
 
     let publish = |tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
                    drift: &PerpetualDrift,
-                   phase: bat_building::DriftPhase,
+                   phase: batlab_core::DriftPhase,
                    steps: usize,
                    steps_per_sec: f32,
                    tempo: f32,
@@ -1995,7 +1995,7 @@ async fn run_perpetual(
         // A climb increment costs no model call, so its pace is free to differ
         // from the descent's; `CLIMB_TEMPO_RATIO` keeps them equal by default.
         let step_tempo = if climbing {
-            tempo * bat_building::CLIMB_TEMPO_RATIO
+            tempo * batlab_core::CLIMB_TEMPO_RATIO
         } else {
             tempo
         };
@@ -2550,7 +2550,7 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
 
 /// Thin wrapper over the library's single diffusion sampler. Kept so the call
 /// sites can pass `(u32, u32, u32)` dims; the actual denoising math (and the
-/// `[signal | timestep]` input composition) lives in `bat_building::metrics` so
+/// `[signal | timestep]` input composition) lives in `batlab_core::metrics` so
 /// training instrumentation and inference cannot drift apart.
 #[allow(clippy::too_many_arguments)]
 fn sample_diffusion_image_with_controls<State, F>(
@@ -2706,7 +2706,7 @@ fn tensor_to_rgb_pixels(tensor: &[f32], dims: (u32, u32, u32)) -> Result<Vec<u8>
 fn append_layer<State>(
     model: &mut Model<State>,
     draft: &LayerDraft,
-) -> Result<(), bat_building::ModelError> {
+) -> Result<(), batlab_core::ModelError> {
     match draft {
         LayerDraft::Convolution {
             dim_input,
@@ -2957,7 +2957,7 @@ mod tests {
         let out = tmp_path("flux_phase_frontier.batflux");
         let (steps, t_star) = (32usize, 8usize);
         let mut drift =
-            PerpetualDrift::new(steps, bat_building::PerpetualRegime::Flux, t_star, 7);
+            PerpetualDrift::new(steps, batlab_core::PerpetualRegime::Flux, t_star, 7);
 
         // 2×2×1 frames: the payload is irrelevant here, the header is not.
         let pixels = vec![0.0_f32; 4];

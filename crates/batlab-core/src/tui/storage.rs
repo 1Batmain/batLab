@@ -4,6 +4,7 @@ use super::app::ModelConfig;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
 pub struct SavedModelEntry {
@@ -23,11 +24,27 @@ fn serde_to_io(err: serde_json::Error) -> io::Error {
     io::Error::other(err)
 }
 
+/// Workspace root: the directory holding `Models/`, `datasets/` and the
+/// generated sample folders.
+///
+/// Found by walking up until a `Cargo.toml` that declares `[workspace]`, not by
+/// a fixed number of `parent()` hops. The crate moved from `<root>/bat_building`
+/// to `<root>/crates/batlab-core` during the restructure, and a hard-coded hop
+/// count would have silently resolved `Models/` to `crates/Models/` — every
+/// model and dataset invisible, with no error until first use.
 pub fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("bat_building crate should live under workspace root")
-        .to_path_buf()
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|dir| {
+                fs::read_to_string(dir.join("Cargo.toml"))
+                    .is_ok_and(|manifest| manifest.contains("[workspace]"))
+            })
+            .expect("batlab_core should live under a cargo workspace root")
+            .to_path_buf()
+    })
+    .clone()
 }
 
 pub fn datasets_dir() -> io::Result<PathBuf> {
@@ -196,4 +213,32 @@ pub fn list_datasets() -> io::Result<Vec<String>> {
 
     datasets.sort();
     Ok(datasets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The restructure moved this crate one level deeper; nothing errors when
+    /// `project_root()` lands on the wrong directory, the TUI just reports an
+    /// empty `Models/`. Anchor it on the two directories that must be there.
+    #[test]
+    fn project_root_is_the_workspace_that_holds_models_and_datasets() {
+        let root = project_root();
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "project_root() = {} has no Cargo.toml",
+            root.display()
+        );
+        assert!(
+            root.join("Models").is_dir(),
+            "project_root() = {} does not hold Models/",
+            root.display()
+        );
+        assert!(
+            root.join("crates").is_dir(),
+            "project_root() = {} does not hold crates/",
+            root.display()
+        );
+    }
 }

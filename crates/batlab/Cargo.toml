@@ -1,7 +1,7 @@
-# File purpose: Cargo manifest for the main crate and its build/dependency settings.
+# File purpose: Cargo manifest for the batlab binary crate (TUI entry point and headless DEV/CI modes).
 
 [package]
-name = "main"
+name = "batlab"
 version = "0.1.0"
 edition = "2024"
 
@@ -10,7 +10,7 @@ edition = "2024"
 image = "0.25.9"
 winit = "0.30.12"
 
-bat_building = { path = "../bat_building", default-features = false }
+batlab_core = { path = "../batlab-core", default-features = false }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
