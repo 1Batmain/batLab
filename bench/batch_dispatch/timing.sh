@@ -40,6 +40,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BASELINE=$REPO/../batch-baseline
 DATASET=${DATASET:-$REPO/datasets/cifar10_grey.batraw}
 OUT=${OUT:-$(mktemp -d)}
+mkdir -p "$OUT" || { echo "FATAL: cannot create $OUT" >&2; exit 1; }
 
 NEW_BIN=$REPO/target/release/batlab
 OLD_BIN=$BASELINE/target/release/batlab
@@ -49,10 +50,15 @@ for bin in "$NEW_BIN" "$OLD_BIN"; do
 done
 [ -f "$DATASET" ] || { echo "FATAL: no dataset at $DATASET" >&2; exit 1; }
 
-# One timed run. Echoes seconds; fails loudly if the banner does not echo the
-# batch back — a binary that silently ignored --batch would produce a perfectly
-# clean, perfectly meaningless arm (the stale-binary trap of
-# bench/optimizer/lib.sh, which cost a whole He-init campaign).
+# One timed run. Result lands in the global LAST_SECONDS.
+#
+# It is a GLOBAL and not an echoed value on purpose. The first version echoed
+# the duration and was called as `x=$(run_one ...)`, which puts the function in
+# a subshell — so its `exit 1` on a failed run killed only the substitution.
+# Every failure then produced an empty string that flowed on into the statistics
+# and surfaced, several batch sizes later, as a Python "could not convert string
+# to float". A benchmark that fails must stop, not return nothing quietly.
+LAST_SECONDS=""
 run_one() {
   local bin=$1 dir=$2 batch=$3 log=$4
   local start end
@@ -73,7 +79,7 @@ run_one() {
     echo "FATAL: '$batch' missing from the banner of $log — stale binary" >&2
     exit 1
   }
-  python3 -c "print(f'{$end - $start:.4f}')"
+  LAST_SECONDS=$(python3 -c "print(f'{$end - $start:.4f}')")
 }
 
 echo "batch-dispatch timing sweep — $ROUNDS rounds x $STEPS steps, model $MODEL"
@@ -83,13 +89,13 @@ echo
 for batch in "${BATCHES[@]}"; do
   olds=(); news=(); nulls=()
   for _ in $(seq "$ROUNDS"); do
-    olds+=("$(run_one "$OLD_BIN" "$BASELINE" "$batch" "$OUT/old_b$batch.log")")
-    news+=("$(run_one "$NEW_BIN" "$REPO"     "$batch" "$OUT/new_b$batch.log")")
+    run_one "$OLD_BIN" "$BASELINE" "$batch" "$OUT/old_b$batch.log"; olds+=("$LAST_SECONDS")
+    run_one "$NEW_BIN" "$REPO"     "$batch" "$OUT/new_b$batch.log"; news+=("$LAST_SECONDS")
   done
   # Null control: the NEW binary run twice, same arm both times. Its spread is
   # the floor below which nothing measured here means anything.
   for _ in $(seq 2); do
-    nulls+=("$(run_one "$NEW_BIN" "$REPO" "$batch" "$OUT/null_b$batch.log")")
+    run_one "$NEW_BIN" "$REPO" "$batch" "$OUT/null_b$batch.log"; nulls+=("$LAST_SECONDS")
   done
 
   python3 - "$batch" "$STEPS" "${#olds[@]}" "${olds[@]}" "${news[@]}" "${nulls[@]}" <<'PY'
