@@ -72,6 +72,14 @@ Le manager, côté contrat observable :
   documenté sur `App::model_run_in_progress`.
 - Sur les deux écrans du manager, **toute touche imprimable est du texte**, `q`
   compris (un modèle peut s'appeler `q-experiment`) ; `Esc` est la sortie.
+- **Tout modèle créé par un template est conditionnable sur t** (`input_size.z >
+  output.z`). Les deux templates ont livré l'inverse (1→1 et 3→3, la géométrie de
+  `Models/Greyscale_Diffusion_broken`) jusqu'à ce qu'un test aveugle lise le
+  `config_file` écrit. Ils dérivent maintenant leurs dims d'un seul
+  `diffusion_unet(signal, temporel)` — ne pas y réintroduire de dims à la main.
+  Gardé des deux côtés : `config::tests` sur `built_in_templates()`, et
+  `every_model_created_from_a_template_is_conditionable_on_the_timestep` sur le
+  fichier réellement écrit.
 - **Un checkpoint est un `.ckpt`**, non caché, dans `pretrained_weights/` — le
   `latest_metrics.jsonl` que tout entraînement dépose à côté n'en est pas un.
   Les deux listages (compteur de la liste, sélecteur de poids) passent par

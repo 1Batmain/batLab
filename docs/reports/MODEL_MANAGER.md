@@ -19,7 +19,7 @@ Deux corrections de fond accompagnent le flow :
 - **`Esc` remonte d'un cran** partout. Six écrans quittaient l'application
   sèchement : un taux d'apprentissage mal tapé coûtait la session.
 
-Sept commits :
+Huit commits :
 
 | Commit | Objet |
 | --- | --- |
@@ -30,10 +30,15 @@ Sept commits :
 | `cc79bf4` | CLAUDE.md : le flow, `BATLAB_ROOT`, la limite levée |
 | `7310e94` | Un checkpoint est un `.ckpt` (trouvé au TUI réel) |
 | `5435440` | `[Esc] back` annoncé sur le formulaire d'inférence |
+| `6b91485` | **Les templates créaient des modèles non conditionnables sur t** (trouvé par l'agent aveugle) |
 
 Les deux corrections marquées « trouvé au TUI réel » ne sont pas sorties d'une
 relecture du code : les deux états fautifs étaient chacun cohérents localement, et
 seul le parcours à la main les a exposés. Elles sont détaillées en §4.
+
+Le défaut bloquant de `6b91485` n'a été trouvé ni par le code ni par mon parcours
+e2e — **c'est l'agent de test aveugle qui l'a vu**, en lisant le `config_file` que
+le flux de création écrit sur disque. §4.3 dit pourquoi je l'ai manqué.
 
 ## 1. Le flow
 
@@ -188,6 +193,54 @@ parce que les AppleDouble de macOS (`._latest.ckpt`) passeraient le test
 d'extension sans être des poids. Gardé par
 `the_metrics_journal_beside_the_weights_is_not_a_checkpoint`.
 
+### 4.3 Les templates créaient des modèles mort-nés — `6b91485`
+
+**Trouvé par l'agent de test aveugle**, pas par moi (`9081b22` sur
+`blind-test-manager`, `blind_tests_manager/t09_template_geometry.sh`).
+
+Le flux « New model (from template) » écrivait `input_size.z == canaux de sortie` :
+
+| Template | Avant | Après |
+| --- | --- | --- |
+| Greyscale Diffusion | `[32,32,1]` → 1 ❌ | `[32,32,3]` → 1 (1 signal + 2 temporels) |
+| Stable Diffusion | `[32,32,3]` → 3 ❌ | `[32,32,7]` → 3 (3 signal + 4 temporels) |
+
+CLAUDE.md exige l'inverse : « un modèle de diffusion DOIT être conditionné sur le
+timestep : `input_size.z > output.z` ». Sans canal excédentaire pour porter
+l'embedding temporel, ε̂ dégénère et l'échantillonnage explose en blanc saturé.
+La géométrie du template Greyscale était **exactement celle que le dépôt conserve
+sous `Models/Greyscale_Diffusion_broken`** — le cas dégénéré historique. Tout
+modèle créé depuis le TUI naissait donc mort-né.
+
+Les nouvelles géométries s'alignent sur les configs saines du dépôt :
+`Models/Greyscale_Diffusion` (`[32,32,3]` → 1) et `Models/Color_Diffusion_L`
+(`[32,32,7]` → 3).
+
+**Ce qui a changé au-delà des chiffres.** Les deux templates n'étaient que le même
+U-Net à deux budgets de canaux près, dupliqué douze couches durant avec toutes les
+dims écrites à la main — la duplication *était* le terrain du bug. Ils partagent
+maintenant `diffusion_unet(signal_channels, time_channels)`, bâti par un
+`UNetDraft` qui **dérive** chaque dimension de la couche précédente. C'est la
+discipline de `tools/gen_unet_config.py`, portée en Rust pour la raison qui l'a
+fait écrire là-bas : `dim_kernel.z` doit suivre le nombre de canaux courant, et si
+`Convolution` rejette une profondeur fausse au build, **`UpsampleConv` ne la rejette
+pas** — son shader indexe les poids avec `IC = dim_input.z` et corrompt en silence.
+
+**Pourquoi mon parcours e2e ne l'a pas vu.** Au pas 9 j'ai entraîné un modèle issu
+du template et j'ai regardé la loss descendre — elle descendait. Une loss qui décroît
+ne dit rien du conditionnement temporel : c'est précisément l'avertissement de
+CLAUDE.md (« une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche
+de t »). Je vérifiais que le manager *manipulait* correctement les modèles, sans
+jamais demander si le modèle produit était *valide*. L'aveugle, lui, partait de la
+spec — l'invariant y est écrit noir sur blanc — et il est allé lire le fichier.
+C'est exactement le désaccord que le protocole cherche à produire.
+
+**Vérification** : au-delà de l'invariant statique, un Greyscale créé au TUI réel
+s'entraîne (loss 1,12 → 0,73 sur 30 pas, `EXIT=0`, stderr vide) et le Stable
+construit et tourne aussi — aucun `KernelChannelMismatch`, le moteur accepte la
+géométrie. Les tests ont été vérifiés **échouants** sur l'ancienne géométrie
+(`time_channels = 0` → « emits 1 channels for 1 in »).
+
 ## 5. Le parcours e2e déroulé
 
 TUI réel (`target/release/batlab`) dans une fenêtre tmux dédiée
@@ -200,7 +253,7 @@ sortie capturé.
 | --- | --- | --- | --- |
 | 1 | Ouvrir sur une racine vide | liste, message « No models yet », **aucun `Models/` créé** | OK — seul `datasets/` apparaît (voir §6) |
 | 2 | `Enter` → template Greyscale → `Enter` | modèle créé sur disque, menu d'actions | OK — `Models/Greyscale_Diffusion/{config_file,pretrained_weights}` |
-| 3 | Menu d'actions | géométrie et couches lues du modèle | OK — `32x32x1 · 12 layers · no checkpoints` |
+| 3 | Menu d'actions | géométrie et couches lues du modèle | OK — `32x32x1 · 12 layers · no checkpoints` **(géométrie dégénérée, non vue ici — voir §4.3 ; le template corrigé affiche `32x32x3`)** |
 | 4 | `Esc` | retour à la liste, le modèle y figure | OK |
 | 5 | Rename, frappe de `q-experiment-e2e` | le `q` initial est **du texte**, l'app ne quitte pas | OK — champ prérempli puis réécrit |
 | 6 | `Enter` | dossier déplacé, `model_name` réécrit, accusé | OK — `Models/q-experiment-e2e/`, `model_name: q-experiment-e2e`, aucun résidu de l'ancien |
@@ -226,8 +279,21 @@ deux fois.
 
 ## 6. Limites connues
 
+- **`Models/Stable_Diffusion` du dépôt porte lui aussi la géométrie dégénérée** —
+  `[32,32,3]` → 3, comme le template qui l'a produit. Corriger le template ne l'a
+  pas corrigé, lui : c'est un fichier suivi, et le réécrire n'était pas dans cette
+  mission. À réentraîner ou régénérer (`tools/gen_unet_config.py`). Les autres
+  modèles du dépôt sont sains (`Greyscale_Diffusion` 3→1,
+  `Greyscale_Diffusion_L` 5→1, `Color_Diffusion_L` 7→3).
+- **« New model (from template) » écrase silencieusement un modèle existant du même
+  nom.** Le modèle créé porte la clé du template, et `apply_template` écrit son
+  `config_file` sans vérifier que le dossier existe déjà — ni prompt, ni accusé.
+  **Vérifié** : un `config_file` marqué à la main a été remplacé sans un mot.
+  Dans le dépôt réel, où `Models/Stable_Diffusion/` existe, une frappe sur
+  « New model » suffit donc à perdre sa configuration. Non corrigé — hors du
+  périmètre de cette mission, mais c'est le prochain défaut à traiter.
 - **La garde de run est mono-processus** (§2.4). C'est la limite la plus sérieuse
-  du manager, et elle est intacte.
+  du manager côté concurrence, et elle est intacte.
 - **Ouvrir une racine y crée `datasets/`** alors que `Models/` n'est créé qu'au
   premier modèle. `list_models` a été rendu sans effet de bord, pas
   `refresh_datasets`. Bénin, mais asymétrique.
@@ -246,14 +312,26 @@ deux fois.
 ## 7. Recette
 
 ```bash
-cargo test --workspace     # 167 tests, 0 échec
+cargo test --workspace     # 171 tests, 0 échec
 git status --porcelain     # doit être vide
 ```
 
-Aucun test n'a été affaibli. Deux ajoutés sur cette mission
-(`re_entering_the_action_menu_re_reads_the_checkpoints`,
-`the_metrics_journal_beside_the_weights_is_not_a_checkpoint`), tous deux issus
-d'un bug observé au TUI réel avant d'être écrit en test.
+Aucun test n'a été affaibli. Six ajoutés sur cette mission, chacun né d'un défaut
+observé avant d'être écrit :
+
+| Test | Origine |
+| --- | --- |
+| `re_entering_the_action_menu_re_reads_the_checkpoints` | TUI réel |
+| `the_metrics_journal_beside_the_weights_is_not_a_checkpoint` | TUI réel |
+| `every_template_is_conditionable_on_the_timestep` | agent aveugle |
+| `every_template_kernel_is_as_deep_as_its_input` | agent aveugle (généralisation) |
+| `every_template_stack_starts_on_its_declared_input` | agent aveugle (généralisation) |
+| `every_model_created_from_a_template_is_conditionable_on_the_timestep` | agent aveugle |
+
+Une assertion existante a été **mise à jour, pas affaiblie** :
+`selecting_template_prefills_architecture_and_advances_to_the_action_menu`
+attendait `(32, 32, 3)` en entrée du template RGB — c'est désormais `(32, 32, 7)`,
+la géométrie ayant changé volontairement.
 
 Pour rejouer le parcours sans toucher au dépôt :
 
