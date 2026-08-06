@@ -191,6 +191,76 @@ impl GpuDataset {
         Ok(())
     }
 
+    /// Copy a whole batch into `destination`, sample `i` of the list landing at
+    /// slot `i` (offset `i * sample_len` floats).
+    ///
+    /// This is NOT `copy_sample_to` in a loop into one encoder, and the
+    /// difference is a correctness one. `ensure_chunk_loaded` uploads through
+    /// `queue.write_buffer`, and wgpu applies every pending queue write BEFORE
+    /// the command buffers submitted after it. Two samples from two different
+    /// chunks encoded into a single encoder would therefore both read the chunk
+    /// loaded last: the first copy would silently pick up the wrong image, with
+    /// no validation error and no crash — just a batch quietly trained on
+    /// duplicated data.
+    ///
+    /// So the batch is grouped by chunk and each resident chunk gets its own
+    /// submission. A dataset that fits in one chunk — the common case — is one
+    /// group and one submission, which is also the point of the exercise.
+    pub fn copy_samples_to(
+        &mut self,
+        gpu: &GpuContext,
+        sample_indices: &[usize],
+        destination: &wgpu::Buffer,
+    ) -> Result<(), GpuDatasetError> {
+        for &sample_index in sample_indices {
+            if sample_index >= self.sample_count {
+                return Err(GpuDatasetError::SampleIndexOutOfBounds {
+                    sample_index,
+                    sample_count: self.sample_count,
+                });
+            }
+        }
+        let sample_bytes = (self.sample_len * std::mem::size_of::<f32>()) as u64;
+        let capacity = self.chunk_sample_capacity;
+
+        // Slot order is preserved: the grouping is by chunk, but every copy
+        // still writes to the destination slot of its own position.
+        let mut pending: Vec<(usize, usize)> = sample_indices
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(slot, sample_index)| (slot, sample_index))
+            .collect();
+        pending.sort_by_key(|(_, sample_index)| sample_index / capacity);
+
+        let mut cursor = 0usize;
+        while cursor < pending.len() {
+            let chunk = pending[cursor].1 / capacity;
+            let end = pending[cursor..]
+                .iter()
+                .position(|(_, s)| s / capacity != chunk)
+                .map(|offset| cursor + offset)
+                .unwrap_or(pending.len());
+
+            self.ensure_chunk_loaded(gpu, pending[cursor].1);
+            let chunk_start = self.loaded_chunk_start.unwrap_or(0);
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            for &(slot, sample_index) in &pending[cursor..end] {
+                let local_index = sample_index.saturating_sub(chunk_start);
+                encoder.copy_buffer_to_buffer(
+                    &self.chunk_buffer,
+                    local_index as u64 * sample_bytes,
+                    destination,
+                    slot as u64 * sample_bytes,
+                    sample_bytes,
+                );
+            }
+            gpu.queue.submit([encoder.finish()]);
+            cursor = end;
+        }
+        Ok(())
+    }
+
     fn ensure_chunk_loaded(&mut self, gpu: &GpuContext, sample_index: usize) {
         if let Some(start) = self.loaded_chunk_start {
             let end = start + self.loaded_chunk_count;

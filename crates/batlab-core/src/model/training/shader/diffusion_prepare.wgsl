@@ -1,7 +1,28 @@
 // File purpose: WGSL compute shader implementing diffusion prepare preprocessing for diffusion training inputs.
 
+// `specs` is an ARRAY, one entry per sample of the batch, and that is the whole
+// of how batching enters this kernel.
+//
+// Before batching it was a single uniform, rewritten between two submissions:
+// the CPU loop set `alpha_bar`, `step` and `seed` for sample i, submitted, and
+// went round again. The batched step submits once, so the per-sample values
+// have to travel together — hence the array, indexed by `index / total`.
+//
+// What matters is what did NOT change: each entry is computed on the CPU by
+// exactly the expression that produced it before (same `batch_offset`, same
+// `sample_index` out of the same SampleShuffle, same `fold_seed`), so sample i
+// of a batch draws bit-for-bit the noise and timestep it drew before. That is
+// what makes an old-path/new-path training run comparable at all.
+//
+// On the CLAUDE.md rule against `seed ^ index`: the forbidden pattern is the
+// COMPOSITION of two XORs — one folding the diffusion step into the path seed,
+// one folding the pixel index into the noise field — whose sum collapsed onto
+// the anti-diagonals (ANISOTROPY_HUNT.md). There is a single XOR here, the one
+// that was already here, and batching adds none: the sample index SELECTS an
+// entry, it never enters a seed.
+
 @group(0) @binding(0) var<storage, read>       clean_target: array<f32>;
-@group(0) @binding(1) var<uniform>             specs: DiffusionPrepareSpec;
+@group(0) @binding(1) var<storage, read>       specs: array<DiffusionPrepareSpec>;
 @group(0) @binding(2) var<storage, read_write> model_input:  array<f32>;
 @group(0) @binding(3) var<storage, read_write> target_noise: array<f32>;
 
@@ -43,13 +64,13 @@ fn gaussian_from_seed(seed: u32) -> f32 {
 // to `LinearNoiseSchedule::timestep_embedding` (schedule.rs): the network is
 // trained with this GPU-side embedding and sampled with the CPU one, so any
 // divergence conditions it on a signal it was never trained on.
-fn timestep_value(offset: u32) -> f32 {
-    if specs.timestep_channels == 0u {
+fn timestep_value(spec: DiffusionPrepareSpec, offset: u32) -> f32 {
+    if spec.timestep_channels == 0u {
         return 0.0;
     }
-    let steps = max(specs.total_steps, 1u);
+    let steps = max(spec.total_steps, 1u);
     let denom = f32(max(steps - 1u, 1u));
-    let tau = f32(min(specs.step, steps - 1u)) / denom;
+    let tau = f32(min(spec.step, steps - 1u)) / denom;
     let pair_idx = offset / 2u;
     let phase = tau * 3.14159265358979 * pow(2.0, f32(pair_idx));
     if (offset & 1u) == 0u {
@@ -61,23 +82,30 @@ fn timestep_value(offset: u32) -> f32 {
 @compute @workgroup_size(64)
 fn diffusion_prepare(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = gid.x;
-    let total = specs.pixel_count * specs.input_channels;
-    if index >= total {
+    if index >= arrayLength(&model_input) {
         return;
     }
 
-    let pixel = index / specs.input_channels;
-    let channel = index % specs.input_channels;
+    // Every entry carries the same shape, so entry 0 is enough to slice the
+    // batch; only alpha_bar / step / seed differ from sample to sample.
+    let total = specs[0].pixel_count * specs[0].input_channels;
+    let sample = index / total;
+    let local = index % total;
+    let spec = specs[sample];
 
-    if channel < specs.signal_channels {
-        let clean_idx = pixel * specs.signal_channels + channel;
-        let noise = gaussian_from_seed(specs.seed ^ clean_idx);
-        let signal_scale = sqrt(specs.alpha_bar);
-        let noise_scale = sqrt(max(1.0 - specs.alpha_bar, 0.0));
-        model_input[index] = signal_scale * clean_target[clean_idx] + noise_scale * noise;
-        target_noise[clean_idx] = noise;
+    let pixel = local / spec.input_channels;
+    let channel = local % spec.input_channels;
+
+    if channel < spec.signal_channels {
+        let clean_idx = pixel * spec.signal_channels + channel;
+        let noise = gaussian_from_seed(spec.seed ^ clean_idx);
+        let signal_scale = sqrt(spec.alpha_bar);
+        let noise_scale = sqrt(max(1.0 - spec.alpha_bar, 0.0));
+        let clean_i = sample * spec.pixel_count * spec.signal_channels + clean_idx;
+        model_input[index] = signal_scale * clean_target[clean_i] + noise_scale * noise;
+        target_noise[clean_i] = noise;
     } else {
-        let extra_channel = channel - specs.signal_channels;
-        model_input[index] = timestep_value(extra_channel);
+        let extra_channel = channel - spec.signal_channels;
+        model_input[index] = timestep_value(spec, extra_channel);
     }
 }

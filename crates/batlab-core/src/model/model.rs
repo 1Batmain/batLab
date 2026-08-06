@@ -361,6 +361,13 @@ impl Model<Training> {
         self.read_last_loss()
     }
 
+    /// Sequential reference path — one submit per sample, no optimiser.
+    ///
+    /// This is what the training loop did before the batch axis moved into the
+    /// dispatches, kept verbatim and reachable from the tests so that the
+    /// equivalence checks compare against *executable code* rather than a
+    /// frozen fixture. See `batch_equivalence_tests.rs`.
+    #[cfg(test)]
     pub(crate) fn train_step_report_with_prepass_no_opt<F>(&mut self, prepass: F) -> Option<f32>
     where
         F: FnOnce(&mut wgpu::CommandEncoder),
@@ -373,6 +380,8 @@ impl Model<Training> {
         self.read_last_loss_optional()
     }
 
+    /// See [`Model::train_step_report_with_prepass_no_opt`].
+    #[cfg(test)]
     pub(crate) fn train_step_with_prepass_no_opt<F>(&mut self, prepass: F)
     where
         F: FnOnce(&mut wgpu::CommandEncoder),
@@ -384,6 +393,55 @@ impl Model<Training> {
         self.gpu.queue.submit([encoder.finish()]);
     }
 
+    /// One training step over the whole batch: **one encoder, one submit**.
+    ///
+    /// This replaces the `begin_batch_accumulation` / N x
+    /// `train_step_*_with_prepass_no_opt` / `finish_batch_accumulation`
+    /// sequence, which cost `2 + batch` submissions per step (18 at batch 16)
+    /// and left every kernel working on a single small tensor.
+    ///
+    /// The order inside the encoder is the same as before, and so is the
+    /// arithmetic that depends on it:
+    ///
+    /// 1. zero `grad_weights` / `grad_bias` — still needed, the gradient
+    ///    kernels still accumulate with `+=`, they just do it once per step
+    ///    now instead of once per sample;
+    /// 2. the caller's prepass (composing `x_t` and the target noise);
+    /// 3. forward, loss, backward for the whole batch;
+    /// 4. the optimiser, with `grad_scale = 1 / batch` — unchanged, because
+    ///    the gradient buffer holds the same SUM over the batch it held before.
+    ///
+    /// wgpu inserts an implicit barrier between compute passes in one encoder,
+    /// so the sequencing that used to be enforced by separate submissions is
+    /// preserved without them.
+    pub(crate) fn train_step_report_batched<F>(
+        &mut self,
+        batch_size: usize,
+        report_loss: bool,
+        prepass: F,
+    ) -> Option<f32>
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder),
+    {
+        debug_assert!(self.state.is_build, "call build() before train_step()");
+        let batch_size = batch_size.max(1) as f32;
+        self.publish_optimizer_specs(1.0 / batch_size);
+
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.encode_zero_optimizer_gradients(&mut encoder);
+        prepass(&mut encoder);
+        self.encode_train_graph(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+
+        if report_loss {
+            self.read_last_loss_optional()
+        } else {
+            None
+        }
+    }
+
+    /// See [`Model::train_step_report_with_prepass_no_opt`].
+    #[cfg(test)]
     pub(crate) fn begin_batch_accumulation(&mut self) {
         debug_assert!(
             self.state.is_build,
@@ -394,6 +452,8 @@ impl Model<Training> {
         self.gpu.queue.submit([encoder.finish()]);
     }
 
+    /// See [`Model::train_step_report_with_prepass_no_opt`].
+    #[cfg(test)]
     pub(crate) fn finish_batch_accumulation(&mut self, batch_size: usize) {
         debug_assert!(
             self.state.is_build,
