@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding,
     ForwardBufferSource, LayerType, OptimizerBindings, ShaderDescriptor,
 };
@@ -85,15 +86,18 @@ impl LayerType for GroupNormType {
         ]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
         vec![
-            // The two reduction passes: one workgroup per group.
-            self.num_groups,
-            self.num_groups,
+            // The two reduction passes: one workgroup per (sample, group).
+            // The statistics are per sample and MUST stay so — normalising
+            // across the batch would change the model, not its implementation.
+            self.num_groups * batch,
+            self.num_groups * batch,
             // grad_input is elementwise (@workgroup_size(64)).
-            self.dim_input.length().div_ceil(64),
-            // grad_gamma / grad_beta reduce over the spatial axis: one
-            // workgroup per channel.
+            (self.dim_input.length() * batch).div_ceil(64),
+            // grad_gamma / grad_beta reduce onto *parameters*: one workgroup
+            // per channel whatever the batch, which the kernel sweeps over
+            // `batch * spatial_len` positions.
             self.dim_input.z,
             self.dim_input.z,
         ]
@@ -101,8 +105,10 @@ impl LayerType for GroupNormType {
 
     /// One workgroup per group — `group_norm.wgsl` reduces cooperatively
     /// instead of running one thread per element.
-    fn get_forward_workgroup_count(&self) -> u32 {
-        self.num_groups
+    fn get_forward_workgroup_count(&self, batch: Batch) -> u32 {
+        // One workgroup per (sample, group): `wid.x / num_groups` is the
+        // sample, `wid.x % num_groups` the group.
+        self.num_groups * batch
     }
 
     fn get_dim_input(&self) -> Dim3 {
@@ -113,8 +119,8 @@ impl LayerType for GroupNormType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| ForwardBufferBinding {
                 init: match name.as_str() {
@@ -133,8 +139,8 @@ impl LayerType for GroupNormType {
             .collect()
     }
 
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
-        self.get_back_buffers_specs()
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs(batch)
             .into_iter()
             .enumerate()
             .map(|(index, (name, spec))| BackwardBufferBinding {
@@ -181,12 +187,12 @@ impl LayerType for GroupNormType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         vec![
             (
                 "input".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -241,7 +247,7 @@ impl LayerType for GroupNormType {
             (
                 "output".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -254,7 +260,7 @@ impl LayerType for GroupNormType {
         ]
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         let read_storage = |size: u32| BufferSpec {
             size: size.max(4),
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
@@ -279,7 +285,7 @@ impl LayerType for GroupNormType {
         vec![
             (
                 "fwd_input".to_string(),
-                read_storage(self.dim_input.bytes_size()),
+                read_storage(batched_bytes(self.dim_input, batch)),
             ),
             (
                 "gamma".to_string(),
@@ -303,11 +309,11 @@ impl LayerType for GroupNormType {
             ),
             (
                 "grad_output".to_string(),
-                read_storage(self.dim_output.bytes_size()),
+                read_storage(batched_bytes(self.dim_output, batch)),
             ),
             (
                 "grad_input".to_string(),
-                write_storage(self.dim_input.bytes_size()),
+                write_storage(batched_bytes(self.dim_input, batch)),
             ),
             (
                 "grad_gamma".to_string(),
@@ -320,9 +326,14 @@ impl LayerType for GroupNormType {
             // Scratch for the two reduction passes: 4 f32 per group
             // ([mean, inv_std, sum_dxhat, sum_dxhat_xhat]). Appended last so
             // the indices the other bindings are addressed by are untouched.
+            //
+            // Per (sample, group), not per group: these ARE the per-sample
+            // statistics, and sharing a slot between two samples of a batch is
+            // exactly the "normalising across the batch" this layer must never
+            // do. Layout is sample-major, `(sample * num_groups + group) * 4`.
             (
                 "stats".to_string(),
-                write_storage(self.num_groups * STATS_PER_GROUP * 4),
+                write_storage(self.num_groups * batch * STATS_PER_GROUP * 4),
             ),
         ]
     }

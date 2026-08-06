@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding,
     ForwardBufferSource, LayerType, ShaderDescriptor,
 };
@@ -89,8 +90,9 @@ impl LayerType for ActivationType {
         vec![self.method.backward_entrypoint()]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
-        vec![self.dim_input.length().div_ceil(64)]
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
+        // Elementwise: one thread per activation, so the whole batch.
+        vec![(self.dim_input.length() * batch).div_ceil(64)]
     }
 
     fn get_dim_input(&self) -> Dim3 {
@@ -101,8 +103,8 @@ impl LayerType for ActivationType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| ForwardBufferBinding {
                 init: if name == "specs" {
@@ -121,8 +123,8 @@ impl LayerType for ActivationType {
             .collect()
     }
 
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
-        self.get_back_buffers_specs()
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs(batch)
             .into_iter()
             .enumerate()
             .map(|(index, (name, spec))| BackwardBufferBinding {
@@ -151,13 +153,13 @@ impl LayerType for ActivationType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         vec![
             // [0] input  — shared with previous layer's output
             (
                 "input".to_string(),
                 BufferSpec {
-                    size: self.get_dim_input().bytes_size().max(4),
+                    size: batched_bytes(self.get_dim_input(), batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -188,7 +190,7 @@ impl LayerType for ActivationType {
             (
                 "output".to_string(),
                 BufferSpec {
-                    size: self.get_dim_output().bytes_size().max(4),
+                    size: batched_bytes(self.get_dim_output(), batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -201,7 +203,7 @@ impl LayerType for ActivationType {
         ]
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         // Backward bind group layout:
         //   [0] fwd_input  — shared from forward[0]
         //   [1] specs      — shared from forward[1]
@@ -211,7 +213,7 @@ impl LayerType for ActivationType {
             (
                 "fwd_input".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -240,7 +242,7 @@ impl LayerType for ActivationType {
             (
                 "grad_output".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -253,7 +255,7 @@ impl LayerType for ActivationType {
             (
                 "grad_input".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {

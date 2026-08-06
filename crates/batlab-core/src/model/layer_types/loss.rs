@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     BufferInit, ForwardBufferBinding, ForwardBufferSource, LayerType, ShaderDescriptor,
 };
 use crate::model::types::{BufferSpec, Dim3};
@@ -56,7 +57,7 @@ impl LayerType for LossType {
         vec![]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    fn get_back_workgroup_counts(&self, _batch: Batch) -> Vec<u32> {
         vec![]
     }
 
@@ -68,11 +69,15 @@ impl LayerType for LossType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| ForwardBufferBinding {
-                init: BufferInit::None,
+                init: if name == "specs" {
+                    BufferInit::SpecsUniform
+                } else {
+                    BufferInit::None
+                },
                 source: if name == "model_result" {
                     ForwardBufferSource::PreviousOutput
                 } else {
@@ -93,13 +98,13 @@ impl LayerType for LossType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         vec![
             // [0] model_result — shared from the last forward layer's output
             (
                 "model_result".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -113,7 +118,7 @@ impl LayerType for LossType {
             (
                 "target".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -127,7 +132,7 @@ impl LayerType for LossType {
             (
                 "loss_terms".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -141,13 +146,45 @@ impl LayerType for LossType {
             (
                 "grad_output".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                },
+            ),
+            // [4] specs uniform — the ONE thing the loss kernel cannot deduce
+            // from its buffers once they carry a batch axis.
+            //
+            // MSE divides the gradient by the number of elements it averages
+            // over: `grad[i] = 2 * (pred - target) / N`. That `N` used to be
+            // `arrayLength(&model_result)`, which was the per-sample length
+            // because the buffer held exactly one sample. Batched, that
+            // expression returns `batch * N` and would quietly divide every
+            // gradient by an extra factor of `batch` — a silent learning-rate
+            // change, not a crash. `N` therefore comes from the uniform, and
+            // does not depend on the batch.
+            //
+            // Appended LAST on purpose: `model.rs` addresses this layer's
+            // buffers positionally (`forward[1]` = target, `forward[2]` =
+            // loss_terms, `forward[3]` = grad_output), and so does
+            // `diffusion.rs`. Inserting anywhere else would have moved them.
+            (
+                "specs".to_string(),
+                BufferSpec {
+                    size: self.get_spec_uniform_bytes_size().max(4),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(
+                            std::num::NonZeroU64::new(self.get_spec_uniform_bytes_size() as u64)
+                                .unwrap(),
+                        ),
                     },
                 },
             ),
@@ -170,7 +207,7 @@ impl LayerType for LossType {
         buffer.into_inner()
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, _batch: Batch) -> Vec<(String, BufferSpec)> {
         // Loss has no backward pass — the forward pass IS the gradient computation.
         vec![]
     }

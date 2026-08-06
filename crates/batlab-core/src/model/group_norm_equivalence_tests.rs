@@ -572,7 +572,7 @@ fn input_gradients_match_finite_differences() {
         let analytic = read_layer_buffer(gpu.as_ref(), bwd[4].as_ref());
 
         let eps = 1e-2f32;
-        let mut loss_at = |model: &mut Model<Training>, x: &[f32]| -> f32 {
+        let loss_at = |model: &mut Model<Training>, x: &[f32]| -> f32 {
             model.train_step(x, &target);
             model.read_last_loss()
         };

@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing the Adam weight update for the optimizer pass.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Adam (Kingma & Ba 2015) weight update.
 // Bindings match create_opt_pass() in layer.rs:
@@ -39,8 +44,11 @@ struct AdamSpecs {
 }
 
 @compute @workgroup_size(64)
-fn adam(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn adam(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let i = gid.y * nwg.x * 64u + gid.x;
 
     if i < arrayLength(&weights) {
         let g = grad_weights[i] * specs.grad_scale;

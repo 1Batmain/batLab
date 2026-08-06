@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing upsample conv operations for model forward/backward or optimizer passes.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Bindings match UpsampleConvType::get_buffers_specs():
 //   [0] input   — original input tensor (HWC)
@@ -46,20 +51,28 @@ fn pad_x() -> i32 {
 }
 
 @compute @workgroup_size(64)
-fn upsample_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn upsample_conv(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
 
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
     let K  = layer_spec.dim_output.z;
-    if idx >= OH * OW * K { return; }
+    let out_len = OH * OW * K;
+    if idx >= arrayLength(&output) { return; }
 
-    let k  = idx % K;
-    let ox = (idx / K) % OW;
-    let oy = idx / (K * OW);
+    let sample = idx / out_len;
+    let local  = idx % out_len;
+
+    let k  = local % K;
+    let ox = (local / K) % OW;
+    let oy = local / (K * OW);
 
     let IW = layer_spec.dim_input.y;
     let IC = layer_spec.dim_input.z;
+    let in_sample = sample * layer_spec.dim_input.x * IW * IC;
     let KH = layer_spec.dim_kernel.x;
     let KW = layer_spec.dim_kernel.y;
     let up_h = i32(upsampled_height());
@@ -77,7 +90,7 @@ fn upsample_conv(@builtin(global_invocation_id) gid: vec3<u32>) {
             let iy = u32(up_y) / scale;
             let ix = u32(up_x) / scale;
             for (var kz: u32 = 0u; kz < IC; kz++) {
-                let in_i = iy * IW * IC + ix * IC + kz;
+                let in_i = in_sample + iy * IW * IC + ix * IC + kz;
                 let w_i = k * KH * KW * IC + ky * KW * IC + kx * IC + kz;
                 sum += input[in_i] * weights[w_i];
             }

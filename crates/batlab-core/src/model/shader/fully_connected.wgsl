@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing fully connected operations for model forward/backward or optimizer passes.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Bindings match FullyConnectedType::get_buffers_specs():
 //   [0] input   — flattened input vector
@@ -39,15 +44,22 @@ fn apply_activation(value: f32, method: u32) -> f32 {
 }
 
 @compute @workgroup_size(64)
-fn fully_connected(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let neuron_idx = gid.x;
-    if neuron_idx >= layer_spec.nb_neurons { return; }
+fn fully_connected(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
+    if idx >= arrayLength(&output) { return; }
+
+    let sample = idx / layer_spec.nb_neurons;
+    let neuron_idx = idx % layer_spec.nb_neurons;
+    let in_base = sample * layer_spec.input_len;
 
     var sum: f32 = bias[neuron_idx];
     for (var in_idx: u32 = 0u; in_idx < layer_spec.input_len; in_idx++) {
         let weight_idx = neuron_idx * layer_spec.input_len + in_idx;
-        sum += input[in_idx] * weights[weight_idx];
+        sum += input[in_base + in_idx] * weights[weight_idx];
     }
-    pre_activation[neuron_idx] = sum;
-    output[neuron_idx] = apply_activation(sum, layer_spec.activation_method);
+    pre_activation[idx] = sum;
+    output[idx] = apply_activation(sum, layer_spec.activation_method);
 }

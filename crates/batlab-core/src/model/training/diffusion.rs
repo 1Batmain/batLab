@@ -5,7 +5,7 @@ use super::{
     GpuDataset, LinearNoiseSchedule, TaskPassSpec, TrainingTask, TrainingTaskError, Workgroups,
 };
 use crate::model::{Dim3, Model, Training};
-use encase::{ShaderSize, ShaderType, UniformBuffer};
+use encase::{ShaderSize, ShaderType, StorageBuffer};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -83,9 +83,16 @@ struct DiffusionPreparePass {
     model_input: Arc<wgpu::Buffer>,
     target_noise: Arc<wgpu::Buffer>,
     expected_target_len: usize,
-    workgroups: u32,
+    /// Workgroups for ONE sample; the encode multiplies by the batch it is
+    /// asked for, so a batch-1 call on a batch-16 graph dispatches a prefix.
+    workgroups_per_sample: u32,
+    /// Samples the pass was built for — the size of `specs` and `clean_target`.
+    batch: u32,
 }
 
+/// One entry per sample of the batch. Only `alpha_bar`, `step` and `seed`
+/// actually differ between entries; the shape fields are replicated so the
+/// shader has everything it needs from a single indexed read.
 #[derive(ShaderType, Clone, Copy)]
 struct DiffusionPrepareUniform {
     alpha_bar: f32,
@@ -154,10 +161,30 @@ impl DiffusionTask {
         self.timestep_channels
     }
 
-    pub fn estimated_prepare_gpu_bytes(&self, output: Dim3) -> u64 {
-        let target_bytes = (output.length() as u64 * std::mem::size_of::<f32>() as u64).max(4);
-        let specs_bytes = (DiffusionPrepareUniform::SHADER_SIZE.get() as u64).max(4);
+    /// GPU bytes the prepass allocates on top of the model, for the resource
+    /// banner. Both buffers now carry the batch axis, so both scale with it —
+    /// which is the point the banner has to convey: raising the batch raises
+    /// GPU memory linearly, and it is the first thing that will hit
+    /// `max_storage_buffer_binding_size` on a large model.
+    pub fn estimated_prepare_gpu_bytes_for_batch(&self, output: Dim3, batch: u32) -> u64 {
+        let batch = batch.max(1) as u64;
+        let target_bytes =
+            (output.length() as u64 * std::mem::size_of::<f32>() as u64 * batch).max(4);
+        let specs_bytes = (DiffusionPrepareUniform::SHADER_SIZE.get() as u64 * batch).max(4);
         target_bytes.saturating_add(specs_bytes)
+    }
+
+    pub fn estimated_prepare_gpu_bytes(&self, output: Dim3) -> u64 {
+        self.estimated_prepare_gpu_bytes_for_batch(output, 1)
+    }
+
+    /// Encode the per-sample spec array the shader indexes by sample.
+    fn encode_prepare_specs(specs: &[DiffusionPrepareUniform]) -> Vec<u8> {
+        let mut buffer = StorageBuffer::new(Vec::new());
+        buffer
+            .write(&specs.to_vec())
+            .expect("failed to encode diffusion prepare specs");
+        buffer.into_inner()
     }
 
     pub fn train_step_report(
@@ -176,7 +203,7 @@ impl DiffusionTask {
         let alpha_bar = self.schedule.alpha_bar(diffusion_step);
         let step = diffusion_step.min(self.schedule.len().saturating_sub(1));
         let seed = fold_seed(seed);
-        let specs_bytes = Self::encode_prepare_uniform(DiffusionPrepareUniform {
+        let specs_bytes = Self::encode_prepare_specs(&[DiffusionPrepareUniform {
             alpha_bar,
             step: step as u32,
             seed,
@@ -185,7 +212,7 @@ impl DiffusionTask {
             timestep_channels: self.timestep_channels as u32,
             pixel_count: output.x * output.y,
             total_steps: self.schedule.len() as u32,
-        });
+        }]);
 
         let pass = self.ensure_prepare_pass(model, input, output)?;
         if clean_target.len() != pass.expected_target_len {
@@ -201,10 +228,43 @@ impl DiffusionTask {
             .write_buffer(&pass.clean_target, 0, bytemuck::cast_slice(clean_target));
         model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
 
+        // One sample, whatever the graph was built for: this entry point takes
+        // a single CPU-side target and fills slot 0.
         let loss = model.train_step_report_with_prepass(|encoder| {
-            pass.encode(encoder);
+            pass.encode_with_batch(encoder, 1);
         });
         Ok(loss)
+    }
+
+    /// `(sample_index, timestep)` for each slot of the batch.
+    ///
+    /// Factored out so the batched path and the sequential reference of
+    /// `train_step_batch_sequential` cannot drift: both draw from the same
+    /// shuffle, the same counter and the same sampler, which is what makes the
+    /// two paths comparable sample by sample.
+    fn plan_batch(
+        &mut self,
+        sample_count: usize,
+        step: usize,
+        batch_size: usize,
+        seed: u64,
+    ) -> Vec<(usize, usize)> {
+        let schedule_len = self.schedule.len();
+        (0..batch_size)
+            .map(|batch_offset| {
+                let counter = step.wrapping_mul(batch_size).wrapping_add(batch_offset);
+                let (epoch, position) = if sample_count == 0 {
+                    (0, 0)
+                } else {
+                    ((counter / sample_count) as u64, counter % sample_count)
+                };
+                let sample_index = self.shuffle.sample_index(position, epoch, sample_count);
+                (
+                    sample_index,
+                    self.sampler.draw(counter, schedule_len, seed),
+                )
+            })
+            .collect()
     }
 
     pub fn train_step_report_batch(
@@ -253,22 +313,106 @@ impl DiffusionTask {
 
         // Resolved up front: the shuffle borrows `self`, while `pass` below
         // borrows it mutably for the rest of the function.
-        let sample_count = dataset.sample_count();
-        let batch_plan: Vec<(usize, usize)> = (0..batch_size)
-            .map(|batch_offset| {
-                let counter = step.wrapping_mul(batch_size).wrapping_add(batch_offset);
-                let (epoch, position) = if sample_count == 0 {
-                    (0, 0)
-                } else {
-                    ((counter / sample_count) as u64, counter % sample_count)
-                };
-                let sample_index = self.shuffle.sample_index(position, epoch, sample_count);
-                (
-                    sample_index,
-                    self.sampler.draw(counter, schedule_len, seed),
-                )
+        let batch_plan = self.plan_batch(dataset.sample_count(), step, batch_size, seed);
+
+        // The graph carries the batch, so the graph must have been built for
+        // it. Anything else would silently train on a prefix (or read past the
+        // end of the spec array).
+        if model.batch() as usize != batch_size {
+            return Err(TrainingTaskError::InvalidBatchSize { batch_size });
+        }
+
+        let pass = self.ensure_prepare_pass(model, input, output)?;
+        if dataset.sample_len() != pass.expected_target_len {
+            return Err(TrainingTaskError::TargetLengthMismatch {
+                expected: pass.expected_target_len,
+                actual: dataset.sample_len(),
+            });
+        }
+
+        // Per-sample specs. Each entry is computed by EXACTLY the expression
+        // that computed it when the batch was unrolled on the CPU — same
+        // `batch_offset`, same `sample_index`, same `fold_seed`. That identity
+        // is what makes sample i of the batched step draw the same noise and
+        // the same timestep as sample i of the sequential step, and hence what
+        // makes an old-path/new-path training run comparable.
+        let specs: Vec<DiffusionPrepareUniform> = batch_plan
+            .iter()
+            .enumerate()
+            .map(|(batch_offset, &(sample_index, diffusion_step))| {
+                let step_seed = seed ^ ((batch_offset as u64) << 32) ^ sample_index as u64;
+                DiffusionPrepareUniform {
+                    alpha_bar: schedule.alpha_bar(diffusion_step),
+                    step: diffusion_step as u32,
+                    seed: fold_seed(step_seed),
+                    input_channels: input.z,
+                    signal_channels: output.z,
+                    timestep_channels,
+                    pixel_count: output.x * output.y,
+                    total_steps: schedule_len as u32,
+                }
             })
             .collect();
+        let specs_bytes = Self::encode_prepare_specs(&specs);
+        model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
+
+        // Dataset -> clean_target, one slot per sample. Submitted separately
+        // (and grouped by chunk) because chunk loading goes through
+        // `queue.write_buffer`, which would otherwise be applied ahead of the
+        // copies encoded before it — see `GpuDataset::copy_samples_to`.
+        let sample_indices: Vec<usize> = batch_plan.iter().map(|&(index, _)| index).collect();
+        let gpu = model.gpu.clone();
+        dataset
+            .copy_samples_to(gpu.as_ref(), &sample_indices, &pass.clean_target)
+            .map_err(|err| TrainingTaskError::DatasetError {
+                message: err.to_string(),
+            })?;
+
+        // ONE encoder, ONE submit: prepare, forward, loss, backward and the
+        // optimiser update for the whole batch. This is the change the mission
+        // is about — it used to be `1 + 16 + 1` submits at batch 16.
+        let loss = model.train_step_report_batched(batch_size, report_last_loss, |encoder| {
+            pass.encode(encoder);
+        });
+
+        Ok(loss)
+    }
+
+    /// The pre-batching training step, kept verbatim as a **test reference**.
+    ///
+    /// One `CommandEncoder` and one `submit` per sample, gradients accumulated
+    /// with `+=` between samples, optimiser applied once at the end. This is
+    /// the code the batched path has to agree with, and keeping it executable
+    /// — rather than freezing a fixture — means the equivalence tests compare
+    /// two things that both still run.
+    ///
+    /// Requires a model built at `batch = 1`.
+    #[cfg(test)]
+    pub(crate) fn train_step_batch_sequential(
+        &mut self,
+        model: &mut Model<Training>,
+        dataset: &mut GpuDataset,
+        step: usize,
+        batch_size: usize,
+        seed: u64,
+    ) -> Result<Option<f32>, TrainingTaskError> {
+        if batch_size == 0 {
+            return Err(TrainingTaskError::InvalidBatchSize { batch_size });
+        }
+        assert_eq!(
+            model.batch(),
+            1,
+            "the sequential reference needs a batch-1 graph"
+        );
+        let input = model.input_dim().ok_or(TrainingTaskError::EmptyModel)?;
+        let output = model.output_dim().ok_or(TrainingTaskError::EmptyModel)?;
+        if !same_dims(self.configured_input, input) || !same_dims(self.configured_output, output) {
+            self.configure(input, output)?;
+        }
+        let schedule = self.schedule.clone();
+        let schedule_len = schedule.len();
+        let timestep_channels = self.timestep_channels as u32;
+        let batch_plan = self.plan_batch(dataset.sample_count(), step, batch_size, seed);
 
         let pass = self.ensure_prepare_pass(model, input, output)?;
         if dataset.sample_len() != pass.expected_target_len {
@@ -282,10 +426,9 @@ impl DiffusionTask {
         let mut last_loss = None;
         model.begin_batch_accumulation();
         for (batch_offset, &(sample_index, diffusion_step)) in batch_plan.iter().enumerate() {
-            let alpha_bar = schedule.alpha_bar(diffusion_step);
             let step_seed = seed ^ ((batch_offset as u64) << 32) ^ sample_index as u64;
-            let specs_bytes = Self::encode_prepare_uniform(DiffusionPrepareUniform {
-                alpha_bar,
+            let specs_bytes = Self::encode_prepare_specs(&[DiffusionPrepareUniform {
+                alpha_bar: schedule.alpha_bar(diffusion_step),
                 step: diffusion_step as u32,
                 seed: fold_seed(step_seed),
                 input_channels: input.z,
@@ -293,19 +436,21 @@ impl DiffusionTask {
                 timestep_channels,
                 pixel_count: output.x * output.y,
                 total_steps: schedule_len as u32,
-            });
+            }]);
             model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
+            dataset
+                .copy_samples_to(gpu.as_ref(), &[sample_index], &pass.clean_target)
+                .map_err(|err| TrainingTaskError::DatasetError {
+                    message: err.to_string(),
+                })?;
 
-            let is_last = batch_offset + 1 == batch_size;
-            if is_last && report_last_loss {
+            if batch_offset + 1 == batch_size {
                 last_loss = model.train_step_report_with_prepass_no_opt(|encoder| {
-                    pass.encode_with_dataset(encoder, gpu.as_ref(), dataset, sample_index)
-                        .expect("diffusion dataset sample copy should be valid");
+                    pass.encode_with_batch(encoder, 1);
                 });
             } else {
                 model.train_step_with_prepass_no_opt(|encoder| {
-                    pass.encode_with_dataset(encoder, gpu.as_ref(), dataset, sample_index)
-                        .expect("diffusion dataset sample copy should be valid");
+                    pass.encode_with_batch(encoder, 1);
                 });
             }
         }
@@ -341,6 +486,9 @@ impl DiffusionTask {
                 !Arc::ptr_eq(&state.model_input, &model_input)
                     || !Arc::ptr_eq(&state.target_noise, &target_noise)
                     || state.expected_target_len != output.length() as usize
+                    // A resized batch means a resized spec array and a resized
+                    // clean_target; the model's buffers were rebuilt with it.
+                    || state.batch != model.batch()
             }
         };
 
@@ -365,20 +513,28 @@ impl DiffusionTask {
         target_noise: Arc<wgpu::Buffer>,
     ) -> DiffusionPreparePass {
         let device = &model.gpu.device;
+        let batch = model.batch().max(1);
         let expected_target_len = output.length() as usize;
-        let target_bytes = (expected_target_len * std::mem::size_of::<f32>()) as u64;
-        let specs_size = DiffusionPrepareUniform::SHADER_SIZE.get() as u64;
+        let target_bytes =
+            (expected_target_len * batch as usize * std::mem::size_of::<f32>()) as u64;
+        let specs_size = DiffusionPrepareUniform::SHADER_SIZE.get() as u64 * batch as u64;
 
         let clean_target = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("diffusion_clean_target"),
+            // COPY_SRC so tests can read back what the dataset copy landed.
             size: target_bytes.max(4),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        // A storage buffer, not a uniform: it is an array indexed by the sample,
+        // and a uniform array of structs would pay 16-byte element alignment for
+        // nothing.
         let specs = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("diffusion_prepare_specs"),
             size: specs_size.max(4),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -399,11 +555,9 @@ impl DiffusionTask {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            std::num::NonZeroU64::new(specs_size.max(4)).unwrap(),
-                        ),
+                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -473,7 +627,6 @@ impl DiffusionTask {
             compilation_options: Default::default(),
         });
 
-        let workgroups = input.length().div_ceil(64);
         DiffusionPreparePass {
             pipeline,
             bind_group,
@@ -482,40 +635,28 @@ impl DiffusionTask {
             model_input,
             target_noise,
             expected_target_len,
-            workgroups,
+            workgroups_per_sample: input.length().div_ceil(64),
+            batch,
         }
-    }
-
-    fn encode_prepare_uniform(specs: DiffusionPrepareUniform) -> Vec<u8> {
-        let mut buffer = UniformBuffer::new(Vec::new());
-        buffer
-            .write(&specs)
-            .expect("failed to encode diffusion prepare uniforms");
-        buffer.into_inner()
     }
 }
 
 impl DiffusionPreparePass {
     fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_with_batch(encoder, self.batch);
+    }
+
+    fn encode_with_batch(&self, encoder: &mut wgpu::CommandEncoder, batch: u32) {
+        let batch = batch.clamp(1, self.batch.max(1));
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("diffusion_prepare_pass"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.dispatch_workgroups(self.workgroups, 1, 1);
-    }
-
-    fn encode_with_dataset(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        gpu: &crate::gpu_context::GpuContext,
-        dataset: &mut GpuDataset,
-        sample_index: usize,
-    ) -> Result<(), super::GpuDatasetError> {
-        dataset.copy_sample_to(gpu, encoder, sample_index, &self.clean_target)?;
-        self.encode(encoder);
-        Ok(())
+        let (x, y) =
+            crate::model::layer::dispatch_grid(self.workgroups_per_sample * batch);
+        pass.dispatch_workgroups(x, y, 1);
     }
 }
 
@@ -656,6 +797,140 @@ mod tests {
             assert!(loss.is_some());
             assert!(loss.unwrap().is_finite());
         });
+    }
+
+    /// The batched prepass must give every sample bit-for-bit the noise and the
+    /// timestep embedding the sequential prepass gave it.
+    ///
+    /// This is the invariant the whole validation plan rests on: if sample i of
+    /// a batch draws different noise than it used to, an old-path/new-path
+    /// training comparison measures nothing, because the two runs are no longer
+    /// solving the same problem.
+    ///
+    /// The comparison is between two *code paths*, with no duplicated formula:
+    /// the batched step is run once, then `train_step_batch_sequential` — the
+    /// pre-batching loop, kept executable — is run with batch sizes 1, 2, ... B,
+    /// each leaving slot 0 holding the prepass output of its last sample. At
+    /// `step = 0` the counter is `0 * batch_size + offset == offset`, so slot j
+    /// of the batch of B and the last slot of the batch of j+1 are the same
+    /// (sample, timestep, batch_offset) triple — and must therefore produce the
+    /// same bits.
+    #[test]
+    fn batched_prepass_gives_each_sample_the_noise_it_had_alone() {
+        pollster::block_on(async {
+            const BATCH: usize = 4;
+            let gpu = Arc::new(GpuContext::new_headless().await);
+
+            // input z > output z: a diffusion model must be conditioned on t.
+            let build = |batch: u32| {
+                let gpu = gpu.clone();
+                async move {
+                    let mut model =
+                        Model::new_training(gpu, 0.01, batch, LossMethod::MeanSquared).await;
+                    model
+                        .add_layer(LayerTypes::Convolution(
+                            crate::model::layer_types::ConvolutionType::new(
+                                Dim3::new((4, 4, 3)),
+                                1,
+                                Dim3::new((3, 3, 3)),
+                                1,
+                                crate::model::PaddingMode::Same,
+                            ),
+                        ))
+                        .unwrap();
+                    model.build().unwrap();
+                    model
+                }
+            };
+            let mut batched = build(BATCH as u32).await;
+            let mut single = build(1).await;
+
+            let sample_len = 4 * 4;
+            let samples: Vec<Vec<f32>> = (0..BATCH)
+                .map(|s| {
+                    (0..sample_len)
+                        .map(|i| (s as f32 + 1.0) * 0.37 - i as f32 * 0.011)
+                        .collect()
+                })
+                .collect();
+            let mut dataset_batched =
+                GpuDataset::from_samples(gpu.as_ref(), samples.clone(), sample_len).unwrap();
+            let mut dataset_single =
+                GpuDataset::from_samples(gpu.as_ref(), samples, sample_len).unwrap();
+
+            let schedule = LinearNoiseSchedule::new_linear(64, 1e-4, 0.02);
+            let seed = 0xC0FFEE_u64;
+            let mut task_batched = DiffusionTask::new(schedule.clone());
+            let mut task_single = DiffusionTask::new(schedule);
+
+            task_batched
+                .train_step_report_batch(&mut batched, &mut dataset_batched, 0, BATCH, seed)
+                .unwrap();
+            let all_input = read_forward(&batched, 0, 0);
+            let all_noise = read_loss_forward(&batched, 1);
+
+            let input_len = 4 * 4 * 3;
+            for j in 0..BATCH {
+                task_single
+                    .train_step_batch_sequential(
+                        &mut single,
+                        &mut dataset_single,
+                        0,
+                        j + 1,
+                        seed,
+                    )
+                    .unwrap();
+                let alone_input = read_forward(&single, 0, 0);
+                let alone_noise = read_loss_forward(&single, 1);
+
+                let batched_slice = &all_input[j * input_len..(j + 1) * input_len];
+                let differing = alone_input[..input_len]
+                    .iter()
+                    .zip(batched_slice)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "\nx_t of sample {j} differs between the batched and the sequential \
+                     prepass ({differing}/{input_len} elements)\n\
+                     sequential[..6]: {:?}\nbatched[..6]:    {:?}\n",
+                    &alone_input[..6],
+                    &batched_slice[..6],
+                );
+
+                let batched_noise = &all_noise[j * sample_len..(j + 1) * sample_len];
+                let differing = alone_noise[..sample_len]
+                    .iter()
+                    .zip(batched_noise)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "\ntarget noise of sample {j} differs between the batched and the \
+                     sequential prepass ({differing}/{sample_len} elements)\n"
+                );
+            }
+
+            // Not vacuous: the samples must actually have drawn different noise,
+            // otherwise "every slice matches" is true for the wrong reason.
+            let first = &all_noise[..sample_len];
+            let last = &all_noise[(BATCH - 1) * sample_len..BATCH * sample_len];
+            assert!(
+                first.iter().zip(last).any(|(a, b)| (a - b).abs() > 1e-3),
+                "every sample of the batch drew the same noise — the per-sample seed \
+                 is not reaching the shader"
+            );
+        });
+    }
+
+    fn read_forward(model: &Model<crate::model::Training>, layer: usize, binding: usize) -> Vec<f32> {
+        let buffer = &model.layers[layer].buffers.forward[binding];
+        crate::model::debug::read_back_f32(model.gpu.as_ref(), buffer, buffer.size()).unwrap()
+    }
+
+    fn read_loss_forward(model: &Model<crate::model::Training>, binding: usize) -> Vec<f32> {
+        let buffer = &model.loss_layer.as_ref().unwrap().buffers.forward[binding];
+        crate::model::debug::read_back_f32(model.gpu.as_ref(), buffer, buffer.size()).unwrap()
     }
 
     /// Kept from PR #6: consecutive draws within a batch must not collapse onto

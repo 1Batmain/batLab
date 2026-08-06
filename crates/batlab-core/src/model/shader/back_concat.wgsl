@@ -1,4 +1,9 @@
 // File purpose: WGSL compute shader implementing back concat operations for model forward/backward or optimizer passes.
+//
+// The dispatch grid is 2-D when the batch pushes the workgroup count past
+// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
+// linear thread index is recovered from `num_workgroups` rather than read
+// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
 
 // Bindings match ConcatType::get_back_buffers_specs():
 //   [0] grad_output — incoming gradient for concatenated output
@@ -17,31 +22,45 @@ struct ConcatSpec {
     dim_output: vec3<u32>,
 }
 
+// Mirror of the forward split, with the same caveat: source and destination
+// have different per-sample lengths, so each gets its own offset.
 @compute @workgroup_size(64)
-fn concat_back_input(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn concat_back_input(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
     let total = layer_spec.dim_input.x * layer_spec.dim_input.y * layer_spec.dim_input.z;
-    if idx >= total { return; }
+    if idx >= arrayLength(&grad_input) { return; }
 
+    let sample = idx / total;
+    let local = idx % total;
     let input_c = layer_spec.dim_input.z;
     let out_c = layer_spec.dim_output.z;
-    let channel = idx % input_c;
-    let pixel_idx = idx / input_c;
-    let out_idx = pixel_idx * out_c + channel;
+    let pixels = layer_spec.dim_output.x * layer_spec.dim_output.y;
+    let channel = local % input_c;
+    let pixel_idx = local / input_c;
+    let out_idx = sample * pixels * out_c + pixel_idx * out_c + channel;
     grad_input[idx] = grad_output[out_idx];
 }
 
 @compute @workgroup_size(64)
-fn concat_back_skip(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn concat_back_skip(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let idx = gid.y * nwg.x * 64u + gid.x;
     let total = layer_spec.dim_skip.x * layer_spec.dim_skip.y * layer_spec.dim_skip.z;
-    if idx >= total { return; }
+    if idx >= arrayLength(&grad_skip) { return; }
 
+    let sample = idx / total;
+    let local = idx % total;
     let skip_c = layer_spec.dim_skip.z;
     let out_c = layer_spec.dim_output.z;
     let out_offset = layer_spec.dim_input.z;
-    let channel = idx % skip_c;
-    let pixel_idx = idx / skip_c;
-    let out_idx = pixel_idx * out_c + out_offset + channel;
+    let pixels = layer_spec.dim_output.x * layer_spec.dim_output.y;
+    let channel = local % skip_c;
+    let pixel_idx = local / skip_c;
+    let out_idx = sample * pixels * out_c + pixel_idx * out_c + out_offset + channel;
     grad_skip[idx] = grad_output[out_idx];
 }

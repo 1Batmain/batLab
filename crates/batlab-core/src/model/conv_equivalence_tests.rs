@@ -478,7 +478,7 @@ fn conv_reduction_lanes_agrees_with_dispatch() {
 
         // Every weight and every bias must be covered by the dispatch.
         let slots = 64 / lanes;
-        let counts = ty.get_back_workgroup_counts();
+        let counts = ty.get_back_workgroup_counts(1);
         let weight_len = shape.weight_len() as u32;
         assert_eq!(
             counts[1],
@@ -759,7 +759,7 @@ fn profile_convolution() {
                     gpu.as_ref(),
                     &[(
                         layer.pipeline.forward.as_ref().unwrap(),
-                        layer.ty.get_forward_workgroup_count(),
+                        layer.ty.get_forward_workgroup_count(layer.batch),
                     )],
                     fwd_bg,
                     32,
@@ -797,7 +797,7 @@ fn profile_convolution() {
                     gpu.as_ref(),
                     &[(
                         layer.pipeline.forward.as_ref().unwrap(),
-                        layer.ty.get_forward_workgroup_count(),
+                        layer.ty.get_forward_workgroup_count(layer.batch),
                     )],
                     fwd_bg,
                     iters,
@@ -901,7 +901,7 @@ fn bench_convolution_isolated() {
                     "forward",
                     fwd_bg,
                     (&fwd_old, legacy_forward_workgroups(shape)),
-                    (fwd_new, layer.ty.get_forward_workgroup_count()),
+                    (fwd_new, layer.ty.get_forward_workgroup_count(layer.batch)),
                 ),
                 (
                     "back_input",

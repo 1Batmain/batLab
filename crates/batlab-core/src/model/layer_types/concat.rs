@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding,
     ForwardBufferSource, LayerType, SavedGradientRoute, ShaderDescriptor,
 };
@@ -58,10 +59,11 @@ impl LayerType for ConcatType {
         vec!["concat_back_input", "concat_back_skip"]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
+        // Both sub-passes are elementwise scatters over activations.
         vec![
-            self.dim_input.length().div_ceil(64),
-            self.dim_skip.length().div_ceil(64),
+            (self.dim_input.length() * batch).div_ceil(64),
+            (self.dim_skip.length() * batch).div_ceil(64),
         ]
     }
 
@@ -73,8 +75,8 @@ impl LayerType for ConcatType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| {
                 let source = match name.as_str() {
@@ -96,8 +98,8 @@ impl LayerType for ConcatType {
             .collect()
     }
 
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
-        self.get_back_buffers_specs()
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs(batch)
             .into_iter()
             .enumerate()
             .map(|(index, (name, spec))| BackwardBufferBinding {
@@ -142,7 +144,7 @@ impl LayerType for ConcatType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         let read_storage = |size: u32| BufferSpec {
             size: size.max(4),
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
@@ -156,11 +158,11 @@ impl LayerType for ConcatType {
         vec![
             (
                 "input".to_string(),
-                read_storage(self.dim_input.bytes_size()),
+                read_storage(batched_bytes(self.dim_input, batch)),
             ),
             (
                 "skip_input".to_string(),
-                read_storage(self.dim_skip.bytes_size()),
+                read_storage(batched_bytes(self.dim_skip, batch)),
             ),
             (
                 "specs".to_string(),
@@ -181,7 +183,7 @@ impl LayerType for ConcatType {
             (
                 "output".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -194,7 +196,7 @@ impl LayerType for ConcatType {
         ]
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         let storage = |size: u32, read_only: bool| BufferSpec {
             size: size.max(4),
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
@@ -208,7 +210,7 @@ impl LayerType for ConcatType {
         vec![
             (
                 "grad_output".to_string(),
-                storage(self.dim_output.bytes_size(), true),
+                storage(batched_bytes(self.dim_output, batch), true),
             ),
             (
                 "specs".to_string(),
@@ -228,11 +230,11 @@ impl LayerType for ConcatType {
             ),
             (
                 "grad_input".to_string(),
-                storage(self.dim_input.bytes_size(), false),
+                storage(batched_bytes(self.dim_input, batch), false),
             ),
             (
                 "grad_skip".to_string(),
-                storage(self.dim_skip.bytes_size(), false),
+                storage(batched_bytes(self.dim_skip, batch), false),
             ),
         ]
     }

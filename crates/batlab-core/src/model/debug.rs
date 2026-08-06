@@ -17,6 +17,21 @@ pub(crate) fn read_back_f32(
     buf: &wgpu::Buffer,
     size_bytes: u64,
 ) -> Option<Vec<f32>> {
+    read_back_f32_at(gpu, buf, 0, size_bytes)
+}
+
+/// Same, starting at `offset_bytes` into the buffer.
+///
+/// Batched activation buffers hold `batch` tensors back to back, so reading
+/// "the tensor of sample i" is a read at an offset, not a read of a prefix.
+/// `offset_bytes` must be a multiple of `COPY_BUFFER_ALIGNMENT` (4) — every
+/// caller offsets by a whole f32 tensor, so it is.
+pub(crate) fn read_back_f32_at(
+    gpu: &GpuContext,
+    buf: &wgpu::Buffer,
+    offset_bytes: u64,
+    size_bytes: u64,
+) -> Option<Vec<f32>> {
     if size_bytes == 0 {
         return Some(vec![]);
     }
@@ -31,7 +46,7 @@ pub(crate) fn read_back_f32(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, size_bytes);
+    encoder.copy_buffer_to_buffer(buf, offset_bytes, &staging, 0, size_bytes);
     gpu.queue.submit([encoder.finish()]);
 
     let slice = staging.slice(..);
@@ -171,7 +186,7 @@ impl fmt::Debug for LayerDebugView<'_> {
         s.field("fwd_workgroups", &layer.num_workgroups);
 
         let back_eps = layer.ty.get_back_entrypoints();
-        let back_wgs = layer.ty.get_back_workgroup_counts();
+        let back_wgs = layer.ty.get_back_workgroup_counts(layer.batch);
         if !back_eps.is_empty() {
             let bwd_passes: Vec<String> = back_eps
                 .iter()
@@ -182,7 +197,7 @@ impl fmt::Debug for LayerDebugView<'_> {
         }
 
         // Forward buffers
-        let fwd_specs = layer.ty.get_buffers_specs();
+        let fwd_specs = layer.ty.get_buffers_specs(layer.batch);
         let fwd_descs: Vec<String> = layer
             .buffers
             .forward
@@ -203,7 +218,7 @@ impl fmt::Debug for LayerDebugView<'_> {
 
         // Backward buffers (present after build())
         if let Some(bwd_bufs) = &layer.buffers.backward {
-            let bwd_specs = layer.ty.get_back_buffers_specs();
+            let bwd_specs = layer.ty.get_back_buffers_specs(layer.batch);
             let bwd_descs: Vec<String> = bwd_bufs
                 .iter()
                 .enumerate()

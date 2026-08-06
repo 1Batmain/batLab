@@ -1229,7 +1229,11 @@ async fn run_training(
     let estimated_training_bytes = model
         .estimated_gpu_bytes()
         .saturating_add(gpu_dataset.gpu_buffer_bytes())
-        .saturating_add(trainer.task().estimated_prepare_gpu_bytes(output_dims));
+        .saturating_add(
+            trainer
+                .task()
+                .estimated_prepare_gpu_bytes_for_batch(output_dims, train_cfg.batch_size.max(1)),
+        );
     let _ = tx.send(tui::TrainingEvent::ResourceReport {
         max_buffer_bytes: limits.max_buffer_size,
         max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
@@ -1537,7 +1541,12 @@ fn apply_training_control_command(
             *current_batch_size = batch_size.max(1);
             *total_steps = new_total_steps.max(1);
             model.set_learning_rate(*current_lr);
-            model.set_batch_size(*current_batch_size);
+            // Rebuilds the graph when the batch actually changes: the batch
+            // axis is baked into every activation buffer. Weights, Adam moments
+            // and the step counter survive the rebuild (see `resize_batch`).
+            if let Err(err) = model.resize_batch(*current_batch_size) {
+                eprintln!("[training] could not resize the batch: {err}");
+            }
         }
         // Perpetual-only controls. The monitor gates them on the run mode, so
         // reaching one here means a stale command from a previous run's

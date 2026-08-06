@@ -2,6 +2,7 @@
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
+    Batch, batched_bytes,
     BackwardBufferBinding, BackwardBufferSource, BufferInit, ForwardBufferBinding,
     ForwardBufferSource, LayerType, OptimizerBindings, ShaderDescriptor,
 };
@@ -154,8 +155,8 @@ impl LayerType for ConvolutionType {
         self.dim_output
     }
 
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding> {
-        self.get_buffers_specs()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding> {
+        self.get_buffers_specs(batch)
             .into_iter()
             .map(|(name, spec)| ForwardBufferBinding {
                 init: match name.as_str() {
@@ -174,8 +175,8 @@ impl LayerType for ConvolutionType {
             .collect()
     }
 
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
-        self.get_back_buffers_specs()
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        self.get_back_buffers_specs(batch)
             .into_iter()
             .enumerate()
             .map(|(index, (name, spec))| BackwardBufferBinding {
@@ -219,13 +220,23 @@ impl LayerType for ConvolutionType {
         vec!["conv_back_input", "conv_back_weights", "conv_back_bias"]
     }
 
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
         // grad_weights / grad_bias no longer run one thread per output element:
         // a workgroup carries `reduction_slots()` independent sums, each split
         // across `64 / slots` cooperating lanes.
+        //
+        // The batch axis splits the three sub-passes in two:
+        //   - `grad_input` writes one activation per thread, so it scales with
+        //     the batch like any elementwise pass;
+        //   - `grad_weights` / `grad_bias` write *parameters*. There are
+        //     exactly as many sums as there are weights whatever the batch, so
+        //     their workgroup count is unchanged and the batch enters inside
+        //     the kernel, as `batch * OH * OW` positions to reduce instead of
+        //     `OH * OW`. That is the whole point of the exercise: one `+=` per
+        //     weight and per step instead of one per weight and per sample.
         let slots = self.reduction_slots();
         vec![
-            self.dim_input.length().div_ceil(WG_SIZE),
+            (self.dim_input.length() * batch).div_ceil(WG_SIZE),
             (self.dim_kernel.length() * self.nb_kernel).div_ceil(slots),
             self.nb_kernel.div_ceil(slots),
         ]
@@ -282,13 +293,13 @@ impl LayerType for ConvolutionType {
         Ok(self.dim_output)
     }
 
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         vec![
             // [0] input — shared with previous layer's output
             (
                 "input".to_string(),
                 BufferSpec {
-                    size: self.dim_input.bytes_size().max(4),
+                    size: batched_bytes(self.dim_input, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -347,7 +358,7 @@ impl LayerType for ConvolutionType {
             (
                 "output".to_string(),
                 BufferSpec {
-                    size: self.dim_output.bytes_size().max(4),
+                    size: batched_bytes(self.dim_output, batch).max(4),
                     usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
@@ -360,7 +371,7 @@ impl LayerType for ConvolutionType {
         ]
     }
 
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
         // Backward bind group layout (all three sub-passes share this layout):
         //   [0] fwd_input    — shared from forward[0]
         //   [1] weights      — shared from forward[1]
@@ -392,7 +403,7 @@ impl LayerType for ConvolutionType {
         vec![
             (
                 "fwd_input".to_string(),
-                read_storage(self.dim_input.bytes_size()),
+                read_storage(batched_bytes(self.dim_input, batch)),
             ),
             ("weights".to_string(), read_storage(self.kernel_bytes())),
             (
@@ -413,11 +424,11 @@ impl LayerType for ConvolutionType {
             ),
             (
                 "grad_output".to_string(),
-                read_storage(self.dim_output.bytes_size()),
+                read_storage(batched_bytes(self.dim_output, batch)),
             ),
             (
                 "grad_input".to_string(),
-                write_storage(self.dim_input.bytes_size()),
+                write_storage(batched_bytes(self.dim_input, batch)),
             ),
             (
                 "grad_weights".to_string(),

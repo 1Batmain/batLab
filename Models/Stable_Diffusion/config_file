@@ -183,7 +183,8 @@
     "random_seed": true,
     "seed": null,
     "denoising_paths": 1,
-    "denoise_magnitude": 1.0
+    "denoise_magnitude": 1.0,
+    "checkpoint": null
   },
   "run": {
     "mode": "Infer"

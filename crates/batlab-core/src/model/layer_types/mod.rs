@@ -80,6 +80,38 @@ pub(crate) struct SavedGradientRoute {
     pub buffer_index: usize,
 }
 
+/// How many samples the graph carries at once.
+///
+/// The batch axis is *implicit* everywhere: it is carried by the size of the
+/// per-sample buffers and by the dispatch grid, never by a uniform field (see
+/// `docs/reports/BATCH_DISPATCH_DESIGN.md` §2). A kernel recovers its sample
+/// index as `global_index / per_sample_length`, and the per-sample length is
+/// already in its uniform. Consequences worth spelling out:
+///
+/// - the uniform of every layer keeps its exact size and offsets, so the
+///   legacy fixtures of `conv_equivalence_tests` / `group_norm_equivalence_tests`
+///   still bind the very same buffer;
+/// - there is a single source of truth for the batch — the buffer size — so a
+///   uniform can never disagree with what was actually allocated.
+///
+/// A layer type receives the batch in the four methods that size buffers and
+/// count workgroups, and applies it *itself* to the bindings that carry a batch
+/// axis. That inventory (activations yes, parameters and their gradients no) is
+/// the substance of the change and belongs with the layer that owns it.
+pub(crate) type Batch = u32;
+
+/// Bytes for a per-sample tensor laid out `batch` times back to back.
+///
+/// Every call site of this function is, by construction, a buffer that carries
+/// a batch axis. The buffers that do *not* — weights, biases, γ/β, their
+/// gradients, the optimiser state and every `specs` uniform — size themselves
+/// without it. Grepping for this name gives the inventory of §2 of the design
+/// note, and the absence of it on a gradient accumulator is the statement that
+/// the accumulator is a *reduction* over the batch, not a slice of it.
+pub(crate) fn batched_bytes(dim: Dim3, batch: Batch) -> u32 {
+    (dim.bytes_size() * batch).max(4)
+}
+
 #[enum_dispatch]
 pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
     fn get_forward_shader(&self) -> ShaderDescriptor;
@@ -95,7 +127,13 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
         vec![]
     }
     /// Workgroup counts for each backward sub-pass (must match get_back_entrypoints length).
-    fn get_back_workgroup_counts(&self) -> Vec<u32> {
+    ///
+    /// `batch` is applied per sub-pass, and the split is the whole point: a
+    /// pass that maps one thread to one *activation* scales with the batch,
+    /// a pass that reduces onto a *parameter* does not — it keeps its
+    /// workgroup count and folds the batch into its own reduction loop.
+    fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
+        let _ = batch;
         vec![]
     }
     /// Whether this layer has trainable weight buffers.
@@ -107,24 +145,25 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
     /// element, `@workgroup_size(64)`. Layers whose forward kernel maps a
     /// workgroup to something else (e.g. GroupNorm: one workgroup per group,
     /// cooperating on a reduction) override this.
-    fn get_forward_workgroup_count(&self) -> u32 {
-        self.get_dim_output().length().div_ceil(64)
+    fn get_forward_workgroup_count(&self, batch: Batch) -> u32 {
+        (self.get_dim_output().length() * batch).div_ceil(64)
     }
     fn get_dim_input(&self) -> Dim3;
     fn get_dim_output(&self) -> Dim3;
-    fn get_forward_buffer_bindings(&self) -> Vec<ForwardBufferBinding>;
-    fn get_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
-        self.get_forward_buffer_bindings()
+    fn get_forward_buffer_bindings(&self, batch: Batch) -> Vec<ForwardBufferBinding>;
+    fn get_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
+        self.get_forward_buffer_bindings(batch)
             .into_iter()
             .map(|binding| (binding.name, binding.spec))
             .collect()
     }
-    fn get_back_buffer_bindings(&self) -> Vec<BackwardBufferBinding> {
+    fn get_back_buffer_bindings(&self, batch: Batch) -> Vec<BackwardBufferBinding> {
+        let _ = batch;
         vec![]
     }
     /// Specs for ALL bindings in the backward bind group (shared forward + new buffers).
-    fn get_back_buffers_specs(&self) -> Vec<(String, BufferSpec)> {
-        self.get_back_buffer_bindings()
+    fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
+        self.get_back_buffer_bindings(batch)
             .into_iter()
             .map(|binding| (binding.name, binding.spec))
             .collect()
