@@ -351,6 +351,14 @@ impl Model<Training> {
         F: FnOnce(&mut wgpu::CommandEncoder),
     {
         debug_assert!(self.state.is_build, "call build() before train_step()");
+        // Single-sample entry point: it writes slot 0 and reads slot 0, but the
+        // graph it encodes covers `self.batch` samples. On a batched graph the
+        // other slots would be computed from stale memory and their gradients
+        // accumulated as if they were data.
+        debug_assert_eq!(
+            self.batch, 1,
+            "train_step_report_with_prepass is a batch-1 entry point"
+        );
         // Single sample, no accumulation: the gradient is already its own mean.
         self.publish_optimizer_specs(1.0);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
@@ -577,6 +585,11 @@ impl<State> Model<State> {
         self.pending_loss_readback = None;
         self.last_reported_loss = None;
         self.loss_readback_disabled = false;
+        // Back to the inference default. `build()` re-reads the training batch
+        // size right after clearing, so this only ever affects a model that is
+        // cleared and never rebuilt for training — including
+        // `Model<Infer>::build_model`, which must always be 1.
+        self.batch = 1;
     }
 
     /// Samples the built graph carries at once (1 for inference).

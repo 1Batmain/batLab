@@ -451,6 +451,14 @@ _À compléter — voir §9._
 - **La longueur des chaînes d'accumulation a été multipliée par `B`.** C'est la
   contrepartie numérique du §4.3. Elle est bornée et documentée, mais elle est
   réelle : à batch 64 les chaînes sont 4× plus longues encore qu'à batch 16.
+- **Le visualiseur montre le PREMIER échantillon du batch.** Il indexe le
+  tampon de sortie par `(y·largeur + x)·canaux` avec les dimensions **par
+  échantillon**, donc il lit la tranche 0. Avant le batching, ce tampon
+  contenait le **dernier** échantillon soumis (chacun écrasait le précédent) —
+  et c'est le dernier dont la loss est rapportée. Ce n'est pas un bug (la
+  tranche lue est valide et complète), mais l'image affichée et le nombre
+  affiché ne décrivent plus le même échantillon. Corriger demanderait de lier
+  le tampon avec un offset, côté `batlab_ui` ; hors périmètre ici, et noté.
 - `PoolingType` n'a pas de shader (`panic!("not wired yet")`) et n'est pas dans
   l'enum `LayerTypes` : ses dispatches ont été rendus batch-conscients par
   cohérence, rien n'a pu être testé.
