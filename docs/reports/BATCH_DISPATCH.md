@@ -14,9 +14,9 @@ qu'on attendait.
 
 ## Résumé
 
-Le batch est passé de la boucle CPU aux dispatches. À batch 16, un pas
-d'entraînement est passé de **18 `submit`** à **2**, et chaque kernel voit
-désormais 16 fois plus de travail par lancement.
+Le batch est passé de la boucle CPU aux dispatches. À batch 16, tout le calcul
+d'un pas d'entraînement tient désormais dans **une seule soumission** au lieu de
+**18**, et chaque kernel voit 16 fois plus de travail par lancement.
 
 _(Tableau de speedup : §7.)_
 
@@ -125,14 +125,26 @@ Par pas d'entraînement, batch 16, `Greyscale_Diffusion_L` :
 
 | | avant | après |
 |---|---:|---:|
-| `CommandEncoder` | 18 | 2 |
-| `queue.submit` | 18 | 2 |
+| `submit` portant du **calcul** | 18 | **1** |
+| `submit` de copies dataset | 0 (encodées dans les 18) | ≈ 3,96 |
+| `submit` au total | 18 | ≈ 4,96 |
 | workgroups du forward de `conv4` (modèle S) | 16 | 256 |
 | positions sommées par `grad_weights` de `conv1` | 1024, **× 16 fois** | 16384, **1 fois** |
 
-Les 2 soumissions sont : les copies dataset → `clean_target` (une par chunk
-résident ; le dataset CIFAR-10 gris tient dans un chunk, donc une), et le graphe
-complet.
+**La ligne qui compte est la première** : tout le calcul d'un pas tient
+désormais dans **une** soumission, contre 18. Les copies dataset sont
+soumises à part, une par chunk **distinct** touché par le batch, pour la raison
+d'ordonnancement du §3.5.
+
+Et il faut être précis sur ce « ≈ 3,96 », parce que la première rédaction de ce
+rapport écrivait « le dataset gris tient dans un chunk, donc une soumission » —
+c'était faux, et la vérification l'a montré. Sur cette machine
+`max_storage_buffer_binding_size` vaut 128 MiB, la règle de
+`select_max_chunk_bytes` retient **64 MiB** par chunk, et CIFAR-10 gris
+(50 000 × 4 KiB = 204,8 Mo) occupe donc **4 chunks**. Un batch de 16 indices
+tirés dans toute la permutation en touche `4·(1 − (3/4)^16) ≈ 3,96` en
+espérance. Voir §5.2 : c'est aussi ce qui rend l'ancien chemin coûteux en
+téléversements.
 
 ### 2.5 Ce qui n'a **pas** changé
 
