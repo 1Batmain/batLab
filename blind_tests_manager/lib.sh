@@ -36,6 +36,17 @@ fail() {
 }
 skip() { BT_SKIP=$((BT_SKIP+1)); printf '  \033[33mskip\033[0m %s\n' "$1"; }
 
+# Écart entre deux textes de spec, ou spec muette là où l'ordre de mission
+# attend quelque chose : ce n'est pas un bug du code, on le consigne sans le
+# compter en échec. Un aveugle signale, il ne tranche pas.
+BT_GAP=0
+spec_gap() {
+  BT_GAP=$((BT_GAP+1))
+  printf '  \033[36mSPEC\033[0m %s\n' "$1"
+  printf '       %s\n' "${2:-}"
+  { echo "SPEC-GAP [${BT_PROP:-?}] $1"; echo "     ${2:-}"; } >> "$BT_FAILLOG"
+}
+
 # assert_contains <écran> <motif> <message> <spec>
 assert_contains() {
   if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else
@@ -203,6 +214,7 @@ PY
 
 bt_summary() {
   echo
-  printf '  ── %s : %d ok, %d FAIL, %d skip\n' "${BT_PROP:-suite}" "$BT_PASS" "$BT_FAIL" "$BT_SKIP"
+  printf '  ── %s : %d ok, %d FAIL, %d skip, %d écart(s) de spec\n' \
+    "${BT_PROP:-suite}" "$BT_PASS" "$BT_FAIL" "$BT_SKIP" "$BT_GAP"
   [ "$BT_FAIL" -eq 0 ]
 }
