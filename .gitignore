@@ -21,3 +21,6 @@ blind_tests/out/
 
 # blind_tests/run.sh recopie ce checkpoint depuis le dépôt principal à chaque run
 Models/*/pretrained_weights/night_run.ckpt
+
+# suite à l'aveugle de l'attention : racine de stockage jetable (BATLAB_ROOT)
+blind_tests_attention/work/
