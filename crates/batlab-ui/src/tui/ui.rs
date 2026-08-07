@@ -5,6 +5,7 @@ use super::app::{
     MODEL_ACTIONS, ModelAction, MonitorImage, NEW_MODEL_ENTRY, PERPETUAL_PARAM_FIELD_NAMES,
     PathStep, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
+use super::help;
 use ratatui::{prelude::*, widgets::*};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -125,6 +126,62 @@ fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
+// The help panel — what the focused parameter actually does
+// ---------------------------------------------------------------------------
+
+/// How wide the panel is when it is shown.
+const HELP_PANEL_WIDTH: u16 = 46;
+/// Below this total width the panel is dropped entirely. The bound leaves the
+/// form the ~60 columns its longest hint line needs: squeezing both is how a
+/// help panel turns into two unreadable columns.
+const HELP_MIN_TOTAL_WIDTH: u16 = 106;
+
+/// Splits a screen's area into `(body, help)`, or hands the whole thing back
+/// when the terminal is too narrow to carry both.
+fn split_for_help(area: Rect, has_help: bool) -> (Rect, Option<Rect>) {
+    if !has_help || area.width < HELP_MIN_TOTAL_WIDTH {
+        return (area, None);
+    }
+    let columns =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(HELP_PANEL_WIDTH)]).split(area);
+    (columns[0], Some(columns[1]))
+}
+
+fn draw_help_panel(f: &mut Frame, entry: &help::HelpEntry, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(format!(" {} ", entry.title))
+        .title_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for paragraph in entry.body {
+        lines.push(Line::from(Span::styled(
+            *paragraph,
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    if let Some(source) = entry.source {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("→ docs/reports/{source}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }),
+        inner.inner(Margin {
+            horizontal: 1,
+            vertical: 0,
+        }),
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -166,10 +223,12 @@ fn focused_value(focused: bool) -> Style {
     }
 }
 
-/// Generic form screen (text fields).
+/// Generic form screen (text fields), with the focused field's explanation
+/// beside it when the terminal is wide enough to carry one.
 fn draw_form_screen(
     f: &mut Frame,
     area: Rect,
+    screen: Screen,
     title: &str,
     field_names: &[&str],
     fields: &[String],
@@ -177,6 +236,12 @@ fn draw_form_screen(
     error: Option<&str>,
     hint: &str,
 ) {
+    let entry = help::help_for(screen, field_idx);
+    let (area, help_area) = split_for_help(area, entry.is_some());
+    if let (Some(entry), Some(help_area)) = (entry, help_area) {
+        draw_help_panel(f, entry, help_area);
+    }
+
     let popup = centered_rect(56, 70, area);
     f.render_widget(Clear, popup);
 
@@ -571,6 +636,14 @@ fn draw_template_selector(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_weight_selector(f: &mut Frame, app: &App, area: Rect) {
+    // The weight choice is a parameter like any other now that it has a
+    // default, so it gets the same panel as the forms.
+    let entry = help::help_for(Screen::WeightSelector, app.weight_selector.selected);
+    let (area, help_area) = split_for_help(area, entry.is_some());
+    if let (Some(entry), Some(help_area)) = (entry, help_area) {
+        draw_help_panel(f, entry, help_area);
+    }
+
     let popup = centered_rect(70, 66, area);
     f.render_widget(Clear, popup);
 
@@ -659,6 +732,7 @@ fn draw_input_size(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
         area,
+        Screen::InputSize,
         "Model Input Size",
         &INPUT_SIZE_FIELD_NAMES,
         &app.input_size.fields,
@@ -908,6 +982,7 @@ fn draw_training_params(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
         area,
+        Screen::TrainingParams,
         "Training Parameters",
         &TRAINING_PARAM_FIELD_NAMES,
         &values,
@@ -932,6 +1007,7 @@ fn draw_inference_params(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
         area,
+        Screen::InferenceParams,
         "Inference Parameters",
         &INFERENCE_PARAM_FIELD_NAMES,
         &values,
@@ -958,6 +1034,7 @@ fn draw_perpetual_params(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
         area,
+        Screen::PerpetualParams,
         "Perpetual Inference",
         &PERPETUAL_PARAM_FIELD_NAMES,
         &values,
@@ -1658,6 +1735,7 @@ fn draw_training_control(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
         area,
+        Screen::TrainingControl,
         "Training Controls",
         &TRAINING_CONTROL_FIELD_NAMES,
         &app.training_control.fields,
