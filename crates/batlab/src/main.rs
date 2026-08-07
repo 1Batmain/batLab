@@ -13,9 +13,10 @@ use batlab_ui::tui::{
     RunMode, TrainingConfig,
 };
 use batlab_core::{
-    ActivationMethod as PActivation, ActivationType, AttentionType, ConvolutionType, DEFAULT_SNR_GAMMA,
-    DenoiseFrame, DiffusionTask, Dim3, DriftAction, DriftWalk, FullyConnectedType, GpuContext,
-    GpuDataset,
+    ActivationMethod as PActivation, ActivationType, AttentionType, CheckpointWeights,
+    ConvolutionType, DEFAULT_SNR_GAMMA,
+    DenoiseFrame, DiffusionTask, Dim3, DriftAction, DriftWalk, EmaConfig, FullyConnectedType,
+    GpuContext, GpuDataset,
     GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
     MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
     Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame_view, log_probe,
@@ -51,13 +52,46 @@ are not reachable from the TUI and never write back a model's config_file.
   --headless-train <model> --steps N --dataset <path>
       [--lr F] [--batch N] [--out <ckpt>] [--optimizer sgd|adam]
       [--weight-init uniform|he] [--loss-weighting uniform|snr] [--snr-gamma F]
+      [--ema F] [--resume <ckpt>] [--checkpoint-every N]
 
   --headless-sample <model> [--checkpoint <path>] [--seed N] [--paths N]
-      [--magnitude F] [--out <img>] [--log <jsonl>]
+      [--magnitude F] [--out <img>] [--log <jsonl>] [--raw-weights]
 
   --headless-perpetual <model> [--checkpoint <path>] [--regime wander|breathe|flux]
       [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
       [--frames N] [--actions N] [--window] [--climb-frames N] [--out <dir>]
+      [--raw-weights]
+
+Weight averaging (EMA):
+  --ema F           keep an exponential moving average of the weights,
+                    `ema <- d*ema + (1-d)*w` after every optimiser step, with
+                    d = min(F, (1+t)/(10+t)) — a warmup ramp — and the shadow
+                    seeded with the weights, never with zeros. F must be
+                    strictly between 0 and 1; 0.999 is the usual choice.
+                    ABSENT MEANS NO AVERAGING: the run is bit-for-bit what it
+                    was before this flag existed, down to the checkpoint bytes.
+                    A run that keeps an average writes a BBCKPT3 checkpoint
+                    holding BOTH weight sets (BBCKPT2 = raw only, still read
+                    and still written by runs without --ema).
+  --raw-weights     generate from the LAST ITERATE instead of the average.
+                    Sampling and perpetual use the average whenever the
+                    checkpoint carries one; this is the other arm of the
+                    comparison. Both paths print which set they loaded.
+
+Resuming and partial checkpoints:
+  --resume <ckpt>   continue a run from <ckpt>: weights, Adam moments, the
+                    global step counter t, and the EMA if the file has one.
+                    Writes to --out, so it never overwrites what it resumed
+                    from unless told to. A checkpoint of another architecture
+                    is refused, not truncated. Without it a headless run still
+                    starts from scratch.
+  --checkpoint-every N
+                    write a partial checkpoint every N steps to
+                    `<out stem>.partial.ckpt` — ONE file, rotated, written via
+                    a temp file and an atomic rename so a kill mid-write can
+                    never leave a truncated .ckpt. It is a normal checkpoint:
+                    --resume and the TUI weight selector both see it. Default:
+                    only at the end of the run, as before.
 
 Perpetual notes:
   --regime          wander (errance) | breathe (respiration) | flux. French
@@ -380,6 +414,50 @@ impl<State> batlab_core::NoisePredictor for ModelNoise<'_, State> {
     }
 }
 
+/// Which weight set a headless generating run asks for.
+///
+/// The default is the average, because a checkpoint that has one was written by
+/// a run that wanted to be sampled from it. `--raw-weights` is what makes the
+/// comparison possible — and it is a *bare* flag, so it cannot swallow the
+/// argument after it.
+fn weights_source(args: &[String]) -> CheckpointWeights {
+    if args.iter().any(|arg| arg == "--raw-weights") {
+        CheckpointWeights::Raw
+    } else {
+        CheckpointWeights::Ema
+    }
+}
+
+/// Load a checkpoint for **generating**, and say which of its two weight sets
+/// was used.
+///
+/// Every sampling path goes through here — the two headless entry points and
+/// the two TUI ones — so "generation uses the average when the file has one"
+/// is one decision in one place rather than four that can drift.
+///
+/// The line it prints is the contract's observable half: an EMA comparison is
+/// worthless if the two arms might silently have loaded the same weights, and
+/// `carries_ema` vs `used_ema` is exactly what tells them apart.
+fn load_sampling_checkpoint(
+    model: &mut Model<Training>,
+    path: &Path,
+    source: CheckpointWeights,
+) -> Result<(), String> {
+    let report = model
+        .load_checkpoint_with(path, source)
+        .map_err(|err| format!("failed to load checkpoint {}: {err}", path.display()))?;
+    let which = match (report.carries_ema, report.used_ema) {
+        (true, true) => format!(
+            "EMA weights (decay {:.5})",
+            report.ema_decay.unwrap_or_default()
+        ),
+        (true, false) => "raw weights (the file also carries an EMA)".to_string(),
+        (false, _) => "raw weights (the file carries no EMA)".to_string(),
+    };
+    println!("[weights] {} → {which}", path.display());
+    Ok(())
+}
+
 /// See the DEV/CI note in `main`.
 fn run_headless_train(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
@@ -401,6 +479,9 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             "--weight-init",
             "--loss-weighting",
             "--snr-gamma",
+            "--ema",
+            "--resume",
+            "--checkpoint-every",
         ],
         &[],
     )?;
@@ -427,6 +508,27 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         Some(value) => WeightInit::parse(&value)
             .ok_or_else(|| format!("invalid value for --weight-init: {value} (want uniform|he)"))?,
         None => WeightInit::default(),
+    };
+    // Absent means no averaging at all, bit for bit the run this binary did
+    // before the flag existed — not "averaging with some default decay".
+    let ema = match flag("--ema") {
+        Some(value) => Some(EmaConfig::parse(&value).ok_or_else(|| {
+            format!("invalid value for --ema: {value} (want a decay strictly between 0 and 1, e.g. 0.999)")
+        })?),
+        None => None,
+    };
+    let resume_from = flag("--resume").map(PathBuf::from);
+    let checkpoint_every = match flag("--checkpoint-every") {
+        Some(value) => {
+            let steps: usize = value
+                .parse()
+                .map_err(|_| format!("invalid value for --checkpoint-every: {value}"))?;
+            if steps == 0 {
+                return Err("--checkpoint-every takes a number of steps > 0".to_string());
+            }
+            Some(steps)
+        }
+        None => None,
     };
     let snr_gamma = parse("--snr-gamma", DEFAULT_SNR_GAMMA)?;
     let loss_weighting = match flag("--loss-weighting") {
@@ -461,20 +563,38 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
         },
         checkpoint_path: Some(checkpoint_path),
         // Fixes #1 and #4 changed the convolution operator and the data range,
-        // so any pre-existing checkpoint is meaningless. Always start fresh.
+        // so any pre-existing checkpoint is meaningless. Always start fresh —
+        // unless `--resume` names a file, which is the explicit opt-in.
         load_checkpoint: false,
         optimizer,
         weight_init,
         loss_weighting,
+        ema_decay: ema.map(|e| e.decay),
     };
     config.run.mode = RunMode::Train(train_cfg.clone());
 
+    // The banner re-emits the parsed configuration: `bench/optimizer/lib.sh`
+    // asserts on it, and it is the only way a scripted run can prove a flag
+    // was understood rather than dropped.
     println!(
         "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
-         optimizer={}, init={}, loss-weighting={}, dataset={}",
+         optimizer={}, init={}, loss-weighting={}, ema={}, resume={}, checkpoint-every={}, \
+         dataset={}",
         optimizer.label(),
         weight_init.label(),
         loss_weighting.label(),
+        match ema {
+            Some(config) => config.decay.to_string(),
+            None => "off".to_string(),
+        },
+        match resume_from.as_ref() {
+            Some(path) => path.display().to_string(),
+            None => "none".to_string(),
+        },
+        match checkpoint_every {
+            Some(steps) => steps.to_string(),
+            None => "final only".to_string(),
+        },
         train_cfg.dataset_path
     );
 
@@ -482,8 +602,12 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
     let worker = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
+            let options = RunOptions {
+                resume_from,
+                checkpoint_every,
+            };
             if let Err(message) =
-                run_training(config, train_cfg, &tx, std::sync::mpsc::channel().1).await
+                run_training(config, train_cfg, options, &tx, std::sync::mpsc::channel().1).await
             {
                 let _ = tx.send(tui::TrainingEvent::Error { message });
             }
@@ -535,7 +659,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             "--out",
             "--log",
         ],
-        &[],
+        &["--raw-weights"],
     )?;
 
     let model_name = flag("--headless-sample")
@@ -556,6 +680,10 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
     let magnitude = flag("--magnitude")
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(1.0);
+    // Generating uses the average when the checkpoint carries one, because
+    // that is the set the average exists to be sampled from. `--raw-weights`
+    // asks for the last iterate instead — the other arm of the comparison.
+    let weights = weights_source(args);
 
     let config_path = storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
@@ -583,11 +711,10 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             INFERENCE_RUNTIME_BATCH_SIZE,
             OptimizerKind::default(),
             WeightInit::default(),
+            None,
         )
         .await?;
-        model
-            .load_checkpoint(&checkpoint_path)
-            .map_err(|err| format!("failed to load checkpoint {checkpoint}: {err}"))?;
+        load_sampling_checkpoint(&mut model, &checkpoint_path, weights)?;
 
         let input_dims = model
             .input_dim()
@@ -778,7 +905,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             "--out",
             "--seed-dataset",
         ],
-        &["--window", "--seed-noise", "--single-view"],
+        &["--window", "--seed-noise", "--single-view", "--raw-weights"],
     )?;
 
     let model_name = flag("--headless-perpetual")
@@ -844,6 +971,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         false => batlab_core::LiveView::Both,
     };
     let seed_dataset = flag("--seed-dataset");
+    let weights = weights_source(args);
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
         storage::project_root()
             .join("perpetual_samples")
@@ -864,12 +992,11 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             INFERENCE_RUNTIME_BATCH_SIZE,
             OptimizerKind::default(),
             WeightInit::default(),
+            None,
         )
         .await?;
         let checkpoint_path = resolve_sampling_checkpoint_path(&config, checkpoint.as_deref())?;
-        model
-            .load_checkpoint(&checkpoint_path)
-            .map_err(|err| format!("failed to load {}: {err}", checkpoint_path.display()))?;
+        load_sampling_checkpoint(&mut model, &checkpoint_path, weights)?;
 
         let input_dims = model
             .input_dim()
@@ -1141,7 +1268,17 @@ fn run_execution_loop(mut config: ModelConfig) {
             rt.block_on(async {
                 let run_result = match config_clone.run.mode.clone() {
                     RunMode::Train(train_cfg) => {
-                        run_training(config_clone, train_cfg, &tx, control_rx).await
+                        // `--resume` and `--checkpoint-every` are DEV/CI flags:
+                        // the TUI walks the weight selector for the first and
+                        // has `[s]` in the monitor for the second.
+                        run_training(
+                            config_clone,
+                            train_cfg,
+                            RunOptions::default(),
+                            &tx,
+                            control_rx,
+                        )
+                        .await
                     }
                     RunMode::Perpetual(perpetual_cfg) => {
                         run_perpetual(config_clone, perpetual_cfg, &tx, control_rx).await
@@ -1198,6 +1335,7 @@ async fn build_execution_model(
     batch_size: u32,
     optimizer: OptimizerKind,
     weight_init: WeightInit,
+    ema: Option<EmaConfig>,
 ) -> Result<(Arc<GpuContext>, Model<Training>), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
     let mut model = Model::new_training_with_optimizer(
@@ -1209,6 +1347,9 @@ async fn build_execution_model(
     )
     .await;
     model.set_weight_init(weight_init);
+    // Before build(): the shadow buffers are allocated with the optimiser
+    // passes and seeded from the weights that exist then.
+    model.set_ema(ema);
     for draft in &config.layers {
         append_layer(&mut model, draft).map_err(|err| err.to_string())?;
     }
@@ -1216,18 +1357,42 @@ async fn build_execution_model(
     Ok((gpu, model))
 }
 
+/// What a run does on top of its `TrainingConfig`, and only ever from the
+/// headless entry point.
+///
+/// A separate struct rather than three more fields on `TrainingConfig`: that
+/// one is serialised into every model's `config_file`, and neither "the file I
+/// happened to resume from tonight" nor "how often to write a partial" is a
+/// property of the model.
+#[derive(Debug, Clone, Default)]
+struct RunOptions {
+    /// `--resume <ckpt>`: pick the weights, the Adam moments, the step counter
+    /// and the EMA out of this file and carry on.
+    resume_from: Option<PathBuf>,
+    /// `--checkpoint-every N`: how often a partial checkpoint is written.
+    checkpoint_every: Option<usize>,
+}
+
 async fn run_training(
     config: ModelConfig,
     train_cfg: TrainingConfig,
+    options: RunOptions,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
     control_rx: Receiver<tui::TrainingControlCommand>,
 ) -> Result<(), String> {
+    let ema = match train_cfg.ema_decay {
+        Some(decay) => Some(EmaConfig::new(decay).ok_or_else(|| {
+            format!("invalid EMA decay {decay}: it must be strictly between 0 and 1")
+        })?),
+        None => None,
+    };
     let (gpu, mut model) = build_execution_model(
         &config,
         train_cfg.lr,
         train_cfg.batch_size,
         train_cfg.optimizer,
         train_cfg.weight_init,
+        ema,
     )
     .await?;
     let checkpoint_path = match train_cfg.checkpoint_path.as_deref() {
@@ -1239,7 +1404,47 @@ async fn run_training(
             .transpose()
             .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?,
     };
-    if let Some(path) = checkpoint_path.as_ref() {
+
+    // `--resume` reads from a file of its own and writes to `--out`, so a
+    // resumed run never overwrites the checkpoint it came from unless it is
+    // asked to. It takes precedence over the config's own load mode: it is an
+    // explicit command-line instruction and the config is a default.
+    if let Some(resume) = options.resume_from.as_ref() {
+        if !resume.exists() {
+            return Err(format!("--resume: no such checkpoint: {}", resume.display()));
+        }
+        // Raw, not Ema: training continues from the iterate the optimiser left
+        // — Adam's moments describe that iterate, and the average is not a
+        // point the optimiser ever visited.
+        let report = model
+            .load_checkpoint_with(resume, batlab_core::CheckpointWeights::Raw)
+            .map_err(|err| {
+                format!(
+                    "--resume {}: incompatible checkpoint ({err}). A checkpoint only \
+                     loads into the architecture it was written from.",
+                    resume.display()
+                )
+            })?;
+        println!(
+            "[resume] {} — optimiser step {}{}",
+            resume.display(),
+            model.optimizer_step(),
+            match (report.carries_ema, ema.is_some()) {
+                (true, true) => format!(
+                    ", EMA restored (file decay {:.5}, this run {:.5})",
+                    report.ema_decay.unwrap_or_default(),
+                    ema.map(|e| e.decay).unwrap_or_default()
+                ),
+                (true, false) =>
+                    ", WARNING: the file carries an EMA and this run keeps none — \
+                     the average will NOT be carried into the checkpoint this run writes"
+                        .to_string(),
+                (false, true) => ", no EMA in the file: the shadow starts on these weights"
+                    .to_string(),
+                (false, false) => String::new(),
+            }
+        );
+    } else if let Some(path) = checkpoint_path.as_ref() {
         if train_cfg.load_checkpoint {
             if !path.exists() {
                 return Err(format!(
@@ -1510,6 +1715,16 @@ async fn run_training(
         }
 
         step += 1;
+
+        // Periodic partial checkpoint. Skipped on the last step, which the
+        // final save below covers anyway.
+        if let Some(every) = options.checkpoint_every
+            && every > 0
+            && step % every == 0
+            && step < total_steps
+        {
+            write_partial_checkpoint(&model, checkpoint_path.as_deref(), step);
+        }
     }
 
     let final_step = step.saturating_sub(1);
@@ -1559,6 +1774,74 @@ async fn run_training(
 
     let _ = tx.send(tui::TrainingEvent::Done);
     Ok(())
+}
+
+/// Where `--checkpoint-every` writes: `<out stem>.partial.ckpt`, beside the
+/// run's own checkpoint.
+///
+/// **Rotation, not history.** One file, overwritten every time, because the
+/// need this serves is "a run of ten hours that dies at hour nine is not lost",
+/// not "keep every intermediate". Seventeen 40 MB files for one night of
+/// training would be a different feature, and a worse default.
+///
+/// It is a plain `.ckpt` and it is *meant* to show up in the weight selector
+/// and in `--resume`: the point is to be able to pick a dying run back up.
+fn partial_checkpoint_path(checkpoint: &Path) -> PathBuf {
+    let stem = checkpoint
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "run".to_string());
+    checkpoint.with_file_name(format!("{stem}.partial.ckpt"))
+}
+
+/// Write the partial checkpoint, **atomically**: a temporary file beside the
+/// target, then a rename.
+///
+/// A checkpoint is tens of megabytes; a kill in the middle of `fs::write`
+/// leaves a truncated file that still ends in `.ckpt`, and the run that
+/// resumes from it fails on a length mismatch — at best. `rename` on the same
+/// filesystem is atomic, so the partial is always either the previous whole
+/// checkpoint or the new whole one.
+///
+/// Never fatal: a run does not die because a disk filled up at step 5 000. It
+/// says so on every failure, which is the loudest thing it can do without
+/// throwing the run away.
+fn write_partial_checkpoint(model: &Model<Training>, checkpoint: Option<&Path>, step: usize) {
+    let Some(checkpoint) = checkpoint else {
+        eprintln!("[checkpoint] step {step}: no checkpoint path configured, nothing written");
+        return;
+    };
+    let target = partial_checkpoint_path(checkpoint);
+    let started = std::time::Instant::now();
+    let bytes = match model.checkpoint_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("[checkpoint] step {step}: failed to encode checkpoint: {err}");
+            return;
+        }
+    };
+    if let Some(parent) = target.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        eprintln!("[checkpoint] step {step}: {}: {err}", parent.display());
+        return;
+    }
+    let scratch = target.with_extension("ckpt.tmp");
+    if let Err(err) = fs::write(&scratch, &bytes) {
+        eprintln!("[checkpoint] step {step}: {}: {err}", scratch.display());
+        return;
+    }
+    if let Err(err) = fs::rename(&scratch, &target) {
+        eprintln!("[checkpoint] step {step}: {}: {err}", target.display());
+        let _ = fs::remove_file(&scratch);
+        return;
+    }
+    println!(
+        "[checkpoint] step {step} → {} ({:.1} MB, {} ms)",
+        target.display(),
+        bytes.len() as f64 / 1.0e6,
+        started.elapsed().as_millis()
+    );
 }
 
 fn apply_and_publish_training_state(
@@ -1677,17 +1960,13 @@ async fn run_inference(
         INFERENCE_RUNTIME_BATCH_SIZE,
         OptimizerKind::default(),
         WeightInit::default(),
+        None,
     )
     .await?;
 
     let checkpoint_path =
         resolve_sampling_checkpoint_path(&config, config.inference.checkpoint.as_deref())?;
-    model.load_checkpoint(&checkpoint_path).map_err(|err| {
-        format!(
-            "failed to load inference checkpoint {}: {err}",
-            checkpoint_path.display()
-        )
-    })?;
+    load_sampling_checkpoint(&mut model, &checkpoint_path, CheckpointWeights::Ema)?;
 
     let limits = gpu.device().limits();
     let _ = tx.send(tui::TrainingEvent::ResourceReport {
@@ -1812,16 +2091,12 @@ async fn run_perpetual(
         INFERENCE_RUNTIME_BATCH_SIZE,
         OptimizerKind::default(),
         WeightInit::default(),
+        None,
     )
     .await?;
 
     let checkpoint_path = resolve_sampling_checkpoint_path(&config, cfg.checkpoint.as_deref())?;
-    model.load_checkpoint(&checkpoint_path).map_err(|err| {
-        format!(
-            "failed to load perpetual checkpoint {}: {err}",
-            checkpoint_path.display()
-        )
-    })?;
+    load_sampling_checkpoint(&mut model, &checkpoint_path, CheckpointWeights::Ema)?;
 
     let limits = gpu.device().limits();
     let _ = tx.send(tui::TrainingEvent::ResourceReport {
@@ -3177,6 +3452,7 @@ mod tests {
                     INFERENCE_RUNTIME_BATCH_SIZE,
                     OptimizerKind::Sgd,
                     WeightInit::default(),
+                    None,
                 )
                 .await
                 .expect("template must build");

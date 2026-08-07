@@ -2416,6 +2416,7 @@ impl App {
                 optimizer: OptimizerKind::default(),
                 weight_init: WeightInit::default(),
                 loss_weighting: LossWeighting::default(),
+                ema_decay: None,
             }),
         });
         Ok(())
@@ -3093,6 +3094,7 @@ mod tests {
                     optimizer: OptimizerKind::default(),
                     weight_init: WeightInit::default(),
                     loss_weighting: LossWeighting::default(),
+                    ema_decay: None,
                 }),
             },
         });

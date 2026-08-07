@@ -883,6 +883,15 @@ pub struct TrainingConfig {
     /// which therefore keep the uniform draw and the unweighted ε-MSE.
     #[serde(default)]
     pub loss_weighting: LossWeighting,
+    /// Decay of the exponential moving average kept over the weights, or `None`
+    /// for no average at all — which is the default, and what every config
+    /// written before averaging existed deserialises to.
+    ///
+    /// A run that keeps one writes a V3 checkpoint holding **both** weight sets,
+    /// and sampling then uses the average unless it is told otherwise. See
+    /// `model::ema`.
+    #[serde(default)]
+    pub ema_decay: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
