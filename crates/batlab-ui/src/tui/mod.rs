@@ -158,6 +158,7 @@ pub fn run_monitor(
             app.perpetual_params.fields[3] = pc.tempo.to_string();
             app.perpetual_params.field_idx = 0;
             app.perpetual_params.error = None;
+            app.perpetual_params.seed_dataset = pc.seed_dataset.clone();
             app.selected_checkpoint_path = pc.checkpoint.clone();
         }
         RunMode::Train(tc) => {

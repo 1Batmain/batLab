@@ -27,31 +27,86 @@ use wgpu::util::DeviceExt as _;
 /// saturated-black column flanked by two saturated-white ones.
 pub const SEPARATOR_COLUMNS: [f32; 3] = [1.0, -1.0, 1.0];
 
+/// How many panes the frame carries.
+///
+/// ```text
+///   Both  — width = 2 * W + 3          X0Only — width = W
+///   ┌───────────────┬─┬───────────────┐  ┌───────────────┐
+///   │      x_t      │▕│    x0_hat     │  │    x0_hat     │
+///   │   (noisy)     │▕│ (what the     │  │               │
+///   │               │▕│  model sees)  │  │               │
+///   └───────────────┴─┴───────────────┘  └───────────────┘
+/// ```
+///
+/// [`LiveView::X0Only`] is the perpetual default, and the reason is not screen
+/// real estate: *"on n'a même pas besoin de la fenêtre de gauche"*. A drift is
+/// something to look at, and the double view puts the picture in half a window
+/// at the wrong aspect ratio, beside a field of noise that competes with it for
+/// attention. The noise is diagnostic, so it stays one key away — `[x]` — for
+/// when the question is what the latent is doing rather than what the image is.
+///
+/// A single pane is also the only view whose frame is **square**, which is the
+/// real geometry of a CIFAR sample; the visualiser letterboxes to whatever
+/// ratio it is handed, so the window simply opens right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveView {
+    /// x̂₀ alone, at the image's own aspect ratio.
+    X0Only,
+    /// x_t, the rule, then x̂₀ — the diagnostic view.
+    Both,
+}
+
+impl Default for LiveView {
+    fn default() -> Self {
+        Self::Both
+    }
+}
+
+impl LiveView {
+    /// Full width of the composed frame for a given pane width — what the
+    /// visualiser must be told, as opposed to the model's own width.
+    pub fn frame_width(self, pane_width: u32) -> u32 {
+        match self {
+            LiveView::X0Only => pane_width.max(1),
+            // The `+ 3` is the rule: the visualiser is told this number, so the
+            // gutter is real pixels in the buffer rather than something the
+            // shader would have to know about.
+            LiveView::Both => pane_width.max(1) * 2 + SEPARATOR_COLUMNS.len() as u32,
+        }
+    }
+
+    /// `[x]` swaps the two.
+    pub fn toggle(self) -> Self {
+        match self {
+            LiveView::X0Only => LiveView::Both,
+            LiveView::Both => LiveView::X0Only,
+        }
+    }
+
+    /// What the window's title bar says it is showing.
+    pub fn caption(self) -> &'static str {
+        match self {
+            LiveView::X0Only => "x̂₀ (estimation)",
+            LiveView::Both => "gauche: x_t (bruité)  |  droite: x̂₀ (estimation)",
+        }
+    }
+}
+
 /// A GPU-resident frame the visualiser renders while the sampler fills it.
 ///
-/// The buffer is laid out as a **single wide image**: the current latent x_t on
-/// the left, [`SEPARATOR_COLUMNS`], then the model's clipped x0 estimate on the
-/// right. The visualiser's shader is a plain row-major indexer
+/// The buffer is laid out as a **single wide image** — see [`LiveView`] for the
+/// two layouts. The visualiser's shader is a plain row-major indexer
 /// (`buf[(y * width + x) * channels + c]`), so a wide image is rendered side by
 /// side with no shader change and no second window — the panes are just spans
 /// of one tensor.
-///
-/// ```text
-///   width = 2 * W + 3                  one row of the buffer
-///   ┌───────────────┬─┬───────────────┐  ┌──────────┬───┬──────────┐
-///   │               │▕│               │  │  x_t row │ ▕ │ x0_hat   │
-///   │      x_t      │▕│    x0_hat     │  │  (W px)  │(3)│ row (W)  │
-///   │   (noisy)     │▕│ (what the     │  └──────────┴───┴──────────┘
-///   │               │▕│  model sees)  │
-///   └───────────────┴─┴───────────────┘
-/// ```
 pub struct LiveFrame {
     gpu: Arc<GpuContext>,
     buffer: Arc<wgpu::Buffer>,
-    /// Width of a single pane, in pixels (the buffer holds two, plus the rule).
+    /// Width of a single pane, in pixels.
     pane_width: u32,
     height: u32,
     channels: u32,
+    view: LiveView,
     /// Scratch row-interleaved staging area, reused across steps so a 256-step
     /// run does not allocate 256 times.
     staging: Vec<f32>,
@@ -61,10 +116,26 @@ impl LiveFrame {
     /// Allocates the double-width frame for a `width × height × channels` model
     /// output. Contents start at zero, which the shader renders mid-grey.
     pub fn new(gpu: Arc<GpuContext>, width: u32, height: u32, channels: u32) -> Self {
+        Self::with_view(gpu, width, height, channels, LiveView::Both)
+    }
+
+    /// The same, in the layout of `view`.
+    ///
+    /// The buffer is sized for the view, so switching views means a new
+    /// `LiveFrame` and a re-registration with the visualiser — the window has
+    /// to be told the new width anyway, and a buffer that could hold either
+    /// would leave half of itself rendered as content in the narrow one.
+    pub fn with_view(
+        gpu: Arc<GpuContext>,
+        width: u32,
+        height: u32,
+        channels: u32,
+        view: LiveView,
+    ) -> Self {
         let pane_width = width.max(1);
         let height = height.max(1);
         let channels = channels.max(1);
-        let element_count = (frame_width_of(pane_width) * height * channels) as usize;
+        let element_count = (view.frame_width(pane_width) * height * channels) as usize;
         let staging = vec![0.0f32; element_count];
 
         let buffer = gpu
@@ -81,6 +152,7 @@ impl LiveFrame {
             pane_width,
             height,
             channels,
+            view,
             staging,
         }
     }
@@ -93,7 +165,11 @@ impl LiveFrame {
     /// Full width of the composed frame — what the visualiser must be told, not
     /// the model's own width.
     pub fn frame_width(&self) -> u32 {
-        frame_width_of(self.pane_width)
+        self.view.frame_width(self.pane_width)
+    }
+
+    pub fn view(&self) -> LiveView {
+        self.view
     }
 
     pub fn frame_height(&self) -> u32 {
@@ -119,6 +195,7 @@ impl LiveFrame {
             self.pane_width,
             self.height,
             self.channels,
+            self.view,
         );
 
         // Queued on the same queue the visualiser renders from, so the next
@@ -145,22 +222,27 @@ pub fn compose_live_frame(
     height: u32,
     channels: u32,
 ) -> Vec<f32> {
+    compose_live_frame_view(latent, x0_hat, width, height, channels, LiveView::Both)
+}
+
+/// The same, in the layout of `view`.
+pub fn compose_live_frame_view(
+    latent: &[f32],
+    x0_hat: &[f32],
+    width: u32,
+    height: u32,
+    channels: u32,
+    view: LiveView,
+) -> Vec<f32> {
     let (width, height, channels) = (width.max(1), height.max(1), channels.max(1));
-    let mut staging = vec![0.0f32; (frame_width_of(width) * height * channels) as usize];
-    compose_frame(&mut staging, latent, x0_hat, width, height, channels);
+    let mut staging = vec![0.0f32; (view.frame_width(width) * height * channels) as usize];
+    compose_frame(&mut staging, latent, x0_hat, width, height, channels, view);
     staging
 }
 
 /// Width of the frame [`compose_live_frame`] returns, for a given pane width.
 pub fn live_frame_width(pane_width: u32) -> u32 {
-    frame_width_of(pane_width.max(1))
-}
-
-/// Width of the composed frame for a given pane width. The `+ 3` is the rule:
-/// the visualiser is told this number, so the gutter is real pixels in the
-/// buffer rather than something the shader would have to know about.
-fn frame_width_of(pane_width: u32) -> u32 {
-    pane_width * 2 + SEPARATOR_COLUMNS.len() as u32
+    LiveView::Both.frame_width(pane_width)
 }
 
 /// Lays the two panes and the rule into `staging`, row-major with interleaved
@@ -181,8 +263,17 @@ fn compose_frame(
     pane_width: u32,
     height: u32,
     channels: u32,
+    view: LiveView,
 ) {
     let pane_stride = (pane_width * channels) as usize;
+    if view == LiveView::X0Only {
+        // One pane, no rule: the frame IS the estimate, row for row.
+        for row in 0..height as usize {
+            let dst = row * pane_stride;
+            copy_row(&mut staging[dst..dst + pane_stride], x0_hat, dst);
+        }
+        return;
+    }
     let rule_stride = SEPARATOR_COLUMNS.len() * channels as usize;
     let frame_stride = pane_stride * 2 + rule_stride;
 
@@ -219,12 +310,16 @@ fn copy_row(dst: &mut [f32], src: &[f32], src_offset: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{SEPARATOR_COLUMNS, compose_frame, copy_row, frame_width_of};
+    use super::{LiveView, SEPARATOR_COLUMNS, compose_frame, copy_row};
+
+    fn frame_width_of(pane_width: u32) -> u32 {
+        LiveView::Both.frame_width(pane_width)
+    }
 
     /// Composes a frame the way `publish` does, returning the staging buffer.
     fn compose(latent: &[f32], x0_hat: &[f32], w: u32, h: u32, c: u32) -> Vec<f32> {
         let mut staging = vec![f32::NAN; (frame_width_of(w) * h * c) as usize];
-        compose_frame(&mut staging, latent, x0_hat, w, h, c);
+        compose_frame(&mut staging, latent, x0_hat, w, h, c, LiveView::Both);
         assert!(
             staging.iter().all(|v| !v.is_nan()),
             "compose_frame left part of the buffer unwritten"
@@ -355,6 +450,52 @@ mod tests {
                 "panes diverge on row {y} despite identical sources"
             );
         }
+    }
+
+    /// The single-pane view is the estimate and **nothing else**: no rule, no
+    /// second half, and the frame is square when the image is.
+    ///
+    /// A pane written at the wrong stride would still look like a picture — a
+    /// sheared one — so the values encode their own `(x, y)`: any misindexing
+    /// shows up as a wrong number rather than as a plausible image.
+    #[test]
+    fn the_single_view_is_the_estimate_alone_at_the_images_own_size() {
+        let (w, h) = (4u32, 4u32);
+        let latent: Vec<f32> = (0..w * h).map(|i| -1000.0 - i as f32).collect();
+        let x0_hat: Vec<f32> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (10 * y + x) as f32))
+            .collect();
+
+        assert_eq!(LiveView::X0Only.frame_width(w), w, "the frame is one pane wide");
+        let mut staging = vec![f32::NAN; (w * h) as usize];
+        compose_frame(&mut staging, &latent, &x0_hat, w, h, 1, LiveView::X0Only);
+
+        assert_eq!(staging, x0_hat, "the frame must be x̂₀, row for row");
+        // The rule is a saturated black column flanked by two white ones; a
+        // single-pane frame that still drew one would put a stripe through the
+        // picture.
+        assert!(
+            !staging.windows(3).any(|w| w == SEPARATOR_COLUMNS),
+            "the single view drew the separator rule"
+        );
+        // And nothing of the latent leaked in — every latent value is < -1000.
+        assert!(staging.iter().all(|v| *v > -1.0));
+    }
+
+    /// `[x]` is a round trip, and the two widths differ by exactly the rule.
+    #[test]
+    fn toggling_the_view_swaps_the_two_layouts_and_nothing_else() {
+        assert_eq!(LiveView::X0Only.toggle(), LiveView::Both);
+        assert_eq!(LiveView::Both.toggle(), LiveView::X0Only);
+        assert_eq!(LiveView::X0Only.toggle().toggle(), LiveView::X0Only);
+        assert_eq!(
+            LiveView::Both.frame_width(32),
+            2 * LiveView::X0Only.frame_width(32) + SEPARATOR_COLUMNS.len() as u32
+        );
+        // Inference and the headless composer keep the double view: only the
+        // perpetual path asked for a single one.
+        assert_eq!(LiveView::default(), LiveView::Both);
+        assert_eq!(super::live_frame_width(32), LiveView::Both.frame_width(32));
     }
 
     #[test]

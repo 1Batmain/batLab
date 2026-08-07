@@ -22,20 +22,25 @@ pub mod model;
 // same names, and flattening both sets into the root would make every `use` site
 // guess which one it got.
 pub use config::{
-    InferenceConfig, LayerDraft, ModelConfig, PerpetualConfig, RunConfig, RunMode, TrainingConfig,
-    TrainingControlCommand, compute_inferred_input,
+    ArchitectureRow, ArchitectureSummary, InferenceConfig, LayerDraft, ModelConfig,
+    PerpetualConfig, RunConfig, RunMode, TrainingConfig, TrainingControlCommand,
+    compute_inferred_input, summarize_architecture,
 };
 pub use gpu_context::GpuContext;
-pub use live_frame::{LiveFrame, compose_live_frame, live_frame_width};
+pub use live_frame::{
+    LiveFrame, LiveView, compose_live_frame, compose_live_frame_view, live_frame_width,
+};
 pub use model::Model;
 pub use model::training;
 pub use model::training::{
     BucketStat, CLIMB_TEMPO_RATIO, DEFAULT_SNR_GAMMA, DenoiseFrame, DenoiseStepStat, DiffusionTask,
-    DriftAction, DriftPhase, GpuDataset, GpuDatasetError, LinearNoiseSchedule, LossWeighting,
-    MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, MetricsLogger, PerpetualDrift, PerpetualRegime, ProbeConfig,
-    RENOISE_DEPTH_STEP, Stats, TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups,
-    compose_diffusion_input, log_probe, log_train_loss, log_trajectory, probe_diffusion,
-    reverse_step, reverse_step_seed, sample_diffusion,
+    DriftAction, DriftFrame, DriftPhase, DriftWalk, GpuDataset, GpuDatasetError,
+    LinearNoiseSchedule, LossWeighting, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, MetricsLogger,
+    NoisePredictor, PerpetualDrift, PerpetualOrigin, PerpetualRegime, ProbeConfig,
+    RENOISE_DEPTH_STEP, Stats,
+    TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups, compose_diffusion_input,
+    log_probe, log_train_loss, log_trajectory, predict_epsilon, probe_diffusion, reverse_step,
+    reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
 };
 pub use model::{
     ActivationMethod, ActivationType, AttentionType, AdamHyperparameters, ConcatType, ConvolutionType, Dim3,

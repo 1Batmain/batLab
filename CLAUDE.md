@@ -79,6 +79,15 @@ mémorisé : c'est ce qui empêche une ligne périmée de recharger un checkpoin
 après une édition d'architecture (tous les chemins qui touchent aux couches
 posent le drapeau à faux). Sans checkpoint, repli sur random, dit à l'écran.
 
+Sur la liste des modèles, ce même panneau de droite décrit le modèle sous le
+curseur : géométrie, couches, paramètres, **champ réceptif avec son verdict**
+(« 13/32 px — NE COUVRE PAS » : les deux templates ne couvrent pas l'image, donc
+un pixel de sortie ne peut pas choisir un contenu global) et la pile entière,
+élidée en son milieu si elle ne tient pas — jamais tronquée en silence. Le champ
+réceptif suit la récurrence de `tools/receptive_field.py`, qui sert d'oracle
+tiers ; le compte de paramètres est croisé avec les scalaires d'un vrai
+checkpoint (`the_parameter_count_matches_the_scalars_a_checkpoint_holds`).
+
 Chaque champ de formulaire a une **info-bulle sourcée** (`tui/help.rs`) : le
 texte cite le rapport dont il vient et ses chiffres en sortent. Une entrée qui
 ment est pire que pas d'entrée — `every_help_entry_sits_on_the_field_it_describes`
@@ -120,7 +129,9 @@ parcourt tous les écrans à la touche depuis la porte d'entrée et exige d'avoi
 `Screen::ALL` — ajouter une variante sans la câbler fait échouer la suite.
 
 Les rapports de mission, avec les contrats observables complets et les parcours
-e2e déroulés : `docs/reports/MODEL_MANAGER.md` (le manager) et
+e2e déroulés : `docs/reports/MODEL_MANAGER.md` (le manager),
+`docs/reports/IMG2IMG_DRIFT.md` (la dérive img2img, la cause racine du « pause »
+de la remontée, et le panneau d'architecture) et
 `docs/reports/UX_NAV.md` (le chemin, les poids par défaut, l'aide — et la cause
 racine du vol de focus au lancement sur macOS : winit appelle
 `activateIgnoringOtherApps(true)` au démarrage de son event loop, ce que
@@ -154,6 +165,31 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - **Pondération de la loss** : `--loss-weighting uniform|snr [--snr-gamma F]` (défaut `uniform`, bit-à-bit l'ancien tirage). Implémentée par biais du tirage de t, pas dans un shader. Sur ce schedule, **γ=5 (valeur de la littérature) ne redistribue presque rien** — `SNR(t) ≤ 5` dès t=33 ; utiliser γ≈1.
 - **`inter_seed_std` n'est pas un critère de diversité lisible seul** : il est proportionnel à `--magnitude` (±6 % sur 0,3/0,6/1,0), donc il mesure surtout le bruit du sampler non débruité. Le lire à magnitude fixée, avec `intra_image_std` (doit approcher 0,206 par le bas, pas le dépasser) et `banding_ratio`.
 
+- **Perpetual est une dérive img2img** : le run part d'une **vraie image du
+  dataset** (`PerpetualOrigin::Image`, dataset dérivé des canaux de sortie —
+  1 → `cifar10_grey`, 3 → `cifar10_rgb` — ou nommé par `seed_dataset` /
+  `--seed-dataset`), et `[r]` en tire une autre. Introuvable → repli sur le bruit
+  pur, annoncé ; **nommé et manquant → erreur**. `--seed-noise` rend l'ancienne
+  ouverture. L'index de l'image est **avalanché** depuis la graine, jamais
+  `seed % len` (même raison que `gaussian_at`).
+- **En remontée, le modèle est appelé aussi.** C'était le « pause » : la montée
+  est arithmétique pure (`forward_from`), donc x̂₀ restait figé `t_r + 1` frames —
+  mesuré **294/294 frames de remontée gelées avant, 0/294 après**
+  (`docs/reports/IMG2IMG_DRIFT.md`). Le fix ne touche pas la trajectoire, c'est un
+  *read* : `asking_the_model_during_the_climb_does_not_move_the_latent` le tient
+  au bit près. Coût, un appel modèle de plus par frame de montée : 523 → 324
+  frames/s non throttlé, contre 30 pas/s de tempo par défaut. Il reste **une**
+  frame répétée par cycle — le tournant, où la remontée et la descente lisent le
+  même latent au même niveau ; c'est un contrat testé, pas une tolérance.
+- **Le pas à pas des tenseurs d'un run perpetual vit dans le moteur**
+  (`training/drift.rs`, `DriftWalk`) ; `perpetual.rs` ne porte que l'itinéraire.
+  Le couplage au réseau tient en une question (`NoisePredictor`), ce qui rend le
+  régime testable sans GPU contre un oracle. Cet oracle est **délibérément
+  sous-confiant (×0,9)** : l'oracle exact inverse `x_t` et rend x̂₀ constant, ce
+  qui rendrait le test du gel aveugle. Ne pas « corriger » cette constante.
+- **La fenêtre perpetual montre x̂₀ SEUL par défaut** (`LiveView::X0Only`, carré,
+  au vrai ratio de l'image) ; `[x]` rebascule sur `x_t | x̂₀`. L'inférence
+  classique garde la double vue.
 - **Graines de bruit : jamais `seed ^ index`.** Les images générées ont été des bandes horizontales pendant toute la campagne parce que le sampler XORait le pas dans la graine (`path_seed ^ diffusion_step`) pendant que le champ de bruit XORait l'index pixel : les deux se composent, et les 256 pas retiraient un seul champ permuté par `index ^ d ^ d'` (`docs/reports/ANISOTROPY_HUNT.md`). Chaque champ isolé restait isotrope — seule leur **somme** s'effondrait, d'où un entraînement et une sonde impeccables face à une génération morte. Passer par `gaussian_at` (avalanche de la graine, *puis* flux additif de l'index) ; l'ordre compte, l'inverse commute et donne un champ constant sur les anti-diagonales. Gardé par `injected_noise_over_reverse_chain_is_isotropic`.
 - Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
 - Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `docs/reports/INSIGHTS_TRAINING.md`).

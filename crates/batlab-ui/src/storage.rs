@@ -34,6 +34,10 @@ pub struct SavedModelEntry {
     /// model list shows them because "which weights does this thing have?" is
     /// the question that decides whether a model is worth opening at all.
     pub checkpoints: Vec<String>,
+    /// The stack, its cost and its reach — read off the same `config_file` the
+    /// fields above come from, so the panel beside the list never re-opens a
+    /// file to say what the row already knows.
+    pub architecture: batlab_core::ArchitectureSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +358,12 @@ impl Storage {
                 input_size: config.input_size,
                 layer_count: config.layers.len(),
                 checkpoints: self.checkpoint_names(name),
+                // Computed once, here, off the config that was just parsed —
+                // the panel beside the list then costs nothing per keystroke.
+                architecture: batlab_core::summarize_architecture(
+                    &config.layers,
+                    config.input_size,
+                ),
             });
         }
         models.sort_by(|a, b| a.name.cmp(&b.name));

@@ -119,6 +119,13 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   en opt-out, le fil d'Ariane `Model › Action › Weights › Parameters › Run` et la
   navigation `←`/`→`, l'aide contextuelle sourcée dans ces rapports. Contient le
   contrat observable de la navigation.
+- **[IMG2IMG_DRIFT.md](IMG2IMG_DRIFT.md)** — le mode Perpetual devient une dérive
+  img2img : départ sur une VRAIE image du dataset, fenêtre x̂₀ seule par défaut
+  (`[x]` pour la double vue) — et la cause racine du « pause » (la remontée
+  n'appelait pas le modèle, x̂₀ figé 100 % du temps, mesuré 294/294 frames avant
+  contre 0/294 après). Aussi : l'aide de la liste des modèles affiche
+  l'architecture, champ réceptif et verdict compris. Contient le contrat
+  observable de la dérive.
 
 ### Restructuration
 

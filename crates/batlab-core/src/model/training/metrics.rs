@@ -360,30 +360,44 @@ pub struct ReverseStep {
     pub x0_hat: Option<Vec<f32>>,
 }
 
-/// One step down the reverse chain: compose `[x_t | timestep]`, predict ε̂, and
-/// sample the posterior.
+/// Asks the model what noise it sees in `latent` at `diffusion_step` — the one
+/// model call of a reverse step, and the only thing about the model any walker
+/// needs.
 ///
-/// **This is the only place the reverse recursion is written.** Both walkers go
-/// through it — [`sample_diffusion`], which descends T→0 once per path, and the
-/// perpetual drift, which descends arbitrary spans and re-noises between them.
-/// The input composition, the step-seed derivation and the posterior draw
-/// therefore cannot diverge between a finite sample and an endless one.
-#[allow(clippy::too_many_arguments)]
-pub fn reverse_step<State>(
+/// Split out of [`reverse_step`] so that the recursion below can be written
+/// once against a *prediction* rather than against a `Model`: the perpetual
+/// walk ([`crate::training::DriftWalk`]) then runs against an oracle predictor
+/// in tests, on a machine with no GPU, without a second copy of the maths.
+pub fn predict_epsilon<State>(
     model: &mut Model<State>,
     schedule: &LinearNoiseSchedule,
     input_channels: usize,
     signal_channels: usize,
     latent: &[f32],
     diffusion_step: usize,
+) -> Vec<f32> {
+    let timestep_channels = input_channels.saturating_sub(signal_channels);
+    let features = schedule.timestep_embedding(diffusion_step, timestep_channels);
+    let model_input = compose_diffusion_input(latent, input_channels, signal_channels, &features);
+    model.predict(&model_input)
+}
+
+/// The reverse recursion proper, from an ε̂ somebody has already predicted.
+///
+/// **This is the only place the reverse recursion is written.** Every walker
+/// goes through it — [`sample_diffusion`], which descends T→0 once per path,
+/// and the perpetual drift, which descends arbitrary spans and re-noises
+/// between them. The step-seed derivation and the posterior draw therefore
+/// cannot diverge between a finite sample and an endless one.
+pub fn reverse_step_from_epsilon(
+    schedule: &LinearNoiseSchedule,
+    latent: &[f32],
+    predicted_noise: Vec<f32>,
+    diffusion_step: usize,
     path_seed: u64,
     denoise_magnitude: f32,
     want_x0_hat: bool,
 ) -> ReverseStep {
-    let timestep_channels = input_channels.saturating_sub(signal_channels);
-    let features = schedule.timestep_embedding(diffusion_step, timestep_channels);
-    let model_input = compose_diffusion_input(latent, input_channels, signal_channels, &features);
-    let predicted_noise = model.predict(&model_input);
     // Derived from x_t, so it must be read before the reverse step produces
     // x_{t-1}. Skipped entirely when nobody is watching.
     let x0_hat =
@@ -400,6 +414,40 @@ pub fn reverse_step<State>(
         predicted_noise,
         x0_hat,
     }
+}
+
+/// One step down the reverse chain: compose `[x_t | timestep]`, predict ε̂, and
+/// sample the posterior — [`predict_epsilon`] then
+/// [`reverse_step_from_epsilon`], which is the whole of it.
+#[allow(clippy::too_many_arguments)]
+pub fn reverse_step<State>(
+    model: &mut Model<State>,
+    schedule: &LinearNoiseSchedule,
+    input_channels: usize,
+    signal_channels: usize,
+    latent: &[f32],
+    diffusion_step: usize,
+    path_seed: u64,
+    denoise_magnitude: f32,
+    want_x0_hat: bool,
+) -> ReverseStep {
+    let predicted_noise = predict_epsilon(
+        model,
+        schedule,
+        input_channels,
+        signal_channels,
+        latent,
+        diffusion_step,
+    );
+    reverse_step_from_epsilon(
+        schedule,
+        latent,
+        predicted_noise,
+        diffusion_step,
+        path_seed,
+        denoise_magnitude,
+        want_x0_hat,
+    )
 }
 
 /// Core diffusion sampler with optional per-step trajectory capture.

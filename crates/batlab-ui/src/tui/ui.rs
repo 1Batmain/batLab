@@ -157,15 +157,29 @@ fn split_for_help(area: Rect, has_help: bool) -> (Rect, Option<Rect>) {
     (columns[0], Some(columns[1]))
 }
 
-fn draw_help_panel(f: &mut Frame, entry: &help::HelpEntry, area: Rect) {
+/// The panel's frame, and where its text goes. Shared by the two things that
+/// claim that column — a parameter's explanation, and the selected model's
+/// architecture — so they cannot drift apart into two panels that merely look
+/// alike.
+///
+/// Returns the rectangle the caller may write into, already inset.
+fn open_side_panel(f: &mut Frame, title: &str, area: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(format!(" {} ", entry.title))
+        .title(format!(" {title} "))
         .title_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
+    inner.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    })
+}
+
+fn draw_help_panel(f: &mut Frame, entry: &help::HelpEntry, area: Rect) {
+    let inner = open_side_panel(f, entry.title, area);
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     for paragraph in entry.body {
@@ -182,13 +196,163 @@ fn draw_help_panel(f: &mut Frame, entry: &help::HelpEntry, area: Rect) {
         )));
     }
 
-    f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }),
-        inner.inner(Margin {
-            horizontal: 1,
-            vertical: 0,
-        }),
-    );
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+// ---------------------------------------------------------------------------
+// The architecture panel — what the model under the cursor actually is
+// ---------------------------------------------------------------------------
+
+/// A parameter count as a human reads it: three significant figures and a
+/// magnitude, because `1216032` says nothing at a glance and `1,2 M` says the
+/// whole thing.
+fn format_parameters(count: u64) -> String {
+    match count {
+        0 => "0 paramètre".to_string(),
+        n if n < 10_000 => format!("{n} paramètres"),
+        n if n < 1_000_000 => format!("{:.0} k paramètres", n as f64 / 1e3),
+        n => format!("{:.1} M paramètres", n as f64 / 1e6).replace('.', ","),
+    }
+}
+
+/// The one-character mark a notable layer carries in the stack.
+///
+/// A mark on every row marks nothing, so only three layer kinds get one: the
+/// ones that change what the network can *do* rather than how big it is.
+fn notable_mark(notable: Option<&str>) -> &'static str {
+    match notable {
+        Some("attention") => "✳",
+        Some("upsample") => "↑",
+        Some("skip") => "⊕",
+        _ => " ",
+    }
+}
+
+/// Cuts a line to `width` columns, ending it in `…` when something was lost.
+///
+/// Counted in `chars`, not bytes: the marks above and the model names both go
+/// through here, and slicing a multi-byte character in half panics.
+fn clip(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    text.chars().take(keep).chain(['…']).collect()
+}
+
+/// The selected model's architecture, laid out for a column `width` wide and
+/// `height` rows tall.
+///
+/// The stack is the part that does not fit: a 28-layer model against a 20-row
+/// panel. Rather than scroll something the user cannot scroll, the middle is
+/// elided and *says* how many rows it swallowed — a silently truncated stack
+/// reads as a shorter network.
+fn architecture_lines(
+    entry: &crate::storage::SavedModelEntry,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let summary = &entry.architecture;
+    let grey = Style::default().fg(Color::Gray);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        clip(
+            &format!(
+                "{}×{}×{} · {} couches · {}",
+                summary.input_edge,
+                entry.input_size.1,
+                entry.input_size.2,
+                summary.layer_count,
+                format_parameters(summary.parameters),
+            ),
+            width,
+        ),
+        grey,
+    )));
+
+    // The receptive field, with the verdict attached. The number alone is a
+    // number; "does not cover the image" is the reason the number is here —
+    // an output pixel that cannot see the whole frame cannot choose a global
+    // content, and the model drifts to the dataset mean.
+    let field = match (summary.receptive_field, summary.covers_the_image()) {
+        // Short enough that the *verdict* survives the 42-column gutter: the
+        // number clipped to "13/32 px — NE COUVRE …" would lose exactly the
+        // half that matters.
+        (Some(field), Some(covers)) => format!(
+            "champ réceptif {:.0}/{} px — {}",
+            field,
+            summary.input_edge,
+            if covers { "couvre" } else { "NE COUVRE PAS" }
+        ),
+        _ => "champ réceptif : aucune convolution".to_string(),
+    };
+    lines.push(Line::from(Span::styled(
+        clip(&field, width),
+        if summary.covers_the_image() == Some(false) {
+            Style::default().fg(Color::Yellow)
+        } else {
+            grey
+        },
+    )));
+
+    let mut notable = Vec::new();
+    if summary.attention_layers > 0 {
+        notable.push(format!("✳ {} attention", summary.attention_layers));
+    }
+    if summary.upsample_layers > 0 {
+        notable.push(format!("↑ {} upsample", summary.upsample_layers));
+    }
+    if summary.concat_layers > 0 {
+        notable.push(format!("⊕ {} skip", summary.concat_layers));
+    }
+    if !notable.is_empty() {
+        lines.push(Line::from(Span::styled(
+            clip(&notable.join("  "), width),
+            grey,
+        )));
+    }
+    lines.push(Line::from(""));
+
+    // Whatever rows are left after the header go to the stack.
+    let budget = height.saturating_sub(lines.len());
+    let row_line = |row: &batlab_core::ArchitectureRow| {
+        Line::from(Span::styled(
+            clip(
+                &format!(
+                    "{:>3}{} {}",
+                    row.index,
+                    notable_mark(row.notable),
+                    row.display
+                ),
+                width,
+            ),
+            if row.notable.is_some() { grey } else { dim },
+        ))
+    };
+    let rows = &summary.rows;
+    if rows.len() <= budget {
+        lines.extend(rows.iter().map(row_line));
+    } else if budget >= 3 {
+        // Head and tail, because a diffusion stack is read from both ends: the
+        // first convolution says what it consumes, the last what it emits.
+        let head = budget.div_ceil(2) - 1;
+        let tail = budget - head - 1;
+        lines.extend(rows[..head].iter().map(row_line));
+        lines.push(Line::from(Span::styled(
+            clip(&format!("    … {} couches …", rows.len() - head - tail), width),
+            dim,
+        )));
+        lines.extend(rows[rows.len() - tail..].iter().map(row_line));
+    }
+    lines
+}
+
+fn draw_architecture_panel(f: &mut Frame, entry: &crate::storage::SavedModelEntry, area: Rect) {
+    let inner = open_side_panel(f, &entry.name, area);
+    let lines = architecture_lines(entry, inner.width as usize, inner.height as usize);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +497,15 @@ fn checkpoint_summary(checkpoints: &[String]) -> String {
 }
 
 fn draw_model_list(f: &mut Frame, app: &App, area: Rect) {
+    // The panel is offered exactly when there is a model under the cursor to
+    // describe: the "new model" row has no architecture yet, and neither has an
+    // empty `Models/`.
+    let selected = app.model_list.selected_model();
+    let (area, panel_area) = split_for_help(area, selected.is_some());
+    if let (Some(entry), Some(panel_area)) = (selected, panel_area) {
+        draw_architecture_panel(f, entry, panel_area);
+    }
+
     let popup = centered_rect(72, 66, area);
     f.render_widget(Clear, popup);
 
@@ -1253,7 +1426,7 @@ fn is_perpetual_mode(app: &App) -> bool {
 /// last asked for.
 fn perpetual_hint(app: &App) -> String {
     const KEYS: &str = "[↑↓] niveau  [←→] tempo  [espace] pause  [r] re-seed  \
-                        [m] regime  [s] PNG  [v] visualise  [q] quit";
+                        [m] regime  [x] vue  [s] PNG  [v] visualise  [q] quit";
 
     // The last PNG write (or failure) is worth a word, but must not cost the
     // user the key list — it rides as a prefix instead of replacing the line.
@@ -1337,7 +1510,7 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
         ),
         row("timestep t", state.diffusion_step.to_string(), ""),
         row(&state.cycle_label, state.cycle.to_string(), "[r] re-seed"),
-        row("reverse steps", state.steps.to_string(), ""),
+        row("appels modèle", state.steps.to_string(), ""),
         row(
             "pace",
             format!("{:.1} / {:.0} steps/s", state.steps_per_sec, state.tempo),
@@ -1348,17 +1521,15 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
             if state.paused { "paused" } else { "running" }.to_string(),
             "[space]",
         ),
+        row("origine", state.origin.clone(), ""),
+        row("fenêtre [v]", state.view.clone(), "[x]"),
         Line::from(""),
         Line::from(Span::styled(
-            "  Fenêtre [v] : gauche x_t (bruité) │ droite x̂₀ (estimation).",
+            "  La dérive part d'une image réelle du dataset et s'en éloigne ; [r] en tire une autre.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  Les deux moitiés convergent vers la même image quand t → 0.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  En remontée, x_t se dissout pas à pas — x̂₀ reste figé, le modèle ne prédit pas.",
+            "  En remontée x_t se dissout pas à pas, et le modèle prédit toujours : x̂₀ rêve, jamais figé.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
@@ -1753,4 +1924,172 @@ fn draw_training_control(f: &mut Frame, app: &App, area: Rect) {
         app.training_control.error.as_deref(),
         "[up/down] field  [type] edit  [Enter] apply  [Esc] cancel",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::SavedModelEntry;
+
+    /// A stack of `count` identical convolutions, wrapped as the list entry the
+    /// panel is handed.
+    fn entry_with(layers: Vec<batlab_core::LayerDraft>, input: (u32, u32, u32)) -> SavedModelEntry {
+        SavedModelEntry {
+            name: "Test_Model".to_string(),
+            path: std::path::PathBuf::from("Models/Test_Model/config_file"),
+            input_size: input,
+            layer_count: layers.len(),
+            checkpoints: Vec::new(),
+            architecture: batlab_core::summarize_architecture(&layers, input),
+        }
+    }
+
+    fn template_entry() -> SavedModelEntry {
+        let template = batlab_core::config::greyscale_diffusion_template();
+        entry_with(template.layers, template.input_size)
+    }
+
+    /// The panel lives in a fixed 46-column gutter, and the layer descriptions
+    /// it prints are not bounded by anything: a `Concat(enc1) 32x32x64 +
+    /// 32x32x32 -> 32x32x96 [save:d2]` is 55 characters. Ratatui does not wrap
+    /// a plain `Paragraph`, so an over-long line is silently cut at the border —
+    /// but a line cut by the *renderer* loses its right edge without a mark,
+    /// where one cut here ends in `…` and says so.
+    #[test]
+    fn no_line_of_the_panel_is_wider_than_the_column_it_lives_in() {
+        let entry = template_entry();
+        for width in [20usize, 30, 42, 44] {
+            for line in architecture_lines(&entry, width, 24) {
+                let rendered: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+                assert!(
+                    rendered.chars().count() <= width,
+                    "at width {width}, {rendered:?} is {} columns",
+                    rendered.chars().count()
+                );
+            }
+        }
+    }
+
+    /// With room for the whole stack, every layer is on screen, in order.
+    #[test]
+    fn a_panel_with_room_shows_every_layer_in_order() {
+        let entry = template_entry();
+        let lines = architecture_lines(&entry, 60, 40);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        for (index, row) in entry.architecture.rows.iter().enumerate() {
+            assert!(
+                rendered.iter().any(|line| line.trim_start().starts_with(&format!("{index}"))
+                    && line.contains(row.display.split_whitespace().next().expect("a kind"))),
+                "layer {index} ({}) is missing from the panel: {rendered:#?}",
+                row.display
+            );
+        }
+        assert!(!rendered.iter().any(|line| line.contains("couches …")));
+    }
+
+    /// A stack taller than the panel is **elided**, not truncated, and the
+    /// elision says how many rows it swallowed. A stack quietly cut at row 12
+    /// reads as a twelve-layer network, which is a different model.
+    #[test]
+    fn a_stack_taller_than_the_panel_says_what_it_hid() {
+        let layers: Vec<batlab_core::LayerDraft> = (0..40)
+            .map(|_| batlab_core::LayerDraft::Convolution {
+                dim_input: (32, 32, 8),
+                nb_kernel: 8,
+                dim_kernel: (3, 3, 8),
+                stride: 1,
+                padding: batlab_core::config::PaddingMode::Same,
+                save_key: None,
+            })
+            .collect();
+        let entry = entry_with(layers, (32, 32, 8));
+
+        let height = 20;
+        let lines = architecture_lines(&entry, 44, height);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+
+        assert!(lines.len() <= height, "the panel overflowed its own height");
+        let elision = rendered
+            .iter()
+            .find(|line| line.contains("couches …"))
+            .expect("an over-long stack must be marked as elided");
+        // Head + tail + the elision line account for the whole stack.
+        let shown = rendered.iter().filter(|line| line.contains("Conv")).count();
+        let hidden: usize = elision
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .expect("the elision states a count");
+        assert_eq!(
+            shown + hidden,
+            40,
+            "the panel accounts for {shown} shown and {hidden} hidden of 40"
+        );
+        // Both ends survive: the first layer says what the model consumes, the
+        // last what it emits.
+        assert!(rendered.iter().any(|line| line.trim_start().starts_with('0')));
+        assert!(rendered.iter().any(|line| line.trim_start().starts_with("39")));
+    }
+
+    /// The verdict, not just the number. 13 px of receptive field on a 32 px
+    /// image is the single most consequential fact about the built-in
+    /// templates, and it has to be legible without doing the comparison in
+    /// one's head.
+    #[test]
+    fn the_panel_states_whether_the_field_covers_the_image() {
+        let rendered: String = architecture_lines(&template_entry(), 60, 40)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("13/32 px"), "{rendered}");
+        assert!(rendered.contains("NE COUVRE PAS"), "{rendered}");
+        // The verdict must survive the real gutter, not just a wide test bench:
+        // clipped to "NE COUVRE …" the panel says the opposite of nothing.
+        let narrow: String = architecture_lines(&template_entry(), 42, 40)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(narrow.contains("NE COUVRE PAS"), "{narrow}");
+        // …and the notable layers of that stack, counted.
+        assert!(rendered.contains("↑ 1 upsample"), "{rendered}");
+        assert!(rendered.contains("⊕ 1 skip"), "{rendered}");
+    }
+
+    #[test]
+    fn parameters_are_written_at_the_magnitude_a_reader_needs() {
+        assert_eq!(format_parameters(0), "0 paramètre");
+        assert_eq!(format_parameters(432), "432 paramètres");
+        assert_eq!(format_parameters(121_000), "121 k paramètres");
+        assert_eq!(format_parameters(1_216_032), "1,2 M paramètres");
+    }
+
+    /// `clip` counts characters, never bytes — the panel's own marks (`✳ ↑ ⊕`)
+    /// and any accented model name are multi-byte, and slicing one in half
+    /// panics the whole TUI.
+    #[test]
+    fn clipping_never_splits_a_character() {
+        assert_eq!(clip("abcdef", 6), "abcdef");
+        assert_eq!(clip("abcdef", 4), "abc…");
+        assert_eq!(clip("✳↑⊕ modèle", 4), "✳↑⊕…");
+        assert_eq!(clip("é", 0), "…");
+    }
 }

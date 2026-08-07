@@ -374,6 +374,12 @@ pub struct PerpetualParamsState {
     /// 0=random toggle, 1=seed, 2=magnitude, 3=depth, 4=tempo, 5=regime toggle
     pub field_idx: usize,
     pub error: Option<String>,
+    /// The dataset the drift sets out from, when the model's `config_file`
+    /// names one. Not a form field — it is carried through untouched so that
+    /// opening a model and starting it does not quietly erase a setting the
+    /// form cannot show. The default (no entry) is derived from the model's
+    /// output channels by the worker.
+    pub seed_dataset: Option<String>,
 }
 
 pub const PERPETUAL_PARAM_FIELD_NAMES: [&str; 6] = [
@@ -429,6 +435,14 @@ pub struct PerpetualStatus {
     pub steps: usize,
     /// Measured pace, as opposed to the requested `tempo`.
     pub steps_per_sec: f32,
+    /// What the `[v]` window is showing — x̂₀ alone, or both panes. Published by
+    /// the worker, which owns the `LiveFrame`, so the legend and the window
+    /// cannot disagree about which layout is up.
+    pub view: String,
+    /// What the run set out from: a dataset image, or pure noise when none
+    /// could be found. Worth saying, because a run that silently fell back on
+    /// noise looks exactly like one that was asked to.
+    pub origin: String,
     pub tempo: f32,
     pub paused: bool,
 }
@@ -713,6 +727,7 @@ impl App {
                 ],
                 field_idx: 0,
                 error: None,
+                seed_dataset: None,
             },
             training_params: TrainingParamsState {
                 fields: vec![
@@ -2238,6 +2253,7 @@ impl App {
         self.perpetual_params.fields[1] = cfg.denoise_magnitude.to_string();
         self.perpetual_params.fields[2] = cfg.renoise_depth.to_string();
         self.perpetual_params.fields[3] = cfg.tempo.to_string();
+        self.perpetual_params.seed_dataset = cfg.seed_dataset.clone();
         self.perpetual_params.field_idx = 0;
         self.perpetual_params.error = None;
     }
@@ -2283,6 +2299,7 @@ impl App {
             regime: self.perpetual_params.regime,
             tempo,
             checkpoint: self.selected_checkpoint_path.clone(),
+            seed_dataset: self.perpetual_params.seed_dataset.clone(),
         };
 
         self.perpetual_params.error = None;
