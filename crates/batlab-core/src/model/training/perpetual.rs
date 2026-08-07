@@ -109,6 +109,34 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What a run sets out from.
+///
+/// The original perpetual run opened on **pure noise** at the top of the
+/// schedule and denoised its way to a first image — which is a generative run
+/// that then wanders. Asked for in use: *"le mieux, c'est de partir d'une image
+/// déjà réelle, jauger le niveau de bruit qu'on réinjecte, refaire prédire le
+/// modèle, itérer, et laisser le modèle drifter"* — a **drift away from a real
+/// photograph**, which is a different piece.
+///
+/// The itinerary machinery needs no new phase for it. A run that starts on a
+/// real image starts where a wander cycle *ends*: on a clean `x₀` at `t = 0`,
+/// about to climb. So [`PerpetualDrift::from_image`] opens in exactly the state
+/// [`PerpetualDrift::open_climb`] leaves — the same code path a settled cycle
+/// takes, entered from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PerpetualOrigin {
+    /// Pure noise at `T-1`. The run denoises down to its first image.
+    Noise,
+    /// A real image at `t = 0`. The run climbs away from it and drifts.
+    Image,
+}
+
+impl Default for PerpetualOrigin {
+    fn default() -> Self {
+        Self::Image
+    }
+}
+
 /// Which way the run wanders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PerpetualRegime {
@@ -346,6 +374,10 @@ pub struct PerpetualDrift {
     /// its seeds are indexed by; it also ticks once per flux approach, which
     /// keeps an approach's field distinct from the frames either side of it.
     frame: u64,
+    /// What the run set out from, kept so `[r]` re-seeds the same way the run
+    /// opened: a drift that began on a photograph and re-seeded into pure noise
+    /// would change what the piece *is* on a keystroke.
+    origin: PerpetualOrigin,
 }
 
 impl PerpetualDrift {
@@ -368,9 +400,45 @@ impl PerpetualDrift {
             climb_seed: 0,
             opens_cycle: false,
             frame: 0,
+            origin: PerpetualOrigin::Noise,
         };
         drift.set_depth(depth);
         drift
+    }
+
+    /// Opens a run on a **real image**, at `t = 0`.
+    ///
+    /// The caller's latent must be that image (see [`PerpetualOrigin`]). The
+    /// drift opens in the state a settled cycle leaves — climbing, from a
+    /// departure at level 0, announcing `opens_cycle` so the caller snapshots
+    /// the picture it set out from. Nothing else about the itinerary differs:
+    /// the run climbs to `t_r`, descends, and cycles, exactly as it would have
+    /// after denoising its way down from pure noise.
+    ///
+    /// The dial is honoured from the very first climb, which is the point of
+    /// the mode — "jauger le niveau de bruit qu'on réinjecte" starts working on
+    /// frame one rather than after a 256-step descent.
+    pub fn from_image(
+        steps: usize,
+        regime: PerpetualRegime,
+        depth: usize,
+        base_seed: u64,
+    ) -> Self {
+        let mut drift = Self::new(steps, regime, depth, base_seed);
+        drift.origin = PerpetualOrigin::Image;
+        drift.open_from_image();
+        drift
+    }
+
+    /// What the run set out from.
+    pub fn origin(&self) -> PerpetualOrigin {
+        self.origin
+    }
+
+    /// Puts the drift in the state a settled cycle leaves: about to climb away
+    /// from a clean image sitting at level 0.
+    fn open_from_image(&mut self) {
+        self.open_climb(0, self.stream_seed(RENOISE_STREAM));
     }
 
     pub fn regime(&self) -> PerpetualRegime {
@@ -470,8 +538,10 @@ impl PerpetualDrift {
         self.set_depth(self.depth);
     }
 
-    /// Restarts the drift from pure noise under a new seed. The caller is
-    /// expected to redraw its latent from the same seed.
+    /// Restarts the drift under a new seed, **from whatever it originally set
+    /// out from**. The caller is expected to redraw its latent to match: fresh
+    /// noise for [`PerpetualOrigin::Noise`], another dataset image for
+    /// [`PerpetualOrigin::Image`].
     pub fn reseed(&mut self, base_seed: u64) {
         self.base_seed = base_seed;
         self.t = self.steps - 1;
@@ -481,6 +551,9 @@ impl PerpetualDrift {
         self.climb_seed = 0;
         self.opens_cycle = false;
         self.frame = 0;
+        if self.origin == PerpetualOrigin::Image {
+            self.open_from_image();
+        }
     }
 
     /// The seed the run's initial latent should be drawn from.
@@ -756,6 +829,122 @@ mod tests {
             climbs.iter().min()
         );
         assert_eq!(descents.iter().max().copied(), Some(STEPS - 1));
+    }
+
+    // -- Setting out from a real image --------------------------------------
+
+    /// The mode in one assertion: a run seeded on a photograph does **not**
+    /// spend its first 256 frames denoising a grey field before anything
+    /// happens. It climbs away from the image on frame one, at the dial the
+    /// user set.
+    #[test]
+    fn a_run_that_sets_out_from_an_image_climbs_away_from_it_immediately() {
+        let depth = 24;
+        let mut drift = PerpetualDrift::from_image(STEPS, PerpetualRegime::Wander, depth, 7);
+        assert_eq!(drift.origin(), PerpetualOrigin::Image);
+        assert_eq!(drift.phase(), DriftPhase::Climb);
+        assert_eq!(drift.current_step(), 0, "the image is a clean x0, at t = 0");
+
+        // The first action announces the cycle, so the caller snapshots the
+        // picture as the climb's departure — the same handshake a settled cycle
+        // uses, which is why no new phase was needed.
+        let first = drift.step();
+        assert!(
+            matches!(
+                first,
+                DriftAction::Climb {
+                    forward_step: 0,
+                    departure_step: 0,
+                    opens_cycle: true,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+
+        // …and then it is an ordinary run: up to t_r, down to the floor, round.
+        // The rest of this climb (depth levels) and the descent it turns into
+        // (depth + 1 levels) — stopping short of the next cycle opening.
+        let (descents, climbs) = walk(&mut drift, depth + depth + 1);
+        assert_eq!(
+            climbs,
+            (1..=depth).collect::<Vec<_>>(),
+            "the climb must visit every level from the image up to t_r"
+        );
+        assert_eq!(descents, (0..=depth).rev().collect::<Vec<_>>());
+    }
+
+    /// A noise-seeded run is untouched — the opening descent from `T-1` is what
+    /// makes a *generative* perpetual run, and both modes have to keep working
+    /// side by side.
+    #[test]
+    fn a_noise_seeded_run_still_opens_on_the_full_descent() {
+        let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, 24, 7);
+        assert_eq!(drift.origin(), PerpetualOrigin::Noise);
+        assert_eq!(drift.phase(), DriftPhase::Descent);
+        let (descents, _) = walk(&mut drift, 1);
+        assert_eq!(descents, vec![STEPS - 1]);
+    }
+
+    /// `[r]` re-seeds the way the run *opened*. A drift that set out from a
+    /// photograph and came back on pure noise would change what the piece is on
+    /// a keystroke — and the caller, which reads `origin` to decide whether to
+    /// draw noise or fetch another image, would be handing the wrong latent to
+    /// a drift already climbing.
+    #[test]
+    fn re_seeding_keeps_the_origin_the_run_opened_on() {
+        for (origin, opener) in [
+            (
+                PerpetualOrigin::Image,
+                PerpetualDrift::from_image as fn(usize, PerpetualRegime, usize, u64) -> PerpetualDrift,
+            ),
+            (PerpetualOrigin::Noise, PerpetualDrift::new),
+        ] {
+            let mut drift = opener(STEPS, PerpetualRegime::Wander, 16, 7);
+            walk(&mut drift, 40);
+            drift.reseed(0x1234);
+
+            assert_eq!(drift.origin(), origin);
+            assert_eq!(drift.cycle(), 0);
+            match origin {
+                PerpetualOrigin::Image => {
+                    assert_eq!(drift.phase(), DriftPhase::Climb);
+                    assert_eq!(drift.current_step(), 0);
+                }
+                PerpetualOrigin::Noise => {
+                    assert_eq!(drift.phase(), DriftPhase::Descent);
+                    assert_eq!(drift.current_step(), STEPS - 1);
+                }
+            }
+        }
+    }
+
+    /// Two runs seeded on images under different seeds must dissolve them under
+    /// *different* fields. Sharing one would make every re-seed walk the same
+    /// path away from whatever picture it was handed.
+    #[test]
+    fn two_image_seeded_runs_climb_under_different_fields() {
+        let field = |seed: u64| {
+            let mut drift = PerpetualDrift::from_image(STEPS, PerpetualRegime::Wander, 16, seed);
+            match drift.step() {
+                DriftAction::Climb { cycle_seed, .. } => cycle_seed,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_ne!(field(1), field(2));
+
+        // And a re-seed changes it too — the same drift, re-opened.
+        let mut drift = PerpetualDrift::from_image(STEPS, PerpetualRegime::Wander, 16, 1);
+        let first = match drift.step() {
+            DriftAction::Climb { cycle_seed, .. } => cycle_seed,
+            other => panic!("{other:?}"),
+        };
+        drift.reseed(2);
+        let second = match drift.step() {
+            DriftAction::Climb { cycle_seed, .. } => cycle_seed,
+            other => panic!("{other:?}"),
+        };
+        assert_ne!(first, second);
     }
 
     /// The instrument panel reads this, and a viewer watching an image come

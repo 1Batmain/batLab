@@ -2,6 +2,7 @@
 
 pub mod dataset;
 pub mod diffusion;
+pub mod drift;
 pub mod metrics;
 pub mod perpetual;
 pub mod schedule;
@@ -13,14 +14,15 @@ use std::fmt;
 
 pub use dataset::{GpuDataset, GpuDatasetError};
 pub use diffusion::DiffusionTask;
+pub use drift::{DriftFrame, DriftWalk, NoisePredictor};
 pub use metrics::{
     BucketStat, DenoiseFrame, DenoiseStepStat, MetricsLogger, ProbeConfig, ReverseStep, Stats,
     compose_diffusion_input, log_probe, log_train_loss, log_trajectory, probe_diffusion,
-    reverse_step, reverse_step_seed, sample_diffusion,
+    predict_epsilon, reverse_step, reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
 };
 pub use perpetual::{
     CLIMB_TEMPO_RATIO, DriftAction, DriftPhase, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, PerpetualDrift,
-    PerpetualRegime, RENOISE_DEPTH_STEP,
+    PerpetualOrigin, PerpetualRegime, RENOISE_DEPTH_STEP,
 };
 pub use schedule::LinearNoiseSchedule;
 pub use weighting::{DEFAULT_SNR_GAMMA, LossWeighting};

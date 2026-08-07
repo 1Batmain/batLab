@@ -14,12 +14,12 @@ use batlab_ui::tui::{
 };
 use batlab_core::{
     ActivationMethod as PActivation, ActivationType, AttentionType, ConvolutionType, DEFAULT_SNR_GAMMA,
-    DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
+    DenoiseFrame, DiffusionTask, Dim3, DriftAction, DriftWalk, FullyConnectedType, GpuContext,
+    GpuDataset,
     GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
     MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
     Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame, live_frame_width, log_probe,
-    log_train_loss, log_trajectory, model::Training, probe_diffusion, reverse_step,
-    sample_diffusion,
+    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -250,7 +250,137 @@ fn main() {
     });
 }
 
-/// See the DEV/CI note in `main`. Not reachable from the TUI.
+/// The dataset a model of `channels` output channels drifts away from, when its
+/// config names none.
+///
+/// Derived from the model's **output** geometry rather than guessed: feeding a
+/// greyscale drift the RGB file would not error — `try_load_raw_dataset` resizes
+/// — and the run would quietly set out from a mangled picture.
+fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
+    match channels {
+        1 => Some("cifar10_grey.batraw"),
+        3 => Some("cifar10_rgb.batraw"),
+        _ => None,
+    }
+}
+
+/// Where a perpetual run's opening picture comes from.
+///
+/// The dataset is loaded once, on the CPU, and kept as plain tensors: a run
+/// asks it for one `x₀` when it starts and one more on every `[r]`. That is
+/// nothing next to a single model call, so there is no GPU dataset here and no
+/// chunk juggling — [`GpuDataset`] exists for training, which streams thousands
+/// of samples a minute.
+///
+/// **One function provides the picture** — [`SeedImages::provide_x0`]. Adding a
+/// chooser later (an index typed into the form, a file dropped on the window)
+/// is a second constructor beside `at_random`, not a new call site: the two
+/// perpetual paths only ever call `provide_x0`.
+struct SeedImages {
+    samples: Vec<ImageSample>,
+    path: PathBuf,
+}
+
+impl SeedImages {
+    /// Finds the dataset a model should drift away from.
+    ///
+    /// `explicit` wins when given (`--seed-dataset`, or `seed_dataset` in the
+    /// model's `config_file`). Otherwise the choice follows the model's own
+    /// **output** geometry: a 1-channel model wants `cifar10_grey.batraw`, a
+    /// 3-channel one `cifar10_rgb.batraw`. Feeding a greyscale drift the RGB
+    /// file would not error — `try_load_raw_dataset` would resize and the run
+    /// would drift away from a mangled picture — so the default is derived
+    /// rather than guessed at.
+    ///
+    /// `Ok(None)` when there is nothing to load: a missing dataset is not a
+    /// reason to refuse to run, it is a reason to fall back on pure noise and
+    /// say so.
+    fn resolve(
+        explicit: Option<&str>,
+        output_size: (u32, u32, u32),
+    ) -> Result<Option<Self>, String> {
+        let candidate = match explicit {
+            Some(path) => PathBuf::from(path),
+            None => match default_seed_dataset_name(output_size.2) {
+                Some(name) => storage::project_root().join("datasets").join(name),
+                // A geometry neither file matches: nothing to default to, and
+                // inventing one would drift away from the wrong images.
+                None => return Ok(None),
+            },
+        };
+        if !candidate.exists() {
+            // Named explicitly, a missing file IS an error — silently drifting
+            // from noise would look like the flag was ignored.
+            return match explicit {
+                Some(path) => Err(format!("--seed-dataset {path}: no such file")),
+                None => Ok(None),
+            };
+        }
+        let samples = load_dataset(&candidate.to_string_lossy(), output_size)?;
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            samples,
+            path: candidate,
+        }))
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The `x₀` a run sets out from: one image of the dataset, drawn from
+    /// `seed`.
+    ///
+    /// The index is **avalanched out of the seed, never taken modulo it**.
+    /// Seeds here come from a clock (`random_seed`) or from a form, so
+    /// `seed % len` would walk consecutive images on consecutive re-seeds and
+    /// correlate the run with whatever order the dataset happens to be in. Same
+    /// discipline as `gaussian_at` — mix first, index second (`ANISOTROPY_HUNT.md`).
+    fn provide_x0(&self, seed: u64) -> Vec<f32> {
+        self.samples[self.at_random(seed)].target.clone()
+    }
+
+    fn at_random(&self, seed: u64) -> usize {
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((z ^ (z >> 31)) % self.samples.len() as u64) as usize
+    }
+}
+
+/// The model, wrapped as the one question a perpetual walk asks it: "what noise
+/// do you see in this latent, at this level?".
+///
+/// The walk itself lives in the engine and holds no model, so this adapter is
+/// the whole of the coupling — and it is the same one on both perpetual paths,
+/// the TUI run and the headless one, which is why they cannot drift apart.
+struct ModelNoise<'a, State> {
+    model: &'a mut Model<State>,
+    schedule: &'a LinearNoiseSchedule,
+    input_channels: usize,
+    signal_channels: usize,
+}
+
+impl<State> batlab_core::NoisePredictor for ModelNoise<'_, State> {
+    fn predict_noise(&mut self, latent: &[f32], diffusion_step: usize) -> Vec<f32> {
+        batlab_core::predict_epsilon(
+            self.model,
+            self.schedule,
+            self.input_channels,
+            self.signal_channels,
+            latent,
+            diffusion_step,
+        )
+    }
+}
+
+/// See the DEV/CI note in `main`.
 fn run_headless_train(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -646,8 +776,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             "--climb-frames",
             "--dump",
             "--out",
+            "--seed-dataset",
         ],
-        &["--window"],
+        &["--window", "--seed-noise"],
     )?;
 
     let model_name = flag("--headless-perpetual")
@@ -699,6 +830,13 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // of the order of one 8-bit level, so a PNG would quantise away the very
     // quantity being measured (`CLIMB_COHERENCE.md` §6).
     let dump_path = flag("--dump").map(PathBuf::from);
+    // The run drifts away from a real image by default, like the TUI mode.
+    // `--seed-noise` asks for the old opening — pure noise at the top of the
+    // schedule — which is the only way to reproduce a pre-img2img campaign;
+    // `--seed-dataset <path>` names the file to draw from instead of deriving
+    // it from the model's output channels.
+    let seed_from_noise = args.iter().any(|arg| arg == "--seed-noise");
+    let seed_dataset = flag("--seed-dataset");
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
         storage::project_root()
             .join("perpetual_samples")
@@ -740,14 +878,27 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             DIFFUSION_BETA_START,
             DIFFUSION_BETA_END,
         );
-        let mut drift = PerpetualDrift::new(schedule.len(), regime, depth, seed);
-        let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
-        let mut last_x0 = vec![0.0f32; output_len];
+        let seed_images = match seed_from_noise {
+            true => None,
+            false => SeedImages::resolve(seed_dataset.as_deref(), output_size)?,
+        };
+        let mut drift = match seed_images.as_ref() {
+            Some(_) => PerpetualDrift::from_image(schedule.len(), regime, depth, seed),
+            None => PerpetualDrift::new(schedule.len(), regime, depth, seed),
+        };
+        // Same walk the TUI run uses, so a dump records the frames a window
+        // would have shown — including the climb's now-live x̂₀.
+        let opening = match seed_images.as_ref() {
+            Some(images) => images.provide_x0(seed),
+            None => schedule.sample_noise(output_len, drift.initial_noise_seed()),
+        };
+        let mut last_x0 = match seed_images.as_ref() {
+            Some(_) => opening.clone(),
+            None => vec![0.0f32; output_len],
+        };
+        let mut walk = DriftWalk::new(opening, magnitude);
         let mut previous_frame: Option<Vec<f32>> = None;
         let mut mid_captured = false;
-        // The state the climb in progress departed from — snapshotted when a
-        // cycle closes and read by every level of that climb.
-        let mut climb_departure: Option<Vec<f32>> = None;
 
         // The banner is the only place a caller can check that what it typed was
         // heard — which is why it reports the dial under the name the *regime*
@@ -766,6 +917,14 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             },
             checkpoint_path.display(),
         );
+        match seed_images.as_ref() {
+            Some(images) => println!(
+                "origine → image du dataset {} ({} images) — dérive img2img",
+                images.path().display(),
+                images.len()
+            ),
+            None => println!("origine → bruit pur en haut du schedule (--seed-noise)"),
+        }
         // Announced only when something will actually land there. A PNG is
         // written when a cycle closes; flux closes none, so naming a directory
         // it never even creates reads as a run that failed to write.
@@ -789,36 +948,85 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             None => written < frames,
         } {
             actions += 1;
-            // Assigned by every arm, so the compiler is the one checking that
-            // no frame is recorded against a level nobody set.
-            let level;
             // Handed whole to `record` below, which names the frame from it —
             // never from `drift.phase()` read beforehand, which `step`
             // reconciles on its way in and so names the phase just *left*.
             let action = drift.step();
-            match action {
-                DriftAction::Descend {
-                    diffusion_step,
-                    path_seed,
-                } => {
-                    let stepped = reverse_step(
-                        &mut model,
-                        &schedule,
-                        input_dims.z as usize,
-                        output_dims.z as usize,
-                        &latent,
-                        diffusion_step,
-                        path_seed,
-                        magnitude,
-                        true,
-                    );
-                    latent = stepped.latent;
-                    if let Some(x0_hat) = stepped.x0_hat {
-                        last_x0 = x0_hat;
-                    }
-                    steps += 1;
-                    level = diffusion_step.saturating_sub(1);
+            let level = match action {
+                DriftAction::Descend { diffusion_step, .. } => diffusion_step.saturating_sub(1),
+                DriftAction::Climb { forward_step, .. } => forward_step,
+                DriftAction::Flux { diffusion_step, .. } => diffusion_step,
+            };
 
+            // A cycle closes on the increment that opens the climb, and what it
+            // settled on is what the run holds *before* that increment moves
+            // anything: the latent at the floor and the estimate beside it. So
+            // the PNGs are written here, ahead of the advance.
+            if let DriftAction::Climb {
+                forward_step,
+                opens_cycle: true,
+                ..
+            } = action
+            {
+                let path = write_tensor_png(
+                    &last_x0,
+                    output_size,
+                    &out_dir.join(format!("{:03}.png", written)),
+                )?;
+                // …and, on request, the frame the live window would be showing
+                // at this instant. In errance the cycle closes at t=0, where the
+                // sampler's output IS its x̂₀ estimate, so the two panes must
+                // land on the same image — the visual half of the check
+                // `identical_sources_produce_two_identical_panes` makes on
+                // synthetic data.
+                if window_frames {
+                    write_tensor_png(
+                        &compose_live_frame(
+                            walk.latent(),
+                            &last_x0,
+                            output_size.0,
+                            output_size.1,
+                            output_size.2,
+                        ),
+                        (live_frame_width(output_size.0), output_size.1, output_size.2),
+                        &out_dir.join(format!("window_{:03}.png", written)),
+                    )?;
+                }
+                let change = previous_frame.as_ref().map(|prev| {
+                    prev.iter()
+                        .zip(last_x0.iter())
+                        .map(|(a, b)| (a - b).abs() as f64)
+                        .sum::<f64>()
+                        / last_x0.len() as f64
+                });
+                println!(
+                    "  cycle {:>3} → {}  (mean |Δ| vs previous frame: {})",
+                    drift.cycle(),
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    change.map_or("—".to_string(), |c| format!("{c:.4}"))
+                );
+                previous_frame = Some(last_x0.clone());
+                written += 1;
+                mid_captured = false;
+                let _ = forward_step;
+            }
+
+            let frame = walk.advance(
+                action,
+                &schedule,
+                &mut ModelNoise {
+                    model: &mut model,
+                    schedule: &schedule,
+                    input_channels: input_dims.z as usize,
+                    signal_channels: output_dims.z as usize,
+                },
+            );
+            steps += frame.model_calls;
+            let latent = frame.latent;
+            last_x0 = frame.x0_hat;
+
+            match action {
+                DriftAction::Descend { diffusion_step, .. } => {
                     // One mid-descent frame per cycle: the moment the panes are
                     // most unlike each other — x_t still visibly noisy, x̂₀
                     // already an image. That contrast is what a user reads as
@@ -833,128 +1041,24 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                                 output_size.1,
                                 output_size.2,
                             ),
-                            (
-                                live_frame_width(output_size.0),
-                                output_size.1,
-                                output_size.2,
-                            ),
+                            (live_frame_width(output_size.0), output_size.1, output_size.2),
                             &out_dir
                                 .join(format!("window_{:03}_mid_t{diffusion_step}.png", written)),
                         )?;
                         mid_captured = true;
                     }
                 }
-                DriftAction::Climb {
-                    forward_step,
-                    departure_step,
-                    cycle_seed,
-                    opens_cycle,
-                } => {
-                    level = forward_step;
-                    // Mid-climb: carry the departure up one level and, on
-                    // request, write the frames that show the image dissolving.
+                DriftAction::Climb { forward_step, .. } => {
                     // Sampled rather than exhaustive — a t_r = 64 climb is 65
-                    // frames and a contact sheet wants a handful.
-                    if !opens_cycle {
-                        latent = schedule.forward_from(
-                            climb_departure
-                                .as_ref()
-                                .expect("a climb always opens with `opens_cycle`"),
-                            departure_step,
-                            forward_step,
-                            cycle_seed,
-                        );
-                        if let Some(count) = climb_frames
-                            && climb_stride(drift.ceiling(), count)
-                                .is_some_and(|stride| forward_step % stride == 0)
-                        {
-                            write_tensor_png(
-                                &compose_live_frame(
-                                    &latent,
-                                    &last_x0,
-                                    output_size.0,
-                                    output_size.1,
-                                    output_size.2,
-                                ),
-                                (
-                                    live_frame_width(output_size.0),
-                                    output_size.1,
-                                    output_size.2,
-                                ),
-                                &out_dir.join(format!("climb_{written:03}_t{forward_step:03}.png")),
-                            )?;
-                        }
-                        // Same record as the tail of the loop — this branch
-                        // leaves early, and a dump that skipped mid-climb
-                        // frames would be missing exactly the frames a climb is
-                        // judged on.
-                        if let Some(dump) = dump.as_mut() {
-                            dump.record(action, forward_step, &latent, &last_x0)?;
-                        }
-                        continue;
-                    }
-
-                    // A cycle just closed: `last_x0` is the image it settled on.
-                    let path = write_tensor_png(
-                        &last_x0,
-                        output_size,
-                        &out_dir.join(format!("{:03}.png", written)),
-                    )?;
-                    // …and, on request, the frame the live window would be
-                    // showing at this instant. In errance the cycle closes at
-                    // t=0, where the sampler's output IS its x̂₀ estimate, so
-                    // the two panes must land on the same image — the visual
-                    // half of the check `identical_sources_produce_two_identical_panes`
-                    // makes on synthetic data.
-                    if window_frames {
-                        write_tensor_png(
-                            &compose_live_frame(
-                                &latent,
-                                &last_x0,
-                                output_size.0,
-                                output_size.1,
-                                output_size.2,
-                            ),
-                            (
-                                live_frame_width(output_size.0),
-                                output_size.1,
-                                output_size.2,
-                            ),
-                            &out_dir.join(format!("window_{:03}.png", written)),
-                        )?;
-                    }
-                    let change = previous_frame.as_ref().map(|prev| {
-                        prev.iter()
-                            .zip(last_x0.iter())
-                            .map(|(a, b)| (a - b).abs() as f64)
-                            .sum::<f64>()
-                            / last_x0.len() as f64
-                    });
-                    println!(
-                        "  cycle {:>3} → {}  (mean |Δ| vs previous frame: {})",
-                        drift.cycle(),
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        change.map_or("—".to_string(), |c| format!("{c:.4}"))
-                    );
-                    previous_frame = Some(last_x0.clone());
-                    written += 1;
-                    mid_captured = false;
-
-                    // The departure of this climb: the latent as the descent
-                    // left it. Every level of the climb is formed from this
-                    // same snapshot and the same field, which is what stops
-                    // the ascent from crackling (`CLIMB_COHERENCE.md`).
-                    climb_departure = Some(latent.clone());
-                    latent = schedule.forward_from(
-                        climb_departure.as_ref().expect("just set"),
-                        departure_step,
-                        forward_step,
-                        cycle_seed,
-                    );
-                    // Written here rather than above so the contact sheet opens
-                    // on the first dissolved frame, not on the settled image
+                    // frames and a contact sheet wants a handful. The opening
+                    // increment is always written, so the sheet starts on the
+                    // first *dissolved* frame rather than on the settled image
                     // (which `window_NNN.png` already holds).
-                    if climb_frames.is_some() {
+                    if let Some(count) = climb_frames
+                        && (forward_step == drift.departure_step()
+                            || climb_stride(drift.ceiling(), count)
+                                .is_some_and(|stride| forward_step % stride == 0))
+                    {
                         write_tensor_png(
                             &compose_live_frame(
                                 &latent,
@@ -968,30 +1072,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                         )?;
                     }
                 }
-                DriftAction::Flux {
-                    diffusion_step,
-                    path_seed,
-                    renoise_seed,
-                } => {
-                    let stepped = reverse_step(
-                        &mut model,
-                        &schedule,
-                        input_dims.z as usize,
-                        output_dims.z as usize,
-                        &latent,
-                        diffusion_step,
-                        path_seed,
-                        magnitude,
-                        true,
-                    );
-                    latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
-                    if let Some(x0_hat) = stepped.x0_hat {
-                        last_x0 = x0_hat;
-                    }
-                    steps += 1;
-                    level = diffusion_step;
-                }
+                DriftAction::Flux { .. } => {}
             }
+
             if let Some(dump) = dump.as_mut() {
                 dump.record(action, level, &latent, &last_x0)?;
             }
@@ -1002,13 +1085,15 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         }
 
         let elapsed = started.elapsed().as_secs_f32();
-        // Both counts, because they differ and the difference is the point: a
-        // climb increment is closed-form arithmetic and never calls the model,
-        // so a run of N actions costs fewer than N reverse steps in every regime
-        // that climbs. Reporting only one of them reads as a miscount.
+        // The two counts used to differ, and the difference was the whole cost
+        // model: a climb increment was closed-form arithmetic and called no
+        // model, so a climbing run cost fewer model calls than actions. It is
+        // also exactly what made x̂₀ freeze on the way up. They are now equal by
+        // construction — one call per frame, every frame — and both are printed
+        // so a run where they diverge again is visible at a glance.
         println!(
-            "{actions} actions, {steps} of them reverse steps (model calls), in {elapsed:.2} s \
-             ({:.0} steps/s, unthrottled)",
+            "{actions} actions, {steps} model calls, in {elapsed:.2} s \
+             ({:.0} calls/s, unthrottled)",
             steps as f32 / elapsed.max(f32::EPSILON)
         );
         Ok::<(), String>(())
@@ -1744,15 +1829,41 @@ async fn run_perpetual(
     } else {
         cfg.seed.unwrap_or(0)
     };
-    let mut drift = PerpetualDrift::new(schedule.len(), cfg.regime, cfg.renoise_depth, seed);
-    let mut latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
-    // Until the first reverse step reports one, the best clean estimate we hold
-    // is a flat mid-grey — never the pure-noise latent, which `add_noise` would
-    // take for a clean image (see the perpetual module's header).
-    let mut last_x0 = vec![0.0f32; output_len];
-    // The state the climb in progress departed from — snapshotted when a cycle
-    // closes and read by every level of that climb.
-    let mut climb_departure: Option<Vec<f32>> = None;
+    // The picture the drift sets out from. A dataset that cannot be found is
+    // not fatal: the run falls back on the pure-noise opening perpetual runs
+    // always had, and says which one it is doing on the status line.
+    let seed_images = SeedImages::resolve(cfg.seed_dataset.as_deref(), output_size)?;
+    let mut drift = match seed_images.as_ref() {
+        Some(_) => PerpetualDrift::from_image(schedule.len(), cfg.regime, cfg.renoise_depth, seed),
+        None => PerpetualDrift::new(schedule.len(), cfg.regime, cfg.renoise_depth, seed),
+    };
+    // The latent, and the climb departure it has to remember, both live in the
+    // walk — engine side, so the frame-by-frame behaviour is unit-testable
+    // against an oracle instead of only observable through a window.
+    let opening = match seed_images.as_ref() {
+        Some(images) => images.provide_x0(seed),
+        None => schedule.sample_noise(output_len, drift.initial_noise_seed()),
+    };
+    // The estimate to show before the first frame reports one. Seeded from an
+    // image, that IS the image — which is the honest answer and also what the
+    // viewer expects to see for the frame before the drift moves. Seeded from
+    // noise, a flat mid-grey: never the pure-noise latent, which `add_noise`
+    // would take for a clean image (see the perpetual module's header).
+    let mut last_x0 = match seed_images.as_ref() {
+        Some(_) => opening.clone(),
+        None => vec![0.0f32; output_len],
+    };
+    let mut walk = DriftWalk::new(opening, cfg.denoise_magnitude);
+    if let Some(images) = seed_images.as_ref() {
+        let _ = tx.send(tui::TrainingEvent::SaveStatus {
+            message: format!(
+                "dérive img2img depuis {} ({} images)",
+                images.path().display(),
+                images.len()
+            ),
+            is_error: false,
+        });
+    }
 
     let mut live = LiveFrame::new(
         model.gpu_context(),
@@ -1840,11 +1951,23 @@ async fn run_perpetual(
                         tui::TrainingControlCommand::Reseed => {
                             let next_seed = random_seed();
                             drift.reseed(next_seed);
-                            latent = schedule.sample_noise(output_len, drift.initial_noise_seed());
-                            last_x0 = vec![0.0f32; output_len];
-                            // The reseed restarts on a descent, so no climb can
-                            // read this — dropped so none ever could.
-                            climb_departure = None;
+                            // `restart_from` drops the climb departure with the
+                            // latent: a climb reading a snapshot from before the
+                            // re-seed would carry the old image up the schedule.
+                            // Whatever the run opened on, `[r]` opens on again
+                            // — the drift keeps its origin across a re-seed, so
+                            // handing it the other kind of latent would put a
+                            // photograph at the top of the schedule.
+                            let opening = match seed_images.as_ref() {
+                                Some(images) => images.provide_x0(next_seed),
+                                None => schedule
+                                    .sample_noise(output_len, drift.initial_noise_seed()),
+                            };
+                            last_x0 = match seed_images.as_ref() {
+                                Some(_) => opening.clone(),
+                                None => vec![0.0f32; output_len],
+                            };
+                            walk.restart_from(opening);
                         }
                         tui::TrainingControlCommand::NudgeTempo(delta) => {
                             let factor = PerpetualConfig::TEMPO_FACTOR.powi(delta);
@@ -1903,103 +2026,32 @@ async fn run_perpetual(
             continue;
         }
 
-        let mut climbing = false;
         let action = drift.step();
         phase = action.phase();
-        match action {
-            DriftAction::Descend {
-                diffusion_step,
-                path_seed,
-            } => {
-                let stepped = reverse_step(
-                    &mut model,
-                    &schedule,
-                    input_channels,
-                    signal_channels,
-                    &latent,
-                    diffusion_step,
-                    path_seed,
-                    cfg.denoise_magnitude,
-                    true,
-                );
-                latent = stepped.latent;
-                if let Some(x0_hat) = stepped.x0_hat {
-                    live.publish(&latent, &x0_hat);
-                    last_x0 = x0_hat;
-                }
-                steps += 1;
-                pace.tick();
-            }
-            DriftAction::Climb {
-                forward_step,
-                departure_step,
-                cycle_seed,
-                opens_cycle,
-            } => {
-                // The cycle just closed: the latent is the image it settled on,
-                // and it is the departure every level of this climb is formed
-                // from — one snapshot, one noise field, revealed progressively.
-                // Re-noising incrementally instead would draw an independent
-                // field per frame and make the ascent crackle
-                // (`CLIMB_COHERENCE.md`).
-                if opens_cycle {
-                    climb_departure = Some(latent.clone());
-                }
-                // One level of the forward process, carried from that departure.
-                // The image dissolves over as many frames as it took to resolve
-                // instead of being replaced by noise between two of them.
-                latent = schedule.forward_from(
-                    climb_departure
-                        .as_ref()
-                        .expect("a climb always opens with `opens_cycle`"),
-                    departure_step,
-                    forward_step,
-                    cycle_seed,
-                );
-                // x̂₀ stays put: the model is not predicting during the climb,
-                // and inventing a right-hand pane would be a lie. The frozen
-                // estimate beside the dissolving latent is also what makes the
-                // dissolution legible.
-                live.publish(&latent, &last_x0);
-                climbing = true;
-                steps += 1;
-                pace.tick();
-                // The turn of the cycle is worth a redraw of the panel; the
-                // rest of the climb rides the usual 100 ms refresh.
-                dirty |= opens_cycle;
-            }
-            DriftAction::Flux {
-                diffusion_step,
-                path_seed,
-                renoise_seed,
-            } => {
-                // One frame of the stationary churn: a step down the reverse
-                // chain, then exactly that one level put back on by the forward
-                // increment. The noise level never moves, so there is no phase
-                // to turn round — only the content drifts, by about
-                // sqrt(beta_t*) a frame.
-                let stepped = reverse_step(
-                    &mut model,
-                    &schedule,
-                    input_channels,
-                    signal_channels,
-                    &latent,
-                    diffusion_step,
-                    path_seed,
-                    cfg.denoise_magnitude,
-                    true,
-                );
-                latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
-                // Unlike the climb, the model *is* predicting on every frame
-                // here, so the right-hand pane is live too.
-                if let Some(x0_hat) = stepped.x0_hat {
-                    live.publish(&latent, &x0_hat);
-                    last_x0 = x0_hat;
-                }
-                steps += 1;
-                pace.tick();
-            }
-        }
+        // A climb increment is closed-form arithmetic and used to be free; it
+        // now costs the one model call that keeps x̂₀ alive while the image
+        // dissolves (`DriftWalk`, and `IMG2IMG_DRIFT.md`). The tempo ratio
+        // below therefore paces two comparable frames, not a cheap one and an
+        // expensive one.
+        let climbing = matches!(action, DriftAction::Climb { .. });
+        let opens_cycle = matches!(action, DriftAction::Climb { opens_cycle: true, .. });
+        let frame = walk.advance(
+            action,
+            &schedule,
+            &mut ModelNoise {
+                model: &mut model,
+                schedule: &schedule,
+                input_channels,
+                signal_channels,
+            },
+        );
+        live.publish(&frame.latent, &frame.x0_hat);
+        last_x0 = frame.x0_hat;
+        steps += frame.model_calls;
+        pace.tick();
+        // The turn of the cycle is worth a redraw of the panel; the rest of the
+        // climb rides the usual 100 ms refresh.
+        dirty |= opens_cycle;
 
         let now = std::time::Instant::now();
         // A climb increment costs no model call, so its pace is free to differ
@@ -3101,6 +3153,107 @@ mod tests {
                 template.key
             );
         }
+    }
+
+    // -- The img2img seed ----------------------------------------------------
+
+    /// **The claim of the mode**: the latent a perpetual run sets out from is a
+    /// real image of the dataset, bit for bit — not noise, not a resized
+    /// approximation of one, not a blend.
+    ///
+    /// Written against distinct, recognisable samples so the answer identifies
+    /// *which* image was drawn: a provider that returned the first sample every
+    /// time, or an average, would pass a "not noise" check and fail this.
+    #[test]
+    fn the_opening_latent_is_a_dataset_image_to_the_bit() {
+        let out = tmp_path("seed_images.batraw");
+        // Eight 2×2 greyscale samples, each a constant of its own value.
+        let samples: Vec<Vec<f32>> = (0..8)
+            .map(|s| vec![s as f32 / 8.0 - 0.5; 4])
+            .collect();
+        write_batraw(&out, 8, 2, 2, 1, &samples);
+
+        let images = SeedImages::resolve(Some(&out.to_string_lossy()), (2, 2, 1))
+            .expect("load should succeed")
+            .expect("an explicit path must yield a source");
+        assert_eq!(images.len(), 8);
+
+        for seed in 0u64..64 {
+            let x0 = images.provide_x0(seed);
+            assert!(
+                samples.iter().any(|sample| sample
+                    .iter()
+                    .zip(x0.iter())
+                    .all(|(a, b)| (a - b).abs() < 1e-6)),
+                "seed {seed} produced a latent that is in the dataset nowhere: {x0:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// The draw has to be a draw. `seed % len` on seeds that come from a clock
+    /// or from a form walks the dataset in order — consecutive `[r]` presses
+    /// would hand out consecutive images, and a run would be correlated with
+    /// whatever order the file happens to be in. The index is therefore
+    /// avalanched first (same discipline as `gaussian_at`,
+    /// `ANISOTROPY_HUNT.md`).
+    ///
+    /// Checked two ways: consecutive seeds must not give consecutive indices,
+    /// and 64 draws over 8 images must reach every one of them.
+    #[test]
+    fn consecutive_seeds_do_not_draw_consecutive_images() {
+        let out = tmp_path("seed_images_spread.batraw");
+        let samples: Vec<Vec<f32>> = (0..8).map(|s| vec![s as f32 / 8.0 - 0.5; 4]).collect();
+        write_batraw(&out, 8, 2, 2, 1, &samples);
+        let images = SeedImages::resolve(Some(&out.to_string_lossy()), (2, 2, 1))
+            .expect("load")
+            .expect("source");
+        let _ = std::fs::remove_file(&out);
+
+        let drawn: Vec<usize> = (0u64..64).map(|seed| images.at_random(seed)).collect();
+        let stepping = drawn
+            .windows(2)
+            .filter(|pair| (pair[1] + 8 - pair[0]) % 8 == 1)
+            .count();
+        assert!(
+            stepping < 24,
+            "{stepping} of 63 consecutive seeds stepped one image forward — the \
+             index is following the seed instead of being drawn from it: {drawn:?}"
+        );
+        let reached: std::collections::HashSet<usize> = drawn.iter().copied().collect();
+        assert_eq!(reached.len(), 8, "only {} of 8 images reachable", reached.len());
+    }
+
+    /// A dataset named on the command line and missing is an **error**: falling
+    /// back on noise would look exactly like the flag being ignored. A dataset
+    /// merely *derived* and missing is not — that is the machine having no
+    /// CIFAR handy, and the run still has a pure-noise opening to fall back on.
+    #[test]
+    fn a_named_dataset_that_is_missing_is_an_error_but_a_derived_one_is_not() {
+        let missing = tmp_path("no_such_dataset.batraw");
+        let _ = std::fs::remove_file(&missing);
+        assert!(
+            SeedImages::resolve(Some(&missing.to_string_lossy()), (2, 2, 1)).is_err(),
+            "a named dataset that is not there must be reported, not swallowed"
+        );
+        // A geometry no built-in dataset matches: nothing to derive, no error.
+        assert!(
+            matches!(SeedImages::resolve(None, (2, 2, 7)), Ok(None)),
+            "a 7-channel model has no default dataset and must not fail for it"
+        );
+    }
+
+    /// The default follows the model's own output channels. Handing a
+    /// greyscale drift the RGB file does not error — the loader resizes — so a
+    /// wrong default would show up as a drift away from a mangled picture and
+    /// nothing else.
+    #[test]
+    fn the_default_dataset_follows_the_models_output_channels() {
+        assert_eq!(default_seed_dataset_name(1), Some("cifar10_grey.batraw"));
+        assert_eq!(default_seed_dataset_name(3), Some("cifar10_rgb.batraw"));
+        assert_eq!(default_seed_dataset_name(2), None);
+        assert_eq!(default_seed_dataset_name(0), None);
     }
 
     #[test]

@@ -374,6 +374,12 @@ pub struct PerpetualParamsState {
     /// 0=random toggle, 1=seed, 2=magnitude, 3=depth, 4=tempo, 5=regime toggle
     pub field_idx: usize,
     pub error: Option<String>,
+    /// The dataset the drift sets out from, when the model's `config_file`
+    /// names one. Not a form field — it is carried through untouched so that
+    /// opening a model and starting it does not quietly erase a setting the
+    /// form cannot show. The default (no entry) is derived from the model's
+    /// output channels by the worker.
+    pub seed_dataset: Option<String>,
 }
 
 pub const PERPETUAL_PARAM_FIELD_NAMES: [&str; 6] = [
@@ -713,6 +719,7 @@ impl App {
                 ],
                 field_idx: 0,
                 error: None,
+                seed_dataset: None,
             },
             training_params: TrainingParamsState {
                 fields: vec![
@@ -2238,6 +2245,7 @@ impl App {
         self.perpetual_params.fields[1] = cfg.denoise_magnitude.to_string();
         self.perpetual_params.fields[2] = cfg.renoise_depth.to_string();
         self.perpetual_params.fields[3] = cfg.tempo.to_string();
+        self.perpetual_params.seed_dataset = cfg.seed_dataset.clone();
         self.perpetual_params.field_idx = 0;
         self.perpetual_params.error = None;
     }
@@ -2283,6 +2291,7 @@ impl App {
             regime: self.perpetual_params.regime,
             tempo,
             checkpoint: self.selected_checkpoint_path.clone(),
+            seed_dataset: self.perpetual_params.seed_dataset.clone(),
         };
 
         self.perpetual_params.error = None;
