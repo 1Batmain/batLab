@@ -2,31 +2,126 @@
 
 use super::app::{
     App, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind,
-    MODEL_ACTIONS, ModelAction, MonitorImage, NEW_MODEL_ENTRY, PERPETUAL_PARAM_FIELD_NAMES, RunMode,
-    Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
+    MODEL_ACTIONS, ModelAction, MonitorImage, NEW_MODEL_ENTRY, PERPETUAL_PARAM_FIELD_NAMES,
+    PathStep, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use ratatui::{prelude::*, widgets::*};
 
 pub fn draw(f: &mut Frame, app: &App) {
+    let full = f.area();
+
+    // The breadcrumb takes the last row of the terminal, and the screen gets
+    // what is left — reserved rather than drawn over, because the monitor uses
+    // its full area right down to the bottom border.
+    let (body, trail) = match app.screen.path_step() {
+        Some(_) if full.height > 1 => {
+            let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);
+            (rows[0], Some(rows[1]))
+        }
+        _ => (full, None),
+    };
+
     match app.screen {
-        Screen::ModelList => draw_model_list(f, app),
-        Screen::TemplateSelector => draw_template_selector(f, app),
-        Screen::ModelActions => draw_model_actions(f, app),
-        Screen::RenameModel => draw_rename_model(f, app),
-        Screen::DeleteConfirm => draw_delete_confirm(f, app),
-        Screen::WeightSelector => draw_weight_selector(f, app),
-        Screen::InputSize => draw_input_size(f, app),
-        Screen::LayerBuilder => draw_layer_builder(f, app),
-        Screen::InferenceParams => draw_inference_params(f, app),
-        Screen::PerpetualParams => draw_perpetual_params(f, app),
-        Screen::TrainingParams => draw_training_params(f, app),
-        Screen::DatasetSelector => draw_dataset_selector(f, app),
-        Screen::Monitor => draw_monitor(f, app),
+        Screen::ModelList => draw_model_list(f, app, body),
+        Screen::TemplateSelector => draw_template_selector(f, app, body),
+        Screen::ModelActions => draw_model_actions(f, app, body),
+        Screen::RenameModel => draw_rename_model(f, app, body),
+        Screen::DeleteConfirm => draw_delete_confirm(f, app, body),
+        Screen::WeightSelector => draw_weight_selector(f, app, body),
+        Screen::InputSize => draw_input_size(f, app, body),
+        Screen::LayerBuilder => draw_layer_builder(f, app, body),
+        Screen::InferenceParams => draw_inference_params(f, app, body),
+        Screen::PerpetualParams => draw_perpetual_params(f, app, body),
+        Screen::TrainingParams => draw_training_params(f, app, body),
+        Screen::DatasetSelector => draw_dataset_selector(f, app, body),
+        Screen::Monitor => draw_monitor(f, app, body),
         Screen::TrainingControl => {
-            draw_monitor(f, app);
-            draw_training_control(f, app);
+            draw_monitor(f, app, body);
+            draw_training_control(f, app, body);
         }
     }
+
+    if let Some(trail) = trail {
+        draw_breadcrumb(f, app, trail);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The breadcrumb — the path, at the bottom of the terminal
+// ---------------------------------------------------------------------------
+
+/// Below this width the breadcrumb drops its key hint, and below the narrower
+/// bound it drops the step names too and keeps only a position — a wrapped
+/// breadcrumb is worse than none.
+const BREADCRUMB_FULL_WIDTH: u16 = 72;
+const BREADCRUMB_MIN_WIDTH: u16 = 30;
+
+/// The flow drawn as the path it is: `Model › Action › Weights › Parameters ›
+/// Run`, current step lit, steps already walked kept legible, steps ahead
+/// dimmed.
+///
+/// It answers the question the screens themselves never did — *where am I, and
+/// how did I get here* — which is why it is drawn on every step and on none of
+/// the detours.
+fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
+    let Some(current) = app.screen.path_step() else {
+        return;
+    };
+    if area.width < BREADCRUMB_MIN_WIDTH {
+        return;
+    }
+    let here = current.position();
+
+    if area.width < BREADCRUMB_FULL_WIDTH {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ({}/{})", current.label(), here + 1, PathStep::ALL.len()),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            area,
+        );
+        return;
+    }
+
+    let mut spans = vec![Span::raw(" ")];
+    for (index, step) in PathStep::ALL.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                " › ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let style = if index == here {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if index < here {
+            // Already chosen. Kept readable rather than dimmed: these are the
+            // decisions the current screen is standing on.
+            Style::default().fg(Color::Gray)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let label = if index == here {
+            format!("[{}]", step.label())
+        } else {
+            step.label().to_string()
+        };
+        spans.push(Span::styled(label, style));
+    }
+
+    // The hint is offered only where the keys actually do something. Advertising
+    // `←/→` on a form that hands them to a field is how a footer starts lying.
+    if app.screen.walks_the_path_by_arrow() {
+        spans.push(Span::styled(
+            "   ← back  → forward",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +169,7 @@ fn focused_value(focused: bool) -> Style {
 /// Generic form screen (text fields).
 fn draw_form_screen(
     f: &mut Frame,
+    area: Rect,
     title: &str,
     field_names: &[&str],
     fields: &[String],
@@ -81,7 +177,6 @@ fn draw_form_screen(
     error: Option<&str>,
     hint: &str,
 ) {
-    let area = f.area();
     let popup = centered_rect(56, 70, area);
     f.render_widget(Clear, popup);
 
@@ -162,8 +257,7 @@ fn checkpoint_summary(checkpoints: &[String]) -> String {
     }
 }
 
-fn draw_model_list(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_model_list(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(72, 66, area);
     f.render_widget(Clear, popup);
 
@@ -238,8 +332,7 @@ fn draw_model_list(f: &mut Frame, app: &App) {
 // Screen: Model Actions — what to do with the model that was just picked
 // ---------------------------------------------------------------------------
 
-fn draw_model_actions(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_model_actions(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(56, 62, area);
     f.render_widget(Clear, popup);
 
@@ -313,8 +406,7 @@ fn draw_model_actions(f: &mut Frame, app: &App) {
 // Screens: the manager — rename and delete
 // ---------------------------------------------------------------------------
 
-fn draw_rename_model(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_rename_model(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(60, 40, area);
     f.render_widget(Clear, popup);
 
@@ -362,8 +454,7 @@ fn draw_rename_model(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_delete_confirm(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(64, 46, area);
     f.render_widget(Clear, popup);
 
@@ -424,8 +515,7 @@ fn draw_delete_confirm(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_template_selector(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_template_selector(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(70, 62, area);
     f.render_widget(Clear, popup);
 
@@ -480,8 +570,7 @@ fn draw_template_selector(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_weight_selector(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_weight_selector(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(70, 66, area);
     f.render_widget(Clear, popup);
 
@@ -566,9 +655,10 @@ fn draw_weight_selector(f: &mut Frame, app: &App) {
 // Screen: Input Size
 // ---------------------------------------------------------------------------
 
-fn draw_input_size(f: &mut Frame, app: &App) {
+fn draw_input_size(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
+        area,
         "Model Input Size",
         &INPUT_SIZE_FIELD_NAMES,
         &app.input_size.fields,
@@ -582,8 +672,7 @@ fn draw_input_size(f: &mut Frame, app: &App) {
 // Screen: Layer Builder
 // ---------------------------------------------------------------------------
 
-fn draw_layer_builder(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_layer_builder(f: &mut Frame, app: &App, area: Rect) {
 
     match app.layer_builder.mode {
         LayerBuilderMode::Browse => draw_lb_browse_mode(f, app, area),
@@ -813,11 +902,12 @@ fn random_weights_value(app: &App) -> String {
     }
 }
 
-fn draw_training_params(f: &mut Frame, app: &App) {
+fn draw_training_params(f: &mut Frame, app: &App, area: Rect) {
     let mut values: Vec<String> = app.training_params.fields[..3].to_vec();
     values.push(random_weights_value(app));
     draw_form_screen(
         f,
+        area,
         "Training Parameters",
         &TRAINING_PARAM_FIELD_NAMES,
         &values,
@@ -827,7 +917,7 @@ fn draw_training_params(f: &mut Frame, app: &App) {
     );
 }
 
-fn draw_inference_params(f: &mut Frame, app: &App) {
+fn draw_inference_params(f: &mut Frame, app: &App, area: Rect) {
     let seed_mode = if app.inference_params.random_seed {
         "Random"
     } else {
@@ -841,6 +931,7 @@ fn draw_inference_params(f: &mut Frame, app: &App) {
     ];
     draw_form_screen(
         f,
+        area,
         "Inference Parameters",
         &INFERENCE_PARAM_FIELD_NAMES,
         &values,
@@ -850,7 +941,7 @@ fn draw_inference_params(f: &mut Frame, app: &App) {
     );
 }
 
-fn draw_perpetual_params(f: &mut Frame, app: &App) {
+fn draw_perpetual_params(f: &mut Frame, app: &App, area: Rect) {
     let seed_mode = if app.perpetual_params.random_seed {
         "Random"
     } else {
@@ -866,6 +957,7 @@ fn draw_perpetual_params(f: &mut Frame, app: &App) {
     ];
     draw_form_screen(
         f,
+        area,
         "Perpetual Inference",
         &PERPETUAL_PARAM_FIELD_NAMES,
         &values,
@@ -879,8 +971,7 @@ fn draw_perpetual_params(f: &mut Frame, app: &App) {
 // Screen: Dataset Selector
 // ---------------------------------------------------------------------------
 
-fn draw_dataset_selector(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_dataset_selector(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(66, 70, area);
     f.render_widget(Clear, popup);
 
@@ -965,8 +1056,7 @@ fn draw_dataset_selector(f: &mut Frame, app: &App) {
 // Screen: Monitor
 // ---------------------------------------------------------------------------
 
-fn draw_monitor(f: &mut Frame, app: &App) {
-    let area = f.area();
+fn draw_monitor(f: &mut Frame, app: &App, area: Rect) {
 
     let vertical = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(area);
     let main_area = vertical[0];
@@ -1564,9 +1654,10 @@ fn draw_analytics(f: &mut Frame, app: &App, area: Rect) {
 // Screen: Training Control (popup over Monitor)
 // ---------------------------------------------------------------------------
 
-fn draw_training_control(f: &mut Frame, app: &App) {
+fn draw_training_control(f: &mut Frame, app: &App, area: Rect) {
     draw_form_screen(
         f,
+        area,
         "Training Controls",
         &TRAINING_CONTROL_FIELD_NAMES,
         &app.training_control.fields,

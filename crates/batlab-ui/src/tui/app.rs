@@ -42,7 +42,96 @@ pub enum Screen {
     TrainingControl,
 }
 
+/// The flow, as the five steps a run actually walks through.
+///
+/// The screens are the implementation; this is the *path*, and it is what the
+/// breadcrumb draws at the bottom of the terminal. Several screens map to one
+/// step — the four parameter forms are all "Parameters", because from the
+/// user's side there is one step there whatever the run mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PathStep {
+    Model,
+    Action,
+    Weights,
+    Parameters,
+    Run,
+}
+
+impl PathStep {
+    /// The path, in order. The breadcrumb draws exactly this.
+    pub const ALL: [PathStep; 5] = [
+        PathStep::Model,
+        PathStep::Action,
+        PathStep::Weights,
+        PathStep::Parameters,
+        PathStep::Run,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            PathStep::Model => "Model",
+            PathStep::Action => "Action",
+            PathStep::Weights => "Weights",
+            PathStep::Parameters => "Parameters",
+            PathStep::Run => "Run",
+        }
+    }
+
+    /// How far along the path this step sits.
+    pub fn position(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|step| *step == self)
+            .expect("PathStep::ALL must list every step")
+    }
+}
+
 impl Screen {
+    /// Which step of the path this screen belongs to, or `None` for the screens
+    /// that sit off it.
+    ///
+    /// The match is exhaustive on purpose: a new screen cannot be added without
+    /// someone deciding whether it is a step of the flow or a detour. The
+    /// detours are the manager forms, the architecture editor and its input
+    /// geometry, and the training-control popup — reached *from* a step, but
+    /// not a step, and drawing a breadcrumb on them would claim a position in
+    /// the path that pressing `←` would not honour.
+    pub const fn path_step(self) -> Option<PathStep> {
+        match self {
+            Screen::ModelList | Screen::TemplateSelector => Some(PathStep::Model),
+            Screen::ModelActions => Some(PathStep::Action),
+            Screen::WeightSelector => Some(PathStep::Weights),
+            Screen::TrainingParams
+            | Screen::DatasetSelector
+            | Screen::InferenceParams
+            | Screen::PerpetualParams => Some(PathStep::Parameters),
+            Screen::Monitor => Some(PathStep::Run),
+            Screen::RenameModel
+            | Screen::DeleteConfirm
+            | Screen::InputSize
+            | Screen::LayerBuilder
+            | Screen::TrainingControl => None,
+        }
+    }
+
+    /// Whether `←`/`→` walk the path on this screen.
+    ///
+    /// Only the pure selectors qualify. Everywhere else those two keys already
+    /// mean something to a field or a cursor — the layer kind, the tempo of a
+    /// perpetual run, the dataset, a seed toggle — and a breadcrumb that took
+    /// them would break bindings people already use. The parameter forms are
+    /// therefore *shown* on the path but not navigable by arrow: `Esc` remains
+    /// the way back out of a form.
+    pub const fn walks_the_path_by_arrow(self) -> bool {
+        matches!(
+            self,
+            Screen::ModelList
+                | Screen::TemplateSelector
+                | Screen::ModelActions
+                | Screen::WeightSelector
+        )
+    }
+
     /// Every screen there is. A test walks the whole flow and asserts it visited
     /// all of these, so a new variant stays failing until something actually
     /// routes to it.
@@ -1755,6 +1844,78 @@ impl App {
     /// The action currently highlighted in the action menu.
     pub fn selected_action(&self) -> Option<ModelAction> {
         ModelAction::from_index(self.model_actions.selected)
+    }
+
+    // --- Walking the path: `←` and `→`, and the `Esc` they share a spine with ---
+
+    /// One step back up the path.
+    ///
+    /// `Esc` and `←` both go through here on the selector screens, which is the
+    /// point: two keys that mean "back" and are implemented twice drift, and the
+    /// drift is invisible until someone uses the one that was not maintained.
+    ///
+    /// Returns `false` when there is nothing above — only on the model list,
+    /// the front door. `Esc` turns that into a quit; `←` turns it into nothing,
+    /// because an arrow key must never be the thing that ends the session.
+    pub fn path_back(&mut self) -> bool {
+        match self.screen {
+            Screen::ModelList => false,
+            Screen::TemplateSelector => {
+                self.refresh_model_list();
+                self.screen = Screen::ModelList;
+                true
+            }
+            Screen::ModelActions => {
+                self.model_actions.error = None;
+                self.refresh_model_list();
+                self.screen = Screen::ModelList;
+                true
+            }
+            Screen::WeightSelector => {
+                self.screen = Screen::ModelActions;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// One step forward along the path, for the user who went back with `←` and
+    /// wants to return without re-deciding anything.
+    ///
+    /// It only ever moves where moving is *navigation*. The template selector is
+    /// the deliberate hole in the sequence: going forward from it writes a new
+    /// model's `config_file` to disk, and an arrow key is not an instruction to
+    /// create something. `Enter` remains the way to do that. The same reasoning
+    /// keeps `Rename` and `Delete` inert here — they are not steps of the path,
+    /// they are what the action menu also happens to offer.
+    pub fn path_forward(&mut self) {
+        match self.screen {
+            Screen::ModelList => {
+                let returning_to_the_same_model = !self.model_list.is_new_model_selected()
+                    && self
+                        .model_list
+                        .selected_model()
+                        .map(|model| model.name.as_str())
+                        == self.active_model_name.as_deref();
+                if returning_to_the_same_model {
+                    // Re-opening would re-read the `config_file` and reset the
+                    // action and weight choices from it. The whole promise of
+                    // `→` is that going back and forward costs nothing, so the
+                    // model already in hand is simply picked back up.
+                    self.model_actions.error = None;
+                    self.screen = Screen::ModelActions;
+                } else {
+                    self.finish_model_list();
+                }
+            }
+            Screen::ModelActions => {
+                if self.selected_action().is_some_and(ModelAction::is_run) {
+                    self.finish_model_actions();
+                }
+            }
+            Screen::WeightSelector => self.finish_weight_selector(),
+            _ => {}
+        }
     }
 
     /// Whether this process is running the named model right now.
