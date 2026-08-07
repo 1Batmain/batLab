@@ -66,6 +66,7 @@ def sample_png(model, records, tag, seed=3, paths=2):
 
 # ---------------------------------------------------------------- a) structure
 def structure():
+    H.adopt_repo_model(XL)
     ds = os.path.join(H.WORK, "datasets", "tiny8.batraw")
     os.makedirs(os.path.dirname(ds), exist_ok=True)
     rng = np.random.default_rng(1234)

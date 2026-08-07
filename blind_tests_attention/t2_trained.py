@@ -31,6 +31,7 @@ results = []
 
 
 def ensure_ckpt():
+    H.adopt_repo_model(XL)
     if not os.path.exists(CKPT):
         os.makedirs(os.path.dirname(CKPT), exist_ok=True)
         open(CKPT, "wb").write(open(BACKUP, "rb").read())

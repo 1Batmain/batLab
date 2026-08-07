@@ -87,6 +87,11 @@ def sensitivity(w, h, c, seed):
         "sans résiduel": good - xs,
         "sans b_o": good - bo,
         "W_o transposé": R.attention(xs, Wq, Wk, Wv, Wo.T, bq, bk, bv, bo),
+        "W_v transposé": R.attention(xs, Wq, Wk, Wv.T, Wo, bq, bk, bv, bo),
+        # la seule dégénérescence plausible : échanger les rôles Q/K ET l'axe de
+        # la softmax. Si elle passait, l'ordre d'empaquetage Q,K resterait
+        # indécidable de l'extérieur — elle ne passe pas.
+        "Q/K échangés + axe inversé": _variant(xs, (Wk, Wq, Wv, Wo, bk, bq, bv, bo), axis=0),
     }
     ok = rel(good) < TOL and all(rel(v) > 100 * TOL for v in variants.values())
     detail = f"correct={rel(good):.1e} | " + "  ".join(f"{k}={rel(v):.1e}"

@@ -24,6 +24,7 @@ import harness as H
 
 XL = "Color_Diffusion_XL"
 CKPT = os.path.join(H.WORK, "Models", XL, "pretrained_weights", "night_run.ckpt")
+BACKUP = "/Users/bat/development/lab/batLab/.checkpoint_backup/Color_Diffusion_XL_attn_5700.ckpt"
 OUT = os.path.join(H.WORK, "out", "rt")
 results = []
 
@@ -40,6 +41,10 @@ def sha_sample(ckpt, tag, seed=4, paths=2, magnitude=1.0):
 
 
 if __name__ == "__main__":
+    H.adopt_repo_model(XL)
+    if not os.path.exists(CKPT):
+        os.makedirs(os.path.dirname(CKPT), exist_ok=True)
+        open(CKPT, "wb").write(open(BACKUP, "rb").read())
     a = sha_sample(CKPT, "run_a")
     b = sha_sample(CKPT, "run_b")
     results.append(("même graine deux fois ⇒ PNG octet pour octet identiques",

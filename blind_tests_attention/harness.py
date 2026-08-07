@@ -33,6 +33,21 @@ SAT = 0.9999            # |x0_hat| au-delà duquel le sampler a écrêté : lect
 FRAME = 160             # frame de lecture pendant la descente (t = 94)
 
 
+def adopt_repo_model(name):
+    """Recopie le `config_file` d'un modèle du dépôt dans la racine jetable.
+
+    Le dépôt reste en lecture seule : la suite n'écrit jamais dans `Models/`.
+    """
+    src = os.path.join(ROOT, "Models", name, "config_file")
+    dst_dir = os.path.join(WORK, "Models", name)
+    os.makedirs(os.path.join(dst_dir, "pretrained_weights"), exist_ok=True)
+    dst = os.path.join(dst_dir, "config_file")
+    if not os.path.exists(dst):
+        with open(src, "rb") as a, open(dst, "wb") as b:
+            b.write(a.read())
+    return name
+
+
 def ensure_model(name, w, h, c, with_attention):
     layers = [{"Convolution": {"dim_input": [w, h, c + 1], "nb_kernel": c,
                                "dim_kernel": [1, 1, c + 1], "stride": 1,
