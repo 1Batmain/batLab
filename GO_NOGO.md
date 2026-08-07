@@ -85,6 +85,24 @@ l'explique pas :
   et arrive à 0,0571 (avec) contre 0,0574 (sans) après 100 pas. Ce n'est donc
   pas le mode d'échec « le command buffer est rejeté et rien ne tourne ».
 
+**Ce n'est pas de la contention machine** (cf. l'encadré du §2). Les mesures se
+sont enchaînées dans cet ordre :
+
+| heure | mesure | ms/pas | ms/éch. |
+|---|---|---:|---:|
+| 23:25–23:34 | attention, batch 16 (smoke) | 2 240 | 140,0 |
+| 23:35–00:03 | **attention, batch 64** | **17 360** | **271,2** |
+| 00:03–00:18 | sans attention, batch 64 | 8 792 | 137,4 |
+| 00:19–00:24 | sans attention, batch 16 | 2 240 | 140,0 |
+| 00:24–00:31 | attention, batch 32 | 4 417 | 138,0 |
+| 00:31–00:34 | attention, batch 16 | 2 240 | 140,0 |
+
+Les deux ancres à batch 16, **avant et après** toute la campagne, donnent
+2 240 ms/pas à l'identique : la machine était dans le même état d'un bout à
+l'autre. Et la mesure qui suit immédiatement `attn64` — `noattn64` — est
+normale. Une contention qui n'aurait frappé que la mesure du milieu, en
+épargnant ses deux voisines, n'est pas crédible.
+
 Hypothèse la plus probable, **non vérifiée** : un seuil d'occupation ou de
 pression mémoire franchi entre 32 et 64. À instruire par une mission de perf ;
 la première cible à profiler est `attn_back_weights` (147 456 threads, chacun
