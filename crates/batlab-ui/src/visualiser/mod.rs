@@ -956,6 +956,26 @@ mod tests {
         );
     }
 
+    /// The single-pane perpetual frame is a **square**, and the window has to
+    /// open square for it — that is the whole reason the default view drops the
+    /// left pane: a 67×32 window puts a 32×32 picture in half of a letterboxed
+    /// strip. Nothing in the visualiser needed changing for it; this pins that
+    /// the geometry it is handed comes out right.
+    #[test]
+    fn the_single_pane_frame_opens_square() {
+        let single = (
+            batlab_core::LiveView::X0Only.frame_width(32),
+            32u32,
+        );
+        assert_eq!(single, (32, 32));
+        let (w, h) = initial_window_size(single.0, single.1);
+        assert_eq!(w, h, "a square frame opened at {w}×{h}");
+        assert_eq!((w, h), (544, 544), "×17, the largest integer fit");
+        // …and dragged to any shape, it stays square inside bands.
+        let (_, _, vw, vh) = letterbox_viewport((900, 400), single);
+        assert!((vw - vh).abs() < 1e-4, "letterboxed to {vw}×{vh}");
+    }
+
     #[test]
     fn the_opening_size_stays_within_the_target_edge_for_any_frame() {
         for frame in [(67u32, 32u32), (32, 32), (1, 1), (0, 0), (700, 3), (4, 900)] {

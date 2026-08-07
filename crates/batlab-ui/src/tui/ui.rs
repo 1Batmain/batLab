@@ -1426,7 +1426,7 @@ fn is_perpetual_mode(app: &App) -> bool {
 /// last asked for.
 fn perpetual_hint(app: &App) -> String {
     const KEYS: &str = "[↑↓] niveau  [←→] tempo  [espace] pause  [r] re-seed  \
-                        [m] regime  [s] PNG  [v] visualise  [q] quit";
+                        [m] regime  [x] vue  [s] PNG  [v] visualise  [q] quit";
 
     // The last PNG write (or failure) is worth a word, but must not cost the
     // user the key list — it rides as a prefix instead of replacing the line.
@@ -1510,7 +1510,7 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
         ),
         row("timestep t", state.diffusion_step.to_string(), ""),
         row(&state.cycle_label, state.cycle.to_string(), "[r] re-seed"),
-        row("reverse steps", state.steps.to_string(), ""),
+        row("appels modèle", state.steps.to_string(), ""),
         row(
             "pace",
             format!("{:.1} / {:.0} steps/s", state.steps_per_sec, state.tempo),
@@ -1521,17 +1521,15 @@ fn draw_perpetual_panel(f: &mut Frame, app: &App, area: Rect) {
             if state.paused { "paused" } else { "running" }.to_string(),
             "[space]",
         ),
+        row("origine", state.origin.clone(), ""),
+        row("fenêtre [v]", state.view.clone(), "[x]"),
         Line::from(""),
         Line::from(Span::styled(
-            "  Fenêtre [v] : gauche x_t (bruité) │ droite x̂₀ (estimation).",
+            "  La dérive part d'une image réelle du dataset et s'en éloigne ; [r] en tire une autre.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "  Les deux moitiés convergent vers la même image quand t → 0.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "  En remontée, x_t se dissout pas à pas — x̂₀ reste figé, le modèle ne prédit pas.",
+            "  En remontée x_t se dissout pas à pas, et le modèle prédit toujours : x̂₀ rêve, jamais figé.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(

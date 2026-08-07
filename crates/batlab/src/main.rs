@@ -18,7 +18,7 @@ use batlab_core::{
     GpuDataset,
     GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
     MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
-    Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame, live_frame_width, log_probe,
+    Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame_view, log_probe,
     log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
@@ -778,7 +778,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             "--out",
             "--seed-dataset",
         ],
-        &["--window", "--seed-noise"],
+        &["--window", "--seed-noise", "--single-view"],
     )?;
 
     let model_name = flag("--headless-perpetual")
@@ -836,6 +836,13 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // `--seed-dataset <path>` names the file to draw from instead of deriving
     // it from the model's output channels.
     let seed_from_noise = args.iter().any(|arg| arg == "--seed-noise");
+    // `--window` writes the frame the live visualiser would be showing, so it
+    // has to be able to write the layout the visualiser actually defaults to in
+    // this mode: x̂₀ alone, square. `--single-view` asks for that one.
+    let window_view = match args.iter().any(|arg| arg == "--single-view") {
+        true => batlab_core::LiveView::X0Only,
+        false => batlab_core::LiveView::Both,
+    };
     let seed_dataset = flag("--seed-dataset");
     let out_dir = flag("--out").map(PathBuf::from).unwrap_or_else(|| {
         storage::project_root()
@@ -981,14 +988,19 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                 // synthetic data.
                 if window_frames {
                     write_tensor_png(
-                        &compose_live_frame(
+                        &compose_live_frame_view(
                             walk.latent(),
                             &last_x0,
                             output_size.0,
                             output_size.1,
                             output_size.2,
+                            window_view,
                         ),
-                        (live_frame_width(output_size.0), output_size.1, output_size.2),
+                        (
+                            window_view.frame_width(output_size.0),
+                            output_size.1,
+                            output_size.2,
+                        ),
                         &out_dir.join(format!("window_{:03}.png", written)),
                     )?;
                 }
@@ -1034,14 +1046,19 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     // rule has to survive.
                     if window_frames && !mid_captured && diffusion_step * 2 <= drift.depth() {
                         write_tensor_png(
-                            &compose_live_frame(
+                            &compose_live_frame_view(
                                 &latent,
                                 &last_x0,
                                 output_size.0,
                                 output_size.1,
                                 output_size.2,
+                                window_view,
                             ),
-                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            (
+                                window_view.frame_width(output_size.0),
+                                output_size.1,
+                                output_size.2,
+                            ),
                             &out_dir
                                 .join(format!("window_{:03}_mid_t{diffusion_step}.png", written)),
                         )?;
@@ -1060,14 +1077,19 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                                 .is_some_and(|stride| forward_step % stride == 0))
                     {
                         write_tensor_png(
-                            &compose_live_frame(
+                            &compose_live_frame_view(
                                 &latent,
                                 &last_x0,
                                 output_size.0,
                                 output_size.1,
                                 output_size.2,
+                                window_view,
                             ),
-                            (live_frame_width(output_size.0), output_size.1, output_size.2),
+                            (
+                                window_view.frame_width(output_size.0),
+                                output_size.1,
+                                output_size.2,
+                            ),
                             &out_dir.join(format!("climb_{written:03}_t{forward_step:03}.png")),
                         )?;
                     }
@@ -1640,6 +1662,7 @@ fn apply_training_control_command(
         | tui::TrainingControlCommand::NudgeTempo(_)
         | tui::TrainingControlCommand::Reseed
         | tui::TrainingControlCommand::ToggleRegime
+        | tui::TrainingControlCommand::ToggleView
         | tui::TrainingControlCommand::SaveImage => {}
     }
 }
@@ -1865,23 +1888,35 @@ async fn run_perpetual(
         });
     }
 
-    let mut live = LiveFrame::new(
+    // A drift is something to look at, so the default is the estimate ALONE,
+    // square, at the image's own aspect ratio — "on n'a même pas besoin de la
+    // fenêtre de gauche". `[x]` brings the latent back when the question is
+    // what the noise is doing.
+    let mut view = batlab_core::LiveView::X0Only;
+    let mut live = LiveFrame::with_view(
         model.gpu_context(),
         output_size.0,
         output_size.1,
         output_size.2,
+        view,
     );
-    tui::register_visualiser_source(
-        model.gpu_context(),
-        live.buffer(),
-        live.frame_width(),
-        live.frame_height(),
-        live.channels(),
-        format!(
-            "Perpetual  —  gauche: x_t (bruité)  |  droite: x̂₀ (estimation)  —  {}×{}×{}",
-            output_size.0, output_size.1, output_size.2
-        ),
-    );
+    let show = |live: &LiveFrame, gpu: std::sync::Arc<batlab_core::GpuContext>, view: batlab_core::LiveView| {
+        tui::register_visualiser_source(
+            gpu,
+            live.buffer(),
+            live.frame_width(),
+            live.frame_height(),
+            live.channels(),
+            format!(
+                "Perpetual  —  {}  —  {}×{}×{}",
+                view.caption(),
+                output_size.0,
+                output_size.1,
+                output_size.2
+            ),
+        );
+    };
+    show(&live, model.gpu_context(), view);
 
     let sample_dir = storage::project_root().join("perpetual_samples");
     let mut tempo = cfg
@@ -1894,13 +1929,18 @@ async fn run_perpetual(
     let mut pace = PaceMeter::new();
     let mut last_published = std::time::Instant::now();
 
+    let origin_label = match seed_images.as_ref() {
+        Some(_) => "image du dataset".to_string(),
+        None => "bruit pur (aucun dataset)".to_string(),
+    };
     let publish = |tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
                    drift: &PerpetualDrift,
                    phase: batlab_core::DriftPhase,
                    steps: usize,
                    steps_per_sec: f32,
                    tempo: f32,
-                   paused: bool|
+                   paused: bool,
+                   view: batlab_core::LiveView|
      -> bool {
         tx.send(tui::TrainingEvent::PerpetualState(tui::PerpetualStatus {
             regime: drift.regime().label().to_string(),
@@ -1922,12 +1962,17 @@ async fn run_perpetual(
             steps_per_sec,
             tempo,
             paused,
+            view: match view {
+                batlab_core::LiveView::X0Only => "x̂₀ seul".to_string(),
+                batlab_core::LiveView::Both => "x_t | x̂₀".to_string(),
+            },
+            origin: origin_label.clone(),
         }))
         .is_ok()
     };
     // Nothing has been stepped yet, so the opening read is the drift's own.
     let mut phase = drift.phase();
-    if !publish(tx, &drift, phase, steps, 0.0, tempo, paused) {
+    if !publish(tx, &drift, phase, steps, 0.0, tempo, paused, view) {
         tui::clear_visualiser_source();
         return Ok(());
     }
@@ -2003,6 +2048,25 @@ async fn run_perpetual(
                                 return Ok(());
                             }
                         }
+                        tui::TrainingControlCommand::ToggleView => {
+                            // The buffer is sized for the layout, so a new view
+                            // means a new frame and a re-registration: the
+                            // window has to be told the new width anyway, and
+                            // it comes back at the new aspect ratio.
+                            view = view.toggle();
+                            live = LiveFrame::with_view(
+                                model.gpu_context(),
+                                output_size.0,
+                                output_size.1,
+                                output_size.2,
+                                view,
+                            );
+                            // Painted at once from what is already in hand, so
+                            // the new window opens on the picture rather than
+                            // on a frame of mid-grey.
+                            live.publish(walk.latent(), &last_x0);
+                            show(&live, model.gpu_context(), view);
+                        }
                         // Training-only commands; a perpetual run has no
                         // optimiser to retune and no weights of its own to save.
                         tui::TrainingControlCommand::SaveCheckpoint
@@ -2019,7 +2083,7 @@ async fn run_perpetual(
         }
 
         if paused {
-            if dirty && !publish(tx, &drift, phase, steps, 0.0, tempo, paused) {
+            if dirty && !publish(tx, &drift, phase, steps, 0.0, tempo, paused, view) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -2072,7 +2136,7 @@ async fn run_perpetual(
 
         if dirty || last_published.elapsed() >= Duration::from_millis(100) {
             last_published = std::time::Instant::now();
-            if !publish(tx, &drift, phase, steps, pace.per_second(), tempo, paused) {
+            if !publish(tx, &drift, phase, steps, pace.per_second(), tempo, paused, view) {
                 break;
             }
         }

@@ -435,6 +435,14 @@ pub struct PerpetualStatus {
     pub steps: usize,
     /// Measured pace, as opposed to the requested `tempo`.
     pub steps_per_sec: f32,
+    /// What the `[v]` window is showing — x̂₀ alone, or both panes. Published by
+    /// the worker, which owns the `LiveFrame`, so the legend and the window
+    /// cannot disagree about which layout is up.
+    pub view: String,
+    /// What the run set out from: a dataset image, or pure noise when none
+    /// could be found. Worth saying, because a run that silently fell back on
+    /// noise looks exactly like one that was asked to.
+    pub origin: String,
     pub tempo: f32,
     pub paused: bool,
 }

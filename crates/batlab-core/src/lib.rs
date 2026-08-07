@@ -27,7 +27,9 @@ pub use config::{
     compute_inferred_input, summarize_architecture,
 };
 pub use gpu_context::GpuContext;
-pub use live_frame::{LiveFrame, compose_live_frame, live_frame_width};
+pub use live_frame::{
+    LiveFrame, LiveView, compose_live_frame, compose_live_frame_view, live_frame_width,
+};
 pub use model::Model;
 pub use model::training;
 pub use model::training::{

@@ -241,20 +241,29 @@ static PERPETUAL_HELP: &[HelpEntry] = &[
     HelpEntry {
         title: "Random Seed",
         body: &[
-            "Random tire une graine neuve. Manual repart toujours du même latent \
-             — utile pour rejouer une dérive qu'on a aimée.",
+            "Random tire une graine neuve. Manual repart toujours de la même \
+             image de départ — utile pour rejouer une dérive qu'on a aimée.",
             "",
-            "En cours de run, [r] re-tire une graine sans tout relancer.",
+            "En cours de run, [r] re-tire une graine, donc une AUTRE image du \
+             dataset, sans tout relancer.",
         ],
-        source: None,
+        source: Some("IMG2IMG_DRIFT.md"),
     },
     HelpEntry {
         title: "Seed",
         body: &[
-            "La graine du latent de départ x_T. Même remarque qu'en inférence : \
-             elle fixe le point de départ, pas le bruit réinjecté ensuite.",
+            "La dérive part d'une VRAIE image du dataset (cifar10_grey ou \
+             cifar10_rgb selon les canaux de sortie du modèle) : la graine dit \
+             LAQUELLE.",
+            "",
+            "Elle ne fixe donc plus un latent de bruit pur — le run n'a plus à \
+             descendre 256 pas avant que quoi que ce soit arrive, il remonte \
+             depuis l'image dès la première frame, au niveau réglé ci-dessous.",
+            "",
+            "Sans dataset trouvable, repli sur l'ancienne ouverture : bruit pur \
+             en haut du schedule, annoncé à l'écran.",
         ],
-        source: Some("ANISOTROPY_HUNT.md"),
+        source: Some("IMG2IMG_DRIFT.md, ANISOTROPY_HUNT.md"),
     },
     HelpEntry {
         title: "Magnitude",
@@ -278,10 +287,11 @@ static PERPETUAL_HELP: &[HelpEntry] = &[
              lisible. Plus haut, ça bouge plus fort : |Δx_t| médiane 10,7 à \
              t*=16, 20,4 à 64, 28,5 à 128.",
             "",
-            "La première descente part toujours du haut du schedule quel que soit \
-             t_r — partir directement à t_r ne ferait que débruiter un champ gris.",
+            "C'est le cadran qui « jauge le bruit qu'on réinjecte », et il agit \
+             dès la première frame : le run part d'une image réelle, il n'a pas \
+             de descente initiale à faire.",
         ],
-        source: Some("PERPETUAL_FLUX.md, PERPETUAL_INFERENCE.md"),
+        source: Some("PERPETUAL_FLUX.md, IMG2IMG_DRIFT.md"),
     },
     HelpEntry {
         title: "Steps / second",
@@ -305,12 +315,14 @@ static PERPETUAL_HELP: &[HelpEntry] = &[
             "",
             "respiration — plancher à t_r/2 : l'image ne se résout jamais.",
             "",
-            "flux — tient un seul niveau t* et n'en repart jamais. C'est le seul \
-             régime sans à-coups : médiane des |Δ| image à image de 3,59 contre \
-             0,00 pour les deux autres, où x̂₀ reste figé la moitié du temps avant \
-             de sauter.",
+            "flux — tient un seul niveau t* et n'en repart jamais : ni phase, ni \
+             point de rebroussement.",
+            "",
+            "errance et respiration ne se figent plus pendant la remontée — le \
+             modèle tourne aussi en montant (0 frame gelée sur 179, contre \
+             179/179 avant). Il reste leur tournant de cycle, une frame.",
         ],
-        source: Some("PERPETUAL_FLUX.md"),
+        source: Some("PERPETUAL_FLUX.md, IMG2IMG_DRIFT.md"),
     },
 ];
 

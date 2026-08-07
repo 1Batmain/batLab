@@ -1047,6 +1047,10 @@ pub enum TrainingControlCommand {
     ToggleRegime,
     /// Write the frame currently on screen to a PNG (perpetual runs).
     SaveImage,
+    /// Swap the visualiser between x̂₀ alone and the double x_t | x̂₀ view
+    /// (perpetual runs). Re-registers the source, so the window comes back at
+    /// the new aspect ratio.
+    ToggleView,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

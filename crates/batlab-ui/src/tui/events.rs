@@ -491,6 +491,10 @@ fn handle_monitor(app: &mut App, code: KeyCode) {
                 app.send_perpetual_command(TrainingControlCommand::SaveImage);
                 return;
             }
+            KeyCode::Char('x') => {
+                app.send_perpetual_command(TrainingControlCommand::ToggleView);
+                return;
+            }
             _ => {}
         }
     }
@@ -650,6 +654,7 @@ mod tests {
             (KeyCode::Char('r'), TrainingControlCommand::Reseed),
             (KeyCode::Char('m'), TrainingControlCommand::ToggleRegime),
             (KeyCode::Char('s'), TrainingControlCommand::SaveImage),
+            (KeyCode::Char('x'), TrainingControlCommand::ToggleView),
         ] {
             handle_key(&mut app, key);
             assert_eq!(
@@ -694,6 +699,7 @@ mod tests {
             KeyCode::Right,
             KeyCode::Char('m'),
             KeyCode::Char('r'),
+            KeyCode::Char('x'),
         ] {
             handle_key(&mut app, key);
             assert!(
