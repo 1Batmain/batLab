@@ -171,6 +171,7 @@ pub fn run_monitor(
                 tc.lr.to_string(),
                 tc.batch_size.to_string(),
                 tc.steps.to_string(),
+                crate::tui::app::ema_decay_field(tc.ema_decay),
                 tc.dataset_path.clone(),
             ];
             app.selected_checkpoint_path = tc.checkpoint_path.clone();

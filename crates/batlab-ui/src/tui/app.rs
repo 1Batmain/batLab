@@ -333,7 +333,13 @@ pub enum LayerBuilderMode {
 }
 
 pub struct TrainingParamsState {
-    pub fields: Vec<String>, // [lr, batch_size, steps, dataset_path]
+    /// `[lr, batch_size, steps, ema_decay, dataset_path]`.
+    ///
+    /// The first four are indexed by `field_idx` directly — one row of the form,
+    /// one slot. The dataset trails behind them with no row of its own: the
+    /// dataset *selector* is a screen of its own, and this slot is only where
+    /// its answer is parked.
+    pub fields: Vec<String>,
     pub field_idx: usize,
     pub error: Option<String>,
     pub datasets: Vec<String>,
@@ -342,19 +348,59 @@ pub struct TrainingParamsState {
 
 /// The training form, in the order it is walked.
 ///
-/// The fourth entry is a toggle, not a typed value: it is the explicit opt-out
+/// The last entry is a toggle, not a typed value: it is the explicit opt-out
 /// from the pretrained weights the flow now defaults to. It sits last because
 /// it is the rare choice — the common case is "keep training this model", and
 /// the common case should be the one you can reach by pressing Enter.
-pub const TRAINING_PARAM_FIELD_NAMES: [&str; 4] = [
+pub const TRAINING_PARAM_FIELD_NAMES: [&str; 5] = [
     "Learning Rate",
     "Batch Size",
     "Steps",
+    "EMA decay",
     "Start from random",
 ];
 
+/// Index of the EMA decay entry, in the form AND in `fields` — the two agree
+/// for every typed row, which is what stops the panel from explaining one
+/// field while the keystrokes edit another.
+pub const TRAINING_EMA_FIELD: usize = 3;
+
 /// Index of the random-weights toggle inside [`TRAINING_PARAM_FIELD_NAMES`].
-pub const TRAINING_RANDOM_WEIGHTS_FIELD: usize = 3;
+pub const TRAINING_RANDOM_WEIGHTS_FIELD: usize = 4;
+
+/// What the EMA row shows for a configured decay. **Empty means off** — the
+/// field is the presence of an average, not a number that is always there.
+pub fn ema_decay_field(decay: Option<f32>) -> String {
+    decay.map(|d| d.to_string()).unwrap_or_default()
+}
+
+/// Read the EMA row back: blank (or whitespace) is `None`, anything else has to
+/// be a decay strictly inside `(0, 1)`.
+///
+/// `1.0` freezes the average on the initial weights for ever and `0.0` makes it
+/// a copy of the weights — both are silently useless rather than loudly wrong,
+/// which is exactly the setting that costs a night of GPU before anyone looks.
+pub fn parse_ema_decay_field(raw: &str) -> Result<Option<f32>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let decay: f32 = raw
+        .parse()
+        .map_err(|_| "EMA decay must be a number, or empty for no average".to_string())?;
+    if !(decay.is_finite() && decay > 0.0 && decay < 1.0) {
+        return Err("EMA decay must be strictly between 0 and 1 (e.g. 0.999)".to_string());
+    }
+    Ok(Some(decay))
+}
+
+/// Where the dataset path is parked inside `TrainingParamsState::fields`.
+///
+/// It is NOT a form row: it shares its number with the toggle by accident of
+/// arithmetic, not by design. Named because it used to be a bare `[3]` in
+/// fifteen places, and inserting a row in front of it silently repointed every
+/// one of them at the EMA field.
+pub const TRAINING_DATASET_FIELD: usize = 4;
 
 pub struct InferenceParamsState {
     pub random_seed: bool,
@@ -734,6 +780,9 @@ impl App {
                     default_lr.to_string(),
                     default_batch.to_string(),
                     default_steps.to_string(),
+                    // Empty means no averaging — the default, and the run this
+                    // binary did before averaging existed.
+                    String::new(),
                     dataset_path,
                 ],
                 field_idx: 0,
@@ -924,8 +973,8 @@ impl App {
             self.training_params.selected_dataset = 0;
             return;
         }
-        if self.training_params.fields[3].trim().is_empty() {
-            self.training_params.fields[3] = self.training_params.datasets[0].clone();
+        if self.training_params.fields[TRAINING_DATASET_FIELD].trim().is_empty() {
+            self.training_params.fields[TRAINING_DATASET_FIELD] = self.training_params.datasets[0].clone();
             self.training_params.selected_dataset = 0;
         } else {
             self.sync_selected_dataset_from_field();
@@ -937,7 +986,7 @@ impl App {
             .training_params
             .datasets
             .iter()
-            .position(|dataset| dataset == &self.training_params.fields[3])
+            .position(|dataset| dataset == &self.training_params.fields[TRAINING_DATASET_FIELD])
         {
             self.training_params.selected_dataset = index;
         }
@@ -983,11 +1032,11 @@ impl App {
         self.training_params.field_idx = 0;
         self.refresh_datasets();
         if self.training_params.datasets.is_empty() {
-            self.training_params.fields[3].clear();
+            self.training_params.fields[TRAINING_DATASET_FIELD].clear();
             self.training_params.selected_dataset = 0;
         } else {
             self.training_params.selected_dataset = 0;
-            self.training_params.fields[3] = self.training_params.datasets[0].clone();
+            self.training_params.fields[TRAINING_DATASET_FIELD] = self.training_params.datasets[0].clone();
         }
 
         self.model_actions.selected = ModelAction::Train.index();
@@ -1042,6 +1091,7 @@ impl App {
                     train.lr.to_string(),
                     train.batch_size.to_string(),
                     train.steps.to_string(),
+                    ema_decay_field(train.ema_decay),
                     train.dataset_path,
                 ];
                 self.sync_selected_dataset_from_field();
@@ -1081,7 +1131,7 @@ impl App {
         }
         self.training_params.selected_dataset =
             (self.training_params.selected_dataset + 1) % self.training_params.datasets.len();
-        self.training_params.fields[3] =
+        self.training_params.fields[TRAINING_DATASET_FIELD] =
             self.training_params.datasets[self.training_params.selected_dataset].clone();
         self.training_params.error = None;
     }
@@ -1095,7 +1145,7 @@ impl App {
         } else {
             self.training_params.selected_dataset -= 1;
         }
-        self.training_params.fields[3] =
+        self.training_params.fields[TRAINING_DATASET_FIELD] =
             self.training_params.datasets[self.training_params.selected_dataset].clone();
         self.training_params.error = None;
     }
@@ -1103,12 +1153,12 @@ impl App {
     pub fn select_dataset(&mut self, index: usize) {
         if self.training_params.datasets.is_empty() {
             self.training_params.selected_dataset = 0;
-            self.training_params.fields[3].clear();
+            self.training_params.fields[TRAINING_DATASET_FIELD].clear();
             return;
         }
         let clamped = index.min(self.training_params.datasets.len() - 1);
         self.training_params.selected_dataset = clamped;
-        self.training_params.fields[3] = self.training_params.datasets[clamped].clone();
+        self.training_params.fields[TRAINING_DATASET_FIELD] = self.training_params.datasets[clamped].clone();
         self.training_params.error = None;
     }
 
@@ -2394,13 +2444,14 @@ impl App {
             return Err("No datasets found in datasets/".into());
         }
         self.select_dataset(self.training_params.selected_dataset);
-        let dataset_path = self.training_params.fields[3].clone();
+        let dataset_path = self.training_params.fields[TRAINING_DATASET_FIELD].clone();
         if dataset_path.trim().is_empty() {
             return Err("Dataset path must not be empty".into());
         }
         if !std::path::Path::new(&dataset_path).exists() {
             return Err("Dataset path does not exist".into());
         }
+        let ema_decay = parse_ema_decay_field(&self.training_params.fields[TRAINING_EMA_FIELD])?;
         self.monitor.total_steps = steps;
         self.monitor.last_sample_path = None;
         self.monitor.error = None;
@@ -2416,7 +2467,7 @@ impl App {
                 optimizer: OptimizerKind::default(),
                 weight_init: WeightInit::default(),
                 loss_weighting: LossWeighting::default(),
-                ema_decay: None,
+                ema_decay,
             }),
         });
         Ok(())
@@ -2441,6 +2492,7 @@ impl App {
         if steps == 0 {
             return Err("Steps must be > 0".into());
         }
+        parse_ema_decay_field(&self.training_params.fields[TRAINING_EMA_FIELD])?;
         self.monitor.total_steps = steps;
         self.training_params.error = None;
         self.training_params.fields[0] = lr.to_string();
@@ -2468,7 +2520,7 @@ impl App {
     pub fn handle_char_training(&mut self, c: char) {
         let idx = self.training_params.field_idx;
         let accepted = match idx {
-            0 => c.is_ascii_digit() || c == '.',
+            0 | TRAINING_EMA_FIELD => c.is_ascii_digit() || c == '.',
             1 | 2 => c.is_ascii_digit(),
             _ => false,
         };
@@ -2480,10 +2532,11 @@ impl App {
 
     /// Backspace deletes a character of the *typed* fields only.
     ///
-    /// The guard is not decoration: `fields[3]` is the dataset path, which the
-    /// dataset selector owns and this form never shows. With the toggle sharing
-    /// index 3, an unguarded `pop()` would have eaten that path one character
-    /// per keystroke, from a screen where nothing appears to change.
+    /// The guard is not decoration: `fields[TRAINING_DATASET_FIELD]` is the
+    /// dataset path, which the dataset selector owns and this form never shows.
+    /// With the toggle sharing its index, an unguarded `pop()` would have eaten
+    /// that path one character per keystroke, from a screen where nothing
+    /// appears to change.
     pub fn handle_backspace_training(&mut self) {
         let idx = self.training_params.field_idx;
         if idx >= TRAINING_RANDOM_WEIGHTS_FIELD {
@@ -2563,8 +2616,9 @@ impl App {
 mod tests {
     use super::{
         App, InferenceConfig, LayerKind, LossMethod, LossWeighting, MIN_RENOISE_DEPTH, ModelAction,
-        ModelConfig, OptimizerKind, PerpetualRegime, RunConfig, RunMode, Screen, TrainingConfig,
-        TrainingControlCommand, WeightInit,
+        ModelConfig, OptimizerKind, PerpetualRegime, RunConfig, RunMode, Screen,
+        TRAINING_DATASET_FIELD, TRAINING_EMA_FIELD, TrainingConfig, TrainingControlCommand,
+        WeightInit, parse_ema_decay_field,
     };
     use crate::storage::TempRoot;
     use batlab_core::config::{built_in_templates, compute_inferred_input};
@@ -2899,7 +2953,7 @@ mod tests {
             .expect("training params should be accepted");
         app.training_params.datasets = vec![".".to_string()];
         app.training_params.selected_dataset = 0;
-        app.training_params.fields[3] = ".".to_string();
+        app.training_params.fields[TRAINING_DATASET_FIELD] = ".".to_string();
         app.finish_dataset_selector()
             .expect("dataset selector should produce run config");
 
@@ -2924,14 +2978,14 @@ mod tests {
     #[test]
     fn backspace_on_the_toggle_does_not_eat_the_dataset_path() {
         let (_temp, mut app, _name) = app_on_a_model("backspace-toggle");
-        app.training_params.fields[3] = "datasets/cifar10_grey.batraw".to_string();
+        app.training_params.fields[TRAINING_DATASET_FIELD] = "datasets/cifar10_grey.batraw".to_string();
         app.training_params.field_idx = super::TRAINING_RANDOM_WEIGHTS_FIELD;
 
         for _ in 0..5 {
             app.handle_backspace_training();
         }
 
-        assert_eq!(app.training_params.fields[3], "datasets/cifar10_grey.batraw");
+        assert_eq!(app.training_params.fields[TRAINING_DATASET_FIELD], "datasets/cifar10_grey.batraw");
     }
 
     #[test]
@@ -3000,6 +3054,122 @@ mod tests {
     }
 
 
+    /// The EMA row is empty by default, and empty means no average — the run
+    /// the framework did before averaging existed.
+    #[test]
+    fn the_ema_row_starts_empty_and_an_empty_row_means_no_average() {
+        let (_temp, mut app) = test_app("ema-default-off");
+        assert_eq!(app.training_params.fields[TRAINING_EMA_FIELD], "");
+
+        app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
+        app.finish_weight_selector();
+        app.training_params.fields[0] = "0.001".to_string();
+        app.training_params.fields[1] = "16".to_string();
+        app.training_params.fields[2] = "500".to_string();
+        app.finish_training_params().expect("form accepted");
+        app.training_params.datasets = vec![".".to_string()];
+        app.training_params.selected_dataset = 0;
+        app.training_params.fields[TRAINING_DATASET_FIELD] = ".".to_string();
+        app.finish_dataset_selector().expect("run config built");
+
+        match &app.run_config.as_ref().expect("run config").mode {
+            RunMode::Train(train) => assert_eq!(train.ema_decay, None),
+            other => panic!("expected a training run, got {other:?}"),
+        }
+    }
+
+    /// A decay typed into the form reaches the run configuration.
+    #[test]
+    fn a_decay_typed_on_the_form_reaches_the_run_configuration() {
+        let (_temp, mut app) = test_app("ema-typed");
+        app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
+        app.finish_weight_selector();
+        app.training_params.fields[0] = "0.001".to_string();
+        app.training_params.fields[1] = "16".to_string();
+        app.training_params.fields[2] = "500".to_string();
+        app.training_params.fields[TRAINING_EMA_FIELD] = "0.999".to_string();
+        app.finish_training_params().expect("form accepted");
+        app.training_params.datasets = vec![".".to_string()];
+        app.training_params.selected_dataset = 0;
+        app.training_params.fields[TRAINING_DATASET_FIELD] = ".".to_string();
+        app.finish_dataset_selector().expect("run config built");
+
+        match &app.run_config.as_ref().expect("run config").mode {
+            RunMode::Train(train) => assert_eq!(train.ema_decay, Some(0.999)),
+            other => panic!("expected a training run, got {other:?}"),
+        }
+    }
+
+    /// The form refuses the two decays that are silently useless rather than
+    /// loudly wrong — and it refuses them on the form, not six hours later.
+    #[test]
+    fn the_form_refuses_a_decay_outside_the_open_unit_interval() {
+        assert_eq!(parse_ema_decay_field(""), Ok(None));
+        assert_eq!(parse_ema_decay_field("   "), Ok(None));
+        assert_eq!(parse_ema_decay_field("0.999"), Ok(Some(0.999)));
+        for refused in ["1", "1.0", "0", "0.0", "-0.5", "2", "abc"] {
+            assert!(
+                parse_ema_decay_field(refused).is_err(),
+                "'{refused}' should be refused"
+            );
+        }
+
+        let (_temp, mut app) = test_app("ema-refused");
+        app.finish_template_selector();
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
+        app.finish_weight_selector();
+        app.training_params.fields[0] = "0.001".to_string();
+        app.training_params.fields[1] = "16".to_string();
+        app.training_params.fields[2] = "500".to_string();
+        app.training_params.fields[TRAINING_EMA_FIELD] = "1.0".to_string();
+        assert!(app.finish_training_params().is_err());
+    }
+
+    /// Typing on the EMA row must not eat the dataset path.
+    ///
+    /// This is the exact bug the old `fields[3]`-is-both-things layout produced
+    /// once already: the toggle shared its index with the dataset, and
+    /// backspace on it deleted the path one character per keystroke from a
+    /// screen where nothing appeared to change. Inserting a row in front of the
+    /// dataset is precisely the edit that re-creates it.
+    #[test]
+    fn typing_on_the_ema_row_leaves_the_dataset_path_alone() {
+        let (_temp, mut app) = test_app("ema-no-clobber");
+        app.training_params.fields[TRAINING_DATASET_FIELD] =
+            "datasets/cifar10_grey.batraw".to_string();
+        app.training_params.field_idx = TRAINING_EMA_FIELD;
+        for c in "0.999".chars() {
+            app.handle_char_training(c);
+        }
+        assert_eq!(app.training_params.fields[TRAINING_EMA_FIELD], "0.999");
+        for _ in 0..10 {
+            app.handle_backspace_training();
+        }
+        assert_eq!(app.training_params.fields[TRAINING_EMA_FIELD], "");
+        assert_eq!(
+            app.training_params.fields[TRAINING_DATASET_FIELD],
+            "datasets/cifar10_grey.batraw",
+            "the dataset path is not what this row edits"
+        );
+
+        // …and the toggle row, which is past every typed field, must not edit
+        // anything at all.
+        app.training_params.field_idx = super::TRAINING_RANDOM_WEIGHTS_FIELD;
+        for _ in 0..10 {
+            app.handle_backspace_training();
+        }
+        app.handle_char_training('7');
+        assert_eq!(
+            app.training_params.fields[TRAINING_DATASET_FIELD],
+            "datasets/cifar10_grey.batraw"
+        );
+    }
+
     #[test]
     fn dataset_selector_requires_available_dataset() {
         let (_temp, mut app) = test_app("dataset-required");
@@ -3013,7 +3183,7 @@ mod tests {
         app.finish_training_params()
             .expect("training params should be valid");
         app.training_params.datasets.clear();
-        app.training_params.fields[3].clear();
+        app.training_params.fields[TRAINING_DATASET_FIELD].clear();
 
         let result = app.finish_dataset_selector();
 
@@ -3037,7 +3207,7 @@ mod tests {
 
         app.training_params.datasets = vec![".".to_string()];
         app.training_params.selected_dataset = 0;
-        app.training_params.fields[3] = ".".to_string();
+        app.training_params.fields[TRAINING_DATASET_FIELD] = ".".to_string();
         app.finish_dataset_selector()
             .expect("dataset selector should produce run config");
 

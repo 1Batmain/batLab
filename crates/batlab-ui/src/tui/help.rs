@@ -155,6 +155,33 @@ static TRAINING_HELP: &[HelpEntry] = &[
         source: Some("COLOR_MODEL.md, SCALE_UNET.md"),
     },
     HelpEntry {
+        title: "EMA decay",
+        body: &[
+            "Moyenne mobile exponentielle des poids : ema ← d·ema + (1−d)·w \
+             après chaque pas d'optimiseur. C'EST ELLE QU'ON UTILISE POUR \
+             GÉNÉRER — l'inférence et le perpetual la prennent dès que le \
+             checkpoint en porte une.",
+            "",
+            "Vide = pas de moyenne (le défaut) : le run est alors bit à bit \
+             celui d'avant, checkpoint compris. Sinon un nombre strictement \
+             entre 0 et 1 — 0,999 est le choix usuel ; le 0,9999 de DDPM n'a de \
+             sens qu'au-delà de ~100 000 pas, sa constante de temps ne tient \
+             pas dans un run plus court.",
+            "",
+            "Le démarrage est protégé de deux façons : la moyenne part DES \
+             POIDS (jamais de zéro) et la décroissance est rampée, \
+             d(t) = min(decay, (1+t)/(10+t)). Sur un run de 1200 pas c'est la \
+             rampe qui lie tout du long (d(1200) = 0,9926), donc la fenêtre \
+             moyennée fait ~135 pas en fin de course, pas 1000.",
+            "",
+            "Ça ne coûte presque rien : un buffer par tenseur et un passe \
+             compute par pas, mesuré à +2,6 % sur le pas d'entraînement. Le \
+             checkpoint porte alors LES DEUX jeux (BBCKPT3) et pèse ~33 % de \
+             plus.",
+        ],
+        source: Some("EMA.md"),
+    },
+    HelpEntry {
         title: "Start from random",
         body: &[
             "Décoché (le défaut), le run REPREND les poids choisis à l'étape \
