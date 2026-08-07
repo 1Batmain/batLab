@@ -17,7 +17,8 @@ import numpy as np
 # numpy 2.0.2 + Accelerate émet des RuntimeWarning « divide by zero / overflow »
 # sur des `matmul` dont les entrées ET les sorties sont pourtant toutes finies
 # (vérifié). Bruit de plateforme, pas un signal — on le tait ici seulement.
-warnings.filterwarnings("ignore", category=RuntimeWarning, module=__name__)
+warnings.filterwarnings("ignore", message=".*encountered in matmul",
+                        category=RuntimeWarning)
 
 
 def softmax(z, axis=-1):

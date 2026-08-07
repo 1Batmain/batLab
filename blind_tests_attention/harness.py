@@ -12,6 +12,7 @@ supposer quoi que ce soit du schedule ni de l'embedding.
 import json
 import os
 import subprocess
+import warnings
 
 import numpy as np
 
@@ -23,6 +24,11 @@ ROOT = os.path.dirname(HERE)
 WORK = os.path.join(HERE, "work")
 TMP = os.path.join(WORK, "probe")
 BIN = os.path.join(ROOT, "target/release/batlab")
+
+# numpy 2.0.2 + Accelerate émet des RuntimeWarning « divide by zero / overflow /
+# invalid » sur des `matmul` dont les entrées ET les sorties sont pourtant toutes
+# finies (vérifié à la main). Bruit de plateforme, pas un signal.
+warnings.filterwarnings("ignore", message=".*encountered in matmul", category=RuntimeWarning)
 SAT = 0.9999            # |x0_hat| au-delà duquel le sampler a écrêté : lecture invalide
 FRAME = 160             # frame de lecture pendant la descente (t = 94)
 

@@ -59,7 +59,7 @@ def one(w, h, c, seed):
     rel = float((np.abs(eps - ref)[mask] / np.maximum(np.abs(ref)[mask], 0.05)).max())
     moved = float(np.abs(ref - x)[mask].max())
     ok = rel < TOL and n > 0.5 * mask.size and moved > 1e-3
-    results.append((f"{w}x{h}x{c} — N={w*h} positions", ok,
+    results.append((f"{w}×{h}×{c} — N={w*h} positions, C={c}", ok,
                     f"t={t} n={n}/{mask.size} rel_max={rel:.2e} |y-x|max={moved:.3f} "
                     f"softmax p_max/p_min={probs.max()/probs.min():.1f} (uniforme=1)"))
 
@@ -106,6 +106,7 @@ if __name__ == "__main__":
     one(8, 8, 3, seed=7)
     one(9, 8, 3, seed=11)
     one(16, 16, 3, seed=13)
+    one(8, 8, 8, seed=17)      # C = 8 : le facteur 1/√d suit bien d = C
     sensitivity(8, 8, 3, seed=7)
     bad = 0
     for label, ok, detail in results:
