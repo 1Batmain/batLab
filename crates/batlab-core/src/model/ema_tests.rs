@@ -480,6 +480,31 @@ fn a_checkpoint_of_another_geometry_is_refused() {
     });
 }
 
+/// A resize rebuilds the graph; the shadow has to survive it, like the moments
+/// and the step counter do.
+#[test]
+fn resizing_the_batch_preserves_the_shadow() {
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        let mut model = conv_model(
+            gpu,
+            5e-2,
+            OptimizerKind::Adam,
+            Some(EmaConfig::new(0.8).unwrap()),
+        )
+        .await;
+        for step in 0..6 {
+            let (input, target) = input_and_target(step);
+            model.train_step(&input, &target);
+        }
+        let before = shadow_of(&model);
+        let weights_before = weights_of(&model);
+        model.resize_batch(4).unwrap();
+        assert_eq!(shadow_of(&model), before);
+        assert_eq!(weights_of(&model), weights_before);
+    });
+}
+
 impl Model<Training> {
     /// Bias as raw bits, so "bit-identical" means bit-identical rather than
     /// "equal under whatever f32 comparison the test happened to write".

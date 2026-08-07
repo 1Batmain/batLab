@@ -163,7 +163,7 @@ pub struct Model<State = Infer> {
 impl Model<Infer> {
     pub fn build_model(&mut self) -> Result<(), ModelError> {
         if self.state.is_build {
-            self.clear();
+            self.discard_built_state();
         }
         self.build_forwards()?;
         self.state.is_build = true;
@@ -273,7 +273,7 @@ impl Model<Training> {
     /// rebuilding — see [`Model::resize_batch`].
     pub fn build(&mut self) -> Result<(), ModelError> {
         if self.state.is_build {
-            self.clear();
+            self.discard_built_state();
         }
         self.batch = self
             .training
@@ -673,6 +673,30 @@ impl<State> Model<State> {
         }
     }
 
+    /// Throw away everything `build()` produced — buffers, pipelines, bind
+    /// groups, optimiser and EMA passes — while **keeping the layer list**.
+    ///
+    /// This is what a rebuild needs, and what it did not have: `build()` used to
+    /// call [`Model::clear`], which drops the layers too, so the second `build()`
+    /// of a model's life panicked with "at least one layer required for
+    /// training". That is the only path [`Model::resize_batch`] has — changing
+    /// the batch size of a live run from the monitor killed the run, and the
+    /// help panel promised the opposite ("la reconstruction préserve poids,
+    /// biais, moments Adam et compteur de pas").
+    fn discard_built_state(&mut self) {
+        self.layers.iter_mut().for_each(|l| l.clear());
+        self.loss_layer = None;
+        self.state.is_build = false;
+        self.optimizer_step = 0;
+        self.pending_loss_readback = None;
+        self.last_reported_loss = None;
+        self.loss_readback_disabled = false;
+        self.batch = 1;
+    }
+
+    /// Back to an empty model: no layers, no graph. Used when the model is
+    /// re-specified from scratch, not when it is rebuilt — see
+    /// [`Model::discard_built_state`].
     pub fn clear(&mut self) {
         self.layers.iter_mut().for_each(|l| l.clear());
         self.layers.clear();
@@ -1749,6 +1773,31 @@ mod tests {
             assert!((output[1] - 1.0).abs() < 1e-3);
             assert!((output[2] + 1.0).abs() < 1e-3);
             assert!((output[3] - 1.0).abs() < 1e-3);
+        });
+    }
+
+    /// A model can be built twice. `resize_batch` is the only caller in the
+    /// product and it goes through `build()` a second time, so this is the
+    /// whole of the "change the batch size of a live run" feature.
+    #[test]
+    fn a_model_can_be_rebuilt_and_keeps_its_layers_and_its_weights() {
+        pollster::block_on(async {
+            let gpu = Arc::new(GpuContext::new_headless().await);
+            let mut model = Model::new_training(gpu, 0.01, 1, LossMethod::MeanSquared).await;
+            model
+                .add_layer(LayerTypes::GroupNorm(GroupNormType::new(
+                    Dim3::new((1, 1, 4)),
+                    2,
+                )))
+                .unwrap();
+            model.build().unwrap();
+            let _ = model.train_step_report(&[1.0, 3.0, 5.0, 7.0], &[0.0, 0.0, 0.0, 0.0]);
+            let before = model.predict(&[0.2, 0.4, 0.6, 0.8]);
+
+            model.resize_batch(4).unwrap();
+            assert_eq!(model.batch(), 4);
+            let after = model.predict(&[0.2, 0.4, 0.6, 0.8]);
+            assert_eq!(before, after, "a resize must not move the weights");
         });
     }
 
