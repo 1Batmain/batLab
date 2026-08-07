@@ -62,6 +62,10 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   « déséquilibre 1e5 » et son unité (x₀ vs ε).
 - **[OPTIMIZER_ADAM.md](OPTIMIZER_ADAM.md)** — Adam contre SGD, comparatif apparié :
   ~20× en nombre de pas pour moins de 1 % de surcoût.
+- **[EMA.md](EMA.md)** — moyenne mobile exponentielle des poids (`--ema`), et c'est
+  elle qui sert à générer ; `--resume` et `--checkpoint-every` pour qu'un run long
+  soit reprenable. Le warmup retenu (semis sur les poids + rampe) et pourquoi la
+  correction de biais a été écartée ; `BBCKPT3` ; le contrat observable des flags.
 - **[LOSS_WEIGHTING.md](LOSS_WEIGHTING.md)** — pondérer la loss par tirage biaisé des
   timesteps. Verdict NO-GO, et pourquoi γ=5 ne redistribue rien sur ce schedule.
 - **[PERF_GROUP_NORM.md](PERF_GROUP_NORM.md)** — optimisation de `group_norm`.
