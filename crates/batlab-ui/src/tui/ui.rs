@@ -92,12 +92,20 @@ fn draw_form_screen(
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
+    // The label column is measured, not assumed. It was pinned at 16, and the
+    // perpetual form's "Renoise Depth (t_r)" is 19 — so that form's colons
+    // walked out of line long before the training form grew a longer label.
+    let label_width = field_names.iter().map(|name| name.len()).max().unwrap_or(0);
+
     let mut lines: Vec<Line> = vec![Line::from("")];
     for (i, name) in field_names.iter().enumerate() {
         let focused = i == field_idx;
         let cursor = if focused { "\u{2588}" } else { "" };
         lines.push(Line::from(vec![
-            Span::styled(format!("  {:>16} : ", name), focused_label(focused)),
+            Span::styled(
+                format!("  {name:>label_width$} : "),
+                focused_label(focused),
+            ),
             Span::styled(
                 format!(
                     "{}{}",
@@ -510,6 +518,14 @@ fn draw_weight_selector(f: &mut Frame, app: &App) {
             "    (none found in Models/<model>/pretrained_weights/)",
             Style::default().fg(Color::DarkGray),
         )));
+        // The default is the pretrained weights — so when there are none, say
+        // which way the flow fell back rather than leaving the cursor sitting
+        // on a row the user never chose.
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "    This model has no weights yet: the run starts from random.",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
         for (idx, checkpoint) in app.weight_selector.checkpoints.iter().enumerate() {
             let selected = app.weight_selector.selected == idx + 1;
@@ -775,16 +791,39 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
 // Screen: Training Params
 // ---------------------------------------------------------------------------
 
+/// How the random-weights toggle reads.
+///
+/// Three states, not two: "No" (continuing from a checkpoint), "Yes" (the
+/// deliberate opt-out), and "Yes — no checkpoint found", which is the *forced*
+/// case. Collapsing the third into the second would show a checkbox the user
+/// cannot uncheck, with nothing on screen to say why.
+fn random_weights_value(app: &App) -> String {
+    if !app.has_pretrained_weights() {
+        return "Yes — no checkpoint found".to_string();
+    }
+    if app.start_from_random_weights() {
+        "Yes".to_string()
+    } else {
+        let name = app
+            .weight_selector
+            .selected_checkpoint()
+            .map(|entry| entry.name.as_str())
+            .unwrap_or("pretrained weights");
+        format!("No — continue from {name}")
+    }
+}
+
 fn draw_training_params(f: &mut Frame, app: &App) {
-    let training_fields = &app.training_params.fields[..3];
+    let mut values: Vec<String> = app.training_params.fields[..3].to_vec();
+    values.push(random_weights_value(app));
     draw_form_screen(
         f,
         "Training Parameters",
         &TRAINING_PARAM_FIELD_NAMES,
-        training_fields,
+        &values,
         app.training_params.field_idx,
         app.training_params.error.as_deref(),
-        "[arrow] field  [type] edit  [Enter] next/confirm  [Backspace] del  [Esc] back",
+        "[arrow] field  [type] edit  [space] toggle  [Enter] next/confirm  [Esc] back",
     );
 }
 

@@ -2,7 +2,8 @@
 
 use super::app::{
     App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS, PERPETUAL_PARAM_FIELD_NAMES,
-    PerpetualStatus, Screen, TrainingControlCommand,
+    PerpetualStatus, Screen, TRAINING_PARAM_FIELD_NAMES, TRAINING_RANDOM_WEIGHTS_FIELD,
+    TrainingControlCommand,
 };
 use crossterm::event::KeyCode;
 
@@ -407,7 +408,7 @@ fn handle_perpetual_params(app: &mut App, code: KeyCode) {
 }
 
 fn handle_training_params(app: &mut App, code: KeyCode) {
-    let max_field = 2;
+    let max_field = TRAINING_PARAM_FIELD_NAMES.len() - 1;
     match code {
         KeyCode::Esc => app.screen = Screen::WeightSelector,
         KeyCode::Char('q') => app.should_quit = true,
@@ -420,6 +421,15 @@ fn handle_training_params(app: &mut App, code: KeyCode) {
             if app.training_params.field_idx < max_field {
                 app.training_params.field_idx += 1;
             }
+        }
+        // The random-weights opt-out is a toggle, so it answers to the toggle
+        // keys the other forms already use — and to nothing else. `←`/`→` are
+        // free on this screen precisely because it is a form: the breadcrumb
+        // never claims them here (see `path_nav`).
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if app.training_params.field_idx == TRAINING_RANDOM_WEIGHTS_FIELD =>
+        {
+            app.toggle_start_from_random();
         }
         KeyCode::Backspace => app.handle_backspace_training(),
         KeyCode::Enter => {

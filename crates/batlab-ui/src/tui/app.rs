@@ -176,6 +176,44 @@ pub struct WeightSelectorState {
     pub error: Option<String>,
 }
 
+/// The checkpoint a model is continued from when nothing more specific was
+/// asked for. It is the file every training run writes, so "open a model and
+/// train" means "keep training the model", not "throw the weights away".
+pub const PREFERRED_CHECKPOINT_NAME: &str = "latest.ckpt";
+
+impl WeightSelectorState {
+    /// The row the cursor should sit on given the checkpoints on disk and the
+    /// path already chosen, if any.
+    ///
+    /// Row 0 is "start from random weights" and it is now the *fallback*, not
+    /// the default: a model with weights opens ready to continue from them.
+    /// Row `i + 1` is `checkpoints[i]`.
+    pub fn preferred_row(&self, chosen: Option<&str>) -> usize {
+        if let Some(index) = chosen.and_then(|path| {
+            self.checkpoints
+                .iter()
+                .position(|entry| entry.path == path)
+        }) {
+            return index + 1;
+        }
+        if let Some(index) = self
+            .checkpoints
+            .iter()
+            .position(|entry| entry.name == PREFERRED_CHECKPOINT_NAME)
+        {
+            return index + 1;
+        }
+        if self.checkpoints.is_empty() { 0 } else { 1 }
+    }
+
+    /// The checkpoint currently under the cursor, or `None` on row 0.
+    pub fn selected_checkpoint(&self) -> Option<&storage::CheckpointEntry> {
+        self.selected
+            .checked_sub(1)
+            .and_then(|index| self.checkpoints.get(index))
+    }
+}
+
 pub struct InputSizeState {
     pub fields: Vec<String>, // [width, height, channels]
     pub field_idx: usize,
@@ -213,7 +251,21 @@ pub struct TrainingParamsState {
     pub selected_dataset: usize,
 }
 
-pub const TRAINING_PARAM_FIELD_NAMES: [&str; 3] = ["Learning Rate", "Batch Size", "Steps"];
+/// The training form, in the order it is walked.
+///
+/// The fourth entry is a toggle, not a typed value: it is the explicit opt-out
+/// from the pretrained weights the flow now defaults to. It sits last because
+/// it is the rare choice — the common case is "keep training this model", and
+/// the common case should be the one you can reach by pressing Enter.
+pub const TRAINING_PARAM_FIELD_NAMES: [&str; 4] = [
+    "Learning Rate",
+    "Batch Size",
+    "Steps",
+    "Start from random",
+];
+
+/// Index of the random-weights toggle inside [`TRAINING_PARAM_FIELD_NAMES`].
+pub const TRAINING_RANDOM_WEIGHTS_FIELD: usize = 3;
 
 pub struct InferenceParamsState {
     pub random_seed: bool,
@@ -650,6 +702,14 @@ impl App {
         self.template_selector.error = None;
     }
 
+    /// Re-reads the model's checkpoints and puts the cursor back where the
+    /// current choice says it belongs.
+    ///
+    /// The cursor is *derived*, never remembered: `load_checkpoint_on_start`
+    /// plus `selected_checkpoint_path` are the single source of truth, and every
+    /// path that invalidates the weights (editing a layer, changing the input
+    /// geometry) clears them. Deriving is what keeps a stale row from
+    /// re-selecting a checkpoint that no longer matches the architecture.
     fn refresh_weight_selector(&mut self) {
         let Some(model_name) = self.active_model_name.clone() else {
             self.weight_selector.checkpoints.clear();
@@ -660,9 +720,12 @@ impl App {
         match self.storage.list_model_checkpoints(&model_name) {
             Ok(checkpoints) => {
                 self.weight_selector.checkpoints = checkpoints;
-                if self.weight_selector.selected > self.weight_selector.checkpoints.len() {
-                    self.weight_selector.selected = 0;
-                }
+                self.weight_selector.selected = if self.load_checkpoint_on_start {
+                    self.weight_selector
+                        .preferred_row(self.selected_checkpoint_path.as_deref())
+                } else {
+                    0
+                };
                 self.weight_selector.error = None;
             }
             Err(err) => {
@@ -672,6 +735,73 @@ impl App {
                     Some(format!("Failed to read pretrained weights: {err}"));
             }
         }
+    }
+
+    /// Whether the open model has any weights to continue from.
+    ///
+    /// The two screens that offer the choice both need it: the weight selector
+    /// says so where the list would otherwise just be empty, and the training
+    /// form uses it to pin its toggle on — "start from random" is not a choice
+    /// when it is the only option, and a form that pretends otherwise is
+    /// lying.
+    pub fn has_pretrained_weights(&self) -> bool {
+        !self.weight_selector.checkpoints.is_empty()
+    }
+
+    /// Points the flow at the model's pretrained weights, which is what opening
+    /// a model now means.
+    ///
+    /// `keep` is the path the model's own `config_file` recorded, honoured when
+    /// it still exists on disk; otherwise the preferred checkpoint
+    /// ([`PREFERRED_CHECKPOINT_NAME`], else the first) is taken. With no
+    /// checkpoints at all this falls back to random weights — the only case
+    /// where it does.
+    fn preselect_pretrained_weights(&mut self, keep: Option<String>) {
+        self.load_checkpoint_on_start = false;
+        self.selected_checkpoint_path = keep.clone();
+        self.refresh_weight_selector();
+
+        let row = self.weight_selector.preferred_row(keep.as_deref());
+        self.weight_selector.selected = row;
+        match self.weight_selector.selected_checkpoint() {
+            Some(entry) => {
+                self.selected_checkpoint_path = Some(entry.path.clone());
+                self.load_checkpoint_on_start = true;
+            }
+            None => {
+                // No weights yet: the run starts from random, and the
+                // checkpoint path is where this run will *write*.
+                self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
+                self.load_checkpoint_on_start = false;
+            }
+        }
+    }
+
+    /// The training form's toggle. Turning it off is only possible when there
+    /// are weights to turn it off *to*.
+    pub fn toggle_start_from_random(&mut self) {
+        if !self.has_pretrained_weights() {
+            return;
+        }
+        if self.load_checkpoint_on_start {
+            self.load_checkpoint_on_start = false;
+            self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
+        } else {
+            self.preselect_pretrained_weights(None);
+        }
+        self.weight_selector.selected = if self.load_checkpoint_on_start {
+            self.weight_selector
+                .preferred_row(self.selected_checkpoint_path.as_deref())
+        } else {
+            0
+        };
+        self.training_params.error = None;
+    }
+
+    /// What the training form shows for its toggle: `true` means this run
+    /// throws the weights away and starts over.
+    pub fn start_from_random_weights(&self) -> bool {
+        !self.load_checkpoint_on_start
     }
 
     fn refresh_datasets(&mut self) {
@@ -784,11 +914,13 @@ impl App {
         self.refresh_datasets();
         self.sync_inference_params_from_config(&config.inference);
 
-        match config.run.mode {
+        // Whichever path the model's own `config_file` last recorded. It is a
+        // preference, not a verdict: `preselect_pretrained_weights` honours it
+        // only if that file is still on disk.
+        let recorded = match config.run.mode {
             RunMode::Infer => {
                 self.model_actions.selected = ModelAction::Infer.index();
-                self.selected_checkpoint_path = config.inference.checkpoint.clone();
-                self.load_checkpoint_on_start = config.inference.checkpoint.is_some();
+                config.inference.checkpoint.clone()
             }
             RunMode::Train(train) => {
                 self.model_actions.selected = ModelAction::Train.index();
@@ -798,35 +930,24 @@ impl App {
                     train.steps.to_string(),
                     train.dataset_path,
                 ];
-                self.selected_checkpoint_path = train.checkpoint_path.clone();
-                self.load_checkpoint_on_start = train.load_checkpoint;
                 self.sync_selected_dataset_from_field();
+                train.checkpoint_path.clone()
             }
             RunMode::Perpetual(perpetual) => {
                 self.model_actions.selected = ModelAction::Perpetual.index();
-                self.selected_checkpoint_path = perpetual.checkpoint.clone();
-                self.load_checkpoint_on_start = perpetual.checkpoint.is_some();
+                let checkpoint = perpetual.checkpoint.clone();
                 self.sync_perpetual_params_from_config(&perpetual);
+                checkpoint
             }
-        }
+        };
 
         // The checkpoint list is prepared here even though the weight screen
-        // comes later, so the action menu can say how many there are.
+        // comes later, so the action menu can say how many there are — and so
+        // that opening a model already points at its weights.
         // Note what this path does *not* do — unlike `apply_template`, it never
         // calls `write_model_config`, so the model's own `inference` block
         // survives being opened.
-        self.refresh_weight_selector();
-        let preselected = self
-            .selected_checkpoint_path
-            .as_deref()
-            .and_then(|path| {
-                self.weight_selector
-                    .checkpoints
-                    .iter()
-                    .position(|entry| entry.path == path)
-            })
-            .map_or(0, |index| index + 1);
-        self.weight_selector.selected = preselected;
+        self.preselect_pretrained_weights(recorded);
         self.model_actions.error = None;
         self.screen = Screen::ModelActions;
     }
@@ -1622,7 +1743,11 @@ impl App {
     /// `run_monitor` builds a fresh `App` and never fills the checkpoint list —
     /// found by driving the real TUI, where a run had just been saved.
     pub fn enter_model_actions(&mut self) {
-        self.refresh_weight_selector();
+        // The run that just ended most likely wrote a checkpoint, and "run
+        // again" almost always means "carry on from it" — so the re-read also
+        // re-points the flow at the weights it just found.
+        let recorded = self.selected_checkpoint_path.clone();
+        self.preselect_pretrained_weights(recorded);
         self.model_actions.error = None;
         self.screen = Screen::ModelActions;
     }
@@ -2150,8 +2275,17 @@ impl App {
         }
     }
 
+    /// Backspace deletes a character of the *typed* fields only.
+    ///
+    /// The guard is not decoration: `fields[3]` is the dataset path, which the
+    /// dataset selector owns and this form never shows. With the toggle sharing
+    /// index 3, an unguarded `pop()` would have eaten that path one character
+    /// per keystroke, from a screen where nothing appears to change.
     pub fn handle_backspace_training(&mut self) {
         let idx = self.training_params.field_idx;
+        if idx >= TRAINING_RANDOM_WEIGHTS_FIELD {
+            return;
+        }
         self.training_params.fields[idx].pop();
     }
 
@@ -2406,6 +2540,195 @@ mod tests {
             assert!(!app.load_checkpoint_on_start);
             assert!(app.selected_checkpoint_path.is_some());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pretrained weights are the default; random is the opt-out
+    // -----------------------------------------------------------------------
+
+    /// Drops `names` into the model's `pretrained_weights/`.
+    fn write_checkpoints(app: &App, model: &str, names: &[&str]) {
+        let dir = app.storage.model_weights_dir(model).expect("weights dir");
+        for name in names {
+            std::fs::write(dir.join(name), b"weights").expect("checkpoint write");
+        }
+    }
+
+    /// The point of the whole item: open a model that has weights, and the
+    /// flow is already pointing at them. Before this, every run started from
+    /// random unless the user walked the weight list by hand — so "train some
+    /// more" silently threw away everything the model had learned.
+    #[test]
+    fn opening_a_model_with_weights_defaults_to_continuing_from_them() {
+        let (_temp, mut app, name) = app_on_a_model("default-pretrained");
+        write_checkpoints(&app, &name, &["latest.ckpt"]);
+
+        app.enter_model_actions();
+
+        assert!(app.load_checkpoint_on_start, "the default went to random");
+        assert!(
+            app.selected_checkpoint_path
+                .as_deref()
+                .expect("a checkpoint should be selected")
+                .ends_with("latest.ckpt")
+        );
+        assert_eq!(
+            app.weight_selector.selected, 1,
+            "the cursor must sit on the checkpoint it defaulted to, or the \
+             screen and the state disagree"
+        );
+        assert!(!app.start_from_random_weights());
+    }
+
+    /// `latest.ckpt` is what every run writes, so it wins over any other file
+    /// in the folder — alphabetical order would have picked `epoch-0010.ckpt`.
+    #[test]
+    fn the_default_checkpoint_is_the_one_training_keeps_writing() {
+        let (_temp, mut app, name) = app_on_a_model("default-latest");
+        write_checkpoints(
+            &app,
+            &name,
+            &["aaa-first-alphabetically.ckpt", "latest.ckpt", "zzz.ckpt"],
+        );
+
+        app.enter_model_actions();
+
+        assert!(
+            app.selected_checkpoint_path
+                .as_deref()
+                .expect("a checkpoint should be selected")
+                .ends_with("latest.ckpt")
+        );
+    }
+
+    /// A model with nothing to load falls back to random — and the fallback is
+    /// coherent: the flag is off, and the path points at where this run will
+    /// *write*, not at a file that does not exist.
+    #[test]
+    fn a_model_with_no_weights_falls_back_to_random() {
+        let (_temp, mut app, _name) = app_on_a_model("default-no-weights");
+
+        app.enter_model_actions();
+
+        assert!(!app.load_checkpoint_on_start);
+        assert!(app.start_from_random_weights());
+        assert!(!app.has_pretrained_weights());
+        assert_eq!(app.weight_selector.selected, 0);
+        assert!(
+            app.selected_checkpoint_path.is_some(),
+            "the run still needs somewhere to save"
+        );
+    }
+
+    /// The opt-out, from the training form. Off by default, and it round-trips:
+    /// turning it on and off again must land back on the same checkpoint.
+    #[test]
+    fn the_training_form_can_opt_out_of_the_pretrained_weights_and_back() {
+        let (_temp, mut app, name) = app_on_a_model("random-toggle");
+        write_checkpoints(&app, &name, &["latest.ckpt"]);
+        app.enter_model_actions();
+        let chosen = app.selected_checkpoint_path.clone();
+
+        assert!(!app.start_from_random_weights(), "the box starts unchecked");
+
+        app.toggle_start_from_random();
+        assert!(app.start_from_random_weights());
+        assert!(!app.load_checkpoint_on_start);
+        assert_eq!(
+            app.weight_selector.selected, 0,
+            "the weight screen must agree with the form"
+        );
+
+        app.toggle_start_from_random();
+        assert!(!app.start_from_random_weights());
+        assert!(app.load_checkpoint_on_start);
+        assert_eq!(app.selected_checkpoint_path, chosen);
+    }
+
+    /// With no weights on disk the toggle is pinned on: there is nothing to
+    /// turn it off *to*, and a checkbox that silently refuses is worse than one
+    /// that is honestly stuck.
+    #[test]
+    fn the_random_toggle_is_pinned_when_there_is_nothing_to_load() {
+        let (_temp, mut app, _name) = app_on_a_model("random-pinned");
+        app.enter_model_actions();
+
+        app.toggle_start_from_random();
+
+        assert!(app.start_from_random_weights());
+        assert!(!app.load_checkpoint_on_start);
+    }
+
+    /// Editing the architecture invalidates the weights, and the default must
+    /// not quietly bring them back: a checkpoint from another geometry would be
+    /// refused by the engine mid-run, after the GPU work of building the model.
+    #[test]
+    fn editing_a_layer_drops_the_weights_and_the_default_does_not_restore_them() {
+        let (_temp, mut app, name) = app_on_a_model("edit-drops-weights");
+        write_checkpoints(&app, &name, &["latest.ckpt"]);
+        app.enter_model_actions();
+        assert!(app.load_checkpoint_on_start, "precondition");
+
+        app.delete_last_layer();
+
+        assert!(!app.load_checkpoint_on_start);
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
+        assert_eq!(
+            app.weight_selector.selected, 0,
+            "the weight screen re-selected a checkpoint for an architecture \
+             that no longer matches it"
+        );
+        assert!(!app.load_checkpoint_on_start);
+    }
+
+    /// The run config the form finally produces is what the engine acts on, so
+    /// the default has to survive all the way to it.
+    #[test]
+    fn the_default_reaches_the_training_run_config() {
+        let (_temp, mut app, name) = app_on_a_model("default-in-run-config");
+        write_checkpoints(&app, &name, &["latest.ckpt"]);
+        app.enter_model_actions();
+        app.model_actions.selected = ModelAction::Train.index();
+        app.finish_model_actions();
+        app.finish_weight_selector();
+        app.finish_training_params()
+            .expect("training params should be accepted");
+        app.training_params.datasets = vec![".".to_string()];
+        app.training_params.selected_dataset = 0;
+        app.training_params.fields[3] = ".".to_string();
+        app.finish_dataset_selector()
+            .expect("dataset selector should produce run config");
+
+        match &app.run_config.as_ref().expect("run config").mode {
+            RunMode::Train(train) => {
+                assert!(train.load_checkpoint, "the run starts from random anyway");
+                assert!(
+                    train
+                        .checkpoint_path
+                        .as_deref()
+                        .expect("checkpoint path")
+                        .ends_with("latest.ckpt")
+                );
+            }
+            other => panic!("expected a training run mode, got {other:?}"),
+        }
+    }
+
+    /// The dataset path lives at `fields[3]`, which is also the toggle's index.
+    /// Backspace on the toggle used to eat that path one character at a time,
+    /// from a screen that shows neither.
+    #[test]
+    fn backspace_on_the_toggle_does_not_eat_the_dataset_path() {
+        let (_temp, mut app, _name) = app_on_a_model("backspace-toggle");
+        app.training_params.fields[3] = "datasets/cifar10_grey.batraw".to_string();
+        app.training_params.field_idx = super::TRAINING_RANDOM_WEIGHTS_FIELD;
+
+        for _ in 0..5 {
+            app.handle_backspace_training();
+        }
+
+        assert_eq!(app.training_params.fields[3], "datasets/cifar10_grey.batraw");
     }
 
     #[test]

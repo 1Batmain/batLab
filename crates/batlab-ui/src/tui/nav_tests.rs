@@ -64,6 +64,7 @@ fn walk_the_builder(app: &mut App) -> HashSet<Screen> {
     step(app, &mut visited, KeyCode::Enter, Screen::TrainingParams);
     handle_key(app, KeyCode::Enter); // learning rate → batch size
     handle_key(app, KeyCode::Enter); // batch size → steps
+    handle_key(app, KeyCode::Enter); // steps → start-from-random toggle
     step(app, &mut visited, KeyCode::Enter, Screen::DatasetSelector);
     step(app, &mut visited, KeyCode::Esc, Screen::TrainingParams);
     step(app, &mut visited, KeyCode::Esc, Screen::WeightSelector);
