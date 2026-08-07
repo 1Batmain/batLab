@@ -22,8 +22,9 @@ pub mod model;
 // same names, and flattening both sets into the root would make every `use` site
 // guess which one it got.
 pub use config::{
-    InferenceConfig, LayerDraft, ModelConfig, PerpetualConfig, RunConfig, RunMode, TrainingConfig,
-    TrainingControlCommand, compute_inferred_input,
+    ArchitectureRow, ArchitectureSummary, InferenceConfig, LayerDraft, ModelConfig,
+    PerpetualConfig, RunConfig, RunMode, TrainingConfig, TrainingControlCommand,
+    compute_inferred_input, summarize_architecture,
 };
 pub use gpu_context::GpuContext;
 pub use live_frame::{LiveFrame, compose_live_frame, live_frame_width};

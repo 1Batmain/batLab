@@ -3024,6 +3024,85 @@ mod tests {
         );
     }
 
+    /// The number the model list puts in front of a user, checked against the
+    /// **real** buffers a built model allocates.
+    ///
+    /// `summarize_architecture` counts parameters from the config alone — no
+    /// GPU, no checkpoint — which is what makes it affordable on every
+    /// keystroke and also what makes it easy to get quietly wrong: forget a
+    /// bias vector and every model in the list is understated by a few hundred,
+    /// with nothing on screen to say so. A checkpoint holds exactly the
+    /// trainable scalars and nothing else, so counting them is an independent
+    /// oracle rather than the same arithmetic written twice.
+    ///
+    /// Run on both built-in templates, which between them exercise
+    /// convolution, GroupNorm, upsample+conv, activation and concat.
+    #[test]
+    fn the_parameter_count_matches_the_scalars_a_checkpoint_holds() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        for template in batlab_core::config::built_in_templates() {
+            let config = ModelConfig {
+                model_name: Some(template.key.clone()),
+                input_size: template.input_size,
+                layers: template.layers.clone(),
+                inference: batlab_core::InferenceConfig::default(),
+                run: batlab_core::RunConfig {
+                    mode: RunMode::Infer,
+                },
+            };
+            let counted =
+                batlab_core::config::summarize_architecture(&config.layers, config.input_size)
+                    .parameters;
+
+            let held = rt.block_on(async {
+                let (_gpu, model) = build_execution_model(
+                    &config,
+                    INFERENCE_RUNTIME_LR,
+                    INFERENCE_RUNTIME_BATCH_SIZE,
+                    OptimizerKind::Sgd,
+                    WeightInit::default(),
+                )
+                .await
+                .expect("template must build");
+                // `BBCKPT2` + entry count, then per entry: layer index, weight
+                // count, weights, bias count, biases; then the optimiser
+                // trailer, which SGD writes as a bare 4-byte `none` tag. The
+                // scalars are read from the declared lengths rather than from
+                // the file size, so the trailer cannot be mistaken for weights.
+                let bytes = model.checkpoint_bytes().expect("checkpoint");
+                let u32_at = |at: usize| {
+                    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                        as usize
+                };
+                let entries = u32_at(7);
+                let mut at = 11;
+                let mut scalars = 0u64;
+                for _ in 0..entries {
+                    at += 4; // layer index
+                    let weights = u32_at(at);
+                    at += 4 + weights * 4;
+                    let bias = u32_at(at);
+                    at += 4 + bias * 4;
+                    scalars += (weights + bias) as u64;
+                }
+                assert_eq!(
+                    at + 4,
+                    bytes.len(),
+                    "the walk did not land on the SGD trailer — the checkpoint \
+                     layout moved and this oracle is reading noise"
+                );
+                scalars
+            });
+
+            assert_eq!(
+                counted, held,
+                "template '{}': the panel would say {counted} parameters where the \
+                 model holds {held}",
+                template.key
+            );
+        }
+    }
+
     #[test]
     fn raw_dataset_greyscale_round_trip() {
         let out = tmp_path("grey.batraw");
