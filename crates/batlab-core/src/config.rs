@@ -111,6 +111,12 @@ pub enum LayerDraft {
         num_groups: u32,
         save_key: Option<String>,
     },
+    /// Spatial self-attention over the `H*W` positions, residual included.
+    /// Shape-preserving, so it carries no dimension of its own beyond its input.
+    Attention {
+        dim_input: (u32, u32, u32),
+        save_key: Option<String>,
+    },
     FullyConnected {
         dim_input: (u32, u32, u32),
         nb_neurons: u32,
@@ -193,6 +199,7 @@ impl LayerDraft {
             LayerDraft::Convolution { save_key, .. }
             | LayerDraft::Activation { save_key, .. }
             | LayerDraft::GroupNorm { save_key, .. }
+            | LayerDraft::Attention { save_key, .. }
             | LayerDraft::FullyConnected { save_key, .. }
             | LayerDraft::UpsampleConv { save_key, .. }
             | LayerDraft::Concat { save_key, .. } => save_key.as_deref(),
@@ -211,6 +218,7 @@ impl LayerDraft {
             } => compute_out_conv(*dim_input, *dim_kernel, *stride, *nb_kernel, padding),
             LayerDraft::Activation { dim_input, .. } => *dim_input,
             LayerDraft::GroupNorm { dim_input, .. } => *dim_input,
+            LayerDraft::Attention { dim_input, .. } => *dim_input,
             LayerDraft::FullyConnected { nb_neurons, .. } => (1, 1, *nb_neurons),
             LayerDraft::UpsampleConv {
                 dim_input,
@@ -282,6 +290,19 @@ impl LayerDraft {
                     dim_input.0,
                     dim_input.1,
                     dim_input.2,
+                    display_save_key(save_key)
+                )
+            }
+            LayerDraft::Attention {
+                dim_input,
+                save_key,
+            } => {
+                format!(
+                    "Attention {}x{}x{} ({} positions){}",
+                    dim_input.0,
+                    dim_input.1,
+                    dim_input.2,
+                    dim_input.0 * dim_input.1,
                     display_save_key(save_key)
                 )
             }
@@ -357,6 +378,7 @@ impl LayerDraft {
             LayerDraft::Convolution { .. } => "Conv",
             LayerDraft::Activation { .. } => "Activation",
             LayerDraft::GroupNorm { .. } => "GroupNorm",
+            LayerDraft::Attention { .. } => "Attention",
             LayerDraft::FullyConnected { .. } => "Perceptron",
             LayerDraft::UpsampleConv { .. } => "UpsampleConv",
             LayerDraft::Concat { .. } => "Concat",
@@ -368,6 +390,7 @@ impl LayerDraft {
             LayerDraft::Convolution { dim_input, .. }
             | LayerDraft::Activation { dim_input, .. }
             | LayerDraft::GroupNorm { dim_input, .. }
+            | LayerDraft::Attention { dim_input, .. }
             | LayerDraft::FullyConnected { dim_input, .. }
             | LayerDraft::UpsampleConv { dim_input, .. }
             | LayerDraft::Concat { dim_input, .. } => *dim_input,
@@ -416,6 +439,10 @@ pub fn update_layer_dim_input(layer: &LayerDraft, new_input: (u32, u32, u32)) ->
         } => LayerDraft::GroupNorm {
             dim_input: new_input,
             num_groups: *num_groups,
+            save_key: save_key.clone(),
+        },
+        LayerDraft::Attention { save_key, .. } => LayerDraft::Attention {
+            dim_input: new_input,
             save_key: save_key.clone(),
         },
         LayerDraft::FullyConnected {
@@ -476,6 +503,7 @@ fn display_save_key(save_key: &Option<String>) -> String {
 pub enum LayerKind {
     Convolution,
     GroupNorm,
+    Attention,
     Activation,
     FullyConnected,
     UpsampleConv,
@@ -487,6 +515,7 @@ impl fmt::Display for LayerKind {
         match self {
             LayerKind::Convolution => write!(f, "Conv"),
             LayerKind::GroupNorm => write!(f, "GNorm"),
+            LayerKind::Attention => write!(f, "Attn"),
             LayerKind::Activation => write!(f, "Activ"),
             LayerKind::FullyConnected => write!(f, "Perceptron"),
             LayerKind::UpsampleConv => write!(f, "UpConv"),

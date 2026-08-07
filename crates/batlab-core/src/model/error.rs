@@ -16,6 +16,9 @@ pub enum ModelError {
         channels: u32,
         groups: u32,
     },
+    InvalidAttentionShape {
+        dim_input: (u32, u32, u32),
+    },
     KernelLargerThanInput {
         input: Dim3,
         kernel: Dim3,
@@ -72,6 +75,13 @@ impl Display for ModelError {
                 write!(
                     f,
                     "invalid group count: {groups} for {channels} channels, expected > 0 and to divide the channel count"
+                )
+            }
+            ModelError::InvalidAttentionShape { dim_input } => {
+                write!(
+                    f,
+                    "invalid attention shape {}x{}x{}: attention needs at least one position and one channel",
+                    dim_input.0, dim_input.1, dim_input.2
                 )
             }
             ModelError::KernelLargerThanInput {

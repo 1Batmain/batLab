@@ -95,6 +95,25 @@ class Builder:
             self.skips[save_key] = list(self.dim)
         return self
 
+    def attention(self, save_key=None):
+        """Self-attention spatiale, résiduel inclus dans la couche.
+
+        Shape-preserving : elle n'a aucune dimension propre, la séquence est la
+        grille spatiale et la dimension de features le nombre de canaux. Le
+        scratch `probs` est en N² par échantillon — 64 positions au goulot 8x8
+        font 4 096 flottants, la MÊME couche en 32x32 en ferait 1 048 576.
+        C'est une couche de goulot, pas une couche à mettre partout.
+        """
+        self.layers.append({
+            "Attention": {
+                "dim_input": list(self.dim),
+                "save_key": save_key,
+            }
+        })
+        if save_key:
+            self.skips[save_key] = list(self.dim)
+        return self
+
     def concat(self, skip_key, save_key=None):
         skip = self.skips[skip_key]
         assert skip[0] == self.dim[0] and skip[1] == self.dim[1], (
@@ -115,7 +134,8 @@ class Builder:
         return self.norm(groups).silu().conv(nb_kernel, stride)
 
 
-def build(signal_channels=DEFAULT_SIGNAL_CHANNELS, widths=DEFAULT_WIDTHS):
+def build(signal_channels=DEFAULT_SIGNAL_CHANNELS, widths=DEFAULT_WIDTHS,
+          attention=False):
     C1, C2, C3 = widths
     b = Builder(32, signal_channels + TIME_CHANNELS)
 
@@ -131,6 +151,13 @@ def build(signal_channels=DEFAULT_SIGNAL_CHANNELS, widths=DEFAULT_WIDTHS):
     # --- down 16 -> 8, C3 (bottleneck) --------------------------------------
     b.conv(C3, stride=2)              # [8,8,128]
     b.block(C3)                       # [8,8,128]
+    if attention:
+        # GroupNorm PUIS attention : la pré-normalisation est la couche
+        # GroupNorm existante placée devant, pas une normalisation interne à
+        # l'attention. C'est ici que le contenu global se décide — 64 positions
+        # qui se voient toutes, ce qui manque au modèle pour composer un objet
+        # plutôt qu'une texture.
+        b.norm().attention()
     b.norm().silu()
 
     # --- up 8 -> 16 ---------------------------------------------------------
@@ -177,9 +204,11 @@ if __name__ == "__main__":
     p.add_argument("--widths", type=int, nargs=3, default=list(DEFAULT_WIDTHS),
                    metavar=("C1", "C2", "C3"),
                    help="largeurs des trois étages 32x32 / 16x16 / 8x8")
+    p.add_argument("--attention", action="store_true",
+                   help="insère GroupNorm + Attention au goulot 8x8")
     args = p.parse_args()
 
-    b = build(args.signal_channels, args.widths)
+    b = build(args.signal_channels, args.widths, args.attention)
     config = {
         "model_name": args.name,
         "input_size": [32, 32, args.signal_channels + TIME_CHANNELS],
@@ -192,7 +221,9 @@ if __name__ == "__main__":
         },
         "run": {"mode": "Infer"},
     }
-    print(f"# {len(b.layers)} couches, {macs(b.layers)/1e6:.1f} MMACs/échantillon",
+    attn = sum(1 for l in b.layers if "Attention" in l)
+    print(f"# {len(b.layers)} couches ({attn} attention), "
+          f"{macs(b.layers)/1e6:.1f} MMACs/échantillon (convolutions seules)",
           file=sys.stderr)
     json.dump(config, sys.stdout, indent=2)
     print()

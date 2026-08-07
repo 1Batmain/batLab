@@ -13,7 +13,7 @@ pub mod weight_init;
 
 pub use error::ModelError;
 pub use layer_types::{
-    ActivationMethod, ActivationType, ConcatType, ConvolutionType, FullyConnectedType,
+    ActivationMethod, ActivationType, AttentionType, ConcatType, ConvolutionType, FullyConnectedType,
     GroupNormType, LayerTypes, LossMethod, LossType, UpsampleConvType,
 };
 pub use model::{Infer, Model, Training};
@@ -23,6 +23,8 @@ pub use weight_init::WeightInit;
 
 #[cfg(test)]
 mod adam_tests;
+#[cfg(test)]
+mod attention_tests;
 #[cfg(test)]
 mod audit_tests;
 #[cfg(test)]

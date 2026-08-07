@@ -13,7 +13,7 @@ use batlab_ui::tui::{
     RunMode, TrainingConfig,
 };
 use batlab_core::{
-    ActivationMethod as PActivation, ActivationType, ConvolutionType, DEFAULT_SNR_GAMMA,
+    ActivationMethod as PActivation, ActivationType, AttentionType, ConvolutionType, DEFAULT_SNR_GAMMA,
     DenoiseFrame, DiffusionTask, Dim3, DriftAction, FullyConnectedType, GpuContext, GpuDataset,
     GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
     MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
@@ -2761,6 +2761,18 @@ fn append_layer<State>(
                 Dim3::new(*dim_input),
                 *num_groups,
             )))?;
+            if let Some(key) = save_key {
+                model.mark_output(key.clone())?;
+            }
+            Ok(())
+        }
+        LayerDraft::Attention {
+            dim_input,
+            save_key,
+        } => {
+            model.add_layer(LayerTypes::Attention(AttentionType::new(Dim3::new(
+                *dim_input,
+            ))))?;
             if let Some(key) = save_key {
                 model.mark_output(key.clone())?;
             }

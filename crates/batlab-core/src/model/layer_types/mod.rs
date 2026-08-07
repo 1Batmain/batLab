@@ -5,6 +5,7 @@ use crate::model::types::{BufferSpec, Dim3};
 use enum_dispatch::enum_dispatch;
 
 mod activation;
+mod attention;
 mod concat;
 mod convolution;
 mod fully_connected;
@@ -14,6 +15,7 @@ mod pooling;
 mod upsample_conv;
 
 pub use activation::{ActivationMethod, ActivationType};
+pub use attention::AttentionType;
 pub use concat::ConcatType;
 pub use convolution::ConvolutionType;
 pub use fully_connected::FullyConnectedType;
@@ -32,6 +34,14 @@ pub(crate) struct ShaderDescriptor {
 pub(crate) enum BufferInit {
     None,
     RandomWeights,
+    /// `RandomWeights`, except the last `n` floats are left at ZERO.
+    ///
+    /// Attention's four projections share one buffer, and the output one
+    /// (`W_o`, the tail) must start at zero: the layer is then the exact
+    /// identity at step 0, so inserting it into a working network can only be
+    /// neutral or better. Drawing it randomly instead injects noise into a
+    /// residual stream that has no reason to want it.
+    RandomWeightsZeroTail(u32),
     Ones,
     SpecsUniform,
 }
@@ -121,6 +131,23 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
     fn get_entrypoint(&self) -> &str {
         "main"
     }
+    /// Entry points of the forward pass, in dispatch order.
+    ///
+    /// Almost every layer is a single kernel and inherits this default. A layer
+    /// overrides it when its forward needs a GLOBAL barrier partway through —
+    /// attention does, because a score row reads every other row's k and v, and
+    /// the barrier wgpu inserts between compute passes of one encoder is the
+    /// only synchronisation available at that scale.
+    fn get_forward_entrypoints(&self) -> Vec<&'static str> {
+        vec![]
+    }
+    /// Workgroup counts for each forward sub-pass, same split as
+    /// `get_back_workgroup_counts`: a pass that maps a thread to an activation
+    /// scales with the batch, a pass that maps one to a parameter does not.
+    /// Ignored unless `get_forward_entrypoints` is overridden.
+    fn get_forward_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
+        vec![self.get_forward_workgroup_count(batch)]
+    }
     /// Entry points for the backward compute passes (one per sub-pass).
     /// Empty for layers that have no backward pass (e.g. Loss).
     fn get_back_entrypoints(&self) -> Vec<&'static str> {
@@ -197,6 +224,7 @@ pub(crate) trait LayerType: std::fmt::Debug + Send + Sync {
 pub enum LayerTypes {
     Convolution(ConvolutionType),
     Activation(ActivationType),
+    Attention(AttentionType),
     Concat(ConcatType),
     FullyConnected(FullyConnectedType),
     GroupNorm(GroupNormType),

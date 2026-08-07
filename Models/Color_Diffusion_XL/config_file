@@ -196,6 +196,27 @@
       }
     },
     {
+      "Attention": {
+        "dim_input": [
+          8,
+          8,
+          192
+        ],
+        "save_key": null
+      }
+    },
+    {
+      "GroupNorm": {
+        "dim_input": [
+          8,
+          8,
+          192
+        ],
+        "num_groups": 8,
+        "save_key": null
+      }
+    },
+    {
       "Activation": {
         "dim_input": [
           8,

@@ -412,6 +412,16 @@ fn group_norm_field_defaults() -> Vec<String> {
     vec!["1".into(), "".into()]
 }
 
+/// Attention has no shape parameter of its own: the sequence is the spatial
+/// grid and the feature dimension the channel count, both inherited.
+fn attention_field_names() -> Vec<&'static str> {
+    vec!["Save As"]
+}
+
+fn attention_field_defaults() -> Vec<String> {
+    vec!["".into()]
+}
+
 fn fully_connected_field_names() -> Vec<&'static str> {
     vec!["Neurons", "Method", "Save As"]
 }
@@ -881,6 +891,7 @@ impl App {
         match self.layer_builder.current_kind {
             LayerKind::Convolution => conv_field_names(),
             LayerKind::GroupNorm => group_norm_field_names(),
+            LayerKind::Attention => attention_field_names(),
             LayerKind::Activation => activation_field_names(),
             LayerKind::FullyConnected => fully_connected_field_names(),
             LayerKind::UpsampleConv => upsample_conv_field_names(),
@@ -892,6 +903,7 @@ impl App {
         self.layer_builder.fields = match self.layer_builder.current_kind {
             LayerKind::Convolution => conv_field_defaults(),
             LayerKind::GroupNorm => group_norm_field_defaults(),
+            LayerKind::Attention => attention_field_defaults(),
             LayerKind::Activation => activation_field_defaults(),
             LayerKind::FullyConnected => fully_connected_field_defaults(),
             LayerKind::UpsampleConv => upsample_conv_field_defaults(),
@@ -922,6 +934,8 @@ impl App {
         let lb = &self.layer_builder;
         let inferred = self.inferred_input();
         match lb.current_kind {
+            // Shape-preserving: the preview is the inferred input itself.
+            LayerKind::Attention => Some(inferred),
             LayerKind::Convolution => {
                 let names = self.layer_field_names();
                 let get = |name: &str| -> Option<u32> {
@@ -1112,6 +1126,10 @@ impl App {
                     save_key: parse_save_key()?,
                 })
             }
+            LayerKind::Attention => Ok(LayerDraft::Attention {
+                dim_input: inferred,
+                save_key: parse_save_key()?,
+            }),
             LayerKind::Activation => {
                 let method = ActivationMethod::from_label(&fields[0])
                     .ok_or_else(|| format!("Unknown activation method '{}'", fields[0]))?;
@@ -1206,6 +1224,7 @@ impl App {
             LayerDraft::Convolution { .. } => LayerKind::Convolution,
             LayerDraft::Activation { .. } => LayerKind::Activation,
             LayerDraft::GroupNorm { .. } => LayerKind::GroupNorm,
+            LayerDraft::Attention { .. } => LayerKind::Attention,
             LayerDraft::FullyConnected { .. } => LayerKind::FullyConnected,
             LayerDraft::UpsampleConv { .. } => LayerKind::UpsampleConv,
             LayerDraft::Concat { .. } => LayerKind::Concat,
@@ -1240,6 +1259,9 @@ impl App {
                 num_groups.to_string(),
                 save_key.as_deref().unwrap_or("").to_string(),
             ],
+            LayerDraft::Attention { save_key, .. } => {
+                vec![save_key.as_deref().unwrap_or("").to_string()]
+            }
             LayerDraft::FullyConnected {
                 nb_neurons,
                 method,
@@ -1493,7 +1515,8 @@ impl App {
     pub fn cycle_kind_forward(&mut self) {
         self.layer_builder.current_kind = match self.layer_builder.current_kind {
             LayerKind::Convolution => LayerKind::GroupNorm,
-            LayerKind::GroupNorm => LayerKind::Activation,
+            LayerKind::GroupNorm => LayerKind::Attention,
+            LayerKind::Attention => LayerKind::Activation,
             LayerKind::Activation => LayerKind::FullyConnected,
             LayerKind::FullyConnected => LayerKind::UpsampleConv,
             LayerKind::UpsampleConv => LayerKind::Concat,
@@ -1506,7 +1529,8 @@ impl App {
         self.layer_builder.current_kind = match self.layer_builder.current_kind {
             LayerKind::Convolution => LayerKind::Concat,
             LayerKind::GroupNorm => LayerKind::Convolution,
-            LayerKind::Activation => LayerKind::GroupNorm,
+            LayerKind::Attention => LayerKind::GroupNorm,
+            LayerKind::Activation => LayerKind::Attention,
             LayerKind::FullyConnected => LayerKind::Activation,
             LayerKind::UpsampleConv => LayerKind::FullyConnected,
             LayerKind::Concat => LayerKind::UpsampleConv,

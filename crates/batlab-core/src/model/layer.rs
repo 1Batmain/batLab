@@ -26,12 +26,17 @@ pub(crate) struct Buffers {
     pub(crate) backward: Option<Vec<Arc<Buffer>>>,
 }
 
-/// Forward: single pipeline.
-/// Backward: one pipeline per sub-pass (e.g. Conv has 3: grad_input, grad_weights, grad_bias).
+/// One pipeline per sub-pass, forward and backward alike (e.g. Conv's backward
+/// has 3: grad_input, grad_weights, grad_bias; attention's forward has 4).
+///
+/// The forward was a single `Option<ComputePipeline>` until attention needed a
+/// global barrier mid-forward. Every other layer still declares one entry point
+/// and lands in a one-element list, so the shape of the change is: the common
+/// case is a list of length 1, not a special case.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Pipelines {
-    pub(crate) forward: Option<ComputePipeline>,
-    pub(crate) backward: Vec<(ComputePipeline, u32)>, // (pipeline, num_workgroups)
+    pub(crate) forward: Vec<(ComputePipeline, u32)>, // (pipeline, num_workgroups)
+    pub(crate) backward: Vec<(ComputePipeline, u32)>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -163,7 +168,7 @@ impl Layer {
     pub(crate) fn clear(&mut self) {
         self.buffers.forward.clear();
         self.buffers.backward = None;
-        self.pipeline.forward = None;
+        self.pipeline.forward.clear();
         self.pipeline.backward.clear();
         self.bind_group.forward = None;
         self.bind_group.backward = None;
@@ -242,9 +247,9 @@ impl Layer {
                     let bytes = self.ty.get_spec_uniform_bytes();
                     gpu.queue.write_buffer(&buf, 0, &bytes);
                 }
-                BufferInit::RandomWeights => {
+                BufferInit::RandomWeights | BufferInit::RandomWeightsZeroTail(_) => {
                     let count = binding.spec.size as usize / 4;
-                    let weights = match (init, self.ty.get_weight_fan_in()) {
+                    let mut weights = match (init, self.ty.get_weight_fan_in()) {
                         (WeightInit::He, Some(fan_in)) => weight_init::he_weights(
                             count,
                             fan_in,
@@ -256,6 +261,14 @@ impl Layer {
                         // parameters) — the historical draw stands.
                         _ => weight_init::uniform_weights(count),
                     };
+                    // A residual layer whose output projection starts at zero
+                    // starts as the identity: the tail is zeroed AFTER the draw
+                    // so the leading projections keep the exact stream they
+                    // would have had on their own.
+                    if let BufferInit::RandomWeightsZeroTail(tail) = binding.init {
+                        let from = weights.len().saturating_sub(tail as usize);
+                        weights[from..].fill(0.0);
+                    }
                     gpu.queue
                         .write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
                 }
@@ -292,16 +305,33 @@ impl Layer {
             bind_group_layouts: &[&bgl],
             immediate_size: 0,
         });
-        self.pipeline.forward = Some(device.create_compute_pipeline(
-            &wgpu::ComputePipelineDescriptor {
-                label: Some("fwd_pipeline"),
-                layout: Some(&pl),
-                module: &self.shader.forward,
-                entry_point: Some(self.ty.get_entrypoint()),
-                compilation_options: Default::default(),
-                cache: Default::default(),
-            },
-        ));
+        // A layer that declares no forward entry points is the ordinary
+        // single-kernel case: one pass at its own workgroup count.
+        let declared = self.ty.get_forward_entrypoints();
+        let (entry_points, counts): (Vec<&str>, Vec<u32>) = if declared.is_empty() {
+            (
+                vec![self.ty.get_entrypoint()],
+                vec![self.ty.get_forward_workgroup_count(self.batch)],
+            )
+        } else {
+            (declared, self.ty.get_forward_workgroup_counts(self.batch))
+        };
+
+        self.pipeline.forward = entry_points
+            .iter()
+            .zip(counts)
+            .map(|(ep, wg)| {
+                let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(&format!("fwd_pipeline_{ep}")),
+                    layout: Some(&pl),
+                    module: &self.shader.forward,
+                    entry_point: Some(ep),
+                    compilation_options: Default::default(),
+                    cache: Default::default(),
+                });
+                (pipeline, wg)
+            })
+            .collect();
     }
 
     pub(crate) fn set_bind_group(&mut self, device: &Device) {
@@ -321,8 +351,9 @@ impl Layer {
                 layout: &self
                     .pipeline
                     .forward
-                    .as_ref()
+                    .first()
                     .expect("set_pipeline must be called before set_bind_group")
+                    .0
                     .get_bind_group_layout(0),
                 entries: &entries,
             }),
@@ -342,28 +373,46 @@ impl Layer {
     /// are sized for a full training batch — the probe would otherwise pay 16x
     /// the work for one result.
     pub(crate) fn encode_pass_with_batch(&self, encoder: &mut CommandEncoder, batch: Batch) {
-        let workgroups = if batch == self.batch {
-            self.num_workgroups
+        assert!(
+            !self.pipeline.forward.is_empty(),
+            "forward pipeline not initialised"
+        );
+        let bg = self
+            .bind_group
+            .forward
+            .as_ref()
+            .expect("forward bind group not initialised");
+
+        // A truncated batch re-derives every sub-pass's count, not just the
+        // first: the sub-passes of one layer do not share a workgroup count
+        // (attention's softmax runs one workgroup per row, its projections one
+        // thread per scalar).
+        let truncated = if batch == self.batch {
+            None
         } else {
-            self.ty.get_forward_workgroup_count(batch.min(self.batch))
+            let smaller = batch.min(self.batch);
+            let declared = self.ty.get_forward_entrypoints();
+            Some(if declared.is_empty() {
+                vec![self.ty.get_forward_workgroup_count(smaller)]
+            } else {
+                self.ty.get_forward_workgroup_counts(smaller)
+            })
         };
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(
-            self.pipeline
-                .forward
-                .as_ref()
-                .expect("forward pipeline not initialised"),
-        );
-        pass.set_bind_group(
-            0,
-            self.bind_group
-                .forward
-                .as_ref()
-                .expect("forward bind group not initialised"),
-            &[],
-        );
-        let (x, y) = dispatch_grid(workgroups);
-        pass.dispatch_workgroups(x, y, 1);
+
+        for (index, (pipeline, built_wg)) in self.pipeline.forward.iter().enumerate() {
+            let workgroups = match &truncated {
+                Some(counts) => counts[index],
+                None => *built_wg,
+            };
+            // wgpu inserts a pipeline barrier between compute passes of one
+            // encoder — that barrier is what makes a multi-pass forward (q/k/v,
+            // then scores, then context) see the previous pass's writes.
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            let (x, y) = dispatch_grid(workgroups);
+            pass.dispatch_workgroups(x, y, 1);
+        }
     }
 
     // -----------------------------------------------------------------------
