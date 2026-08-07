@@ -58,6 +58,33 @@ les deux racines : la liste (rien au-dessus) et le moniteur (un run en cours, qu
 quitter termine). `[e]` depuis le menu d'actions ouvre le constructeur de
 couches, `[i]` dedans ouvre la géométrie d'entrée.
 
+Ce chemin est **affiché** : `Model › Action › Weights › Parameters › Run`, en bas
+du terminal, étape courante mise en évidence (`PathStep`, distinct de `Screen` —
+les quatre formulaires de paramètres sont une seule étape). `←`/`→` le remontent
+et le redescendent, mais **seulement sur les sélecteurs purs**
+(`Screen::walks_the_path_by_arrow`) : partout ailleurs les flèches appartiennent
+déjà à un champ ou à un curseur (type de couche, tempo perpetual, cycle de
+dataset, bascules seed/regime). `Esc` et `←` passent par le même
+`App::path_back()` — deux « retour » implémentés deux fois divergent. Une seule
+différence, voulue : à la racine `Esc` quitte, `←` ne fait rien. Et `→` n'avance
+que là où avancer est de la navigation : depuis le sélecteur de templates il est
+**inerte**, parce qu'avancer y écrirait un `config_file` sur disque.
+
+**Le défaut est de continuer depuis les poids du modèle**, pas de repartir de
+zéro : ouvrir un modèle qui a un checkpoint pointe le flux dessus (`latest.ckpt`
+d'abord — ordre alphabétique sinon), et « Start from random » est une case du
+formulaire d'entraînement, décochée. Le curseur du sélecteur de poids est
+**dérivé** de `load_checkpoint_on_start` + `selected_checkpoint_path`, jamais
+mémorisé : c'est ce qui empêche une ligne périmée de recharger un checkpoint
+après une édition d'architecture (tous les chemins qui touchent aux couches
+posent le drapeau à faux). Sans checkpoint, repli sur random, dit à l'écran.
+
+Chaque champ de formulaire a une **info-bulle sourcée** (`tui/help.rs`) : le
+texte cite le rapport dont il vient et ses chiffres en sortent. Une entrée qui
+ment est pire que pas d'entrée — `every_help_entry_sits_on_the_field_it_describes`
+compare les titres aux `*_FIELD_NAMES` (les tables sont indexées par position) et
+`a_cited_source_is_a_report_that_exists` vérifie les citations.
+
 Le manager, côté contrat observable :
 
 - **Renommer** déplace `Models/<ancien>/` → `Models/<nouveau>/` **et** réécrit le
@@ -92,8 +119,13 @@ Un écran dessiné mais jamais assigné est le bug récurrent de ce dépôt (tro
 parcourt tous les écrans à la touche depuis la porte d'entrée et exige d'avoir vu
 `Screen::ALL` — ajouter une variante sans la câbler fait échouer la suite.
 
-Le rapport de mission, avec le contrat observable complet et le parcours e2e
-déroulé : `docs/reports/MODEL_MANAGER.md`.
+Les rapports de mission, avec les contrats observables complets et les parcours
+e2e déroulés : `docs/reports/MODEL_MANAGER.md` (le manager) et
+`docs/reports/UX_NAV.md` (le chemin, les poids par défaut, l'aide — et la cause
+racine du vol de focus au lancement sur macOS : winit appelle
+`activateIgnoringOtherApps(true)` au démarrage de son event loop, ce que
+`ActivationPolicy::Accessory` ne couvre pas ; ne pas retirer le
+`with_activate_ignoring_other_apps(false)` de `visualiser::build_event_loop`).
 
 ## Lancer / valider un entraînement sans le TUI
 

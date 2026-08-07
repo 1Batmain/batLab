@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod events;
+pub mod help;
 #[cfg(test)]
 mod nav_tests;
 pub mod ui;

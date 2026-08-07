@@ -2,7 +2,8 @@
 
 use super::app::{
     App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS, PERPETUAL_PARAM_FIELD_NAMES,
-    PerpetualStatus, Screen, TrainingControlCommand,
+    PerpetualStatus, Screen, TRAINING_PARAM_FIELD_NAMES, TRAINING_RANDOM_WEIGHTS_FIELD,
+    TrainingControlCommand,
 };
 use crossterm::event::KeyCode;
 
@@ -70,10 +71,15 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
     }
 }
 
-/// The front door. `Esc` quits because there is nowhere above it to go.
+/// The front door. `Esc` quits because there is nowhere above it to go — and
+/// `←` does *not*, which is the one place the two "go back" keys differ.
 fn handle_model_list(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Esc | KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Left => {
+            app.path_back();
+        }
+        KeyCode::Right => app.path_forward(),
         KeyCode::Up => {
             if app.model_list.selected > 0 {
                 app.model_list.selected -= 1;
@@ -96,11 +102,10 @@ fn handle_model_list(app: &mut App, code: KeyCode) {
 
 fn handle_model_actions(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => {
-            app.model_actions.error = None;
-            app.refresh_model_list();
-            app.screen = Screen::ModelList;
+        KeyCode::Esc | KeyCode::Left => {
+            app.path_back();
         }
+        KeyCode::Right => app.path_forward(),
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('e') => app.enter_layer_builder(),
         KeyCode::Up => {
@@ -151,10 +156,11 @@ fn handle_delete_confirm(app: &mut App, code: KeyCode) {
 
 fn handle_template_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => {
-            app.refresh_model_list();
-            app.screen = Screen::ModelList;
+        KeyCode::Esc | KeyCode::Left => {
+            app.path_back();
         }
+        // `→` is deliberately inert here: forward from a template *creates a
+        // model on disk*. `Enter` stays the only key that writes.
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.template_selector.selected > 0 {
@@ -173,7 +179,10 @@ fn handle_template_selector(app: &mut App, code: KeyCode) {
 
 fn handle_weight_selector(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Esc => app.screen = Screen::ModelActions,
+        KeyCode::Esc | KeyCode::Left => {
+            app.path_back();
+        }
+        KeyCode::Right => app.path_forward(),
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.weight_selector.selected > 0 {
@@ -407,7 +416,7 @@ fn handle_perpetual_params(app: &mut App, code: KeyCode) {
 }
 
 fn handle_training_params(app: &mut App, code: KeyCode) {
-    let max_field = 2;
+    let max_field = TRAINING_PARAM_FIELD_NAMES.len() - 1;
     match code {
         KeyCode::Esc => app.screen = Screen::WeightSelector,
         KeyCode::Char('q') => app.should_quit = true,
@@ -420,6 +429,15 @@ fn handle_training_params(app: &mut App, code: KeyCode) {
             if app.training_params.field_idx < max_field {
                 app.training_params.field_idx += 1;
             }
+        }
+        // The random-weights opt-out is a toggle, so it answers to the toggle
+        // keys the other forms already use — and to nothing else. `←`/`→` are
+        // free on this screen precisely because it is a form: the breadcrumb
+        // never claims them here (see `path_nav`).
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if app.training_params.field_idx == TRAINING_RANDOM_WEIGHTS_FIELD =>
+        {
+            app.toggle_start_from_random();
         }
         KeyCode::Backspace => app.handle_backspace_training(),
         KeyCode::Enter => {
