@@ -5,6 +5,7 @@ use crate::model::error::ModelError;
 use crate::model::layer_types::{
     Batch, BackwardBufferSource, BufferInit, ForwardBufferSource, LayerType, LayerTypes,
 };
+use crate::model::ema::{EmaConfig, EmaSpecs};
 use crate::model::optimizer::{AdamHyperparameters, AdamSpecs, OptimizerKind};
 use crate::model::types::Dim3;
 use crate::model::weight_init::{self, WeightInit};
@@ -73,6 +74,29 @@ impl OptPass {
     }
 }
 
+/// Per-layer exponential-moving-average pass (only on trainable layers, and
+/// only when the run asked for an EMA).
+///
+/// Separate from [`OptPass`] rather than folded into the update shaders: the
+/// recurrence is the same whichever optimiser produced the weights, and a pass
+/// of its own is one that can be read, tested and switched off on its own.
+#[derive(Debug, Clone)]
+pub(crate) struct EmaPass {
+    pub(crate) pipeline: ComputePipeline,
+    pub(crate) bind_group: BindGroup,
+    /// The effective decay of the step about to be dispatched.
+    pub(crate) specs: Arc<Buffer>,
+    /// `[ema_weights, ema_bias]`, in checkpoint order.
+    pub(crate) state: Vec<Arc<Buffer>>,
+    pub(crate) num_workgroups: u32,
+}
+
+impl EmaPass {
+    pub(crate) fn owned_buffers(&self) -> impl Iterator<Item = &Arc<Buffer>> {
+        std::iter::once(&self.specs).chain(self.state.iter())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MergePass {
     pub(crate) pipeline: ComputePipeline,
@@ -122,6 +146,9 @@ pub(crate) struct Layer {
     pub(crate) bind_group: BindGroups,
     /// Present after create_opt_pass is called on trainable layers.
     pub(crate) opt_pass: Option<OptPass>,
+    /// Present after create_ema_pass, i.e. on trainable layers of a run that
+    /// asked for a weight average.
+    pub(crate) ema_pass: Option<EmaPass>,
     pub(crate) merge_pass: Option<MergePass>,
     pub(crate) saved_output_key: Option<String>,
     /// How many samples this layer's activation buffers hold.
@@ -159,6 +186,7 @@ impl Layer {
             num_workgroups,
             bind_group: BindGroups::default(),
             opt_pass: None,
+            ema_pass: None,
             merge_pass: None,
             saved_output_key: None,
             batch: 1,
@@ -173,6 +201,7 @@ impl Layer {
         self.bind_group.forward = None;
         self.bind_group.backward = None;
         self.opt_pass = None;
+        self.ema_pass = None;
         self.merge_pass = None;
     }
 
@@ -797,6 +826,185 @@ impl Layer {
         self.opt_pass
             .as_ref()
             .map(|o| o.state.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Build the EMA pass for this layer: two shadow buffers and the kernel that
+    /// pulls them towards the weights after every update.
+    ///
+    /// The shadow is **seeded with the weights as they stand now**, not with
+    /// zeros. `create_opt_pass` runs during `build()`, so "now" is either the
+    /// fresh initialisation or — on a rebuild — the weights that were just
+    /// restored. A zero-seeded shadow would need thousands of steps to shed the
+    /// zeros, and every checkpoint written before then would carry an EMA set
+    /// that generates noise. See `ema.rs` for the pairing with the warmup ramp.
+    pub(crate) fn create_ema_pass(&mut self, gpu: &GpuContext, ema: EmaConfig) {
+        let Some(layout) = self.ty.get_optimizer_bindings() else {
+            return;
+        };
+        let weights = Arc::clone(&self.buffers.forward[layout.weights_forward_index]);
+        let bias = Arc::clone(&self.buffers.forward[layout.bias_forward_index]);
+
+        let storage_entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout_entries = vec![
+            storage_entry(0, true),  // weights
+            storage_entry(1, true),  // bias
+            storage_entry(2, false), // ema_weights
+            storage_entry(3, false), // ema_bias
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ];
+
+        let specs = Arc::new(gpu.device.create_buffer(&BufferDescriptor {
+            label: Some("ema_specs_uniform"),
+            size: EmaSpecs::BYTES as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        let make = |label: &str, size: u64| {
+            Arc::new(gpu.device.create_buffer(&BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        };
+        let state = vec![
+            make("ema_weights", weights.size()),
+            make("ema_bias", bias.size()),
+        ];
+
+        let module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ema"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                    "shader/ema.wgsl"
+                ))),
+            });
+        let bgl = gpu
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ema_bgl"),
+                entries: &layout_entries,
+            });
+        let pl = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ema_pl"),
+                bind_group_layouts: &[&bgl],
+                immediate_size: 0,
+            });
+        let pipeline = gpu
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("ema_pipeline"),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("ema"),
+                compilation_options: Default::default(),
+                cache: Default::default(),
+            });
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ema_bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: weights.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bias.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: state[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: state[1].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: specs.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.ema_pass = Some(EmaPass {
+            pipeline,
+            bind_group,
+            specs,
+            state,
+            num_workgroups: layout.weight_count.div_ceil(64),
+        });
+        self.write_ema_specs(gpu, ema.effective_decay(1));
+        self.seed_ema_from_weights(gpu);
+    }
+
+    /// Copy the live weights over the shadow, on the GPU.
+    ///
+    /// Called when the pass is built, and again by the model after a checkpoint
+    /// that carried no EMA set was loaded: in both cases the shadow would
+    /// otherwise describe weights the model no longer has.
+    pub(crate) fn seed_ema_from_weights(&self, gpu: &GpuContext) {
+        let Some(ema) = &self.ema_pass else { return };
+        let Some(layout) = self.ty.get_optimizer_bindings() else {
+            return;
+        };
+        let weights = &self.buffers.forward[layout.weights_forward_index];
+        let bias = &self.buffers.forward[layout.bias_forward_index];
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(weights, 0, &ema.state[0], 0, weights.size());
+        encoder.copy_buffer_to_buffer(bias, 0, &ema.state[1], 0, bias.size());
+        gpu.queue.submit([encoder.finish()]);
+    }
+
+    pub(crate) fn encode_ema_pass(&self, encoder: &mut CommandEncoder) {
+        let Some(ema) = &self.ema_pass else { return };
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&ema.pipeline);
+        pass.set_bind_group(0, &ema.bind_group, &[]);
+        let (x, y) = dispatch_grid(ema.num_workgroups);
+        pass.dispatch_workgroups(x, y, 1);
+    }
+
+    /// Refresh the EMA uniform for the step about to be dispatched. `decay` is
+    /// the EFFECTIVE decay — the warmup ramp is resolved by the caller, which
+    /// is the only place the step counter lives.
+    pub(crate) fn write_ema_specs(&self, gpu: &GpuContext, decay: f32) -> bool {
+        let Some(ema) = &self.ema_pass else {
+            return false;
+        };
+        gpu.queue
+            .write_buffer(&ema.specs, 0, &EmaSpecs { decay }.to_bytes());
+        true
+    }
+
+    /// The shadow buffers, in checkpoint order (`[ema_weights, ema_bias]`).
+    pub(crate) fn ema_state_buffers(&self) -> &[Arc<Buffer>] {
+        self.ema_pass
+            .as_ref()
+            .map(|e| e.state.as_slice())
             .unwrap_or(&[])
     }
 

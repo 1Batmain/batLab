@@ -2,6 +2,7 @@
 
 use crate::gpu_context::GpuContext;
 use crate::model::debug::{LayerDebugView, read_back_f32, read_back_f32_at};
+use crate::model::ema::EmaConfig;
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
 use crate::model::layer_types::{ConcatType, LayerType, LayerTypes, LossMethod, LossType};
@@ -19,12 +20,42 @@ use wgpu::Buffer;
 /// Weights + biases only. Still read; never written any more.
 const CHECKPOINT_MAGIC_V1: &[u8; 7] = b"BBCKPT1";
 /// V1 body followed by an optimiser-state trailer (see `save_checkpoint`).
+/// Still WRITTEN, by every run that keeps no weight average.
 const CHECKPOINT_MAGIC_V2: &[u8; 7] = b"BBCKPT2";
+/// V2 followed by an EMA trailer: the averaged copy of every weight and bias.
+/// Written only by a run that has an EMA, so a run without one produces a file
+/// byte-identical to the one it produced before averaging existed.
+const CHECKPOINT_MAGIC_V3: &[u8; 7] = b"BBCKPT3";
 const CHECKPOINT_MAGIC_LEN: usize = 7;
 
 /// Trailer tags for the optimiser-state section of a V2 checkpoint.
 const OPT_STATE_NONE: u32 = 0;
 const OPT_STATE_ADAM: u32 = 1;
+
+/// Trailer tags for the EMA section of a V3 checkpoint.
+const EMA_STATE_NONE: u32 = 0;
+const EMA_STATE_PRESENT: u32 = 1;
+
+/// Which of the two weight sets a checkpoint carries lands in the model's
+/// weight buffers.
+///
+/// A V3 checkpoint holds both the last iterate and its moving average. Training
+/// must resume from the iterate — the average is not a point the optimiser ever
+/// visited, and Adam's moments describe the iterate. Sampling wants the
+/// average, which is the whole reason it is kept. So the choice is made by the
+/// caller, at the call site, rather than guessed from a model state that reads
+/// the same in both cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckpointWeights {
+    /// The weights as the last optimiser step left them. The historical
+    /// behaviour, and the one every training path wants.
+    #[default]
+    Raw,
+    /// The moving average, when the file has one; falls back on `Raw` when it
+    /// has not, which is what makes `--raw-weights` a comparison and not a
+    /// prerequisite.
+    Ema,
+}
 
 // ---------------------------------------------------------------------------
 // State markers
@@ -44,6 +75,41 @@ pub struct Training {
 #[derive(Debug)]
 pub struct ModelState {
     pub(crate) is_build: bool,
+}
+
+/// What a checkpoint turned out to hold, reported back to whoever loaded it.
+///
+/// `carries_ema` and `used_ema` differ exactly when a caller asked for the
+/// average and the file has none — the case that would otherwise turn an
+/// EMA-vs-raw comparison into a comparison of a thing with itself. The CLI
+/// prints both.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CheckpointLoad {
+    /// The file has an EMA trailer.
+    pub carries_ema: bool,
+    /// The averaged set is what landed in the weight buffers.
+    pub used_ema: bool,
+    /// The decay the file was written with, when it carries an average.
+    pub ema_decay: Option<f32>,
+}
+
+/// The EMA trailer of a checkpoint, parsed but not yet applied.
+struct EmaPayload {
+    decay: f32,
+    /// `(layer_index, [ema_weights, ema_bias])`.
+    records: Vec<(usize, Vec<Vec<f32>>)>,
+}
+
+impl EmaPayload {
+    fn weights_and_bias_for(&self, layer_index: usize) -> Option<(&Vec<f32>, &Vec<f32>)> {
+        self.records
+            .iter()
+            .find(|(index, _)| *index == layer_index)
+            .and_then(|(_, section)| match section.as_slice() {
+                [weights, bias] => Some((weights, bias)),
+                _ => None,
+            })
+    }
 }
 
 struct PendingLossReadback {
@@ -72,6 +138,13 @@ pub struct Model<State = Infer> {
     /// Initialisation scheme for trainable weight buffers. On the model rather
     /// than on `Training` because `build_forwards` is shared with inference.
     weight_init: WeightInit,
+    /// The weight average this run keeps, if any. `None` — the default — means
+    /// no shadow buffers, no extra dispatch, and a V2 checkpoint.
+    ///
+    /// On the model rather than on `Training` for the same reason the step
+    /// counter is: checkpoint I/O is shared with `Model<Infer>`, and it has to
+    /// know whether there is a shadow to fill.
+    ema: Option<EmaConfig>,
     pending_loss_readback: Option<PendingLossReadback>,
     last_reported_loss: Option<f32>,
     loss_readback_disabled: bool,
@@ -163,6 +236,7 @@ impl Model<Training> {
             saved_outputs: HashMap::new(),
             optimizer_step: 0,
             weight_init: WeightInit::default(),
+            ema: None,
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
@@ -174,6 +248,15 @@ impl Model<Training> {
     /// before `build()`; the default is the historical uniform draw.
     pub fn set_weight_init(&mut self, init: WeightInit) {
         self.weight_init = init;
+    }
+
+    /// Keep an exponential moving average of the weights (`None` — the default
+    /// — keeps none).
+    ///
+    /// Must be set before `build()`: the shadow buffers are allocated with the
+    /// optimiser passes and seeded from the weights that exist then.
+    pub fn set_ema(&mut self, ema: Option<EmaConfig>) {
+        self.ema = ema;
     }
 
     pub fn optimizer(&self) -> OptimizerKind {
@@ -248,6 +331,7 @@ impl Model<Training> {
         //    Each layer receives the previous layer's grad_input as its grad_output.
         let lr = self.training.as_ref().unwrap().lr;
         let optimizer = self.training.as_ref().unwrap().optimizer;
+        let ema = self.ema;
         let mut incoming_grad = loss_grad_out;
         let mut pending_saved_grads: HashMap<String, Arc<Buffer>> = HashMap::new();
 
@@ -273,6 +357,9 @@ impl Model<Training> {
             }
             if layer.ty.has_weights() {
                 layer.create_opt_pass(&self.gpu, lr, optimizer);
+                if let Some(ema) = ema {
+                    layer.create_ema_pass(&self.gpu, ema);
+                }
             }
         }
 
@@ -514,8 +601,12 @@ impl Model<Training> {
             .as_ref()
             .expect("training config unavailable")
             .lr;
+        let ema_decay = self.ema.map(|ema| ema.effective_decay(step));
         for layer in &self.layers {
             layer.write_opt_specs(self.gpu.as_ref(), lr, grad_scale, step);
+            if let Some(decay) = ema_decay {
+                layer.write_ema_specs(self.gpu.as_ref(), decay);
+            }
         }
     }
 
@@ -544,6 +635,12 @@ impl Model<Training> {
         for layer in &self.layers {
             layer.encode_opt_pass(encoder);
         }
+        // …then the weight average, in the same encoder. wgpu's implicit
+        // barrier between compute passes is what makes the EMA read the weights
+        // this step produced rather than the previous step's.
+        for layer in &self.layers {
+            layer.encode_ema_pass(encoder);
+        }
     }
 
     fn encode_zero_optimizer_gradients(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -568,6 +665,7 @@ impl<State> Model<State> {
             saved_outputs: HashMap::new(),
             optimizer_step: 0,
             weight_init: WeightInit::default(),
+            ema: None,
             pending_loss_readback: None,
             last_reported_loss: None,
             loss_readback_disabled: false,
@@ -668,8 +766,20 @@ impl<State> Model<State> {
             });
         }
 
+        // The version is decided by what there is to write, not by what the
+        // code can write: a run without an EMA still produces the exact V2 file
+        // it produced before this trailer existed.
+        let has_ema = self
+            .layers
+            .iter()
+            .any(|layer| !layer.ema_state_buffers().is_empty());
+
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(CHECKPOINT_MAGIC_V2);
+        bytes.extend_from_slice(if has_ema {
+            CHECKPOINT_MAGIC_V3
+        } else {
+            CHECKPOINT_MAGIC_V2
+        });
         bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         for entry in entries {
             bytes.extend_from_slice(&entry.layer_index.to_le_bytes());
@@ -689,6 +799,16 @@ impl<State> Model<State> {
         // keeps its checkpoints byte-identical to V1 apart from the magic and
         // the 4-byte tag.
         self.append_optimizer_state(&mut bytes)?;
+
+        // EMA trailer (V3 only).
+        //
+        // The averaged weights are the ones a V3 checkpoint is generated from,
+        // so they are not an optional diagnostic: a file that dropped them
+        // would silently sample from the raw iterate, which is precisely the
+        // comparison `--raw-weights` exists to make deliberate.
+        if has_ema {
+            self.append_ema_state(&mut bytes)?;
+        }
 
         Ok(bytes)
     }
@@ -745,6 +865,91 @@ impl<State> Model<State> {
             }
         }
         Ok(())
+    }
+
+    /// Serialise the EMA trailer: the decay, then `[ema_weights, ema_bias]` per
+    /// trainable layer, in the same shape as the optimiser trailer.
+    fn append_ema_state(&self, bytes: &mut Vec<u8>) -> Result<(), ModelError> {
+        let shadowed: Vec<(u32, &Layer)> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, layer)| !layer.ema_state_buffers().is_empty())
+            .map(|(i, layer)| (i as u32, layer))
+            .collect();
+
+        if shadowed.is_empty() {
+            bytes.extend_from_slice(&EMA_STATE_NONE.to_le_bytes());
+            return Ok(());
+        }
+
+        bytes.extend_from_slice(&EMA_STATE_PRESENT.to_le_bytes());
+        // The decay is recorded so the file says what produced it: a shadow
+        // whose decay is unknown cannot be compared with another run's, and
+        // `--resume` reads it back to warn when the resuming command line would
+        // drop the average or average it differently.
+        bytes.extend_from_slice(&self.ema.map(|e| e.decay).unwrap_or(0.0).to_le_bytes());
+        bytes.extend_from_slice(&(shadowed.len() as u32).to_le_bytes());
+        for (layer_index, layer) in shadowed {
+            let buffers = layer.ema_state_buffers();
+            bytes.extend_from_slice(&layer_index.to_le_bytes());
+            bytes.extend_from_slice(&(buffers.len() as u32).to_le_bytes());
+            for buffer in buffers {
+                let values =
+                    read_back_f32(self.gpu.as_ref(), buffer, buffer.size()).ok_or_else(|| {
+                        ModelError::CheckpointLayerMismatch {
+                            layer_index: layer_index as usize,
+                            message: "EMA buffer is not readable from GPU".to_string(),
+                        }
+                    })?;
+                bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(bytemuck::cast_slice(&values));
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse the EMA trailer written by `append_ema_state`, without applying it.
+    ///
+    /// Parsing and applying are separated because the trailer sits *after* the
+    /// weight entries in the stream while [`CheckpointWeights::Ema`] needs it
+    /// *before* deciding what to write into the weight buffers.
+    fn parse_ema_state(
+        bytes: &[u8],
+        offset: &mut usize,
+    ) -> Result<Option<EmaPayload>, ModelError> {
+        let tag = read_u32_le(bytes, offset)?;
+        if tag == EMA_STATE_NONE {
+            return Ok(None);
+        }
+        if tag != EMA_STATE_PRESENT {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: format!("unknown EMA state tag {tag}"),
+            });
+        }
+        let decay = f32::from_le_bytes(
+            bytes
+                .get(*offset..offset.saturating_add(4))
+                .ok_or_else(|| ModelError::InvalidCheckpointFormat {
+                    message: "unexpected end of checkpoint while reading the EMA decay".to_string(),
+                })?
+                .try_into()
+                .unwrap(),
+        );
+        *offset += 4;
+        let layer_count = read_u32_le(bytes, offset)? as usize;
+        let mut records = Vec::with_capacity(layer_count);
+        for _ in 0..layer_count {
+            let layer_index = read_u32_le(bytes, offset)? as usize;
+            let buffer_count = read_u32_le(bytes, offset)? as usize;
+            let mut section = Vec::with_capacity(buffer_count);
+            for _ in 0..buffer_count {
+                let len = read_u32_le(bytes, offset)? as usize;
+                section.push(read_f32_vec_le(bytes, offset, len)?);
+            }
+            records.push((layer_index, section));
+        }
+        Ok(Some(EmaPayload { decay, records }))
     }
 
     /// Restore the optimiser state trailer written by `append_optimizer_state`.
@@ -818,26 +1023,54 @@ impl<State> Model<State> {
     /// [`Model::load_checkpoint_bytes`]: `fs` is used here and nowhere deeper,
     /// so the inference path stays usable where there is no filesystem.
     pub fn load_checkpoint<P: AsRef<Path>>(&mut self, path: P) -> Result<(), ModelError> {
+        self.load_checkpoint_with(path, CheckpointWeights::Raw)
+            .map(|_| ())
+    }
+
+    /// Read a checkpoint, choosing which of its weight sets lands in the model.
+    ///
+    /// Reports what the file held and what was used — see [`CheckpointLoad`].
+    pub fn load_checkpoint_with<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        source: CheckpointWeights,
+    ) -> Result<CheckpointLoad, ModelError> {
         let path = path.as_ref();
         let bytes = fs::read(path).map_err(|err| ModelError::CheckpointIo {
             path: path.display().to_string(),
             message: err.to_string(),
         })?;
-        self.load_checkpoint_bytes(&bytes)
+        self.load_checkpoint_bytes_with(&bytes, source)
     }
 
     /// Restore weights (and the optimiser trailer, if present) from checkpoint
     /// bytes — the entry point a browser build uses, handed a `fetch` body.
     pub fn load_checkpoint_bytes(&mut self, bytes: &[u8]) -> Result<(), ModelError> {
+        self.load_checkpoint_bytes_with(bytes, CheckpointWeights::Raw)
+            .map(|_| ())
+    }
+
+    /// See [`Model::load_checkpoint_with`]. The whole stream is parsed before
+    /// anything is written: the EMA trailer sits after the weight entries, and
+    /// [`CheckpointWeights::Ema`] has to know about it before it can decide
+    /// what those entries mean.
+    pub fn load_checkpoint_bytes_with(
+        &mut self,
+        bytes: &[u8],
+        source: CheckpointWeights,
+    ) -> Result<CheckpointLoad, ModelError> {
         if !self.state.is_build {
             return Err(ModelError::InvalidCheckpointFormat {
                 message: "model must be built before loading checkpoint".to_string(),
             });
         }
 
-        let has_optimizer_trailer = match bytes.get(..CHECKPOINT_MAGIC_LEN) {
-            Some(magic) if magic == CHECKPOINT_MAGIC_V2 => true,
-            Some(magic) if magic == CHECKPOINT_MAGIC_V1 => false,
+        // Version, read off the magic. V1 has no trailer at all, V2 an
+        // optimiser trailer, V3 that plus the weight average.
+        let (has_optimizer_trailer, has_ema_trailer) = match bytes.get(..CHECKPOINT_MAGIC_LEN) {
+            Some(magic) if magic == CHECKPOINT_MAGIC_V3 => (true, true),
+            Some(magic) if magic == CHECKPOINT_MAGIC_V2 => (true, false),
+            Some(magic) if magic == CHECKPOINT_MAGIC_V1 => (false, false),
             _ => {
                 return Err(ModelError::InvalidCheckpointFormat {
                     message: "missing or invalid checkpoint magic".to_string(),
@@ -845,15 +1078,50 @@ impl<State> Model<State> {
             }
         };
 
-        let mut offset = CHECKPOINT_MAGIC_LEN;
-        let entry_count = read_u32_le(&bytes, &mut offset)? as usize;
-        for _ in 0..entry_count {
-            let layer_index = read_u32_le(&bytes, &mut offset)? as usize;
-            let weight_len = read_u32_le(&bytes, &mut offset)? as usize;
-            let weights = read_f32_vec_le(&bytes, &mut offset, weight_len)?;
-            let bias_len = read_u32_le(&bytes, &mut offset)? as usize;
-            let bias = read_f32_vec_le(&bytes, &mut offset, bias_len)?;
+        struct LoadedEntry {
+            layer_index: usize,
+            weights: Vec<f32>,
+            bias: Vec<f32>,
+        }
 
+        let mut offset = CHECKPOINT_MAGIC_LEN;
+        let entry_count = read_u32_le(bytes, &mut offset)? as usize;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            let layer_index = read_u32_le(bytes, &mut offset)? as usize;
+            let weight_len = read_u32_le(bytes, &mut offset)? as usize;
+            let weights = read_f32_vec_le(bytes, &mut offset, weight_len)?;
+            let bias_len = read_u32_le(bytes, &mut offset)? as usize;
+            let bias = read_f32_vec_le(bytes, &mut offset, bias_len)?;
+            entries.push(LoadedEntry {
+                layer_index,
+                weights,
+                bias,
+            });
+        }
+
+        // The optimiser trailer is applied where it is parsed — nothing
+        // downstream depends on it. The EMA trailer is not, hence the split.
+        let optimizer_trailer_at = offset;
+        if has_optimizer_trailer {
+            skip_optimizer_state(bytes, &mut offset)?;
+        }
+        let ema = if has_ema_trailer {
+            Self::parse_ema_state(bytes, &mut offset)?
+        } else {
+            None
+        };
+
+        if offset != bytes.len() {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: "checkpoint has trailing bytes".to_string(),
+            });
+        }
+
+        let use_ema = matches!(source, CheckpointWeights::Ema) && ema.is_some();
+
+        for entry in &entries {
+            let layer_index = entry.layer_index;
             let layer = self.layers.get(layer_index).ok_or_else(|| {
                 ModelError::CheckpointLayerMismatch {
                     layer_index,
@@ -885,43 +1153,90 @@ impl<State> Model<State> {
 
             let expected_weights = (weights_buf.size() as usize) / std::mem::size_of::<f32>();
             let expected_bias = (bias_buf.size() as usize) / std::mem::size_of::<f32>();
-            if weights.len() != expected_weights {
+            if entry.weights.len() != expected_weights {
                 return Err(ModelError::CheckpointLayerMismatch {
                     layer_index,
                     message: format!(
                         "weights length mismatch (expected {expected_weights}, got {})",
-                        weights.len()
+                        entry.weights.len()
                     ),
                 });
             }
-            if bias.len() != expected_bias {
+            if entry.bias.len() != expected_bias {
                 return Err(ModelError::CheckpointLayerMismatch {
                     layer_index,
                     message: format!(
                         "bias length mismatch (expected {expected_bias}, got {})",
-                        bias.len()
+                        entry.bias.len()
                     ),
                 });
             }
 
+            // The averaged set, when the file has one, is validated against the
+            // very same lengths — an EMA section of the wrong shape is a broken
+            // file, not a reason to fall back in silence.
+            let averaged = match ema.as_ref().and_then(|p| p.weights_and_bias_for(layer_index)) {
+                Some((weights, bias)) => {
+                    if weights.len() != expected_weights || bias.len() != expected_bias {
+                        return Err(ModelError::CheckpointLayerMismatch {
+                            layer_index,
+                            message: format!(
+                                "EMA length mismatch (expected {expected_weights}/{expected_bias}, \
+                                 got {}/{})",
+                                weights.len(),
+                                bias.len()
+                            ),
+                        });
+                    }
+                    Some((weights, bias))
+                }
+                None => None,
+            };
+
+            let (weights, bias) = match (use_ema, averaged) {
+                (true, Some((weights, bias))) => (weights, bias),
+                _ => (&entry.weights, &entry.bias),
+            };
             self.gpu
                 .queue
-                .write_buffer(weights_buf.as_ref(), 0, bytemuck::cast_slice(&weights));
+                .write_buffer(weights_buf.as_ref(), 0, bytemuck::cast_slice(weights));
             self.gpu
                 .queue
-                .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(&bias));
+                .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(bias));
+
+            // Fill this run's shadow, if it keeps one. Whatever landed in the
+            // weight buffers is what the shadow must describe: adopting the
+            // average and then averaging towards the raw iterate would make the
+            // next checkpoint a blend of two different runs.
+            let shadow = layer.ema_state_buffers();
+            if shadow.len() == 2 {
+                self.gpu
+                    .queue
+                    .write_buffer(shadow[0].as_ref(), 0, bytemuck::cast_slice(weights));
+                self.gpu
+                    .queue
+                    .write_buffer(shadow[1].as_ref(), 0, bytemuck::cast_slice(bias));
+                if !use_ema && let Some((avg_w, avg_b)) = averaged {
+                    self.gpu
+                        .queue
+                        .write_buffer(shadow[0].as_ref(), 0, bytemuck::cast_slice(avg_w));
+                    self.gpu
+                        .queue
+                        .write_buffer(shadow[1].as_ref(), 0, bytemuck::cast_slice(avg_b));
+                }
+            }
         }
 
         if has_optimizer_trailer {
-            self.restore_optimizer_state(&bytes, &mut offset)?;
+            let mut opt_offset = optimizer_trailer_at;
+            self.restore_optimizer_state(bytes, &mut opt_offset)?;
         }
 
-        if offset != bytes.len() {
-            return Err(ModelError::InvalidCheckpointFormat {
-                message: "checkpoint has trailing bytes".to_string(),
-            });
-        }
-        Ok(())
+        Ok(CheckpointLoad {
+            carries_ema: ema.is_some(),
+            used_ema: use_ema,
+            ema_decay: ema.as_ref().map(|payload| payload.decay),
+        })
     }
 
     /// The run's global optimiser step counter `t` (0 before the first update).
@@ -1082,6 +1397,11 @@ impl<State> Model<State> {
             }
             if let Some(opt) = &layer.opt_pass {
                 for buffer in opt.owned_buffers() {
+                    add_unique(&mut total, &mut seen, buffer);
+                }
+            }
+            if let Some(ema) = &layer.ema_pass {
+                for buffer in ema.owned_buffers() {
                     add_unique(&mut total, &mut seen, buffer);
                 }
             }
@@ -1249,6 +1569,37 @@ impl<State> Model<State> {
             }
         }
     }
+}
+
+/// Walk past the optimiser trailer without applying it, leaving `offset` on the
+/// byte after it.
+///
+/// The loader has to reach the EMA trailer, which sits behind this one, before
+/// it can decide what to write — so the optimiser section is walked first and
+/// applied afterwards from the offset it started at. Two readers of one layout
+/// would drift; this one shares `restore_optimizer_state`'s field order and
+/// nothing else, and the round-trip tests fail the moment they disagree.
+fn skip_optimizer_state(bytes: &[u8], offset: &mut usize) -> Result<(), ModelError> {
+    let tag = read_u32_le(bytes, offset)?;
+    if tag == OPT_STATE_NONE {
+        return Ok(());
+    }
+    if tag != OPT_STATE_ADAM {
+        return Err(ModelError::InvalidCheckpointFormat {
+            message: format!("unknown optimiser state tag {tag}"),
+        });
+    }
+    let _step = read_u64_le(bytes, offset)?;
+    let layer_count = read_u32_le(bytes, offset)? as usize;
+    for _ in 0..layer_count {
+        let _layer_index = read_u32_le(bytes, offset)?;
+        let buffer_count = read_u32_le(bytes, offset)? as usize;
+        for _ in 0..buffer_count {
+            let len = read_u32_le(bytes, offset)? as usize;
+            let _ = read_f32_vec_le(bytes, offset, len)?;
+        }
+    }
+    Ok(())
 }
 
 fn read_u32_le(bytes: &[u8], offset: &mut usize) -> Result<u32, ModelError> {
