@@ -106,6 +106,12 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   modèles en écran d'accueil, un menu d'actions par modèle), renommage et suppression,
   racine de stockage injectable (`BATLAB_ROOT`) — et la fin de « `cargo test` réécrit
   un fichier suivi ». Contient le contrat observable du manager.
+- **[UX_NAV.md](UX_NAV.md)** — quatre retours après usage réel : le vol de focus au
+  lancement (cause racine, `activateIgnoringOtherApps` de winit, que la policy
+  `Accessory` ne couvre pas), les poids pré-entraînés en défaut avec « from random »
+  en opt-out, le fil d'Ariane `Model › Action › Weights › Parameters › Run` et la
+  navigation `←`/`→`, l'aide contextuelle sourcée dans ces rapports. Contient le
+  contrat observable de la navigation.
 
 ### Restructuration
 
