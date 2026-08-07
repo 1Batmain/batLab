@@ -1228,26 +1228,22 @@ impl<State> Model<State> {
                 .queue
                 .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(bias));
 
-            // Fill this run's shadow, if it keeps one. Whatever landed in the
-            // weight buffers is what the shadow must describe: adopting the
-            // average and then averaging towards the raw iterate would make the
-            // next checkpoint a blend of two different runs.
+            // Fill this run's shadow, if it keeps one.
+            //
+            // The file's average when it has one — that is the resume case, and
+            // it is the whole point of persisting it. Otherwise whatever landed
+            // in the weight buffers, which re-seeds a V1/V2 file's shadow on the
+            // weights it just brought rather than leaving it on the random draw
+            // the rebuild produced.
             let shadow = layer.ema_state_buffers();
             if shadow.len() == 2 {
+                let (shadow_w, shadow_b) = averaged.unwrap_or((weights, bias));
                 self.gpu
                     .queue
-                    .write_buffer(shadow[0].as_ref(), 0, bytemuck::cast_slice(weights));
+                    .write_buffer(shadow[0].as_ref(), 0, bytemuck::cast_slice(shadow_w));
                 self.gpu
                     .queue
-                    .write_buffer(shadow[1].as_ref(), 0, bytemuck::cast_slice(bias));
-                if !use_ema && let Some((avg_w, avg_b)) = averaged {
-                    self.gpu
-                        .queue
-                        .write_buffer(shadow[0].as_ref(), 0, bytemuck::cast_slice(avg_w));
-                    self.gpu
-                        .queue
-                        .write_buffer(shadow[1].as_ref(), 0, bytemuck::cast_slice(avg_b));
-                }
+                    .write_buffer(shadow[1].as_ref(), 0, bytemuck::cast_slice(shadow_b));
             }
         }
 
