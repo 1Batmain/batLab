@@ -28,6 +28,20 @@ cargo run --release -p batlab -- --headless-train Color_Diffusion_XL \
 
 `5700` pas ≈ **7 h** à 4,417 s/pas. Ajuster au prorata : **1 h ≈ 815 pas**.
 
+> ### ⚠ Les mesures supposent un GPU LIBRE
+>
+> Toutes les mesures du §3 ont été prises machine au repos. À 02h10, le même
+> `--batch 32` tournait à **8,7 s/pas** — presque exactement le double — pendant
+> qu'**Ableton Live 12 occupait 55 % du CPU** (plus `coreaudiod` et `usbaudio`).
+> Mesure : pas 350 à 02:10:57, pas 375 à 02:14:35, soit 218 s pour 25 pas.
+>
+> Ce n'est pas un A/B contrôlé — je n'ai pas relancé le banc DAW fermé — mais la
+> corrélation est nette et le dépôt connaît déjà le phénomène (le batch 64 avait
+> dû être « re-certifié sur GPU libre »).
+>
+> **Fermer le DAW avant de lancer la nuit**, ou prévoir ~2x le temps mural :
+> 5 700 pas coûteraient alors ~14 h au lieu de 7.
+
 > `--headless-train` n'écrit jamais dans le `config_file` du modèle et dépose son
 > checkpoint dans un fichier scratch — il n'écrase aucun poids sauvegardé.
 > Pour garder les poids, lancer par le TUI, ou copier le scratch en fin de run.
