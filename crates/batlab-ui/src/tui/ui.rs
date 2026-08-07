@@ -11,6 +11,16 @@ use ratatui::{prelude::*, widgets::*};
 pub fn draw(f: &mut Frame, app: &App) {
     let full = f.area();
 
+    // Most screens are a popup over nothing, so the cells they do not touch
+    // keep whatever the *previous* screen left there. That is invisible while a
+    // screen redraws itself — consecutive frames are identical — and glaring
+    // the moment the flow moves from a full-screen one to a popup one: coming
+    // back from the monitor, half the architecture panel and the analytics
+    // table stayed behind the weight selector, interleaved with it. Clearing
+    // the frame first is one line, and ratatui still diffs before writing, so
+    // it costs nothing on a still screen.
+    f.render_widget(Clear, full);
+
     // The breadcrumb takes the last row of the terminal, and the screen gets
     // what is left — reserved rather than drawn over, because the monitor uses
     // its full area right down to the bottom border.
