@@ -130,6 +130,12 @@ Ce point n'est **pas bloquant** pour la nuit : batch 32 donne le même débit pa
 Smoke train batch 16, 300 pas : loss **1,426 → 0,021**, les quatre tranches de t
 décroissent, **zéro valeur non finie** sur 49 152 échantillons par tranche.
 
+**Run de dérisquage à la configuration exacte recommandée** — 500 pas,
+`--batch 32`, soit 5x plus de pas que le banc et à la taille de batch qui part
+cette nuit : loss **1,434 → plancher ~0,012**, **zéro** valeur non finie, aucune
+panique, aucune dérive. (La loss par pas reste bruitée — 0,146 au pas 499 — parce
+que chaque batch tire ses propres timesteps ; c'est le plancher qui compte.)
+
 **Chaîne complète vérifiée** — entraînement avec attention → checkpoint →
 rechargement → 256 pas de débruitage → PNG 32×32 :
 
