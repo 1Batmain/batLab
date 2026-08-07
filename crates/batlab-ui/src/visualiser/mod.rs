@@ -884,12 +884,29 @@ fn build_event_loop() -> Option<EventLoop<()>> {
 
     // The TUI owns the terminal and stays the primary interface, so the
     // visualiser registers as an accessory: it shows its window without adding
-    // a dock icon or stealing focus from the terminal at startup.
+    // a dock icon.
+    //
+    // The activation policy is only half of it, and the half that does *not*
+    // fix focus. `run_on_main_thread` starts this event loop at process start,
+    // long before any window exists, and winit's AppKit backend ends
+    // `applicationDidFinishLaunching` with an unconditional
+    // `NSApp.activateIgnoringOtherApps(…)` — the flag defaults to `true`
+    // (winit 0.30.12, `platform_impl/macos/event_loop.rs`, `PlatformSpecific::
+    // default`). `Accessory` keeps batlab out of the Dock and the menu bar; it
+    // does not keep AppKit from making it the frontmost application. That one
+    // call is why launching batlab pulled focus out of the terminal on macOS,
+    // with no visualiser window on screen to explain it.
+    //
+    // Asking for `false` leaves the terminal frontmost. Nothing is lost: the
+    // window still orders front when `[v]` makes it visible, it simply does so
+    // without taking the keyboard away from the TUI — which is what a user
+    // pressing `[v]` and then `[q]` actually wants.
     #[cfg(target_os = "macos")]
     let event_loop = {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
         let mut builder = EventLoop::builder();
         builder.with_activation_policy(ActivationPolicy::Accessory);
+        builder.with_activate_ignoring_other_apps(false);
         match builder.build() {
             Ok(el) => el,
             Err(e) => {
@@ -982,6 +999,26 @@ mod tests {
         assert!((ratio(w, h) - frame_ratio).abs() < 1e-4, "{w}×{h}");
         assert_eq!(y, 0.0);
         assert!(x > 0.0 && (x + w) <= 1600.0);
+    }
+
+    /// The one line that keeps the terminal's focus at launch.
+    ///
+    /// There is no runtime observable to assert here: whether AppKit made
+    /// batlab frontmost is a fact about the window server, not about any value
+    /// this process holds. So the guard is on the source — crude, but it fails
+    /// if the call is dropped, and dropping it silently returns a bug the user
+    /// experiences as "batlab ate my keyboard" with no window to explain it.
+    /// `docs/reports/UX_NAV.md` §1 has the mechanism.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_event_loop_never_activates_the_app_over_the_terminal() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("with_activate_ignoring_other_apps(false)"),
+            "the macOS event loop must opt out of winit's default \
+             `activateIgnoringOtherApps(true)`, or launching batlab pulls focus \
+             out of the terminal before a single frame is drawn"
+        );
     }
 
     /// wgpu rejects a viewport that leaves the attachment, so the arithmetic
