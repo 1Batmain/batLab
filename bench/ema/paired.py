@@ -13,6 +13,13 @@ propre paire et la différence se lit par paire :
 - les deltas signés par seed sur `intra_image_std` : combien de seeds sur N
   l'EMA améliore, pas seulement la moyenne (une moyenne peut bouger sur un seul
   outlier).
+- `affine_residual_frac` : le piège de cette comparaison. Si l'EMA ne faisait
+  que monter le contraste et la luminosité, `intra_image_std` grimperait vers
+  0,206 sans qu'aucune STRUCTURE ait changé — et le rapport vendrait un gain
+  d'amplitude comme un gain de qualité. On ajuste donc par seed le meilleur
+  `a·brut + b` sur l'image EMA : ce qui RESTE après cet ajustement est la part
+  que le gain/offset n'explique pas. Proche de 0 → l'EMA n'a fait que
+  rééchelonner ; proche de 1 → elle a déplacé le contenu.
 """
 import argparse
 import glob as globmod
@@ -54,6 +61,16 @@ def main():
     # doit APPROCHER 0,206 par le bas, pas le dépasser (CLAUDE.md).
     closer = np.abs(std_a - DATASET_INTRA_STD) < np.abs(std_b - DATASET_INTRA_STD)
 
+    # Meilleur `a·B + b` par seed, en fermé : a = cov(A,B)/var(B), b = Ā − a·B̄.
+    resid, gains = [], []
+    for x, y in zip(b.reshape(len(kb), -1), a.reshape(len(ka), -1)):
+        var = x.var()
+        gain = float(((x - x.mean()) * (y - y.mean())).mean() / var) if var > 0 else 1.0
+        off = float(y.mean() - gain * x.mean())
+        resid.append(float(np.sqrt(((y - (gain * x + off)) ** 2).mean())))
+        gains.append(gain)
+    resid = np.asarray(resid)
+
     print(json.dumps({
         "n": len(ka),
         "identical_files": bool(np.all(per_seed_rmse == 0.0)),
@@ -63,6 +80,9 @@ def main():
         "intra_std_a": [round(float(v), 4) for v in std_a],
         "intra_std_b": [round(float(v), 4) for v in std_b],
         "seeds_where_a_is_closer_to_dataset": int(closer.sum()),
+        "mean_affine_gain": float(np.mean(gains)),
+        "mean_affine_residual": float(resid.mean()),
+        "affine_residual_frac": float(resid.mean() / per_seed_rmse.mean()),
     }, indent=2))
 
 
