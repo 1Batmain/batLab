@@ -23,6 +23,9 @@ use std::collections::HashSet;
 
 fn test_app(tag: &str) -> (TempRoot, App) {
     let temp = TempRoot::new(tag);
+    // `with_storage` never probes an adapter — see `App::new`. Pressing a key
+    // on the Resources page must not need a GPU, and a stated profile is also
+    // what makes its verdict reproducible.
     let app = App::with_storage(temp.storage());
     (temp, app)
 }
@@ -50,6 +53,12 @@ fn walk_the_builder(app: &mut App) -> HashSet<Screen> {
     step(app, &mut visited, KeyCode::Enter, Screen::TemplateSelector);
     // Picking a template creates the model and rejoins the common path.
     step(app, &mut visited, KeyCode::Enter, Screen::ModelActions);
+
+    // What the model costs on the GPU, and the batch dial on it.
+    step(app, &mut visited, KeyCode::Char('r'), Screen::Resources);
+    handle_key(app, KeyCode::Right); // the batch simulator, same screen
+    handle_key(app, KeyCode::Char('i')); // training ↔ inference, same screen
+    step(app, &mut visited, KeyCode::Esc, Screen::ModelActions);
 
     // The architecture, and the input geometry behind it.
     step(app, &mut visited, KeyCode::Char('e'), Screen::LayerBuilder);
@@ -131,6 +140,60 @@ fn walk_the_monitor(app: &mut App) -> HashSet<Screen> {
     visited
 }
 
+/// The batch dial has to actually move the number.
+///
+/// This is the page's one interactive promise — "what would this cost on a
+/// bigger machine" is answered by pressing `→` — and a dial that changed a
+/// field nothing reads would look exactly the same on screen until someone
+/// compared two totals. So the assertion is on the inventory, not on the field.
+#[test]
+fn the_batch_dial_moves_the_totals_and_leaves_the_parameters_alone() {
+    let (_temp, mut app) = test_app("resources-dial");
+    handle_key(&mut app, KeyCode::Enter); // template selector
+    handle_key(&mut app, KeyCode::Enter); // a model exists, action menu
+    handle_key(&mut app, KeyCode::Char('r'));
+    assert_eq!(app.screen, Screen::Resources);
+
+    app.resources.batch = 4;
+    let small = app
+        .resources_inventory(app.resources.batch)
+        .expect("the template must be sizeable");
+    handle_key(&mut app, KeyCode::Right);
+    assert_eq!(app.resources.batch, 8, "→ must step to the next stop");
+    let large = app
+        .resources_inventory(app.resources.batch)
+        .expect("the template must be sizeable");
+
+    assert_eq!(
+        large.bytes_of(batlab_core::Kind::Activations),
+        small.bytes_of(batlab_core::Kind::Activations) * 2,
+        "doubling the batch must double the activations"
+    );
+    assert_eq!(
+        large.bytes_of(batlab_core::Kind::Weights),
+        small.bytes_of(batlab_core::Kind::Weights),
+        "the weights do not depend on the batch"
+    );
+
+    // And `←` comes back to exactly where it was.
+    handle_key(&mut app, KeyCode::Left);
+    assert_eq!(app.resources.batch, 4);
+    assert_eq!(
+        app.resources_inventory(app.resources.batch)
+            .unwrap()
+            .total_bytes(),
+        small.total_bytes()
+    );
+
+    // `[i]` is a different graph, not a smaller batch: inference drops the loss
+    // layer, the backward chain and the optimiser state entirely.
+    handle_key(&mut app, KeyCode::Char('i'));
+    assert!(app.resources.inference);
+    let inference = app.resources_inventory(app.resources.batch).unwrap();
+    assert_eq!(inference.bytes_of(batlab_core::Kind::OptimizerState), 0);
+    assert!(inference.total_bytes() < small.total_bytes());
+}
+
 #[test]
 fn every_screen_is_reachable_by_pressing_keys() {
     let (_temp, mut app) = test_app("nav-reachability");
@@ -170,6 +233,7 @@ fn esc_parent(screen: Screen) -> Option<Screen> {
         Screen::DatasetSelector => Some(Screen::TrainingParams),
         Screen::Monitor => None,
         Screen::TrainingControl => Some(Screen::Monitor),
+        Screen::Resources => Some(Screen::ModelActions),
     }
 }
 

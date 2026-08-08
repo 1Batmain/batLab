@@ -602,6 +602,17 @@ impl Storage {
         Ok(datasets)
     }
 
+    /// A dataset's shape, for the resource inventory, from its header alone.
+    ///
+    /// `None` when the file is missing or is not a `.batraw` — the inventory
+    /// then simply has no streamed post, which is the truth rather than a zero.
+    pub fn dataset_spec(&self, path: &str) -> Option<batlab_core::DatasetSpec> {
+        read_batraw_header(Path::new(path)).map(|header| batlab_core::DatasetSpec {
+            sample_count: header.0,
+            sample_bytes: header.1 as u64 * header.2 as u64 * header.3 as u64 * 4,
+        })
+    }
+
     // --- The manager: rename and delete ---
 
     /// Resolve `<Models>/<name>` and prove it is a directory that `Models/`
@@ -1004,6 +1015,31 @@ pub fn list_models() -> io::Result<Vec<SavedModelEntry>> {
 
 pub fn list_datasets() -> io::Result<Vec<String>> {
     Storage::default().list_datasets()
+}
+
+/// `(sample_count, width, height, channels)` from a `.batraw` header.
+///
+/// The header only: CIFAR-10 is 195 MiB on disk, and reading it whole to answer
+/// "how many chunks does this become on the GPU?" would make the answer cost
+/// more than the run it describes. Both magics are accepted — `BATRAW1` differs
+/// from `BATRAW2` in the *range* of its payload, not in its shape.
+pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32)> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header).ok()?;
+    if &header[..8] != b"BATRAW2\0" && &header[..8] != b"BATRAW1\0" {
+        return None;
+    }
+    let word = |i: usize| {
+        u32::from_le_bytes([
+            header[8 + i * 4],
+            header[9 + i * 4],
+            header[10 + i * 4],
+            header[11 + i * 4],
+        ])
+    };
+    Some((word(0) as u64, word(1), word(2), word(3)))
 }
 
 // ---------------------------------------------------------------------------

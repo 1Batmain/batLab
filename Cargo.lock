@@ -245,6 +245,7 @@ dependencies = [
  "bytemuck",
  "crossterm",
  "libc",
+ "pollster",
  "ratatui",
  "serde",
  "serde_json",

@@ -9,18 +9,15 @@ use std::time::{Duration, SystemTime};
 
 use batlab_ui::storage;
 use batlab_ui::tui::{
-    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, PerpetualConfig,
+    self, LayerDraft, ModelConfig, MonitorOutcome, PerpetualConfig,
     RunMode, TrainingConfig,
 };
 use batlab_core::{
-    ActivationMethod as PActivation, ActivationType, AttentionType, CheckpointWeights,
-    ConvolutionType, DEFAULT_SNR_GAMMA,
-    DenoiseFrame, DiffusionTask, Dim3, DriftAction, DriftWalk, EmaConfig, FullyConnectedType,
-    GpuContext, GpuDataset,
-    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
-    MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
-    Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame_view, log_probe,
-    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
+    CheckpointWeights, DEFAULT_SNR_GAMMA, DenoiseFrame, DiffusionTask, DriftAction,
+    DriftWalk, EmaConfig, GpuContext, GpuDataset, LinearNoiseSchedule, LiveFrame,
+    LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind, PerpetualDrift,
+    ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, log_probe, log_train_loss,
+    log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -61,6 +58,39 @@ are not reachable from the TUI and never write back a model's config_file.
       [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
       [--frames N] [--actions N] [--window] [--climb-frames N] [--out <dir>]
       [--raw-weights]
+
+  --resources <model> [--batch N] [--dataset <path>] [--measure] [--steps N]
+      [--inference] [--vram GiB] [--device <name>] [--no-gpu] [--width N]
+
+What the model costs on the GPU:
+  --resources       print the itemised GPU inventory: weights, gradients, Adam
+                    moments, EMA, activations, attention's N² scratch, the
+                    diffusion prepass, the resident dataset chunk — each against
+                    this machine's real limits, with the batch ceiling that
+                    follows. Read-only: it opens an adapter to read its limits
+                    and writes nothing anywhere. The TUI shows the same page on
+                    `[R]` from a model's action menu.
+  --batch N         size the inventory for N samples instead of the config's
+                    batch. The activation posts scale with it, the parameter
+                    posts do not, and the page says which is which.
+  --dataset <path>  the dataset to account for; defaults to the one the model's
+                    config trains on. Only its header is read.
+  --measure         also RUN: build the model, take a few training steps and a
+                    few reverse steps, and report the counters' difference —
+                    bytes up, bytes down, round trips and submissions per step.
+                    Without it no traffic table is printed at all, rather than a
+                    plausible zero. Needs a real GPU.
+  --steps N         steps to measure (default 5). The first is a warmup and is
+                    excluded: it uploads the first dataset chunk.
+  --inference       size the inference graph (forward only, batch 1) instead of
+                    the training one.
+  --vram GiB        state a memory budget — 'would this fit on an 8 GiB card?'.
+                    No API reports one, so without this flag the verdict is
+                    about per-binding limits only.
+  --device <name>   answer for a machine that is not here, at the WebGPU default
+                    limits (128 MiB storage bindings, 256 MiB buffers) — which
+                    is what a browser grants the visitor's GPU.
+  --no-gpu          same, unnamed: never opens an adapter.
 
 Weight averaging (EMA):
   --ema F           keep an exponential moving average of the weights,
@@ -283,6 +313,23 @@ fn main() {
         //       [--regime wander|breathe] [--seed N] [--magnitude F] \
         //       [--window] [--climb-frames N] [--out <dir>]
         // -----------------------------------------------------------------
+        // -----------------------------------------------------------------
+        // What this model costs on the GPU, and what crosses the boundary.
+        //
+        // Read-only: it opens an adapter to read its limits, and with
+        // `--measure` it builds the model and runs a handful of steps. It never
+        // writes a config, a checkpoint or an image.
+        //
+        //   cargo run -p batlab -- --resources <model> [--batch N] [--measure]
+        // -----------------------------------------------------------------
+        if args.iter().any(|arg| arg == "--resources") {
+            if let Err(err) = run_resources(&args) {
+                eprintln!("resources: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
         if args.iter().any(|arg| arg == "--headless-perpetual") {
             if let Err(err) = run_headless_perpetual(&args) {
                 eprintln!("headless perpetual failed: {err}");
@@ -877,6 +924,353 @@ impl FrameDump {
             .map_err(|err| format!("failed to flush {}: {err}", self.path.display()))?;
         Ok(self.path)
     }
+}
+
+/// The `.batraw` header alone: how many samples, and how big each one is.
+///
+/// A dataset's GPU footprint is decided by those two numbers, and CIFAR-10 is
+/// 195 MiB on disk — reading it whole to answer "how many chunks?" would make
+/// `--resources` slower than the run it describes.
+fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32), String> {
+    use std::io::Read;
+    let mut file =
+        fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header)
+        .map_err(|err| format!("failed to read the header of {}: {err}", path.display()))?;
+    let magic = &header[..8];
+    if magic != RAW_DATASET_MAGIC_SIGNED && magic != RAW_DATASET_MAGIC_UNIT {
+        return Err(format!("invalid magic in {}", path.display()));
+    }
+    let word = |i: usize| {
+        u32::from_le_bytes([
+            header[8 + i * 4],
+            header[9 + i * 4],
+            header[10 + i * 4],
+            header[11 + i * 4],
+        ])
+    };
+    Ok((word(0) as u64, word(1), word(2), word(3)))
+}
+
+/// The dataset a `--resources` question is about: the one named on the command
+/// line, else the one the model's config trains on. `None` when neither exists
+/// on disk — the inventory then simply has no streamed post, and says so.
+fn resources_dataset(
+    explicit: Option<String>,
+    config: &ModelConfig,
+) -> Option<(PathBuf, batlab_core::DatasetSpec)> {
+    let named = explicit.or_else(|| match &config.run.mode {
+        RunMode::Train(train) => Some(train.dataset_path.clone()),
+        _ => None,
+    })?;
+    let path = PathBuf::from(&named);
+    let (count, width, height, channels) = read_batraw_header(&path).ok()?;
+    Some((
+        path,
+        batlab_core::DatasetSpec {
+            sample_count: count,
+            sample_bytes: width as u64 * height as u64 * channels as u64 * 4,
+        },
+    ))
+}
+
+/// See the DEV/CI note in `main`. Not reachable from the TUI — except that the
+/// TUI shows the same page, from the same inventory, on the same key.
+///
+/// Prints what the model puts on the GPU and what crosses the host boundary.
+/// Two questions, and the second is the one nobody could answer before: the
+/// model is uploaded once and stays resident, the dataset is streamed one
+/// 64 MiB chunk at a time, and the reverse chain pays a full CPU↔GPU round trip
+/// on every one of its 256 steps because the latent lives on the CPU.
+///
+/// `--measure` is what makes those claims measurements instead of assertions:
+/// it builds the model, runs real training steps and real reverse steps, and
+/// reports the counters' difference. Without it the page is pure prediction and
+/// prints no traffic table at all, rather than a plausible zero.
+fn run_resources(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    reject_unknown_flags(
+        args,
+        &[
+            "--resources",
+            "--batch",
+            "--dataset",
+            "--vram",
+            "--device",
+            "--width",
+            "--steps",
+        ],
+        &["--measure", "--no-gpu", "--inference"],
+    )?;
+
+    let model_name =
+        flag("--resources").ok_or_else(|| "--resources requires a model name".to_string())?;
+    let config_path = storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    // The batch the config trains at, unless the caller asks about another —
+    // which is the whole point of the flag: "what would batch 64 cost?".
+    let config_batch = match &config.run.mode {
+        RunMode::Train(train) => train.batch_size.max(1),
+        _ => 16,
+    };
+    let batch = match flag("--batch") {
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|_| format!("--batch takes an integer, got `{value}`"))?
+            .max(1),
+        None => config_batch,
+    };
+    let width = flag("--width")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(96);
+    let measure = args.iter().any(|a| a == "--measure");
+    let measure_steps = flag("--steps")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(5)
+        .max(1);
+
+    let dataset = resources_dataset(flag("--dataset"), &config);
+
+    // The device: this machine unless the question is about another one.
+    let hypothetical = flag("--device");
+    let no_gpu = args.iter().any(|a| a == "--no-gpu");
+    let (gpu, mut device) = if hypothetical.is_some() || no_gpu {
+        (
+            None,
+            batlab_core::DeviceProfile::hypothetical(
+                hypothetical.unwrap_or_else(|| "unnamed device (WebGPU default limits)".to_string()),
+                None,
+            ),
+        )
+    } else {
+        let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+        let gpu = Arc::new(rt.block_on(GpuContext::new_headless()));
+        let profile = batlab_core::DeviceProfile::from_gpu(gpu.as_ref());
+        (Some((rt, gpu)), profile)
+    };
+    if let Some(vram) = flag("--vram") {
+        let gib: f64 = vram
+            .parse()
+            .map_err(|_| format!("--vram takes a size in GiB, got `{vram}`"))?;
+        device = device.with_budget((gib * 1024.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    let inference_only = args.iter().any(|a| a == "--inference");
+    let workload = if inference_only {
+        batlab_core::Workload::Inference
+    } else {
+        match &config.run.mode {
+            RunMode::Train(train) => {
+                batlab_core::Workload::training(train.optimizer, train.ema_decay.is_some())
+            }
+            // A model whose config is not a training config still answers the
+            // training question — that is what someone sizing a machine asks.
+            _ => batlab_core::Workload::training(OptimizerKind::Adam, false),
+        }
+    };
+
+    let request = batlab_core::InventoryRequest {
+        layers: config.layers.clone(),
+        input_size: config.input_size,
+        batch,
+        workload,
+        dataset: dataset.as_ref().map(|(_, spec)| *spec),
+        live_frame: false,
+    };
+    let inventory = batlab_core::inventory(&request, &device)
+        .map_err(|err| format!("failed to compute the inventory: {err}"))?;
+
+    let measured = match (measure, gpu.as_ref()) {
+        (true, Some((rt, gpu))) => Some(rt.block_on(measure_transfers(
+            gpu,
+            &config,
+            batch,
+            dataset.as_ref().map(|(path, _)| path.as_path()),
+            measure_steps,
+        ))?),
+        (true, None) => {
+            return Err("--measure needs a real GPU: drop --no-gpu/--device".to_string());
+        }
+        _ => None,
+    };
+
+    println!("model '{model_name}' — {}", config_path.display());
+    println!();
+    for line in batlab_core::report_lines(
+        &inventory,
+        measured.as_ref(),
+        batlab_core::ReportOptions {
+            width,
+            max_layer_rows: None,
+            bars: true,
+        },
+    ) {
+        println!("{line}");
+    }
+
+    // The two questions the page exists for, answered last because they are
+    // what someone screenshots: where the ceiling is, and what the other
+    // workload costs.
+    println!();
+    match batlab_core::max_batch_that_fits(&request, &device, 4096) {
+        Ok(Some(ceiling)) => println!(
+            "BATCH CEILING  {ceiling}{}",
+            if device.memory_budget.is_none() {
+                "  (per-binding limits only — no memory budget was stated; \
+                 pass --vram N to bound it)"
+            } else {
+                ""
+            }
+        ),
+        Ok(None) => println!("BATCH CEILING  none — not even one sample fits"),
+        Err(err) => println!("BATCH CEILING  unknown: {err}"),
+    }
+    let other = batlab_core::inventory(
+        &request
+            .clone()
+            .with_workload(if inference_only {
+                batlab_core::Workload::training(OptimizerKind::Adam, false)
+            } else {
+                batlab_core::Workload::Inference
+            })
+            .with_dataset(None),
+        &device,
+    )
+    .map_err(|err| format!("failed to compute the paired inventory: {err}"))?;
+    println!(
+        "{:<14} {} ({})",
+        if inference_only {
+            "TRAINING"
+        } else {
+            "INFERENCE"
+        },
+        batlab_core::format_bytes(other.total_bytes()),
+        other.workload.label()
+    );
+    Ok(())
+}
+
+/// Run the real thing and read the counters — the measured half of the page.
+///
+/// Deliberately runs *production* entry points: `DiffusionTask::train_step_
+/// report_batch` for training and `reverse_step` for inference, the same calls
+/// the trainer and the sampler make. A measurement of a special path measures
+/// the special path.
+///
+/// The first step is measured separately and thrown away: it uploads the first
+/// dataset chunk and warms every pipeline, so folding it into the average would
+/// attribute a one-off 64 MiB to every step for ever.
+async fn measure_transfers(
+    gpu: &Arc<GpuContext>,
+    config: &ModelConfig,
+    batch: u32,
+    dataset_path: Option<&Path>,
+    steps: usize,
+) -> Result<batlab_core::MeasuredTransfers, String> {
+    let output_size = {
+        let out = batlab_core::compute_inferred_input(&config.layers, config.input_size);
+        (out.0, out.1, out.2)
+    };
+
+    let before_build = gpu.transfers();
+    let mut model = Model::new_training_with_optimizer(
+        Arc::clone(gpu),
+        1e-3,
+        batch,
+        PLoss::MeanSquared,
+        OptimizerKind::Adam,
+    )
+    .await;
+    for draft in &config.layers {
+        model.add_draft(draft).map_err(|err| err.to_string())?;
+    }
+    model.build().map_err(|err| err.to_string())?;
+    let build_upload_bytes = gpu.transfers().since(before_build).host_to_device_bytes;
+
+    let schedule = LinearNoiseSchedule::new_linear(
+        DIFFUSION_SCHEDULE_STEPS,
+        DIFFUSION_BETA_START,
+        DIFFUSION_BETA_END,
+    );
+    let mut task = DiffusionTask::new(schedule.clone());
+
+    let training_step = match dataset_path {
+        Some(path) => {
+            let samples = try_load_raw_dataset(path, output_size)?
+                .ok_or_else(|| format!("no .batraw dataset at {}", path.display()))?;
+            let sample_len = samples
+                .first()
+                .map(|s| s.target.len())
+                .ok_or_else(|| "the dataset is empty".to_string())?;
+            let flat: Vec<Vec<f32>> = samples.into_iter().map(|s| s.target).collect();
+            let mut dataset = GpuDataset::from_samples(gpu.as_ref(), flat, sample_len)
+                .map_err(|err| format!("failed to upload the dataset: {err}"))?;
+
+            // Warmup, then measure.
+            task.train_step_report_batch(&mut model, &mut dataset, 0, batch as usize, 7)
+                .map_err(|err| format!("training step failed: {err}"))?;
+            let before = gpu.transfers();
+            for step in 1..=steps {
+                task.train_step_report_batch(&mut model, &mut dataset, step, batch as usize, 7)
+                    .map_err(|err| format!("training step failed: {err}"))?;
+            }
+            Some(gpu.transfers().since(before).per(steps as u64))
+        }
+        None => None,
+    };
+
+    // Inference: the reverse chain, one step at a time, on the very function
+    // the sampler uses.
+    let input_channels = config.input_size.2 as usize;
+    let signal_channels = output_size.2 as usize;
+    let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+    let mut latent = schedule.sample_noise(output_len, 11);
+    let reverse_steps = steps.min(schedule.len());
+    // Warmup outside the measured window, same reason as above.
+    latent = batlab_core::reverse_step(
+        &mut model,
+        &schedule,
+        input_channels,
+        signal_channels,
+        &latent,
+        schedule.len() - 1,
+        11,
+        1.0,
+        false,
+    )
+    .latent;
+    let before = gpu.transfers();
+    for index in 0..reverse_steps {
+        latent = batlab_core::reverse_step(
+            &mut model,
+            &schedule,
+            input_channels,
+            signal_channels,
+            &latent,
+            schedule.len().saturating_sub(2 + index),
+            11,
+            1.0,
+            false,
+        )
+        .latent;
+    }
+    let inference_step = Some(gpu.transfers().since(before).per(reverse_steps as u64));
+
+    Ok(batlab_core::MeasuredTransfers {
+        training_step,
+        inference_step,
+        build_upload_bytes: Some(build_upload_bytes),
+        steps_per_image: schedule.len(),
+    })
 }
 
 /// See the DEV/CI note in `main`. Not reachable from the TUI.
@@ -3260,134 +3654,19 @@ fn tensor_to_rgb_pixels(tensor: &[f32], dims: (u32, u32, u32)) -> Result<Vec<u8>
     Ok(pixels)
 }
 
+/// Append the layer a `config_file` entry describes.
+///
+/// One line, because the translation itself now lives in the engine
+/// ([`Model::add_draft`]). It used to live here, spelled out layer by layer —
+/// and the resource inventory, which has to build the same stack from the same
+/// file without a GPU, could not reach it. Two copies of "what this config
+/// means" is exactly the kind of duplication that ends with a page confidently
+/// reporting a graph the trainer does not build.
 fn append_layer<State>(
     model: &mut Model<State>,
     draft: &LayerDraft,
 ) -> Result<(), batlab_core::ModelError> {
-    match draft {
-        LayerDraft::Convolution {
-            dim_input,
-            nb_kernel,
-            dim_kernel,
-            stride,
-            padding,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::Convolution(ConvolutionType::new(
-                Dim3::new(*dim_input),
-                *nb_kernel,
-                Dim3::new(*dim_kernel),
-                *stride,
-                convert_padding(padding),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::Activation {
-            dim_input,
-            method,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::Activation(ActivationType::new(
-                convert_activation(method),
-                Dim3::new(*dim_input),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::GroupNorm {
-            dim_input,
-            num_groups,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::GroupNorm(GroupNormType::new(
-                Dim3::new(*dim_input),
-                *num_groups,
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::Attention {
-            dim_input,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::Attention(AttentionType::new(Dim3::new(
-                *dim_input,
-            ))))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::FullyConnected {
-            dim_input,
-            nb_neurons,
-            method,
-            save_key,
-            ..
-        } => {
-            model.add_layer(LayerTypes::FullyConnected(FullyConnectedType::new(
-                Dim3::new(*dim_input),
-                *nb_neurons,
-                convert_activation(method),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::UpsampleConv {
-            dim_input,
-            scale_factor,
-            nb_kernel,
-            dim_kernel,
-            padding,
-            save_key,
-            ..
-        } => {
-            model.add_layer(LayerTypes::UpsampleConv(UpsampleConvType::new(
-                Dim3::new(*dim_input),
-                *scale_factor,
-                *nb_kernel,
-                Dim3::new(*dim_kernel),
-                convert_padding(padding),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::Concat {
-            skip_key, save_key, ..
-        } => {
-            model.add_concat(skip_key.clone())?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn convert_padding(p: &PaddingMode) -> PPadding {
-    match p {
-        PaddingMode::Valid => PPadding::Valid,
-        PaddingMode::Same => PPadding::Same,
-    }
-}
-
-fn convert_activation(a: &ActivationMethod) -> PActivation {
-    match a {
-        ActivationMethod::Relu => PActivation::Relu,
-        ActivationMethod::Silu => PActivation::Silu,
-        ActivationMethod::Linear => PActivation::Linear,
-    }
+    model.add_draft(draft)
 }
 
 #[cfg(test)]

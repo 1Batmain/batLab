@@ -10,7 +10,7 @@ use encase::{ShaderSize, ShaderType, UniformBuffer};
 use serde::{Deserialize, Serialize};
 use wgpu::BufferUsages;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LossMethod {
     MeanSquared,
 }

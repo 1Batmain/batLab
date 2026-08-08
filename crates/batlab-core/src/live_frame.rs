@@ -200,7 +200,7 @@ impl LiveFrame {
 
         // Queued on the same queue the visualiser renders from, so the next
         // frame it presents observes this write — no fence or readback needed.
-        self.gpu.queue().write_buffer(
+        self.gpu.write_buffer(
             &self.buffer,
             0,
             bytemuck::cast_slice::<f32, u8>(&self.staging),

@@ -167,11 +167,23 @@ impl DiffusionTask {
     /// GPU memory linearly, and it is the first thing that will hit
     /// `max_storage_buffer_binding_size` on a large model.
     pub fn estimated_prepare_gpu_bytes_for_batch(&self, output: Dim3, batch: u32) -> u64 {
-        let batch = batch.max(1) as u64;
-        let target_bytes =
-            (output.length() as u64 * std::mem::size_of::<f32>() as u64 * batch).max(4);
-        let specs_bytes = (DiffusionPrepareUniform::SHADER_SIZE.get() as u64 * batch).max(4);
-        target_bytes.saturating_add(specs_bytes)
+        Self::prepare_target_bytes(output, batch)
+            .saturating_add(Self::prepare_specs_bytes(batch))
+    }
+
+    /// The clean image batch the prepass noises — one slot per sample.
+    ///
+    /// Split out of the total so the resource inventory can name the two
+    /// buffers separately: they are the two allocations `build_prepare_pass`
+    /// makes, and a page that says "prepass: 2 MiB" without saying which half
+    /// grows with the batch has not said anything.
+    pub fn prepare_target_bytes(output: Dim3, batch: u32) -> u64 {
+        (output.length() as u64 * std::mem::size_of::<f32>() as u64 * batch.max(1) as u64).max(4)
+    }
+
+    /// The per-sample spec array the prepass shader indexes by sample.
+    pub fn prepare_specs_bytes(batch: u32) -> u64 {
+        (DiffusionPrepareUniform::SHADER_SIZE.get() as u64 * batch.max(1) as u64).max(4)
     }
 
     pub fn estimated_prepare_gpu_bytes(&self, output: Dim3) -> u64 {
@@ -224,9 +236,8 @@ impl DiffusionTask {
 
         model
             .gpu
-            .queue
             .write_buffer(&pass.clean_target, 0, bytemuck::cast_slice(clean_target));
-        model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
+        model.gpu.write_buffer(&pass.specs, 0, &specs_bytes);
 
         // One sample, whatever the graph was built for: this entry point takes
         // a single CPU-side target and fills slot 0.
@@ -354,7 +365,7 @@ impl DiffusionTask {
             })
             .collect();
         let specs_bytes = Self::encode_prepare_specs(&specs);
-        model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
+        model.gpu.write_buffer(&pass.specs, 0, &specs_bytes);
 
         // Dataset -> clean_target, one slot per sample. Submitted separately
         // (and grouped by chunk) because chunk loading goes through
@@ -437,7 +448,7 @@ impl DiffusionTask {
                 pixel_count: output.x * output.y,
                 total_steps: schedule_len as u32,
             }]);
-            model.gpu.queue.write_buffer(&pass.specs, 0, &specs_bytes);
+            model.gpu.write_buffer(&pass.specs, 0, &specs_bytes);
             dataset
                 .copy_samples_to(gpu.as_ref(), &[sample_index], &pass.clean_target)
                 .map_err(|err| TrainingTaskError::DatasetError {

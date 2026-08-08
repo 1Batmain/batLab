@@ -40,11 +40,37 @@ impl PaddingMode {
     }
 }
 
+/// The engine's own padding enum, from the config's mirror of it.
+///
+/// The two enums exist because the config is serialisable and the engine's is
+/// not, but the translation between them was written out by hand in the CLI and
+/// nowhere else — so anything else that wanted to turn a `config_file` into a
+/// graph (the resource inventory does) had to write it a second time. One
+/// conversion, in the crate that owns both types.
+impl From<&PaddingMode> for crate::model::types::PaddingMode {
+    fn from(mode: &PaddingMode) -> Self {
+        match mode {
+            PaddingMode::Valid => crate::model::types::PaddingMode::Valid,
+            PaddingMode::Same => crate::model::types::PaddingMode::Same,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ActivationMethod {
     Relu,
     Silu,
     Linear,
+}
+
+impl From<ActivationMethod> for crate::model::layer_types::ActivationMethod {
+    fn from(method: ActivationMethod) -> Self {
+        match method {
+            ActivationMethod::Relu => crate::model::layer_types::ActivationMethod::Relu,
+            ActivationMethod::Silu => crate::model::layer_types::ActivationMethod::Silu,
+            ActivationMethod::Linear => crate::model::layer_types::ActivationMethod::Linear,
+        }
+    }
 }
 
 impl fmt::Display for ActivationMethod {

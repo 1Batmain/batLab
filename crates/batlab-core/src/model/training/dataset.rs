@@ -87,22 +87,40 @@ impl fmt::Display for GpuDatasetError {
 
 impl Error for GpuDatasetError {}
 
+/// Bytes of one dataset chunk on a device with these caps.
+///
+/// Pure, and public, because the resource inventory has to answer "how much of
+/// the dataset sits on the GPU at once?" for a machine that is not here — see
+/// [`crate::resources::plan_dataset`]. Sharing the function is what stops the
+/// prediction from drifting away from the allocation: there is one rule, and
+/// both callers read it.
+pub fn select_chunk_bytes(
+    binding_cap: u64,
+    buffer_cap: u64,
+    gpu_cap: u64,
+    dataset_total_bytes: u64,
+) -> u64 {
+    let hard_cap = buffer_cap
+        .min(binding_cap)
+        .min(gpu_cap)
+        .min(MAX_DYNAMIC_CHUNK_BYTES as u64);
+
+    let target_from_gpu = gpu_cap / GPU_MEMORY_CHUNK_FRACTION;
+    let target = target_from_gpu
+        .max(DEFAULT_CHUNK_BYTES as u64)
+        .min(hard_cap.max(1));
+    target.min(dataset_total_bytes.max(1))
+}
+
 impl GpuDataset {
     fn select_max_chunk_bytes(gpu: &GpuContext, dataset_total_bytes: usize) -> usize {
         let limits = gpu.device.limits();
-        let binding_cap = limits.max_storage_buffer_binding_size as u64;
-        let buffer_cap = limits.max_buffer_size;
-        let gpu_cap = gpu.specs().memory_size();
-        let hard_cap = buffer_cap
-            .min(binding_cap)
-            .min(gpu_cap)
-            .min(MAX_DYNAMIC_CHUNK_BYTES as u64) as usize;
-
-        let target_from_gpu = (gpu_cap / GPU_MEMORY_CHUNK_FRACTION) as usize;
-        let target = target_from_gpu
-            .max(DEFAULT_CHUNK_BYTES)
-            .min(hard_cap.max(1));
-        target.min(dataset_total_bytes.max(1))
+        select_chunk_bytes(
+            limits.max_storage_buffer_binding_size as u64,
+            limits.max_buffer_size,
+            gpu.specs().memory_size(),
+            dataset_total_bytes as u64,
+        ) as usize
     }
 
     pub fn from_samples(
@@ -276,7 +294,7 @@ impl GpuDataset {
                     sample_bytes,
                 );
             }
-            gpu.queue.submit([encoder.finish()]);
+            gpu.submit([encoder.finish()]);
             cursor = end;
         }
         Ok(())
@@ -299,7 +317,7 @@ impl GpuDataset {
         for sample in &self.samples[chunk_start..chunk_end] {
             self.staging_cpu.extend_from_slice(sample);
         }
-        gpu.queue.write_buffer(
+        gpu.write_buffer(
             &self.chunk_buffer,
             0,
             bytemuck::cast_slice(&self.staging_cpu),
