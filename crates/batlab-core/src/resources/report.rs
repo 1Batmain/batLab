@@ -10,6 +10,7 @@
 //! never to truncate in silence — a table cut short reads as a complete table.
 
 use super::{format_bytes, GpuInventory, Kind, ProfileSource, Workload};
+use crate::gpu_context::GpuLimitsProfile;
 use crate::transfers::TransferRate;
 
 /// Measured traffic, to print beside the predicted memory.
@@ -98,6 +99,26 @@ fn device_section(inventory: &GpuInventory, width: usize, out: &mut Vec<String>)
                     "unified memory (host and GPU share it)"
                 } else {
                     "discrete memory"
+                }
+            ),
+            width,
+        ));
+    }
+    // Named first, because every number under it follows from it: the limits
+    // below are what `request_device` was ASKED for, not what the adapter can
+    // do, and the gap between the two profiles is four orders of magnitude on
+    // this machine. A page that showed 256 MiB without saying "because we asked
+    // for the web baseline" reads as a hardware fact.
+    if let Some(profile) = device.limits_profile {
+        out.push(row(
+            "limits profile",
+            &format!(
+                "{} — {}",
+                profile.label(),
+                match profile {
+                    GpuLimitsProfile::Native => "the adapter's own limits",
+                    GpuLimitsProfile::Web =>
+                        "the WebGPU baseline, what a browser grants unasked",
                 }
             ),
             width,
@@ -317,6 +338,21 @@ fn execution_model_section(
         options.width,
     ));
     match inventory.dataset {
+        // One chunk is a different execution model, not a smaller number of the
+        // same one: the dataset stops being streamed at all, and the per-step
+        // host→GPU traffic goes to zero rather than down. Worth its own
+        // sentence, because it is the difference a limits profile makes.
+        Some(plan) if plan.chunk_count <= 1 => out.push(wrap(
+            &format!(
+                "  resident — the dataset too. All {} of it sits in one buffer, uploaded \
+                 once at the first step and never again: a batch of {} costs NO host→GPU \
+                 dataset traffic. (This needs a device that will bind a buffer that big — \
+                 see the limits profile above.)",
+                format_bytes(plan.total_bytes),
+                inventory.batch,
+            ),
+            options.width,
+        )),
         Some(plan) => out.push(wrap(
             &format!(
                 "  streamed — the dataset, and only the dataset. {} is cut into {} \

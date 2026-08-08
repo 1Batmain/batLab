@@ -234,6 +234,34 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
 - Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `docs/reports/INSIGHTS_TRAINING.md`).
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
+- **Les limites GPU sont un choix : `--gpu-limits native|web`** (défaut
+  `native`). `request_device` ne donne pas ce que l'adaptateur sait faire, il
+  donne ce qu'on **demande** — et ne rien demander, c'était demander la base
+  WebGPU : 256 Mio par tampon, 128 Mio par binding de stockage. Juste pour
+  l'**inférence** (la cible est le navigateur du visiteur, cf. la frontière
+  moteur/interface), faux pour l'**entraînement**, qui tourne ici : le même Mac
+  autorise 28 Gio par tampon et 4 Gio par binding. Mesuré sur
+  `Color_Diffusion_XL` : plafond de batch **341 → 4096** (c'était la limite de
+  *binding*, pas la mémoire), et `cifar10_rgb` en u8 (146 Mio) passe de 2 chunks
+  streamés à **UN seul chunk résident** — trafic dataset par pas **146,5 Mio →
+  1,9 Kio**. Le dimensionnement suit : si le dataset tient dans un tampon que
+  l'appareil accepte de lier ET sous le budget de résidence (`gpu_cap/4`, plus
+  généreux que le budget de streaming `gpu_cap/8` parce qu'on le paie **une
+  fois**), on prend tout. C'est ce qui rend ImageNet 32×32 u8 (3,94 Go < les
+  4 Gio de binding) entièrement résident.
+  **Honnêteté sur le gain** : sur cette machine à mémoire unifiée le trafic
+  n'était **pas** le goulot — 10 pas à batch 32 prennent 46,0 s sous les deux
+  profils, à 0,1 % près. Ce que le profil natif achète réellement ici, c'est le
+  **plafond de batch** et la possibilité de tenir un corpus entier ; le gain de
+  trafic, lui, se paierait sur une carte discrète (PCIe). Ne pas annoncer une
+  accélération non mesurée.
+  Garde-fous : l'inférence et le perpetual tournent sous les deux profils
+  (`--headless-sample` rend des stats identiques au bit près), le profil
+  **obtenu** (pas demandé) est imprimé par la bannière de run et par
+  `--resources`, un adaptateur qui refuse ses propres limites fait retomber sur
+  la base en le disant, et `--resources --no-gpu` / `--device <nom>` donnent
+  toujours le verdict **contre les limites WebGPU** (`ProfileSource::Hypothetical`)
+  pour savoir si un modèle passerait dans un navigateur.
 - **Format dataset `.batraw` : le payload est en u8 (`BATRAW3`)**, élargi en
   [-1,1] **sur le GPU** (`training/shader/dataset_decode.wgsl`). Même en-tête
   qu'avant ; `BATRAW2` (f32 en [-1,1]) et `BATRAW1` (f32 en [0,1], rééchelonné)

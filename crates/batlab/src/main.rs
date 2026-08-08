@@ -14,7 +14,7 @@ use batlab_ui::tui::{
 };
 use batlab_core::{
     CheckpointWeights, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame, DiffusionTask, DriftAction,
-    DriftWalk, EmaConfig, GpuContext, GpuDataset, LinearNoiseSchedule, LiveFrame,
+    DriftWalk, EmaConfig, GpuContext, GpuDataset, GpuLimitsProfile, LinearNoiseSchedule, LiveFrame,
     LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind, PerpetualDrift,
     ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, log_probe, log_train_loss,
     log_trajectory, model::Training, probe_diffusion, sample_diffusion,
@@ -97,6 +97,26 @@ What the model costs on the GPU:
                     limits (128 MiB storage bindings, 256 MiB buffers) — which
                     is what a browser grants the visitor's GPU.
   --no-gpu          same, unnamed: never opens an adapter.
+
+Which GPU limits the run asks for:
+  --gpu-limits native|web
+                    `request_device` hands out what you ASK for, and asking for
+                    nothing means the WebGPU baseline: 256 MiB per buffer,
+                    128 MiB per storage binding. That is right for inference —
+                    the engine's target is the visitor's browser — and wrong for
+                    training on this machine, whose adapter allows 28 GiB.
+                    native (DEFAULT) asks the adapter for its own limits: a
+                    higher batch ceiling, and a dataset that fits stays RESIDENT
+                    instead of being streamed in chunks (CIFAR-10 RGB in 8-bit
+                    is 147 MiB — one upload for the whole run, then no host→GPU
+                    traffic per step at all).
+                    web asks for the baseline: the way to check a model would
+                    still run in a browser. Inference and perpetual work under
+                    both. `--resources --no-gpu` answers the browser question
+                    without opening an adapter at all, whatever this flag says.
+                    Every run banner prints the profile it was GRANTED — if the
+                    adapter refuses its own limits the run falls back to the
+                    baseline and says so.
 
 Weight averaging (EMA):
   --ema F           keep an exponential moving average of the weights,
@@ -207,6 +227,28 @@ fn reject_unknown_flags(args: &[String], valued: &[&str], bare: &[&str]) -> Resu
     Ok(())
 }
 
+/// Reads `--gpu-limits` and makes it the profile every device request uses.
+///
+/// Applied before any adapter is opened and never consulted again — see
+/// [`GpuLimitsProfile::set_process_default`] for why this is a process setting
+/// rather than a parameter. Absent, the default stands (native).
+fn apply_gpu_limits_flag(args: &[String]) -> Result<(), String> {
+    let Some(value) = args
+        .iter()
+        .position(|arg| arg == "--gpu-limits")
+        .map(|index| args.get(index + 1))
+    else {
+        return Ok(());
+    };
+    let value = value.ok_or_else(|| {
+        "--gpu-limits takes a value: native (the adapter's own limits, default) \
+         or web (the WebGPU baseline)"
+            .to_string()
+    })?;
+    GpuLimitsProfile::parse(value)?.set_process_default();
+    Ok(())
+}
+
 /// The level dial of a perpetual run, under any of its three spellings.
 ///
 /// One field, three names, because the field means two things: `t_r`, the depth
@@ -278,6 +320,14 @@ fn main() {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             print!("{HELP}");
             return;
+        }
+        // The limits a device is opened with cannot be changed afterwards, and
+        // every path below — headless, TUI, visualiser — opens one. So the
+        // choice is made here, once, before the first adapter request. It is
+        // read again nowhere: `GpuContext::new_headless` picks it up.
+        if let Err(err) = apply_gpu_limits_flag(&args) {
+            eprintln!("{err}");
+            std::process::exit(1);
         }
         if args.iter().any(|arg| arg == "--headless-train") {
             if let Err(err) = run_headless_train(&args) {
@@ -551,6 +601,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             "--ema",
             "--resume",
             "--checkpoint-every",
+            "--gpu-limits",
         ],
         &[],
     )?;
@@ -729,6 +780,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             "--magnitude",
             "--out",
             "--log",
+            "--gpu-limits",
         ],
         &["--raw-weights"],
     )?;
@@ -1019,6 +1071,7 @@ fn run_resources(args: &[String]) -> Result<(), String> {
             "--device",
             "--width",
             "--steps",
+            "--gpu-limits",
         ],
         &["--measure", "--no-gpu", "--inference"],
     )?;
@@ -1329,6 +1382,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             "--dump",
             "--out",
             "--seed-dataset",
+            "--gpu-limits",
         ],
         &["--window", "--seed-noise", "--single-view", "--raw-weights"],
     )?;
@@ -2030,6 +2084,36 @@ async fn run_training(
         .collect();
     let mut gpu_dataset = GpuDataset::from_payload(gpu.as_ref(), dataset.payload, sample_len)
         .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
+
+    // The two numbers that decide what a step costs before it has computed
+    // anything, printed together because one explains the other: the limits the
+    // device was GRANTED, and whether the dataset fits inside them.
+    //
+    // A run whose dataset is resident pays its upload once and then nothing;
+    // one whose dataset is streamed pays a chunk on most steps. That difference
+    // is worth more than any optimiser flag on a large corpus, and it used to
+    // be invisible — the engine always asked for the WebGPU baseline, so the
+    // answer was always "streamed" and nobody had a reason to ask.
+    {
+        use batlab_core::format_bytes;
+        let limits = gpu.device().limits();
+        let residency = if gpu_dataset.is_resident() {
+            "ONE resident chunk — uploaded once, no dataset traffic per step".to_string()
+        } else {
+            format!(
+                "{} chunks of {} — streamed, a shuffled batch re-uploads the ones it lands in",
+                gpu_dataset.chunk_count(),
+                format_bytes(gpu_dataset.gpu_buffer_bytes())
+            )
+        };
+        println!(
+            "[gpu] limits={} (buffer {}, storage binding {}) · dataset {} in {residency}",
+            gpu.limits_profile().label(),
+            format_bytes(limits.max_buffer_size),
+            format_bytes(limits.max_storage_buffer_binding_size as u64),
+            format_bytes(gpu_dataset.payload_bytes()),
+        );
+    }
 
     // Metrics land next to the checkpoint (`<stem>_metrics.jsonl`), or in a
     // temp file when no checkpoint path is configured. Truncated per run so the

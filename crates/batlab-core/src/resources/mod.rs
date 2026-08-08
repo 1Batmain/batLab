@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 
 use crate::config::{LayerDraft, ModelConfig};
-use crate::gpu_context::GpuContext;
+use crate::gpu_context::{GpuContext, GpuLimitsProfile};
 use crate::model::ema::EmaSpecs;
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
@@ -80,10 +80,11 @@ pub struct DeviceProfile {
     /// flatter it relative to a discrete card.
     pub unified_memory: bool,
     /// What the DEVICE will allocate — the limits the graph actually runs
-    /// against, which are wgpu's defaults because `request_device` asks for
-    /// defaults. On this Mac that is 256 MiB per buffer on an adapter that
-    /// would allow 28 GiB: the engine runs at the WebGPU contract on purpose,
-    /// because that contract is what the visitor's browser will hand it.
+    /// against, i.e. the ones `request_device` was asked for. Which profile
+    /// that was is in [`DeviceProfile::limits_profile`]: under `web` they are
+    /// wgpu's defaults (256 MiB per buffer on an adapter that would allow
+    /// 28 GiB — the WebGPU contract the visitor's browser will hand the
+    /// engine), under `native` they are the adapter's own.
     pub max_buffer_size: u64,
     pub max_storage_buffer_binding_size: u64,
     /// What the ADAPTER says it could allocate in one buffer.
@@ -113,6 +114,12 @@ pub struct DeviceProfile {
     /// question this module exists to answer.
     pub memory_budget: Option<u64>,
     pub source: ProfileSource,
+    /// Which profile the device was opened under, when it was opened at all.
+    ///
+    /// `None` for a hypothetical machine: no device was requested, so nothing
+    /// was granted. The distinction matters on the page — "this GPU, asked for
+    /// the web baseline" and "a machine that is not here" are different claims.
+    pub limits_profile: Option<GpuLimitsProfile>,
 }
 
 impl DeviceProfile {
@@ -135,6 +142,7 @@ impl DeviceProfile {
             max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
             memory_budget: None,
             source: ProfileSource::Measured,
+            limits_profile: Some(gpu.limits_profile()),
         }
     }
 
@@ -161,6 +169,7 @@ impl DeviceProfile {
             max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
             memory_budget,
             source: ProfileSource::Hypothetical,
+            limits_profile: None,
         }
     }
 

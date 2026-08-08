@@ -28,7 +28,7 @@ pub use config::{
     PerpetualConfig, RunConfig, RunMode, TrainingConfig, TrainingControlCommand,
     compute_inferred_input, summarize_architecture,
 };
-pub use gpu_context::GpuContext;
+pub use gpu_context::{GpuContext, GpuLimitsProfile};
 pub use resources::report::{MeasuredTransfers, ReportOptions, report_lines};
 pub use resources::{
     Allocation, DatasetPlan, DatasetSpec, DeviceProfile, GpuInventory, InventoryRequest, Kind,

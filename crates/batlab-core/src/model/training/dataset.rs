@@ -5,8 +5,20 @@ use std::error::Error;
 use std::fmt;
 
 const DEFAULT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
-const MAX_DYNAMIC_CHUNK_BYTES: usize = 512 * 1024 * 1024;
+/// Share of the GPU's capacity a **streamed** chunk may take.
+///
+/// A streamed chunk is re-uploaded on every miss, so its size is a recurring
+/// cost and the fraction is deliberately small.
 const GPU_MEMORY_CHUNK_FRACTION: u64 = 8;
+/// Share of the GPU's capacity a **resident** dataset may take.
+///
+/// Twice as generous as the streaming fraction, and for the opposite reason: a
+/// dataset that fits entirely is uploaded once and never again, so its size is
+/// paid a single time in exchange for removing the traffic altogether. On the
+/// machine this is developed on the two work out at 3.5 GiB and 7 GiB, and
+/// ImageNet 32×32 in 8-bit — 3.94 GB — lands between them: it is streamed under
+/// the streaming rule and resident under this one, which is the whole point.
+const GPU_MEMORY_RESIDENT_FRACTION: u64 = 4;
 
 /// What the dataset holds on the host, and therefore what crosses to the GPU.
 ///
@@ -171,22 +183,39 @@ impl Error for GpuDatasetError {}
 /// [`crate::resources::plan_dataset`]. Sharing the function is what stops the
 /// prediction from drifting away from the allocation: there is one rule, and
 /// both callers read it.
+///
+/// # Two cases, and the second is the one worth having
+///
+/// **Resident** — the whole dataset fits in one buffer this device will
+/// allocate, and within the residency budget. Then take all of it: one upload
+/// for the life of the run, and every step after the first costs *nothing*.
+/// This is unreachable under the WebGPU baseline for anything real (128 MiB per
+/// storage binding), and reachable for CIFAR-10 and for ImageNet 32×32 alike
+/// under an adapter's own limits — see [`crate::GpuLimitsProfile`].
+///
+/// **Streamed** — it does not fit, so the chunk is sized to the streaming
+/// budget and a shuffled batch pays for the chunks it lands in. Unchanged from
+/// what it always was, because that is what the browser target still gets.
+///
+/// The `.min(binding_cap)` matters as much as the buffer cap: the chunk is
+/// bound as a storage buffer by the decode shader, so a limit on bindings is a
+/// limit on residency. It is the one that binds on the web profile.
 pub fn select_chunk_bytes(
     binding_cap: u64,
     buffer_cap: u64,
     gpu_cap: u64,
     dataset_total_bytes: u64,
 ) -> u64 {
-    let hard_cap = buffer_cap
-        .min(binding_cap)
-        .min(gpu_cap)
-        .min(MAX_DYNAMIC_CHUNK_BYTES as u64);
+    let dataset = dataset_total_bytes.max(1);
+    let allocatable = buffer_cap.min(binding_cap).min(gpu_cap).max(1);
 
-    let target_from_gpu = gpu_cap / GPU_MEMORY_CHUNK_FRACTION;
-    let target = target_from_gpu
-        .max(DEFAULT_CHUNK_BYTES as u64)
-        .min(hard_cap.max(1));
-    target.min(dataset_total_bytes.max(1))
+    let resident_budget = (gpu_cap / GPU_MEMORY_RESIDENT_FRACTION).max(DEFAULT_CHUNK_BYTES as u64);
+    if dataset <= allocatable.min(resident_budget) {
+        return dataset;
+    }
+
+    let streaming_budget = (gpu_cap / GPU_MEMORY_CHUNK_FRACTION).max(DEFAULT_CHUNK_BYTES as u64);
+    streaming_budget.min(allocatable).min(dataset)
 }
 
 impl GpuDataset {
@@ -310,6 +339,26 @@ impl GpuDataset {
     /// dataset size, how much of the above a shuffled batch costs.
     pub fn chunk_sample_capacity(&self) -> usize {
         self.chunk_sample_capacity
+    }
+
+    /// The whole dataset's size in its payload encoding — what would cross the
+    /// boundary if it were uploaded in one go, and what it does cross once when
+    /// it is resident.
+    pub fn payload_bytes(&self) -> u64 {
+        (self.sample_count * self.payload.sample_bytes(self.sample_len)) as u64
+    }
+
+    /// Chunks the dataset is cut into. `1` means resident: one upload for the
+    /// life of the run, and no dataset traffic per step afterwards.
+    pub fn chunk_count(&self) -> usize {
+        self.sample_count
+            .div_ceil(self.chunk_sample_capacity.max(1))
+            .max(1)
+    }
+
+    /// Whether the whole dataset sits on the GPU at once.
+    pub fn is_resident(&self) -> bool {
+        self.chunk_count() == 1
     }
 
     /// Copy a whole batch into `destination`, sample `i` of the list landing at
@@ -868,10 +917,20 @@ mod tests {
 
     /// The same claim where it is actually allocated: two real datasets, same
     /// images, and the 8-bit one resident in fewer chunks.
+    ///
+    /// Pinned to the **web** profile, and that is the test's subject rather than
+    /// a detail: chunking is what a device with a 128 MiB binding cap does, and
+    /// under native limits both datasets would simply be resident and the
+    /// comparison would have nothing left to compare.
     #[test]
     fn a_real_8_bit_dataset_is_resident_in_fewer_chunks() {
         pollster::block_on(async {
-            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let gpu = Arc::new(
+                crate::gpu_context::GpuContext::new_headless_with(
+                    crate::gpu_context::GpuLimitsProfile::Web,
+                )
+                .await,
+            );
             let sample_len = 3072;
             let count = 40_000;
             let floats = GpuDataset::from_samples(
@@ -939,6 +998,57 @@ mod tests {
                     .unwrap();
             let want: Vec<f32> = [250u8, 251, 252, 1, 2, 3].iter().copied().map(decode_u8).collect();
             assert_eq!(values, want);
+        });
+    }
+
+    /// A dataset that fits is uploaded ONCE, and no step after the first pays
+    /// for it.
+    ///
+    /// This is the whole of what the native limits profile buys on the data
+    /// side. Asserted on `chunk_loads` rather than on a duration, because the
+    /// property is "no upload happens", not "uploads are fast" — on the unified
+    /// memory this is developed on a 128 MiB chunk copy costs about a
+    /// millisecond against a step of seconds, so a timing would have measured
+    /// nothing and would have passed just as well if the uploads had stayed.
+    #[test]
+    fn a_dataset_that_fits_is_uploaded_once_and_never_again() {
+        pollster::block_on(async {
+            let gpu = Arc::new(
+                crate::gpu_context::GpuContext::new_headless_with(
+                    crate::gpu_context::GpuLimitsProfile::Native,
+                )
+                .await,
+            );
+            let sample_len = 3072;
+            let count = 20_000; // 61 MiB in 8-bit: resident on any real adapter
+            let mut dataset = GpuDataset::from_payload(
+                gpu.as_ref(),
+                DatasetPayload::Bytes(vec![7u8; count * sample_len]),
+                sample_len,
+            )
+            .unwrap();
+            assert!(
+                dataset.is_resident(),
+                "{} chunks — a 61 MiB dataset must be resident under native limits",
+                dataset.chunk_count()
+            );
+
+            let destination = batch_destination(gpu.as_ref(), 32 * sample_len);
+            // Batches drawn from all over the dataset, which is exactly the
+            // access pattern that made streaming expensive.
+            for round in 0..16 {
+                let batch: Vec<usize> = (0..32)
+                    .map(|slot| (round * 977 + slot * 613) % count)
+                    .collect();
+                dataset
+                    .copy_samples_to(gpu.as_ref(), &batch, &destination)
+                    .unwrap();
+            }
+            assert_eq!(
+                dataset.chunk_loads(),
+                1,
+                "a resident dataset re-uploaded its chunk"
+            );
         });
     }
 
