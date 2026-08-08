@@ -9,18 +9,15 @@ use std::time::{Duration, SystemTime};
 
 use batlab_ui::storage;
 use batlab_ui::tui::{
-    self, ActivationMethod, LayerDraft, ModelConfig, MonitorOutcome, PaddingMode, PerpetualConfig,
+    self, LayerDraft, ModelConfig, MonitorOutcome, PerpetualConfig,
     RunMode, TrainingConfig,
 };
 use batlab_core::{
-    ActivationMethod as PActivation, ActivationType, AttentionType, CheckpointWeights,
-    ConvolutionType, DEFAULT_SNR_GAMMA,
-    DenoiseFrame, DiffusionTask, Dim3, DriftAction, DriftWalk, EmaConfig, FullyConnectedType,
-    GpuContext, GpuDataset,
-    GroupNormType, LayerTypes, LinearNoiseSchedule, LiveFrame, LossMethod as PLoss, LossWeighting,
-    MetricsLogger, Model, OptimizerKind, PaddingMode as PPadding, PerpetualDrift, ProbeConfig,
-    Stats, Trainer, UpsampleConvType, WeightInit, compose_live_frame_view, log_probe,
-    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
+    CheckpointWeights, DEFAULT_SNR_GAMMA, DenoiseFrame, DiffusionTask, DriftAction,
+    DriftWalk, EmaConfig, GpuContext, GpuDataset, LinearNoiseSchedule, LiveFrame,
+    LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind, PerpetualDrift,
+    ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, log_probe, log_train_loss,
+    log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -3260,134 +3257,19 @@ fn tensor_to_rgb_pixels(tensor: &[f32], dims: (u32, u32, u32)) -> Result<Vec<u8>
     Ok(pixels)
 }
 
+/// Append the layer a `config_file` entry describes.
+///
+/// One line, because the translation itself now lives in the engine
+/// ([`Model::add_draft`]). It used to live here, spelled out layer by layer —
+/// and the resource inventory, which has to build the same stack from the same
+/// file without a GPU, could not reach it. Two copies of "what this config
+/// means" is exactly the kind of duplication that ends with a page confidently
+/// reporting a graph the trainer does not build.
 fn append_layer<State>(
     model: &mut Model<State>,
     draft: &LayerDraft,
 ) -> Result<(), batlab_core::ModelError> {
-    match draft {
-        LayerDraft::Convolution {
-            dim_input,
-            nb_kernel,
-            dim_kernel,
-            stride,
-            padding,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::Convolution(ConvolutionType::new(
-                Dim3::new(*dim_input),
-                *nb_kernel,
-                Dim3::new(*dim_kernel),
-                *stride,
-                convert_padding(padding),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::Activation {
-            dim_input,
-            method,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::Activation(ActivationType::new(
-                convert_activation(method),
-                Dim3::new(*dim_input),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::GroupNorm {
-            dim_input,
-            num_groups,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::GroupNorm(GroupNormType::new(
-                Dim3::new(*dim_input),
-                *num_groups,
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::Attention {
-            dim_input,
-            save_key,
-        } => {
-            model.add_layer(LayerTypes::Attention(AttentionType::new(Dim3::new(
-                *dim_input,
-            ))))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::FullyConnected {
-            dim_input,
-            nb_neurons,
-            method,
-            save_key,
-            ..
-        } => {
-            model.add_layer(LayerTypes::FullyConnected(FullyConnectedType::new(
-                Dim3::new(*dim_input),
-                *nb_neurons,
-                convert_activation(method),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::UpsampleConv {
-            dim_input,
-            scale_factor,
-            nb_kernel,
-            dim_kernel,
-            padding,
-            save_key,
-            ..
-        } => {
-            model.add_layer(LayerTypes::UpsampleConv(UpsampleConvType::new(
-                Dim3::new(*dim_input),
-                *scale_factor,
-                *nb_kernel,
-                Dim3::new(*dim_kernel),
-                convert_padding(padding),
-            )))?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-        LayerDraft::Concat {
-            skip_key, save_key, ..
-        } => {
-            model.add_concat(skip_key.clone())?;
-            if let Some(key) = save_key {
-                model.mark_output(key.clone())?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn convert_padding(p: &PaddingMode) -> PPadding {
-    match p {
-        PaddingMode::Valid => PPadding::Valid,
-        PaddingMode::Same => PPadding::Same,
-    }
-}
-
-fn convert_activation(a: &ActivationMethod) -> PActivation {
-    match a {
-        ActivationMethod::Relu => PActivation::Relu,
-        ActivationMethod::Silu => PActivation::Silu,
-        ActivationMethod::Linear => PActivation::Linear,
-    }
+    model.add_draft(draft)
 }
 
 #[cfg(test)]

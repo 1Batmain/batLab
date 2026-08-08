@@ -16,6 +16,8 @@ pub mod config;
 pub mod gpu_context;
 pub mod live_frame;
 pub mod model;
+pub mod resources;
+pub mod transfers;
 
 // The config mirror types `PaddingMode`, `ActivationMethod` and `LossMethod`
 // deliberately stay behind `config::`: the engine exports layer types under those
@@ -27,6 +29,12 @@ pub use config::{
     compute_inferred_input, summarize_architecture,
 };
 pub use gpu_context::GpuContext;
+pub use resources::{
+    Allocation, DatasetPlan, DatasetSpec, DeviceProfile, GpuInventory, InventoryRequest, Kind,
+    LayerFootprint, Obstacle, ProfileSource, Workload, format_bytes, inventory,
+    max_batch_that_fits,
+};
+pub use transfers::{TransferRate, TransferSnapshot};
 pub use live_frame::{
     LiveFrame, LiveView, compose_live_frame, compose_live_frame_view, live_frame_width,
 };

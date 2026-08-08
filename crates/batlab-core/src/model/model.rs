@@ -452,7 +452,7 @@ impl Model<Training> {
         prepass(&mut encoder);
         self.encode_zero_optimizer_gradients(&mut encoder);
         self.encode_train_graph(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
         self.read_last_loss()
     }
 
@@ -471,7 +471,7 @@ impl Model<Training> {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         prepass(&mut encoder);
         self.encode_train_graph_without_opt(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
         self.read_last_loss_optional()
     }
 
@@ -485,7 +485,7 @@ impl Model<Training> {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         prepass(&mut encoder);
         self.encode_train_graph_without_opt(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
     }
 
     /// One training step over the whole batch: **one encoder, one submit**.
@@ -526,7 +526,7 @@ impl Model<Training> {
         self.encode_zero_optimizer_gradients(&mut encoder);
         prepass(&mut encoder);
         self.encode_train_graph(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
 
         if report_loss {
             self.read_last_loss_optional()
@@ -544,7 +544,7 @@ impl Model<Training> {
         );
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_zero_optimizer_gradients(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
     }
 
     /// See [`Model::train_step_report_with_prepass_no_opt`].
@@ -558,14 +558,14 @@ impl Model<Training> {
         self.publish_optimizer_specs(1.0 / batch_size);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_train_optimizer_graph(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
     }
 
     fn run_train_step(&mut self, input: &[f32], target: &[f32]) {
         debug_assert!(self.state.is_build, "call build() before train_step()");
 
         // Write CPU data before any GPU work is encoded.
-        self.gpu.queue.write_buffer(
+        self.gpu.write_buffer(
             self.layers.first().unwrap().buffers.forward[0].as_ref(),
             0,
             bytemuck::cast_slice(input),
@@ -587,7 +587,7 @@ impl Model<Training> {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.encode_zero_optimizer_gradients(&mut encoder);
         self.encode_train_graph(&mut encoder);
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
     }
 
     /// Advance the global step counter and push the resulting hyperparameters
@@ -1275,7 +1275,7 @@ impl<State> Model<State> {
             "call build/build_model before predict()"
         );
 
-        self.gpu.queue.write_buffer(
+        self.gpu.write_buffer(
             self.layers
                 .first()
                 .expect("at least one layer required")
@@ -1295,7 +1295,7 @@ impl<State> Model<State> {
             // throw them away.
             layer.encode_pass_with_batch(&mut encoder, 1);
         }
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
 
         self.read_last_output()
     }
@@ -1320,6 +1320,33 @@ impl<State> Model<State> {
             if let Some(key) = layer.saved_output_key().map(str::to_string) {
                 saved_output_buffers.insert(key, Arc::clone(last_output.as_ref().unwrap()));
             }
+        }
+        Ok(())
+    }
+
+    /// Append the layer a `config_file` entry describes.
+    ///
+    /// The translation from [`LayerDraft`] to [`LayerTypes`] used to live in the
+    /// binary, which meant anything else that wanted the same graph from the
+    /// same file — the resource inventory does, without a GPU — had to write it
+    /// a second time and could disagree. It is one function now
+    /// ([`crate::resources::layer_type_of`]), called from here and from the
+    /// planner, so "what the inventory counts" and "what the model builds"
+    /// cannot be two different stacks.
+    ///
+    /// `Concat` keeps going through [`Model::add_concat`]: its skip dimension is
+    /// resolved from the model's own saved outputs, not from the draft.
+    pub fn add_draft(&mut self, draft: &crate::config::LayerDraft) -> Result<(), ModelError> {
+        match draft {
+            crate::config::LayerDraft::Concat { skip_key, .. } => {
+                self.add_concat(skip_key.clone())?;
+            }
+            other => {
+                self.add_layer(crate::resources::layer_type_of(other, None))?;
+            }
+        }
+        if let Some(key) = draft.save_key() {
+            self.mark_output(key.to_string())?;
         }
         Ok(())
     }
@@ -1537,7 +1564,8 @@ impl<State> Model<State> {
             0,
             size_bytes,
         );
-        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu.submit([encoder.finish()]);
+        self.gpu.record_readback(size_bytes);
 
         let slice = staging.slice(..);
         let (tx, rx) = futures::channel::oneshot::channel();

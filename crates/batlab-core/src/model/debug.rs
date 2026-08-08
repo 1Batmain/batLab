@@ -47,7 +47,11 @@ pub(crate) fn read_back_f32_at(
         mapped_at_creation: false,
     });
     encoder.copy_buffer_to_buffer(buf, offset_bytes, &staging, 0, size_bytes);
-    gpu.queue.submit([encoder.finish()]);
+    gpu.submit([encoder.finish()]);
+    // Counted here rather than after the map: this is the point where the bytes
+    // are committed to travel, and a readback that then fails to map has still
+    // cost the round trip that makes this number interesting.
+    gpu.record_readback(size_bytes);
 
     let slice = staging.slice(..);
     let (tx, rx) = futures::channel::oneshot::channel();

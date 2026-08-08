@@ -274,7 +274,7 @@ impl Layer {
             match binding.init {
                 BufferInit::SpecsUniform => {
                     let bytes = self.ty.get_spec_uniform_bytes();
-                    gpu.queue.write_buffer(&buf, 0, &bytes);
+                    gpu.write_buffer(&buf, 0, &bytes);
                 }
                 BufferInit::RandomWeights | BufferInit::RandomWeightsZeroTail(_) => {
                     let count = binding.spec.size as usize / 4;
@@ -304,7 +304,7 @@ impl Layer {
                 BufferInit::Ones => {
                     let count = binding.spec.size as usize / 4;
                     let ones = vec![1.0f32; count];
-                    gpu.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&ones));
+                    gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&ones));
                 }
                 BufferInit::None => {}
             }
@@ -799,7 +799,7 @@ impl Layer {
             OptimizerKind::Sgd => {
                 let mut bytes = [0u8; 16];
                 bytes[0..4].copy_from_slice(&(lr * grad_scale).to_le_bytes());
-                gpu.queue.write_buffer(&opt.specs, 0, &bytes);
+                gpu.write_buffer(&opt.specs, 0, &bytes);
             }
             OptimizerKind::Adam => {
                 let hp = AdamHyperparameters::default();
@@ -814,7 +814,7 @@ impl Layer {
                     bias_correction2,
                 }
                 .to_bytes();
-                gpu.queue.write_buffer(&opt.specs, 0, &bytes);
+                gpu.write_buffer(&opt.specs, 0, &bytes);
             }
         }
         true
@@ -976,7 +976,7 @@ impl Layer {
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_buffer(weights, 0, &ema.state[0], 0, weights.size());
         encoder.copy_buffer_to_buffer(bias, 0, &ema.state[1], 0, bias.size());
-        gpu.queue.submit([encoder.finish()]);
+        gpu.submit([encoder.finish()]);
     }
 
     pub(crate) fn encode_ema_pass(&self, encoder: &mut CommandEncoder) {

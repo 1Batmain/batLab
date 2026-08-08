@@ -33,6 +33,13 @@ pub struct GpuContext {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) gpu_specs: GpuSpecs,
+    /// What has crossed the host↔GPU boundary through this context.
+    ///
+    /// It lives here because this is the one object every path already shares:
+    /// a counter anywhere else would have to be threaded through the sampler,
+    /// the trainer and the dataset separately, and would miss whichever of them
+    /// was added next.
+    transfers: crate::transfers::TransferCounters,
 }
 
 impl GpuContext {
@@ -77,7 +84,45 @@ impl GpuContext {
             device,
             queue,
             gpu_specs,
+            transfers: Default::default(),
         }
+    }
+
+    /// Upload bytes to a GPU buffer, and count them.
+    ///
+    /// Every host→device write in the engine goes through here rather than
+    /// through `queue.write_buffer` directly. That is the whole discipline: the
+    /// counter is only true if there is no second door, and `grep -n
+    /// 'queue.write_buffer' crates/batlab-core/src` outside of tests is the way
+    /// to check there is not.
+    pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.transfers.record_write(data.len() as u64);
+        self.queue.write_buffer(buffer, offset, data);
+    }
+
+    /// Submit command buffers, and count the submission.
+    pub fn submit<I>(&self, command_buffers: I) -> wgpu::SubmissionIndex
+    where
+        I: IntoIterator<Item = wgpu::CommandBuffer>,
+    {
+        let buffers: Vec<wgpu::CommandBuffer> = command_buffers.into_iter().collect();
+        self.transfers.record_submit(buffers.len() as u64);
+        self.queue.submit(buffers)
+    }
+
+    /// Record a device→host readback of `bytes`.
+    ///
+    /// Separate from a helper that performs one, because a readback is three
+    /// steps (copy into a staging buffer, `map_async`, block on a poll) spread
+    /// across `model::debug` and the loss path, and the counter belongs at the
+    /// point where the bytes are known.
+    pub fn record_readback(&self, bytes: u64) {
+        self.transfers.record_read(bytes);
+    }
+
+    /// A reading of the counters — see [`crate::transfers::TransferSnapshot`].
+    pub fn transfers(&self) -> crate::transfers::TransferSnapshot {
+        self.transfers.snapshot()
     }
 
     /// Access to the underlying wgpu device for callers outside the crate.
