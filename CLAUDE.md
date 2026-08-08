@@ -234,7 +234,28 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
 - Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `docs/reports/INSIGHTS_TRAINING.md`).
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
-- Format dataset `.batraw` : magic `BATRAW2` = payload en [-1,1] ; les fichiers `BATRAW1` ([0,1]) restent lisibles et sont rééchelonnés au chargement.
+- **Format dataset `.batraw` : le payload est en u8 (`BATRAW3`)**, élargi en
+  [-1,1] **sur le GPU** (`training/shader/dataset_decode.wgsl`). Même en-tête
+  qu'avant ; `BATRAW2` (f32 en [-1,1]) et `BATRAW1` (f32 en [0,1], rééchelonné)
+  restent lisibles. Toutes les images de ce projet sont 8 bits à la source, donc
+  l'ancien encodage stockait quatre octets dont trois se déduisaient du premier :
+  CIFAR-10 RGB passe de 586 Mio à 146 Mio, ImageNet 32×32 de 15,7 Go à 3,9 Go.
+  Ce qui compte n'est pas le disque mais le **trafic** — un chunk résident tient
+  4× plus d'images, donc 4× moins de rechargements. Mesuré, pas déduit :
+  `--resources Color_Diffusion_XL --batch 32 --dataset … --measure` donne
+  **585,9 Mio/pas → 146,5 Mio/pas** (facteur 4,00) et 7 → 4 soumissions.
+  Le décodage est **exact** (256 valeurs, aucun arrondi) : le shader lit une
+  **table de 256 f32**, il ne recalcule pas `v/127.5 - 1` — écrite comme
+  formule elle divergeait du CPU d'1 ULP sur 111 valeurs sur 256, Metal
+  compilant la division en réciproque approchée. Ne pas « simplifier » la table
+  en une formule. Gardé au bit près des deux côtés :
+  `the_gpu_decode_agrees_with_the_cpu_one`,
+  `an_8_bit_file_decodes_to_the_same_bits_as_the_f32_one_it_replaces`, et
+  `an_8_bit_dataset_trains_exactly_like_the_f32_one_it_replaces` (mêmes pertes,
+  pas pour pas). Un fichier 8 bits dont la géométrie ne colle pas au modèle
+  retombe sur le chemin f32 : le rééchantillonnage se fait sur l'hôte de toute
+  façon. La définition du format côté Python vit dans `tools/batraw.py`, seule
+  et importée par les trois convertisseurs.
 - Tests de non-régression du pipeline : `crates/batlab-core/src/model/audit_tests.rs` (`cargo test`). Ne pas les affaiblir pour les faire passer.
 - **La racine de stockage s'injecte, elle ne se déduit pas.** `batlab_ui::storage::Storage` porte la racine de tous les chemins de données (`Models/`, `datasets/`, `perpetual_samples/`) ; `Storage::at(chemin)` en construit une ailleurs, et `App::with_storage` la fait descendre dans tout le TUI. **Tout test qui touche au stockage passe par `TempRoot`** — c'est ce qui a fait tomber la limite « `cargo test` réécrit `Models/Stable_Diffusion/config_file` » de `docs/reports/PERPETUAL_INFERENCE.md` §5. Critère de recette permanent : `cargo test --workspace` puis `git status` **propre**.
   Le défaut (`Storage::default()`, et les fonctions libres du module que le CLI utilise) reste le workspace, trouvé en remontant jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.

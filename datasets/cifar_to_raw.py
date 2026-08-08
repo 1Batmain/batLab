@@ -1,50 +1,59 @@
 #!/usr/bin/env python3
 """Convert CIFAR-10 binary batches to the batLab raw dataset format.
 
-The output `.batraw` file can be loaded directly by the Rust training crate without
-any image-library dependencies.  All dataset-specific parsing logic lives here so the
-Rust side only needs to read a flat array of normalised f32 values.
+The output `.batraw` file can be loaded directly by the Rust training crate
+without any image-library dependencies. All dataset-specific parsing logic lives
+here so the Rust side only needs to read a flat array of pixel values.
 
-Raw file layout
----------------
-Offset  Size   Type    Description
-------  ----   ----    -----------
-0       8 B    bytes   Magic: b"BATRAW1\\0"
-8       4 B    u32le   Number of samples (N)
-12      4 B    u32le   Image width  (W)
-16      4 B    u32le   Image height (H)
-20      4 B    u32le   Channels per pixel (C)  – 1 for greyscale, 3 for RGB
-24      N*W*H*C*4 B    f32le   Pixel values normalised to [0, 1], stored in
-                               row-major order; for RGB the channel order is R,G,B.
+The file layout, the three payload encodings and the reasons for them live in
+`tools/batraw.py`, which this script imports — one definition of the format, read
+by every converter.
+
+**BATRAW3 is the default**, and for CIFAR-10 it is exactly lossless in RGB: the
+archive holds one byte per channel, and that byte is what gets written.
+
+Greyscale is the one place a byte is lost: BT.601 luminance of three bytes is
+not a byte, and it is now rounded to one. That applies to **every** format this
+script writes, including `--format batraw2` — the pipeline's common form is
+bytes, so quantising once here rather than differently per format is what keeps
+the three outputs describing the same images. A `cifar10_grey.batraw` produced
+today therefore differs from one produced before BATRAW3 by at most 1/255 per
+pixel, on a payload the model reads in [-1, 1]. Existing files keep loading
+unchanged; nothing needs reconverting.
 
 Usage
 -----
-    # Convert all training batches to greyscale (default):
+    # Toutes les batches d'entraînement en niveaux de gris (défaut) :
     python cifar_to_raw.py --cifar-dir cifar-10-batches-bin
 
-    # Explicit greyscale output:
-    python cifar_to_raw.py --cifar-dir cifar-10-batches-bin --mode grey
-
-    # RGB output:
+    # RGB, le cas courant :
     python cifar_to_raw.py --cifar-dir cifar-10-batches-bin --mode rgb
 
-    # Include the test batch and specify an output file name:
+    # L'ancien format f32, si un outil tiers en dépend :
+    python cifar_to_raw.py --cifar-dir cifar-10-batches-bin --format batraw2
+
+    # Ajouter la batch de test et nommer la sortie :
     python cifar_to_raw.py --cifar-dir cifar-10-batches-bin --include-test --out cifar_rgb.batraw
 
-The script requires no third-party libraries – only the Python standard library.
+Le script ne demande aucune bibliothèque tierce — numpy est utilisé s'il est là,
+seulement pour aller vite.
 """
 
 import argparse
-import struct
 import os
 import sys
 
-try:  # chemin rapide : 50000×32×32×3 f32 en pur Python coûte des minutes
+# Le format vit dans tools/, à côté des deux autres convertisseurs. Ce script
+# est dans datasets/ depuis toujours (les chemins de la doc et des bancs le
+# citent), d'où l'ajout de chemin plutôt qu'un déplacement.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+import batraw  # noqa: E402
+
+try:  # chemin rapide : 50000×32×32×3 en pur Python coûte des minutes
     import numpy as _np
 except ImportError:
     _np = None
 
-MAGIC = b"BATRAW1\0"
 CIFAR_RECORD_BYTES = 3073  # 1 label byte + 3*1024 channel bytes
 CIFAR_WIDTH = 32
 CIFAR_HEIGHT = 32
@@ -53,19 +62,23 @@ CIFAR_PIXELS = CIFAR_WIDTH * CIFAR_HEIGHT
 
 
 def _luminance(r: int, g: int, b: int) -> float:
-    """Convert an sRGB pixel to a normalised greyscale value using BT.601 weights."""
-    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+    """Convert an sRGB pixel to a greyscale value in [0, 255] using BT.601 weights."""
+    return 0.299 * r + 0.587 * g + 0.114 * b
 
 
-def _parse_cifar_batch(data: bytes, mode: str) -> list:
-    """Parse a CIFAR-10 binary batch and return a list of flat f32 sample lists."""
+def _parse_cifar_batch(data: bytes, mode: str) -> bytearray:
+    """Parse a CIFAR-10 binary batch into a flat `bytearray` of pixel bytes.
+
+    Everything downstream takes bytes, whatever the output format: the archive
+    is 8-bit, so bytes are the common form all three encodings agree on.
+    """
     if len(data) % CIFAR_RECORD_BYTES != 0:
         raise ValueError(
             f"Unexpected batch size: {len(data)} bytes "
             f"(not a multiple of {CIFAR_RECORD_BYTES})"
         )
 
-    samples = []
+    out = bytearray()
     for record in _chunks(data, CIFAR_RECORD_BYTES):
         # record[0] is the class label – not used for unconditional diffusion.
         payload = record[1:]  # 3072 bytes: R plane, G plane, B plane (1024 each)
@@ -74,28 +87,21 @@ def _parse_cifar_batch(data: bytes, mode: str) -> list:
         b_plane = payload[2048:3072]
 
         if mode == "grey":
-            floats = [
-                _luminance(r_plane[i], g_plane[i], b_plane[i])
+            out.extend(
+                round(_luminance(r_plane[i], g_plane[i], b_plane[i]))
                 for i in range(CIFAR_PIXELS)
-            ]
-        else:  # rgb
-            floats = []
+            )
+        else:  # rgb : plan → pixel, canaux contigus
             for i in range(CIFAR_PIXELS):
-                floats.append(r_plane[i] / 255.0)
-                floats.append(g_plane[i] / 255.0)
-                floats.append(b_plane[i] / 255.0)
+                out.append(r_plane[i])
+                out.append(g_plane[i])
+                out.append(b_plane[i])
 
-        samples.append(floats)
-
-    return samples
+    return out
 
 
 def _parse_cifar_batch_np(data: bytes, mode: str):
-    """Version vectorisée de `_parse_cifar_batch` (résultat bit-à-bit identique).
-
-    Les calculs se font en float64 comme en pur Python, puis sont abaissés en
-    float32 au moment de l'écriture — mêmes octets que `struct.pack('<f', …)`.
-    """
+    """Version vectorisée de `_parse_cifar_batch`, même résultat."""
     if len(data) % CIFAR_RECORD_BYTES != 0:
         raise ValueError(
             f"Unexpected batch size: {len(data)} bytes "
@@ -104,14 +110,21 @@ def _parse_cifar_batch_np(data: bytes, mode: str):
 
     records = _np.frombuffer(data, dtype=_np.uint8).reshape(-1, CIFAR_RECORD_BYTES)
     # record[0] = label (inutilisé) ; puis 3 plans de 1024 octets (R, G, B)
-    planes = records[:, 1:].reshape(-1, CIFAR_RGB_CHANNELS, CIFAR_PIXELS).astype(_np.float64)
+    planes = records[:, 1:].reshape(-1, CIFAR_RGB_CHANNELS, CIFAR_PIXELS)
 
     if mode == "grey":
-        out = (0.299 * planes[:, 0] + 0.587 * planes[:, 1] + 0.114 * planes[:, 2]) / 255.0
-    else:  # rgb : entrelacement plan → pixel (row-major, canaux R,G,B contigus)
-        out = (planes / 255.0).transpose(0, 2, 1).reshape(-1, CIFAR_PIXELS * CIFAR_RGB_CHANNELS)
+        lum = (
+            0.299 * planes[:, 0].astype(_np.float64)
+            + 0.587 * planes[:, 1].astype(_np.float64)
+            + 0.114 * planes[:, 2].astype(_np.float64)
+        )
+        # `round()` de Python, comme le chemin lent : arrondi au pair le plus
+        # proche. Les deux chemins doivent rendre le MÊME fichier.
+        out = _np.rint(lum).astype(_np.uint8)
+    else:  # rgb : entrelacement plan → pixel
+        out = planes.transpose(0, 2, 1).reshape(-1, CIFAR_PIXELS * CIFAR_RGB_CHANNELS)
 
-    return _np.ascontiguousarray(out, dtype=_np.float32)
+    return _np.ascontiguousarray(out, dtype=_np.uint8)
 
 
 def _chunks(data: bytes, size: int):
@@ -141,42 +154,33 @@ def _collect_batch_files(cifar_dir: str, include_test: bool) -> list:
     return batch_files
 
 
-def convert(cifar_dir: str, out_path: str, mode: str, include_test: bool) -> None:
+def convert(cifar_dir: str, out_path: str, mode: str, include_test: bool, version: int) -> None:
     """Convert CIFAR-10 batches to a .batraw file."""
     batch_files = _collect_batch_files(cifar_dir, include_test)
     channels = 1 if mode == "grey" else CIFAR_RGB_CHANNELS
 
-    all_samples: list = []
+    payload = bytearray()
     for batch_file in batch_files:
         print(f"  Reading {batch_file} …", flush=True)
         with open(batch_file, "rb") as fh:
             data = fh.read()
         if _np is not None:
-            all_samples.append(_parse_cifar_batch_np(data, mode))
+            payload.extend(_parse_cifar_batch_np(data, mode).tobytes())
         else:
-            all_samples.extend(_parse_cifar_batch(data, mode))
+            payload.extend(_parse_cifar_batch(data, mode))
 
-    sample_floats = CIFAR_WIDTH * CIFAR_HEIGHT * channels
-    count = sum(len(chunk) for chunk in all_samples) if _np is not None else len(all_samples)
+    sample_bytes = CIFAR_WIDTH * CIFAR_HEIGHT * channels
+    count = len(payload) // sample_bytes
 
     print(
-        f"  Writing {count} samples ({CIFAR_WIDTH}×{CIFAR_HEIGHT}×{channels}) → {out_path}",
+        f"  Writing {count} samples ({CIFAR_WIDTH}×{CIFAR_HEIGHT}×{channels}, "
+        f"{batraw.MAGIC[version][:7].decode()}) → {out_path}",
         flush=True,
     )
-
-    with open(out_path, "wb") as fh:
-        fh.write(MAGIC)
-        fh.write(struct.pack("<IIII", count, CIFAR_WIDTH, CIFAR_HEIGHT, channels))
-        if _np is not None:
-            for chunk in all_samples:
-                assert chunk.shape[1] == sample_floats, chunk.shape
-                fh.write(chunk.tobytes())
-        else:
-            for sample in all_samples:
-                fh.write(struct.pack(f"<{sample_floats}f", *sample))
-
-    size_mb = os.path.getsize(out_path) / (1024 * 1024)
-    print(f"  Done – {size_mb:.1f} MiB written to {out_path}")
+    size = batraw.write(
+        out_path, payload, count, CIFAR_WIDTH, CIFAR_HEIGHT, channels, version=version
+    )
+    print(f"  Done – {size / (1024 * 1024):.1f} MiB written to {out_path}")
 
 
 def _default_output_name(mode: str) -> str:
@@ -198,7 +202,11 @@ def main() -> None:
         "--mode",
         choices=["grey", "rgb"],
         default="grey",
-        help="Output colour mode: 'grey' (1 channel, BT.601) or 'rgb' (3 channels). Default: grey",
+        help=(
+            "Output colour mode: 'rgb' (3 channels, byte-exact) or 'grey' "
+            "(1 channel, BT.601 luminance ROUNDED to a byte — the archive has no "
+            "greyscale plane, so this one is a quantisation, ±1/255). Default: grey"
+        ),
     )
     parser.add_argument(
         "--out",
@@ -210,6 +218,7 @@ def main() -> None:
         action="store_true",
         help="Also include test_batch.bin in addition to the training batches.",
     )
+    batraw.add_format_argument(parser)
 
     args = parser.parse_args()
 
@@ -221,7 +230,13 @@ def main() -> None:
     out_path = args.out or _default_output_name(args.mode)
 
     try:
-        convert(cifar_dir, out_path, args.mode, args.include_test)
+        convert(
+            cifar_dir,
+            out_path,
+            args.mode,
+            args.include_test,
+            batraw.version_from_choice(args.format),
+        )
     except (FileNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

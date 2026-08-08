@@ -8,14 +8,91 @@ const DEFAULT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DYNAMIC_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 const GPU_MEMORY_CHUNK_FRACTION: u64 = 8;
 
+/// What the dataset holds on the host, and therefore what crosses to the GPU.
+///
+/// The two variants are the two `.batraw` payload encodings, kept apart all the
+/// way to the device instead of being normalised to f32 on load. That is the
+/// whole of BATRAW3: a corpus whose source is 8-bit stays 8-bit until a shader
+/// widens it, so the file, the host RAM and — the expensive one — the chunk
+/// upload are all a quarter of what they were.
+#[derive(Debug, Clone)]
+pub enum DatasetPayload {
+    /// One `Vec<f32>` per sample. Every dataset that predates BATRAW3, plus any
+    /// whose geometry had to be resampled on the way in.
+    Floats(Vec<Vec<f32>>),
+    /// `sample_count * sample_len` bytes, flat, sample `i` starting at
+    /// `i * sample_len`. Widened on the GPU by `shader/dataset_decode.wgsl`.
+    Bytes(Vec<u8>),
+}
+
+/// The `[0, 255] -> [-1, 1]` widening, in the one place both sides read.
+///
+/// Exact: 256 inputs, 256 f32 outputs, no rounding — which is why BATRAW3 is a
+/// lossless re-encoding of a BATRAW2 file that came from 8-bit sources, and why
+/// `to_u8` in the binary is its exact inverse. The GPU copy of this expression
+/// lives in `dataset_decode.wgsl` and is pinned to it by test.
+pub fn decode_u8(value: u8) -> f32 {
+    value as f32 / 127.5 - 1.0
+}
+
+impl DatasetPayload {
+    /// Samples the payload holds, given the length one sample has.
+    pub fn sample_count(&self, sample_len: usize) -> usize {
+        match self {
+            DatasetPayload::Floats(samples) => samples.len(),
+            DatasetPayload::Bytes(bytes) => {
+                if sample_len == 0 {
+                    0
+                } else {
+                    bytes.len() / sample_len
+                }
+            }
+        }
+    }
+
+    /// Bytes one sample occupies — 4× the value count for f32, 1× for u8.
+    ///
+    /// This is the number that decides how many samples a chunk holds, so it is
+    /// also the number that makes BATRAW3 cheaper: same chunk, four times the
+    /// residency, a quarter of the misses.
+    pub fn sample_bytes(&self, sample_len: usize) -> usize {
+        match self {
+            DatasetPayload::Floats(_) => sample_len * std::mem::size_of::<f32>(),
+            DatasetPayload::Bytes(_) => sample_len,
+        }
+    }
+
+    /// One sample as f32, decoding if it has to.
+    ///
+    /// For the callers that genuinely need CPU-side pixels — the metrics probe
+    /// and the perpetual seed image — and for nothing else: the training path
+    /// never materialises a sample on the host.
+    pub fn sample_f32(&self, index: usize, sample_len: usize) -> Option<Vec<f32>> {
+        match self {
+            DatasetPayload::Floats(samples) => samples.get(index).cloned(),
+            DatasetPayload::Bytes(bytes) => {
+                let start = index.checked_mul(sample_len)?;
+                let end = start.checked_add(sample_len)?;
+                bytes
+                    .get(start..end)
+                    .map(|slice| slice.iter().copied().map(decode_u8).collect())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GpuDataset {
-    samples: Vec<Vec<f32>>,
+    payload: DatasetPayload,
     chunk_buffer: wgpu::Buffer,
     chunk_sample_capacity: usize,
     loaded_chunk_start: Option<usize>,
     loaded_chunk_count: usize,
-    staging_cpu: Vec<f32>,
+    staging_cpu: Vec<u8>,
+    /// The decode pipeline, built on the first 8-bit copy and never for an f32
+    /// dataset: an old-format run allocates nothing new and takes the same path
+    /// it always did.
+    decode: Option<DecodePass>,
     sample_count: usize,
     sample_len: usize,
     /// How many times a chunk has been uploaded to the GPU.
@@ -123,20 +200,15 @@ impl GpuDataset {
         ) as usize
     }
 
+    /// A dataset of f32 samples — every caller that predates BATRAW3.
+    ///
+    /// Byte for byte the path it always was: [`DatasetPayload::Floats`] is
+    /// copied straight from the chunk to the batch slot, no shader involved.
     pub fn from_samples(
         gpu: &GpuContext,
         samples: Vec<Vec<f32>>,
         sample_len: usize,
     ) -> Result<Self, GpuDatasetError> {
-        if samples.is_empty() {
-            return Err(GpuDatasetError::EmptyDataset);
-        }
-        if sample_len == 0 {
-            return Err(GpuDatasetError::InvalidFlatLength {
-                total: 0,
-                sample_len,
-            });
-        }
         for (sample_index, sample) in samples.iter().enumerate() {
             if sample.len() != sample_len {
                 return Err(GpuDatasetError::InvalidSampleLength {
@@ -146,8 +218,39 @@ impl GpuDataset {
                 });
             }
         }
-        let sample_count = samples.len();
-        let sample_bytes = sample_len * std::mem::size_of::<f32>();
+        Self::from_payload(gpu, DatasetPayload::Floats(samples), sample_len)
+    }
+
+    /// A dataset in whichever encoding it arrived in.
+    ///
+    /// The encoding decides one number — [`DatasetPayload::sample_bytes`] — and
+    /// everything else follows from it: how many samples a chunk holds, how
+    /// often a shuffled batch misses, how many bytes each miss costs. An 8-bit
+    /// corpus gets four times the residency out of the same chunk.
+    pub fn from_payload(
+        gpu: &GpuContext,
+        payload: DatasetPayload,
+        sample_len: usize,
+    ) -> Result<Self, GpuDatasetError> {
+        if sample_len == 0 {
+            return Err(GpuDatasetError::InvalidFlatLength {
+                total: 0,
+                sample_len,
+            });
+        }
+        if let DatasetPayload::Bytes(bytes) = &payload
+            && !bytes.len().is_multiple_of(sample_len)
+        {
+            return Err(GpuDatasetError::InvalidFlatLength {
+                total: bytes.len(),
+                sample_len,
+            });
+        }
+        let sample_count = payload.sample_count(sample_len);
+        if sample_count == 0 {
+            return Err(GpuDatasetError::EmptyDataset);
+        }
+        let sample_bytes = payload.sample_bytes(sample_len);
         let dataset_total_bytes = sample_count.saturating_mul(sample_bytes);
         let max_chunk_bytes = Self::select_max_chunk_bytes(gpu, dataset_total_bytes);
         if sample_bytes > max_chunk_bytes {
@@ -157,7 +260,12 @@ impl GpuDataset {
             });
         }
         let chunk_sample_capacity = (max_chunk_bytes / sample_bytes).max(1);
-        let chunk_bytes = (chunk_sample_capacity * sample_bytes) as u64;
+        // Rounded up to a word: `write_buffer` refuses a size that is not a
+        // multiple of 4, and the decode shader reads the chunk as `array<u32>`.
+        // An 8-bit sample whose length is not a multiple of 4 (a 3-value test
+        // fixture, a 5×5 greyscale image) would otherwise be rejected by the
+        // driver rather than by us.
+        let chunk_bytes = ((chunk_sample_capacity * sample_bytes) as u64).next_multiple_of(4);
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("training_dataset_chunk"),
             size: chunk_bytes.max(4),
@@ -168,12 +276,13 @@ impl GpuDataset {
         });
 
         Ok(Self {
-            samples,
+            payload,
             chunk_buffer: buffer,
             chunk_sample_capacity,
             loaded_chunk_start: None,
             loaded_chunk_count: 0,
             staging_cpu: Vec::new(),
+            decode: None,
             sample_count,
             sample_len,
             chunk_loads: 0,
@@ -203,38 +312,11 @@ impl GpuDataset {
         self.chunk_sample_capacity
     }
 
-    pub fn copy_sample_to(
-        &mut self,
-        gpu: &GpuContext,
-        encoder: &mut wgpu::CommandEncoder,
-        sample_index: usize,
-        destination: &wgpu::Buffer,
-    ) -> Result<(), GpuDatasetError> {
-        if sample_index >= self.sample_count {
-            return Err(GpuDatasetError::SampleIndexOutOfBounds {
-                sample_index,
-                sample_count: self.sample_count,
-            });
-        }
-        self.ensure_chunk_loaded(gpu, sample_index);
-        let sample_bytes = (self.sample_len * std::mem::size_of::<f32>()) as u64;
-        let local_index = sample_index.saturating_sub(self.loaded_chunk_start.unwrap_or(0));
-        let source_offset = local_index as u64 * sample_bytes;
-        encoder.copy_buffer_to_buffer(
-            &self.chunk_buffer,
-            source_offset,
-            destination,
-            0,
-            sample_bytes,
-        );
-        Ok(())
-    }
-
     /// Copy a whole batch into `destination`, sample `i` of the list landing at
     /// slot `i` (offset `i * sample_len` floats).
     ///
-    /// This is NOT `copy_sample_to` in a loop into one encoder, and the
-    /// difference is a correctness one. `ensure_chunk_loaded` uploads through
+    /// This is NOT one copy per sample into one encoder, and the difference is a
+    /// correctness one. `ensure_chunk_loaded` uploads through
     /// `queue.write_buffer`, and wgpu applies every pending queue write BEFORE
     /// the command buffers submitted after it. Two samples from two different
     /// chunks encoded into a single encoder would therefore both read the chunk
@@ -245,6 +327,11 @@ impl GpuDataset {
     /// So the batch is grouped by chunk and each resident chunk gets its own
     /// submission. A dataset that fits in one chunk — the common case — is one
     /// group and one submission, which is also the point of the exercise.
+    ///
+    /// What the group does depends on the payload: an f32 chunk is copied
+    /// buffer-to-buffer, an 8-bit one is widened by a compute pass. The grouping
+    /// itself is shared, because the reason for it is the chunk upload and that
+    /// is the same on both sides.
     pub fn copy_samples_to(
         &mut self,
         gpu: &GpuContext,
@@ -259,7 +346,6 @@ impl GpuDataset {
                 });
             }
         }
-        let sample_bytes = (self.sample_len * std::mem::size_of::<f32>()) as u64;
         let capacity = self.chunk_sample_capacity;
 
         // Slot order is preserved: the grouping is by chunk, but every copy
@@ -283,21 +369,105 @@ impl GpuDataset {
 
             self.ensure_chunk_loaded(gpu, pending[cursor].1);
             let chunk_start = self.loaded_chunk_start.unwrap_or(0);
-            let mut encoder = gpu.device.create_command_encoder(&Default::default());
-            for &(slot, sample_index) in &pending[cursor..end] {
-                let local_index = sample_index.saturating_sub(chunk_start);
-                encoder.copy_buffer_to_buffer(
-                    &self.chunk_buffer,
-                    local_index as u64 * sample_bytes,
-                    destination,
-                    slot as u64 * sample_bytes,
-                    sample_bytes,
-                );
+            let group: Vec<(usize, usize)> = pending[cursor..end]
+                .iter()
+                .map(|&(slot, sample_index)| (slot, sample_index - chunk_start))
+                .collect();
+
+            match self.payload {
+                DatasetPayload::Floats(_) => {
+                    let sample_bytes = (self.sample_len * std::mem::size_of::<f32>()) as u64;
+                    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+                    for &(slot, local_index) in &group {
+                        encoder.copy_buffer_to_buffer(
+                            &self.chunk_buffer,
+                            local_index as u64 * sample_bytes,
+                            destination,
+                            slot as u64 * sample_bytes,
+                            sample_bytes,
+                        );
+                    }
+                    gpu.submit([encoder.finish()]);
+                }
+                DatasetPayload::Bytes(_) => self.decode_group(gpu, &group, destination),
             }
-            gpu.submit([encoder.finish()]);
             cursor = end;
         }
         Ok(())
+    }
+
+    /// Widen one chunk's worth of 8-bit samples into their batch slots.
+    ///
+    /// `group` is `(destination slot, index inside the resident chunk)`, which
+    /// is exactly the pair the shader indexes by — see `dataset_decode.wgsl`.
+    fn decode_group(
+        &mut self,
+        gpu: &GpuContext,
+        group: &[(usize, usize)],
+        destination: &wgpu::Buffer,
+    ) {
+        let sample_len = self.sample_len;
+        let pass = self
+            .decode
+            .get_or_insert_with(|| DecodePass::new(gpu, group.len().max(1)));
+        pass.ensure_plan_capacity(gpu, group.len());
+
+        let plan: Vec<u32> = group
+            .iter()
+            .flat_map(|&(slot, local_index)| [local_index as u32, slot as u32])
+            .collect();
+        gpu.write_buffer(&pass.plan, 0, bytemuck::cast_slice(&plan));
+        gpu.write_buffer(
+            &pass.spec,
+            0,
+            bytemuck::cast_slice(&[sample_len as u32, group.len() as u32, 0u32, 0u32]),
+        );
+
+        // The bind group is rebuilt rather than cached because `destination`
+        // belongs to the caller — the diffusion prepass owns it and rebuilds it
+        // whenever the batch changes. One bind group per chunk group per step,
+        // next to a forward and a backward pass, is not a cost worth a cache
+        // keyed on a buffer identity that could go stale.
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dataset_decode_bg"),
+            layout: &pass.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.chunk_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pass.plan.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: destination.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: pass.spec.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: pass.palette.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        {
+            let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("dataset_decode_pass"),
+                timestamp_writes: None,
+            });
+            compute.set_pipeline(&pass.pipeline);
+            compute.set_bind_group(0, &bind_group, &[]);
+            let threads = (sample_len * group.len()) as u32;
+            let (x, y) = crate::model::layer::dispatch_grid(threads.div_ceil(64));
+            compute.dispatch_workgroups(x, y, 1);
+        }
+        gpu.submit([encoder.finish()]);
     }
 
     fn ensure_chunk_loaded(&mut self, gpu: &GpuContext, sample_index: usize) {
@@ -313,18 +483,145 @@ impl GpuDataset {
         let chunk_count = chunk_end - chunk_start;
 
         self.staging_cpu.clear();
-        self.staging_cpu.reserve(chunk_count * self.sample_len);
-        for sample in &self.samples[chunk_start..chunk_end] {
-            self.staging_cpu.extend_from_slice(sample);
+        match &self.payload {
+            DatasetPayload::Floats(samples) => {
+                self.staging_cpu
+                    .reserve(chunk_count * self.sample_len * std::mem::size_of::<f32>());
+                for sample in &samples[chunk_start..chunk_end] {
+                    self.staging_cpu
+                        .extend_from_slice(bytemuck::cast_slice(sample));
+                }
+            }
+            DatasetPayload::Bytes(bytes) => {
+                let from = chunk_start * self.sample_len;
+                let to = chunk_end * self.sample_len;
+                self.staging_cpu.extend_from_slice(&bytes[from..to]);
+            }
         }
-        gpu.write_buffer(
-            &self.chunk_buffer,
-            0,
-            bytemuck::cast_slice(&self.staging_cpu),
-        );
+        // `write_buffer` refuses a size that is not a multiple of 4. The tail
+        // padding is never read: the shader only addresses bytes below
+        // `chunk_count * sample_len`.
+        while !self.staging_cpu.len().is_multiple_of(4) {
+            self.staging_cpu.push(0);
+        }
+        gpu.write_buffer(&self.chunk_buffer, 0, &self.staging_cpu);
         self.loaded_chunk_start = Some(chunk_start);
         self.loaded_chunk_count = chunk_count;
         self.chunk_loads += 1;
+    }
+}
+
+/// The compute pass that widens an 8-bit chunk, built once per dataset.
+///
+/// Only the plan and the spec are rewritten per call; the pipeline and its
+/// layout outlive every batch.
+#[derive(Debug, Clone)]
+struct DecodePass {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    /// `(local index, destination slot)` per sample of the group.
+    plan: wgpu::Buffer,
+    /// `sample_len`, `pair_count`, and two words of padding to reach the 16-byte
+    /// minimum a uniform binding has.
+    spec: wgpu::Buffer,
+    /// The 256 decoded values. Written once, read by every dispatch — see the
+    /// comment on binding 4 in `dataset_decode.wgsl` for why the shader looks
+    /// them up instead of computing them.
+    palette: wgpu::Buffer,
+    plan_pairs: usize,
+}
+
+impl DecodePass {
+    fn new(gpu: &GpuContext, pairs: usize) -> Self {
+        let device = &gpu.device;
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("dataset_decode_bgl"),
+            entries: &[
+                storage(0, true),
+                storage(1, true),
+                storage(2, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                storage(4, true),
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("dataset_decode"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "shader/dataset_decode.wgsl"
+            ))),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("dataset_decode_layout"),
+            bind_group_layouts: &[&layout],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("dataset_decode_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("dataset_decode"),
+            cache: None,
+            compilation_options: Default::default(),
+        });
+        let spec = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dataset_decode_spec"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let palette = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dataset_decode_palette"),
+            size: 256 * std::mem::size_of::<f32>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let values: Vec<f32> = (0..=255u8).map(decode_u8).collect();
+        gpu.write_buffer(&palette, 0, bytemuck::cast_slice(&values));
+
+        Self {
+            pipeline,
+            layout,
+            plan: Self::plan_buffer(gpu, pairs),
+            spec,
+            palette,
+            plan_pairs: pairs,
+        }
+    }
+
+    fn plan_buffer(gpu: &GpuContext, pairs: usize) -> wgpu::Buffer {
+        gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dataset_decode_plan"),
+            size: (pairs.max(1) * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn ensure_plan_capacity(&mut self, gpu: &GpuContext, pairs: usize) {
+        if pairs > self.plan_pairs {
+            self.plan = Self::plan_buffer(gpu, pairs);
+            self.plan_pairs = pairs;
+        }
     }
 }
 
@@ -335,7 +632,7 @@ mod tests {
 
     /// A batch must upload each chunk it needs AT MOST ONCE.
     ///
-    /// `copy_sample_to` in a loop did not guarantee this: with a shuffled
+    /// One copy per sample did not guarantee this: with a shuffled
     /// sampler, consecutive samples of a batch land in unrelated chunks, so the
     /// old path re-uploaded a whole chunk on most samples. On CIFAR-10 grey
     /// (50 000 samples of 4 KiB, 64 MiB chunks => 4 chunks) a batch of 16 costs
@@ -420,5 +717,242 @@ mod tests {
                 }
             }
         });
+    }
+
+    fn batch_destination(gpu: &GpuContext, floats: usize) -> wgpu::Buffer {
+        gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_decode_destination"),
+            size: (floats * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// The GPU widening and the CPU one must be the SAME function.
+    ///
+    /// They are written twice — once in WGSL for the training path, once in Rust
+    /// for the probe and the seed image — and a disagreement between them is a
+    /// brightness shift applied to half the pipeline, with nothing to signal it.
+    /// So all 256 byte values go through both and are compared exactly, not
+    /// within a tolerance: `v / 127.5 - 1` is representable in f32 on both sides
+    /// and there is no reason for the results to merely be close.
+    #[test]
+    fn the_gpu_decode_agrees_with_the_cpu_one() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let sample_len = 256;
+            // Sample 0 is 0..=255 in order, sample 1 the reverse: between them
+            // every value is decoded at an even and at an odd byte offset, which
+            // is what the shader's shift-and-mask has to get right.
+            let mut bytes: Vec<u8> = (0..=255u8).collect();
+            bytes.extend((0..=255u8).rev());
+            let mut dataset =
+                GpuDataset::from_payload(gpu.as_ref(), DatasetPayload::Bytes(bytes), sample_len)
+                    .unwrap();
+            assert_eq!(dataset.sample_count(), 2);
+
+            let destination = batch_destination(gpu.as_ref(), 2 * sample_len);
+            dataset
+                .copy_samples_to(gpu.as_ref(), &[0, 1], &destination)
+                .unwrap();
+            let values =
+                crate::model::debug::read_back_f32(gpu.as_ref(), &destination, destination.size())
+                    .unwrap();
+
+            for byte in 0..=255u8 {
+                assert_eq!(
+                    values[byte as usize],
+                    decode_u8(byte),
+                    "the GPU decoded {byte} differently from decode_u8"
+                );
+                assert_eq!(
+                    values[sample_len + 255 - byte as usize],
+                    decode_u8(byte),
+                    "the GPU decoded {byte} differently at an odd offset"
+                );
+            }
+            // The convention itself, spelled out where it is easy to check
+            // against the loader: black is -1, white is +1.
+            assert_eq!(values[0], -1.0);
+            assert_eq!(values[255], 1.0);
+        });
+    }
+
+    /// Slot order survives the decode path too.
+    ///
+    /// The f32 path preserves it with a copy offset; the 8-bit path preserves it
+    /// with the `.y` of a plan entry, which is a second implementation of the
+    /// same promise and therefore a second thing that can be wrong.
+    #[test]
+    fn an_8_bit_batch_lands_in_the_slot_it_was_asked_for() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let sample_len = 4;
+            let bytes: Vec<u8> = (0..16u8)
+                .flat_map(|s| std::iter::repeat_n(s, sample_len))
+                .collect();
+            let mut dataset =
+                GpuDataset::from_payload(gpu.as_ref(), DatasetPayload::Bytes(bytes), sample_len)
+                    .unwrap();
+            let batch = [11usize, 2, 7];
+            let destination = batch_destination(gpu.as_ref(), batch.len() * sample_len);
+            dataset
+                .copy_samples_to(gpu.as_ref(), &batch, &destination)
+                .unwrap();
+
+            let values =
+                crate::model::debug::read_back_f32(gpu.as_ref(), &destination, destination.size())
+                    .unwrap();
+            for (slot, &sample_index) in batch.iter().enumerate() {
+                for offset in 0..sample_len {
+                    assert_eq!(
+                        values[slot * sample_len + offset],
+                        decode_u8(sample_index as u8),
+                        "slot {slot} does not hold sample {sample_index}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The point of the format, as a number.
+    ///
+    /// Same device rule, same images, four times the residency — so a quarter of
+    /// the chunks, so a quarter of the misses. Stated on the pure sizing rule
+    /// rather than on two built datasets because the interesting scale is
+    /// ImageNet 32×32 (1.28 M images), and no test is going to allocate the
+    /// 15.7 GiB the f32 encoding of it would take.
+    ///
+    /// The clamp at the end is why this is phrased as "at least": once a whole
+    /// dataset fits in one chunk, the 8-bit encoding stops buying residency and
+    /// starts buying the thing residency was for — it buys ALL of it, and the
+    /// chunk count falls to one.
+    #[test]
+    fn an_8_bit_chunk_holds_four_times_the_images() {
+        // The rule's inputs, as a real device reports them; only the ratio is
+        // under test, so the exact caps do not matter as long as both sides see
+        // the same ones.
+        let caps = (128 << 20, 1 << 30, 8u64 << 30);
+        let sample_len = 3072u64; // CIFAR-10 / ImageNet 32×32 RGB
+        for count in [50_000u64, 1_281_167] {
+            let capacity = |sample_bytes: u64| {
+                select_chunk_bytes(caps.0, caps.1, caps.2, count * sample_bytes) / sample_bytes
+            };
+            let floats = capacity(sample_len * 4);
+            let bytes = capacity(sample_len);
+            assert!(
+                bytes >= floats * 4 || bytes >= count,
+                "{count} samples: an 8-bit chunk holds {bytes}, four f32 chunks hold {}",
+                floats * 4
+            );
+            // Rounded up, because the last chunk is short on both sides: four
+            // f32 chunks' worth of images fit in one 8-bit chunk, so the count
+            // falls to a quarter of itself, ceiling included.
+            assert!(
+                count.div_ceil(bytes) <= count.div_ceil(floats).div_ceil(4),
+                "{count} samples: {} 8-bit chunks against {} f32 ones",
+                count.div_ceil(bytes),
+                count.div_ceil(floats)
+            );
+        }
+
+        // The headline of the report, spelled out. ImageNet 32×32 RGB is
+        // 1 281 167 images of 3072 bytes: 15.7 GB as f32, 3.9 GB as u8 — and it
+        // is the f32 figure that makes the corpus impractical, not the corpus.
+        let imagenet = 1_281_167u64 * sample_len;
+        assert_eq!(imagenet * 4 / 1_000_000_000, 15);
+        assert_eq!(imagenet / 1_000_000_000, 3);
+    }
+
+    /// The same claim where it is actually allocated: two real datasets, same
+    /// images, and the 8-bit one resident in fewer chunks.
+    #[test]
+    fn a_real_8_bit_dataset_is_resident_in_fewer_chunks() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let sample_len = 3072;
+            let count = 40_000;
+            let floats = GpuDataset::from_samples(
+                gpu.as_ref(),
+                vec![vec![0.0; sample_len]; count],
+                sample_len,
+            )
+            .unwrap();
+            let bytes = GpuDataset::from_payload(
+                gpu.as_ref(),
+                DatasetPayload::Bytes(vec![0u8; count * sample_len]),
+                sample_len,
+            )
+            .unwrap();
+
+            assert!(
+                bytes.chunk_sample_capacity() >= floats.chunk_sample_capacity() * 4
+                    || bytes.chunk_sample_capacity() == count,
+                "8-bit chunk holds {}, f32 chunk holds {}",
+                bytes.chunk_sample_capacity(),
+                floats.chunk_sample_capacity()
+            );
+            assert!(
+                count.div_ceil(bytes.chunk_sample_capacity())
+                    <= count.div_ceil(floats.chunk_sample_capacity()).div_ceil(4),
+                "{} 8-bit chunks against {} f32 ones",
+                count.div_ceil(bytes.chunk_sample_capacity()),
+                count.div_ceil(floats.chunk_sample_capacity())
+            );
+        });
+    }
+
+    /// A byte payload that is not a whole number of samples is a truncated file,
+    /// and must be refused rather than silently short by one image.
+    #[test]
+    fn a_ragged_8_bit_payload_is_refused() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let result =
+                GpuDataset::from_payload(gpu.as_ref(), DatasetPayload::Bytes(vec![0u8; 10]), 4);
+            assert!(
+                matches!(result, Err(GpuDatasetError::InvalidFlatLength { .. })),
+                "a ragged byte payload was accepted"
+            );
+        });
+    }
+
+    /// A sample length that is not a multiple of 4 must still work: the chunk is
+    /// padded to a word for `write_buffer`, and the padding is never read.
+    #[test]
+    fn an_8_bit_sample_of_odd_length_still_decodes() {
+        pollster::block_on(async {
+            let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+            let sample_len = 3;
+            let bytes: Vec<u8> = vec![1, 2, 3, 250, 251, 252];
+            let mut dataset =
+                GpuDataset::from_payload(gpu.as_ref(), DatasetPayload::Bytes(bytes), sample_len)
+                    .unwrap();
+            let destination = batch_destination(gpu.as_ref(), 2 * sample_len);
+            dataset
+                .copy_samples_to(gpu.as_ref(), &[1, 0], &destination)
+                .unwrap();
+            let values =
+                crate::model::debug::read_back_f32(gpu.as_ref(), &destination, destination.size())
+                    .unwrap();
+            let want: Vec<f32> = [250u8, 251, 252, 1, 2, 3].iter().copied().map(decode_u8).collect();
+            assert_eq!(values, want);
+        });
+    }
+
+    /// The CPU-side accessor the probe and the seed image use must agree with
+    /// the GPU one — same values, same order.
+    #[test]
+    fn the_cpu_accessor_decodes_the_same_sample_the_gpu_does() {
+        let bytes: Vec<u8> = (0..12u8).collect();
+        let payload = DatasetPayload::Bytes(bytes);
+        assert_eq!(payload.sample_count(4), 3);
+        assert_eq!(
+            payload.sample_f32(2, 4).unwrap(),
+            vec![decode_u8(8), decode_u8(9), decode_u8(10), decode_u8(11)]
+        );
+        assert!(payload.sample_f32(3, 4).is_none());
     }
 }

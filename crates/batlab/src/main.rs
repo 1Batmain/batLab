@@ -13,7 +13,7 @@ use batlab_ui::tui::{
     RunMode, TrainingConfig,
 };
 use batlab_core::{
-    CheckpointWeights, DEFAULT_SNR_GAMMA, DenoiseFrame, DiffusionTask, DriftAction,
+    CheckpointWeights, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame, DiffusionTask, DriftAction,
     DriftWalk, EmaConfig, GpuContext, GpuDataset, LinearNoiseSchedule, LiveFrame,
     LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind, PerpetualDrift,
     ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, log_probe, log_train_loss,
@@ -27,8 +27,14 @@ use image::{DynamicImage, GrayImage, RgbImage};
 /// Legacy raw-dataset magic — payload stored in `[0, 1]`. Converted to the
 /// model's `[-1, 1]` convention at load time.
 const RAW_DATASET_MAGIC_UNIT: &[u8; 8] = b"BATRAW1\0";
-/// Current raw-dataset magic — payload already stored in `[-1, 1]`.
+/// Legacy raw-dataset magic — f32 payload already stored in `[-1, 1]`.
 const RAW_DATASET_MAGIC_SIGNED: &[u8; 8] = b"BATRAW2\0";
+/// Current raw-dataset magic — **u8** payload in `[0, 255]`, widened to
+/// `[-1, 1]` on the GPU. A quarter of the file, a quarter of the host RAM and a
+/// quarter of the chunk traffic, for exactly the same values: the sources are
+/// 8-bit, so the f32 encoding stored four bytes of which three were always
+/// derivable from the first.
+const RAW_DATASET_MAGIC_BYTES: &[u8; 8] = b"BATRAW3\0";
 
 const DIFFUSION_SCHEDULE_STEPS: usize = 256;
 const DIFFUSION_BETA_START: f32 = 1e-4;
@@ -374,7 +380,7 @@ fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
 /// is a second constructor beside `at_random`, not a new call site: the two
 /// perpetual paths only ever call `provide_x0`.
 struct SeedImages {
-    samples: Vec<ImageSample>,
+    samples: Dataset,
     path: PathBuf,
 }
 
@@ -440,7 +446,7 @@ impl SeedImages {
     /// correlate the run with whatever order the dataset happens to be in. Same
     /// discipline as `gaussian_at` — mix first, index second (`ANISOTROPY_HUNT.md`).
     fn provide_x0(&self, seed: u64) -> Vec<f32> {
-        self.samples[self.at_random(seed)].target.clone()
+        self.samples.sample(self.at_random(seed))
     }
 
     fn at_random(&self, seed: u64) -> usize {
@@ -926,12 +932,16 @@ impl FrameDump {
     }
 }
 
-/// The `.batraw` header alone: how many samples, and how big each one is.
+/// The `.batraw` header alone: how many samples, how big each one is, and how
+/// many bytes one value takes.
 ///
-/// A dataset's GPU footprint is decided by those two numbers, and CIFAR-10 is
+/// A dataset's GPU footprint is decided by those numbers, and CIFAR-10 is
 /// 195 MiB on disk — reading it whole to answer "how many chunks?" would make
-/// `--resources` slower than the run it describes.
-fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32), String> {
+/// `--resources` slower than the run it describes. The payload width is part of
+/// the answer since BATRAW3: the same 50 000 images are 586 MiB of f32 or
+/// 147 MiB of u8, and an inventory that assumed f32 would over-report a
+/// BATRAW3 dataset's residency by four.
+fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32, u64), String> {
     use std::io::Read;
     let mut file =
         fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
@@ -939,9 +949,13 @@ fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32), String> {
     file.read_exact(&mut header)
         .map_err(|err| format!("failed to read the header of {}: {err}", path.display()))?;
     let magic = &header[..8];
-    if magic != RAW_DATASET_MAGIC_SIGNED && magic != RAW_DATASET_MAGIC_UNIT {
+    let value_bytes: u64 = if magic == RAW_DATASET_MAGIC_BYTES {
+        1
+    } else if magic == RAW_DATASET_MAGIC_SIGNED || magic == RAW_DATASET_MAGIC_UNIT {
+        4
+    } else {
         return Err(format!("invalid magic in {}", path.display()));
-    }
+    };
     let word = |i: usize| {
         u32::from_le_bytes([
             header[8 + i * 4],
@@ -950,7 +964,7 @@ fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32), String> {
             header[11 + i * 4],
         ])
     };
-    Ok((word(0) as u64, word(1), word(2), word(3)))
+    Ok((word(0) as u64, word(1), word(2), word(3), value_bytes))
 }
 
 /// The dataset a `--resources` question is about: the one named on the command
@@ -965,12 +979,12 @@ fn resources_dataset(
         _ => None,
     })?;
     let path = PathBuf::from(&named);
-    let (count, width, height, channels) = read_batraw_header(&path).ok()?;
+    let (count, width, height, channels, value_bytes) = read_batraw_header(&path).ok()?;
     Some((
         path,
         batlab_core::DatasetSpec {
             sample_count: count,
-            sample_bytes: width as u64 * height as u64 * channels as u64 * 4,
+            sample_bytes: width as u64 * height as u64 * channels as u64 * value_bytes,
         },
     ))
 }
@@ -1207,12 +1221,11 @@ async fn measure_transfers(
         Some(path) => {
             let samples = try_load_raw_dataset(path, output_size)?
                 .ok_or_else(|| format!("no .batraw dataset at {}", path.display()))?;
-            let sample_len = samples
-                .first()
-                .map(|s| s.target.len())
-                .ok_or_else(|| "the dataset is empty".to_string())?;
-            let flat: Vec<Vec<f32>> = samples.into_iter().map(|s| s.target).collect();
-            let mut dataset = GpuDataset::from_samples(gpu.as_ref(), flat, sample_len)
+            if samples.is_empty() {
+                return Err("the dataset is empty".to_string());
+            }
+            let sample_len = samples.sample_len;
+            let mut dataset = GpuDataset::from_payload(gpu.as_ref(), samples.payload, sample_len)
                 .map_err(|err| format!("failed to upload the dataset: {err}"))?;
 
             // Warmup, then measure.
@@ -2008,16 +2021,14 @@ async fn run_training(
 
     let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
     let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
-    let gpu_samples: Vec<Vec<f32>> = dataset.into_iter().map(|sample| sample.target).collect();
     // CPU copies of a handful of clean targets kept for the diagnostic probe
-    // (the GPU dataset is opaque to CPU-side readback).
+    // (the GPU dataset is opaque to CPU-side readback). Widened one by one:
+    // an 8-bit dataset is not decoded on the host for anything else.
     let probe_config = ProbeConfig::default();
-    let probe_samples: Vec<Vec<f32>> = gpu_samples
-        .iter()
-        .take(probe_config.sample_count)
-        .cloned()
+    let probe_samples: Vec<Vec<f32>> = (0..probe_config.sample_count.min(dataset.len()))
+        .map(|index| dataset.sample(index))
         .collect();
-    let mut gpu_dataset = GpuDataset::from_samples(gpu.as_ref(), gpu_samples, sample_len)
+    let mut gpu_dataset = GpuDataset::from_payload(gpu.as_ref(), dataset.payload, sample_len)
         .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
 
     // Metrics land next to the checkpoint (`<stem>_metrics.jsonl`), or in a
@@ -3071,20 +3082,57 @@ fn resolve_sampling_checkpoint_path(
     Ok(checkpoint)
 }
 
-fn load_dataset(
-    dataset_path: &str,
-    output_size: (u32, u32, u32),
-) -> Result<Vec<ImageSample>, String> {
+/// A loaded dataset, still in the encoding it will cross to the GPU in.
+///
+/// The point of the type is that it does NOT normalise: a BATRAW3 file arrives
+/// as bytes and leaves as bytes, and only the two callers that genuinely need
+/// host-side pixels (the metrics probe, the perpetual seed image) pay to widen
+/// one sample. Flattening on load would have thrown away three quarters of the
+/// format's benefit before it reached the buffer that matters.
+struct Dataset {
+    payload: DatasetPayload,
+    sample_len: usize,
+}
+
+impl Dataset {
+    fn from_samples(samples: Vec<ImageSample>, sample_len: usize) -> Self {
+        Self {
+            payload: DatasetPayload::Floats(
+                samples.into_iter().map(|sample| sample.target).collect(),
+            ),
+            sample_len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.payload.sample_count(self.sample_len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// One sample as f32. Panics on an out-of-range index, which callers avoid
+    /// by taking it modulo `len()`.
+    fn sample(&self, index: usize) -> Vec<f32> {
+        self.payload
+            .sample_f32(index, self.sample_len)
+            .unwrap_or_else(|| panic!("sample {index} out of a dataset of {}", self.len()))
+    }
+}
+
+fn load_dataset(dataset_path: &str, output_size: (u32, u32, u32)) -> Result<Dataset, String> {
     let canonical_path = Path::new(dataset_path)
         .canonicalize()
         .map_err(|err| format!("failed to resolve dataset path '{}': {err}", dataset_path))?;
+    let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
 
     if let Some(dataset) = try_load_raw_dataset(&canonical_path, output_size)? {
         return Ok(dataset);
     }
 
     if let Some(dataset) = try_load_cifar_dataset(&canonical_path, output_size)? {
-        return Ok(dataset);
+        return Ok(Dataset::from_samples(dataset, sample_len));
     }
 
     let mut image_paths = Vec::new();
@@ -3096,7 +3144,7 @@ fn load_dataset(
         return Err(format!("no images found at '{}'", dataset_path));
     }
 
-    image_paths
+    let samples = image_paths
         .into_iter()
         .map(|path| {
             let image = image::open(&path)
@@ -3105,7 +3153,8 @@ fn load_dataset(
                 target: image_to_tensor(&image, output_size),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Dataset::from_samples(samples, sample_len))
 }
 
 /// Tries to load a dataset from a raw binary file (`*.batraw`) or a directory that contains such
@@ -3114,21 +3163,34 @@ fn load_dataset(
 ///
 /// # Binary format (produced by the Python pre-processing scripts)
 /// ```text
-/// [0..8]   magic: b"BATRAW2\0" (or legacy b"BATRAW1\0")
+/// [0..8]   magic: b"BATRAW3\0" (or legacy b"BATRAW2\0" / b"BATRAW1\0")
 /// [8..12]  count:    u32 LE – number of samples
 /// [12..16] width:    u32 LE – image width in pixels
 /// [16..20] height:   u32 LE – image height in pixels
 /// [20..24] channels: u32 LE – number of channels per pixel
-/// [24..]   data:     count * width * height * channels × f32 LE values
+/// [24..]   data:     count * width * height * channels values, in the payload
+///                    encoding the magic names
 /// ```
 ///
-/// `BATRAW2` stores values already normalised in `[-1, 1]` — the convention the
-/// diffusion pipeline expects. `BATRAW1` files store `[0, 1]` and are rescaled
-/// on the fly, so pre-existing datasets keep loading unchanged.
+/// Three magics, one header, three payloads:
+///
+/// - `BATRAW3` — **u8**, `[0, 255]`, widened to `[-1, 1]` on the GPU. The
+///   default the converters write, because every image this project has trained
+///   on was 8-bit at the source and storing it as f32 quadrupled the file, the
+///   host RAM and the chunk uploads for nothing. The widening is exact, so a
+///   BATRAW3 file and the BATRAW2 file converted from the same images decode to
+///   the same bits.
+/// - `BATRAW2` — f32 already in `[-1, 1]`, the convention the diffusion pipeline
+///   expects.
+/// - `BATRAW1` — f32 in `[0, 1]`, rescaled on the fly.
+///
+/// A BATRAW3 file whose geometry already matches the model stays 8-bit all the
+/// way to the GPU. Anything else — a mismatched geometry needing a resample —
+/// falls back to the f32 path, because the resample happens on the host anyway.
 fn try_load_raw_dataset(
     dataset_path: &Path,
     output_size: (u32, u32, u32),
-) -> Result<Option<Vec<ImageSample>>, String> {
+) -> Result<Option<Dataset>, String> {
     // Collect candidate .batraw files.
     let mut raw_files: Vec<PathBuf> = Vec::new();
 
@@ -3170,7 +3232,13 @@ fn try_load_raw_dataset(
         return Ok(None);
     }
 
-    let mut dataset: Vec<ImageSample> = Vec::new();
+    let model_sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+    // Both accumulate; at most one ends up non-empty. A directory holding an
+    // 8-bit file next to an f32 one is a mixture the GPU cannot stream as one
+    // payload, so it is refused rather than silently widened.
+    let mut floats: Vec<ImageSample> = Vec::new();
+    let mut eight_bit: Vec<u8> = Vec::new();
+
     for raw_file in &raw_files {
         let bytes = fs::read(raw_file)
             .map_err(|err| format!("failed to read {}: {err}", raw_file.display()))?;
@@ -3183,10 +3251,12 @@ fn try_load_raw_dataset(
         }
         let magic = &bytes[..RAW_DATASET_MAGIC_SIGNED.len()];
         // BATRAW1 payloads predate the [-1, 1] convention and are rescaled below.
-        let needs_unit_rescale = if magic == RAW_DATASET_MAGIC_SIGNED {
-            false
+        let (value_bytes, needs_unit_rescale) = if magic == RAW_DATASET_MAGIC_BYTES {
+            (1usize, false)
+        } else if magic == RAW_DATASET_MAGIC_SIGNED {
+            (4, false)
         } else if magic == RAW_DATASET_MAGIC_UNIT {
-            true
+            (4, true)
         } else {
             return Err(format!(
                 "invalid magic in raw dataset file: {}",
@@ -3202,8 +3272,8 @@ fn try_load_raw_dataset(
         let height = read_u32_le_bytes(&bytes, &mut offset)?;
         let channels = read_u32_le_bytes(&bytes, &mut offset)?;
 
-        let sample_floats = (width * height * channels) as usize;
-        let expected_bytes = offset + count * sample_floats * 4;
+        let sample_values = (width * height * channels) as usize;
+        let expected_bytes = offset + count * sample_values * value_bytes;
         if bytes.len() != expected_bytes {
             return Err(format!(
                 "raw dataset file size mismatch in {}: expected {expected_bytes} bytes, got {}",
@@ -3212,12 +3282,13 @@ fn try_load_raw_dataset(
             ));
         }
 
+        let geometry_matches = (width, height, channels) == output_size;
         // The geometry mismatch below is silently repaired by a u8 round-trip
         // (`raw_floats_to_dynamic_image` + `image_to_tensor`). That is convenient for
         // rescaling, but it also means feeding a 1-channel dataset to a 3-channel model
         // "works": every sample is grey replicated over R, G and B, and a whole overnight
         // run trains on colourless data without a single error. Say it out loud.
-        if (width, height, channels) != output_size {
+        if !geometry_matches {
             eprintln!(
                 "[dataset] WARNING {}: file is {width}x{height}x{channels}, model expects \
                  {}x{}x{} — samples are converted through an 8-bit image round-trip\
@@ -3234,32 +3305,69 @@ fn try_load_raw_dataset(
             );
         }
 
+        // The fast lane, and the only one that keeps the format's benefit: an
+        // 8-bit file the model can eat as it lies. `bytes` is moved wholesale
+        // rather than copied sample by sample — on ImageNet that is 3.9 GB not
+        // walked.
+        if value_bytes == 1 && geometry_matches {
+            if !floats.is_empty() {
+                return Err(format!(
+                    "{}: a directory cannot mix 8-bit and f32 .batraw files",
+                    dataset_path.display()
+                ));
+            }
+            let mut payload = bytes;
+            payload.drain(..offset);
+            eight_bit.extend_from_slice(&payload);
+            continue;
+        }
+        if !eight_bit.is_empty() {
+            return Err(format!(
+                "{}: a directory cannot mix 8-bit and f32 .batraw files",
+                dataset_path.display()
+            ));
+        }
+
         for _ in 0..count {
-            let raw: Vec<f32> = bytes[offset..offset + sample_floats * 4]
-                .chunks_exact(4)
-                .map(|b| {
-                    let value = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                    if needs_unit_rescale {
-                        value * 2.0 - 1.0
-                    } else {
-                        value
-                    }
-                })
-                .collect();
-            offset += sample_floats * 4;
+            let raw: Vec<f32> = if value_bytes == 1 {
+                bytes[offset..offset + sample_values]
+                    .iter()
+                    .copied()
+                    .map(batlab_core::decode_u8)
+                    .collect()
+            } else {
+                bytes[offset..offset + sample_values * 4]
+                    .chunks_exact(4)
+                    .map(|b| {
+                        let value = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                        if needs_unit_rescale {
+                            value * 2.0 - 1.0
+                        } else {
+                            value
+                        }
+                    })
+                    .collect()
+            };
+            offset += sample_values * value_bytes;
 
             // Rescale to the model's output dimensions if they differ.
-            let target = if (width, height, channels) == output_size {
+            let target = if geometry_matches {
                 raw
             } else {
                 let image = raw_floats_to_dynamic_image(&raw, width, height, channels)?;
                 image_to_tensor(&image, output_size)
             };
-            dataset.push(ImageSample { target });
+            floats.push(ImageSample { target });
         }
     }
 
-    Ok(Some(dataset))
+    if !eight_bit.is_empty() {
+        return Ok(Some(Dataset {
+            payload: DatasetPayload::Bytes(eight_bit),
+            sample_len: model_sample_len,
+        }));
+    }
+    Ok(Some(Dataset::from_samples(floats, model_sample_len)))
 }
 
 /// Decode a flat `[-1, 1]` f32 slice back into a [`DynamicImage`] for rescaling.
@@ -3622,8 +3730,12 @@ fn write_tensor_png(tensor: &[f32], dims: (u32, u32, u32), path: &Path) -> Resul
 /// Diffusion's forward process `x_t = sqrt(a_bar)*x_0 + sqrt(1-a_bar)*eps`
 /// assumes a zero-centered `x_0`; a `[0, 1]` encoding leaves a mean bias of
 /// `0.5*sqrt(a_bar)` at every timestep while the sampler starts from N(0, 1).
+///
+/// Delegates rather than restates: the same widening is applied by the dataset
+/// decode shader, and a second copy of the expression here would be a second
+/// thing to keep in step.
 fn from_u8(value: u8) -> f32 {
-    value as f32 / 127.5 - 1.0
+    batlab_core::decode_u8(value)
 }
 
 /// Inverse of [`from_u8`].
@@ -3804,6 +3916,25 @@ mod tests {
             for &v in sample {
                 file.write_all(&v.to_le_bytes()).unwrap();
             }
+        }
+    }
+
+    /// A BATRAW3 file: the same header, an 8-bit payload.
+    fn write_batraw3(
+        path: &std::path::Path,
+        count: u32,
+        width: u32,
+        height: u32,
+        channels: u32,
+        samples: &[Vec<u8>],
+    ) {
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(RAW_DATASET_MAGIC_BYTES).unwrap();
+        for v in [count, width, height, channels] {
+            file.write_all(&v.to_le_bytes()).unwrap();
+        }
+        for sample in samples {
+            file.write_all(sample).unwrap();
         }
     }
 
@@ -4090,7 +4221,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&out);
         assert_eq!(dataset.len(), 1);
-        for (a, b) in dataset[0].target.iter().zip(sample.iter()) {
+        for (a, b) in dataset.sample(0).iter().zip(sample.iter()) {
             assert!((a - b).abs() < 1e-6, "value mismatch: {a} vs {b}");
         }
     }
@@ -4108,7 +4239,7 @@ mod tests {
 
         let _ = std::fs::remove_file(&out);
         assert_eq!(dataset.len(), 1);
-        for (a, b) in dataset[0].target.iter().zip(sample.iter()) {
+        for (a, b) in dataset.sample(0).iter().zip(sample.iter()) {
             assert!((a - b).abs() < 1e-6, "value mismatch: {a} vs {b}");
         }
     }
@@ -4138,7 +4269,7 @@ mod tests {
         let _ = std::fs::remove_file(&raw);
 
         let png = tmp_path("rgb_png_path.png");
-        write_tensor_png(&dataset[0].target, (2, 2, 3), &png).expect("png should be written");
+        write_tensor_png(&dataset.sample(0), (2, 2, 3), &png).expect("png should be written");
         let decoded = image::open(&png).expect("png should decode").to_rgb8();
         let _ = std::fs::remove_file(&png);
 
@@ -4169,9 +4300,117 @@ mod tests {
 
         let _ = std::fs::remove_file(&out);
         assert_eq!(dataset.len(), 1);
-        for (got, want) in dataset[0].target.iter().zip(expected.iter()) {
+        for (got, want) in dataset.sample(0).iter().zip(expected.iter()) {
             assert!((got - want).abs() < 1e-6, "value mismatch: {got} vs {want}");
         }
+    }
+
+    /// BATRAW3 is a **lossless** re-encoding, and this is the proof the claim
+    /// rests on.
+    ///
+    /// The two files hold the same images: one as the f32 values the old
+    /// converter wrote, one as the bytes those values came from. Decoded, they
+    /// must be equal **bit for bit** — not close. Anything less and "a quarter
+    /// of the size, at no cost" would be a quarter of the size at a cost nobody
+    /// could see: a systematic shift of the whole corpus, invisible in a loss
+    /// curve and impossible to attribute later.
+    ///
+    /// (The GPU side of the same equality is
+    /// `the_gpu_decode_agrees_with_the_cpu_one` in `training/dataset.rs` — the
+    /// widening happens there for training, and here for the probe.)
+    #[test]
+    fn an_8_bit_file_decodes_to_the_same_bits_as_the_f32_one_it_replaces() {
+        // Sixteen bytes spanning the range, including both ends and mid-grey.
+        let source: Vec<u8> = vec![0, 1, 2, 3, 63, 64, 65, 127, 128, 129, 191, 200, 252, 253, 254, 255];
+        let as_floats: Vec<f32> = source.iter().copied().map(from_u8).collect();
+
+        let old = tmp_path("lossless_f32.batraw");
+        let new = tmp_path("lossless_u8.batraw");
+        write_batraw(&old, 1, 4, 4, 1, &[as_floats.clone()]);
+        write_batraw3(&new, 1, 4, 4, 1, &[source.clone()]);
+
+        let from_old = try_load_raw_dataset(&old, (4, 4, 1)).unwrap().unwrap();
+        let from_new = try_load_raw_dataset(&new, (4, 4, 1)).unwrap().unwrap();
+
+        // The reason for all of the above: same images, a quarter of the
+        // payload. Measured on the files, header excluded.
+        let header = 24;
+        let old_payload = std::fs::metadata(&old).unwrap().len() - header;
+        let new_payload = std::fs::metadata(&new).unwrap().len() - header;
+        assert_eq!(old_payload, new_payload * 4);
+        let _ = std::fs::remove_file(&old);
+        let _ = std::fs::remove_file(&new);
+
+        assert_eq!(from_old.len(), 1);
+        assert_eq!(from_new.len(), 1);
+        assert_eq!(
+            from_new.sample(0).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            from_old.sample(0).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the 8-bit file decoded to different bits than the f32 file it replaces"
+        );
+    }
+
+    /// An 8-bit file whose geometry matches must stay 8-bit: widening it on the
+    /// host would give the right pixels and throw away the entire point.
+    #[test]
+    fn a_matching_8_bit_file_reaches_the_gpu_as_bytes() {
+        let out = tmp_path("stays_bytes.batraw");
+        write_batraw3(&out, 2, 2, 2, 1, &[vec![0, 64, 128, 255], vec![255, 128, 64, 0]]);
+        let dataset = try_load_raw_dataset(&out, (2, 2, 1)).unwrap().unwrap();
+        let _ = std::fs::remove_file(&out);
+
+        assert!(
+            matches!(dataset.payload, DatasetPayload::Bytes(_)),
+            "a matching 8-bit dataset was widened on the host"
+        );
+        assert_eq!(dataset.len(), 2);
+        assert_eq!(dataset.sample(1), vec![1.0, from_u8(128), from_u8(64), -1.0]);
+    }
+
+    /// A geometry that does not match still has to be resampled, and that
+    /// happens on the host — so the payload falls back to f32 rather than
+    /// pretending the bytes are usable as they lie.
+    #[test]
+    fn a_mismatched_8_bit_file_falls_back_to_the_float_path() {
+        let out = tmp_path("resampled_bytes.batraw");
+        write_batraw3(&out, 1, 4, 4, 1, &[vec![128u8; 16]]);
+        let dataset = try_load_raw_dataset(&out, (2, 2, 1)).unwrap().unwrap();
+        let _ = std::fs::remove_file(&out);
+
+        assert!(
+            matches!(dataset.payload, DatasetPayload::Floats(_)),
+            "a resampled dataset must not claim to be 8-bit"
+        );
+        assert_eq!(dataset.len(), 1);
+        assert_eq!(dataset.sample(0).len(), 4);
+    }
+
+    /// The header reader has to report the payload width, because the resource
+    /// inventory multiplies by it. Reading a BATRAW3 file as f32 would predict
+    /// four times the residency it will actually get.
+    #[test]
+    fn the_header_reports_how_wide_a_value_is() {
+        let f32_file = tmp_path("header_f32.batraw");
+        let u8_file = tmp_path("header_u8.batraw");
+        write_batraw(&f32_file, 1, 2, 2, 3, &[vec![0.0; 12]]);
+        write_batraw3(&u8_file, 1, 2, 2, 3, &[vec![0u8; 12]]);
+
+        assert_eq!(read_batraw_header(&f32_file).unwrap(), (1, 2, 2, 3, 4));
+        assert_eq!(read_batraw_header(&u8_file).unwrap(), (1, 2, 2, 3, 1));
+        let _ = std::fs::remove_file(&f32_file);
+        let _ = std::fs::remove_file(&u8_file);
+    }
+
+    /// A truncated 8-bit file must be refused, not read short. The size check is
+    /// the only thing standing between a partial download and a dataset that
+    /// silently holds fewer images than its header claims.
+    #[test]
+    fn a_truncated_8_bit_file_is_refused() {
+        let out = tmp_path("truncated.batraw");
+        write_batraw3(&out, 4, 2, 2, 1, &[vec![0u8; 4], vec![0u8; 4]]);
+        let result = try_load_raw_dataset(&out, (2, 2, 1));
+        let _ = std::fs::remove_file(&out);
+        assert!(result.is_err(), "a short 8-bit payload was accepted");
     }
 
     /// Finding #4 — the encode/decode pair must be symmetric, so a sample that

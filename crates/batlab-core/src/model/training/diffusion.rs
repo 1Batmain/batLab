@@ -1030,4 +1030,101 @@ mod tests {
             assert_eq!(sorted, (0..sample_count).collect::<Vec<_>>());
         }
     }
+
+    /// Training on an 8-bit dataset must be the SAME run as training on the f32
+    /// dataset converted from it — same losses, step for step, bit for bit.
+    ///
+    /// This is the claim BATRAW3 lives or dies on. A quarter of the traffic is
+    /// worth nothing if it also changes the numbers, and "changes the numbers"
+    /// is not something a loss curve reveals: a systematically shifted corpus
+    /// still trains, still converges, and still looks entirely normal. So the
+    /// two paths are run side by side against each other rather than each
+    /// against a plausibility check.
+    ///
+    /// It closes the loop the unit tests leave open. `dataset.rs` proves the GPU
+    /// widening equals `decode_u8`; this proves that equality survives the
+    /// prepass, the forward, the loss and the optimiser — that nothing else in
+    /// the step reads the payload's encoding.
+    ///
+    /// (Verified at scale outside the suite as well: 40 steps of
+    /// `Color_Diffusion_XL` on `cifar10_rgb.batraw` in both encodings print the
+    /// same three losses to six decimals — `docs/reports/CUSTOM_DATASET.md` §3.)
+    #[test]
+    fn an_8_bit_dataset_trains_exactly_like_the_f32_one_it_replaces() {
+        pollster::block_on(async {
+            let gpu = Arc::new(GpuContext::new_headless().await);
+            const BATCH: usize = 4;
+            let sample_len = 4 * 4;
+
+            // The bytes are the source of both datasets, which is the honest
+            // shape of the question: a real corpus is 8-bit and the f32 file is
+            // the derived one, not the other way round.
+            let bytes: Vec<u8> = (0..16 * sample_len)
+                .map(|i| ((i * 37 + 11) % 256) as u8)
+                .collect();
+            let floats: Vec<Vec<f32>> = bytes
+                .chunks(sample_len)
+                .map(|s| s.iter().copied().map(super::super::decode_u8).collect())
+                .collect();
+
+            let build = || {
+                let gpu = gpu.clone();
+                async move {
+                    let mut model =
+                        Model::new_training(gpu, 0.01, BATCH as u32, LossMethod::MeanSquared).await;
+                    model
+                        .add_layer(LayerTypes::Convolution(
+                            crate::model::layer_types::ConvolutionType::new(
+                                Dim3::new((4, 4, 3)),
+                                1,
+                                Dim3::new((3, 3, 3)),
+                                1,
+                                crate::model::PaddingMode::Same,
+                            ),
+                        ))
+                        .unwrap();
+                    model.build().unwrap();
+                    model
+                }
+            };
+            let mut from_bytes = build().await;
+            let mut from_floats = build().await;
+
+            let mut dataset_bytes = GpuDataset::from_payload(
+                gpu.as_ref(),
+                super::super::DatasetPayload::Bytes(bytes),
+                sample_len,
+            )
+            .unwrap();
+            let mut dataset_floats =
+                GpuDataset::from_samples(gpu.as_ref(), floats, sample_len).unwrap();
+
+            let schedule = LinearNoiseSchedule::new_linear(64, 1e-4, 0.02);
+            let mut task_bytes = DiffusionTask::new(schedule.clone());
+            let mut task_floats = DiffusionTask::new(schedule);
+            let seed = 0xC0FFEE_u64;
+
+            for step in 0..8 {
+                let a = task_bytes
+                    .train_step_report_batch(&mut from_bytes, &mut dataset_bytes, step, BATCH, seed)
+                    .unwrap()
+                    .expect("a reported step returns its loss");
+                let b = task_floats
+                    .train_step_report_batch(
+                        &mut from_floats,
+                        &mut dataset_floats,
+                        step,
+                        BATCH,
+                        seed,
+                    )
+                    .unwrap()
+                    .expect("a reported step returns its loss");
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step}: the 8-bit run reported {a}, the f32 run {b}"
+                );
+            }
+        });
+    }
 }
