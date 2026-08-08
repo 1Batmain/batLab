@@ -66,6 +66,9 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   elle qui sert à générer ; `--resume` et `--checkpoint-every` pour qu'un run long
   soit reprenable. Le warmup retenu (semis sur les poids + rampe) et pourquoi la
   correction de biais a été écartée ; `BBCKPT3` ; le contrat observable des flags.
+  Campagne §5 : **NO-GO à 1500 pas** — la moyenne est à 4,9 % de l'itéré et déplace
+  la sortie sur 16 seeds sur 16, mais aux deux tiers par un simple gain de contraste,
+  et les indicateurs se contredisent. L'échelle visée est ≥ 10 000 pas.
 - **[LOSS_WEIGHTING.md](LOSS_WEIGHTING.md)** — pondérer la loss par tirage biaisé des
   timesteps. Verdict NO-GO, et pourquoi γ=5 ne redistribue rien sur ce schedule.
 - **[PERF_GROUP_NORM.md](PERF_GROUP_NORM.md)** — optimisation de `group_norm`.
