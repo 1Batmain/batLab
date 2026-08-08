@@ -88,6 +88,10 @@ fn walk_the_builder(app: &mut App) -> HashSet<Screen> {
     step(app, &mut visited, KeyCode::Enter, Screen::RenameModel);
     step(app, &mut visited, KeyCode::Esc, Screen::ModelActions);
 
+    select_action(app, ModelAction::Duplicate);
+    step(app, &mut visited, KeyCode::Enter, Screen::DuplicateModel);
+    step(app, &mut visited, KeyCode::Esc, Screen::ModelActions);
+
     select_action(app, ModelAction::Delete);
     step(app, &mut visited, KeyCode::Enter, Screen::DeleteConfirm);
     step(app, &mut visited, KeyCode::Esc, Screen::ModelActions);
@@ -155,6 +159,7 @@ fn esc_parent(screen: Screen) -> Option<Screen> {
         Screen::TemplateSelector => Some(Screen::ModelList),
         Screen::ModelActions => Some(Screen::ModelList),
         Screen::RenameModel => Some(Screen::ModelActions),
+        Screen::DuplicateModel => Some(Screen::ModelActions),
         Screen::DeleteConfirm => Some(Screen::ModelActions),
         Screen::WeightSelector => Some(Screen::ModelActions),
         Screen::InputSize => Some(Screen::LayerBuilder),
@@ -362,7 +367,11 @@ fn right_never_creates_anything() {
         let name = app.active_model_name.clone().expect("model");
         (temp, app, name)
     };
-    for action in [ModelAction::Rename, ModelAction::Delete] {
+    for action in [
+        ModelAction::Rename,
+        ModelAction::Duplicate,
+        ModelAction::Delete,
+    ] {
         app.screen = Screen::ModelActions;
         app.model_actions.selected = action.index();
         handle_key(&mut app, KeyCode::Right);

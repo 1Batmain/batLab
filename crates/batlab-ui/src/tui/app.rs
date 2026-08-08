@@ -30,6 +30,7 @@ pub enum Screen {
     TemplateSelector,
     ModelActions,
     RenameModel,
+    DuplicateModel,
     DeleteConfirm,
     WeightSelector,
     InputSize,
@@ -107,6 +108,7 @@ impl Screen {
             | Screen::PerpetualParams => Some(PathStep::Parameters),
             Screen::Monitor => Some(PathStep::Run),
             Screen::RenameModel
+            | Screen::DuplicateModel
             | Screen::DeleteConfirm
             | Screen::InputSize
             | Screen::LayerBuilder
@@ -135,11 +137,12 @@ impl Screen {
     /// Every screen there is. A test walks the whole flow and asserts it visited
     /// all of these, so a new variant stays failing until something actually
     /// routes to it.
-    pub const ALL: [Screen; 14] = [
+    pub const ALL: [Screen; 15] = [
         Screen::ModelList,
         Screen::TemplateSelector,
         Screen::ModelActions,
         Screen::RenameModel,
+        Screen::DuplicateModel,
         Screen::DeleteConfirm,
         Screen::WeightSelector,
         Screen::InputSize,
@@ -189,7 +192,7 @@ impl ModelListState {
 }
 
 /// What can be done to the model that was just picked. The three run modes and
-/// the two manager operations, in one menu — the model is chosen first, the
+/// the three manager operations, in one menu — the model is chosen first, the
 /// action second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelAction {
@@ -197,12 +200,23 @@ pub enum ModelAction {
     Infer,
     Perpetual,
     Rename,
+    Duplicate,
     Delete,
 }
 
 /// The actions, in the order they are drawn. The key handler bounds its cursor
 /// on this list, so adding an action here is enough to make it selectable.
-pub const MODEL_ACTIONS: [&str; 5] = ["Train", "Infer", "Perpetual", "Rename", "Delete"];
+///
+/// `Delete` stays last: the cursor arriving there has to be a deliberate walk
+/// past everything else.
+pub const MODEL_ACTIONS: [&str; 6] = [
+    "Train",
+    "Infer",
+    "Perpetual",
+    "Rename",
+    "Duplicate",
+    "Delete",
+];
 
 impl ModelAction {
     pub const fn index(self) -> usize {
@@ -211,7 +225,8 @@ impl ModelAction {
             ModelAction::Infer => 1,
             ModelAction::Perpetual => 2,
             ModelAction::Rename => 3,
-            ModelAction::Delete => 4,
+            ModelAction::Duplicate => 4,
+            ModelAction::Delete => 5,
         }
     }
 
@@ -221,7 +236,8 @@ impl ModelAction {
             1 => Some(ModelAction::Infer),
             2 => Some(ModelAction::Perpetual),
             3 => Some(ModelAction::Rename),
-            4 => Some(ModelAction::Delete),
+            4 => Some(ModelAction::Duplicate),
+            5 => Some(ModelAction::Delete),
             _ => None,
         }
     }
@@ -243,6 +259,48 @@ pub struct ModelActionsState {
 pub struct RenameModelState {
     pub input: String,
     pub error: Option<String>,
+}
+
+/// What a duplicate carries, in the order the two rows are drawn.
+///
+/// Weights first, and selected by default: duplicating exists so a foundation
+/// model can be fine-tuned under another name, and a fine-tune with no weights
+/// to start from is a new model, not a copy.
+pub const DUPLICATE_CONTENT_CHOICES: [&str; 2] = [
+    "config + weights — fine-tune the copy, the original keeps its own",
+    "config only     — same architecture, fresh weights",
+];
+
+pub struct DuplicateModelState {
+    /// The copy's name. Opens on [`Storage::suggest_copy_name`], so the common
+    /// case is Enter.
+    pub input: String,
+    /// Cursor over [`DUPLICATE_CONTENT_CHOICES`].
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+impl DuplicateModelState {
+    pub fn copies_weights(&self) -> bool {
+        self.selected == 0
+    }
+}
+
+/// What the model list says a duplication just did.
+///
+/// It names the files, and it does not round up: asking for weights from a
+/// model that has none copies the config alone, and the line says *that* rather
+/// than leaving the user to discover an empty `pretrained_weights/` two screens
+/// later.
+pub fn duplicate_status(from: &str, to: &str, outcome: &storage::DuplicateOutcome) -> String {
+    if outcome.copied_weights.is_empty() {
+        format!("Duplicated '{from}' → '{to}' — config only, no weights copied")
+    } else {
+        format!(
+            "Duplicated '{from}' → '{to}' — config + {}",
+            outcome.copied_weights.join(", ")
+        )
+    }
 }
 
 /// Deleting is irreversible, so the confirmation is not a keystroke: the model's
@@ -553,6 +611,7 @@ pub struct App {
     pub template_selector: TemplateSelectorState,
     pub model_actions: ModelActionsState,
     pub rename_model: RenameModelState,
+    pub duplicate_model: DuplicateModelState,
     pub delete_confirm: DeleteConfirmState,
     pub weight_selector: WeightSelectorState,
     pub input_size: InputSizeState,
@@ -730,6 +789,11 @@ impl App {
             },
             rename_model: RenameModelState {
                 input: String::new(),
+                error: None,
+            },
+            duplicate_model: DuplicateModelState {
+                input: String::new(),
+                selected: 0,
                 error: None,
             },
             delete_confirm: DeleteConfirmState {
@@ -2058,6 +2122,16 @@ impl App {
                 self.rename_model.error = None;
                 self.screen = Screen::RenameModel;
             }
+            ModelAction::Duplicate => {
+                self.duplicate_model.input = self.storage.suggest_copy_name(&model_name);
+                // Weights, every time the form opens. The choice is not
+                // remembered between visits: "duplicate to fine-tune" is what
+                // the feature is for, and a leftover "config only" from a
+                // previous visit would silently make a copy with no weights.
+                self.duplicate_model.selected = 0;
+                self.duplicate_model.error = None;
+                self.screen = Screen::DuplicateModel;
+            }
             ModelAction::Delete => {
                 self.delete_confirm.typed.clear();
                 self.delete_confirm.error = None;
@@ -2096,6 +2170,40 @@ impl App {
                 self.screen = Screen::ModelList;
             }
             Err(err) => self.rename_model.error = Some(err.to_string()),
+        }
+    }
+
+    /// Copies the open model under a new name, then returns to the list with the
+    /// **copy** selected — the copy is the model the user now wants to work on,
+    /// which is the whole reason for having duplicated.
+    ///
+    /// The original is left open in `active_model_name`: nothing about it
+    /// changed, so nothing about the session's grip on it needs to.
+    pub fn finish_duplicate(&mut self) {
+        let Some(current) = self.active_model_name.clone() else {
+            self.duplicate_model.error = Some("No model selected.".to_string());
+            return;
+        };
+        if let Err(err) = self.guard_model_not_running(&current) {
+            self.duplicate_model.error = Some(err);
+            return;
+        }
+        let target = self.duplicate_model.input.trim().to_string();
+        let weights = if self.duplicate_model.copies_weights() {
+            storage::WeightsToCopy::Newest
+        } else {
+            storage::WeightsToCopy::None
+        };
+        match self.storage.duplicate_model(&current, &target, weights) {
+            Ok(outcome) => {
+                self.duplicate_model.error = None;
+                self.refresh_model_list();
+                self.select_model_in_list(&target);
+                self.model_list.error = None;
+                self.model_list.status = Some(duplicate_status(&current, &target, &outcome));
+                self.screen = Screen::ModelList;
+            }
+            Err(err) => self.duplicate_model.error = Some(err.to_string()),
         }
     }
 
@@ -2599,6 +2707,18 @@ impl App {
         self.rename_model.error = None;
     }
 
+    pub fn handle_char_duplicate(&mut self, c: char) {
+        if !c.is_control() {
+            self.duplicate_model.input.push(c);
+            self.duplicate_model.error = None;
+        }
+    }
+
+    pub fn handle_backspace_duplicate(&mut self) {
+        self.duplicate_model.input.pop();
+        self.duplicate_model.error = None;
+    }
+
     pub fn handle_char_delete_confirm(&mut self, c: char) {
         if !c.is_control() {
             self.delete_confirm.typed.push(c);
@@ -2615,12 +2735,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, InferenceConfig, LayerKind, LossMethod, LossWeighting, MIN_RENOISE_DEPTH, ModelAction,
-        ModelConfig, OptimizerKind, PerpetualRegime, RunConfig, RunMode, Screen,
-        TRAINING_DATASET_FIELD, TRAINING_EMA_FIELD, TrainingConfig, TrainingControlCommand,
-        WeightInit, parse_ema_decay_field,
+        App, DUPLICATE_CONTENT_CHOICES, InferenceConfig, LayerKind, LossMethod, LossWeighting,
+        MIN_RENOISE_DEPTH, ModelAction, ModelConfig, OptimizerKind, PerpetualRegime, RunConfig,
+        RunMode, Screen, TRAINING_DATASET_FIELD, TRAINING_EMA_FIELD, TrainingConfig,
+        TrainingControlCommand, WeightInit, parse_ema_decay_field, storage,
     };
     use crate::storage::TempRoot;
+    use crate::tui::events::handle_key;
+    use crossterm::event::KeyCode;
     use batlab_core::config::{built_in_templates, compute_inferred_input};
 
     /// Every app under test lives on its own throwaway storage root. The
@@ -3293,7 +3415,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The manager: rename and delete, as the UI drives them
+    // The manager: rename, duplicate and delete, as the UI drives them
     // -----------------------------------------------------------------------
 
     /// Puts the app on the action menu of a freshly created template model.
@@ -3403,6 +3525,152 @@ mod tests {
         assert!(app.model_list.status.is_some(), "the delete went unreported");
     }
 
+    /// Writes weights into a model, the way a finished run leaves them: a dated
+    /// run with `latest.ckpt` linked onto it.
+    fn weights_on_disk(app: &App, model: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = app.storage.model_weights_dir(model).expect("weights dir");
+        let dated = dir.join("run-2026-08-08_1120.ckpt");
+        std::fs::write(&dated, bytes).expect("write");
+        storage::point_latest_at(&dated).expect("latest link");
+        dated
+    }
+
+    /// The flow the feature exists for: open the foundation, duplicate it with
+    /// its weights, and end up on the *copy* — with the original untouched.
+    #[test]
+    fn duplicating_lands_on_the_copy_and_leaves_the_original_alone() {
+        let (_temp, mut app, original) = app_on_a_model("ui-duplicate");
+        let source_weights = weights_on_disk(&app, &original, b"the foundation's weights");
+
+        app.model_actions.selected = ModelAction::Duplicate.index();
+        app.finish_model_actions();
+        assert_eq!(app.screen, Screen::DuplicateModel);
+        assert_eq!(
+            app.duplicate_model.input,
+            format!("{original}-copy"),
+            "the form should open on a free name, so the common case is one keystroke"
+        );
+        assert!(
+            app.duplicate_model.copies_weights(),
+            "weights are the default — a fine-tune with no weights is a new model"
+        );
+
+        app.duplicate_model.input = "Elephants_XL".to_string();
+        app.finish_duplicate();
+
+        assert_eq!(app.screen, Screen::ModelList);
+        assert_eq!(
+            app.model_list.selected_model().map(|model| model.name.as_str()),
+            Some("Elephants_XL"),
+            "the cursor must land on the copy — it is the model to work on now"
+        );
+        let status = app.model_list.status.clone().expect("the copy went unreported");
+        assert!(
+            status.contains("run-2026-08-08_1120.ckpt") && status.contains("latest.ckpt"),
+            "the list must say what was copied, got: {status}"
+        );
+
+        // The copy is a model of its own, and it carries the weights.
+        assert_eq!(
+            app.storage
+                .load_model_config_for_model("Elephants_XL")
+                .expect("the copy's config should load")
+                .model_name
+                .as_deref(),
+            Some("Elephants_XL")
+        );
+        let copied = app
+            .storage
+            .list_model_checkpoints("Elephants_XL")
+            .expect("listing");
+        assert_eq!(copied.len(), 2, "expected the dated run and latest.ckpt");
+
+        // And the foundation is exactly where it was.
+        assert!(app.storage.models_root().join(&original).is_dir());
+        assert_eq!(
+            std::fs::read(&source_weights).expect("read"),
+            b"the foundation's weights"
+        );
+        assert_eq!(
+            app.storage
+                .list_model_checkpoints(&original)
+                .expect("listing")
+                .len(),
+            2,
+            "the original's weights directory changed"
+        );
+    }
+
+    /// The other row of the form: same architecture, no weights — and the list
+    /// says so instead of letting an empty `pretrained_weights/` be a surprise.
+    #[test]
+    fn a_duplicate_can_be_asked_for_without_the_weights() {
+        let (_temp, mut app, original) = app_on_a_model("ui-duplicate-config-only");
+        weights_on_disk(&app, &original, b"weights that stay behind");
+
+        app.model_actions.selected = ModelAction::Duplicate.index();
+        app.finish_model_actions();
+        handle_key(&mut app, KeyCode::Down);
+        assert!(!app.duplicate_model.copies_weights());
+        app.duplicate_model.input = "Fresh_XL".to_string();
+        app.finish_duplicate();
+
+        assert_eq!(app.screen, Screen::ModelList);
+        assert!(
+            app.storage
+                .list_model_checkpoints("Fresh_XL")
+                .expect("listing")
+                .is_empty()
+        );
+        let status = app.model_list.status.clone().expect("unreported");
+        assert!(
+            status.contains("config only"),
+            "the list must say no weights were copied, got: {status}"
+        );
+
+        // `↑` comes back to the default; the cursor cannot run off either end.
+        app.model_actions.selected = ModelAction::Duplicate.index();
+        app.finish_model_actions();
+        handle_key(&mut app, KeyCode::Up);
+        assert!(app.duplicate_model.copies_weights());
+        handle_key(&mut app, KeyCode::Up);
+        assert_eq!(app.duplicate_model.selected, 0);
+        handle_key(&mut app, KeyCode::Down);
+        handle_key(&mut app, KeyCode::Down);
+        assert_eq!(app.duplicate_model.selected, DUPLICATE_CONTENT_CHOICES.len() - 1);
+    }
+
+    /// A refused name leaves the form up with a reason, and writes nothing.
+    #[test]
+    fn duplicating_under_an_unusable_name_changes_nothing() {
+        let (_temp, mut app, original) = app_on_a_model("ui-duplicate-refusals");
+        app.model_actions.selected = ModelAction::Duplicate.index();
+        app.finish_model_actions();
+
+        for bad in ["", "../evil", "a/b", ".hidden", &original] {
+            app.duplicate_model.input = bad.to_string();
+            app.finish_duplicate();
+
+            assert_eq!(
+                app.screen,
+                Screen::DuplicateModel,
+                "duplicate to {bad:?} left the form"
+            );
+            assert!(
+                app.duplicate_model.error.is_some(),
+                "duplicate to {bad:?} was silent"
+            );
+        }
+        let models: Vec<String> = app
+            .storage
+            .list_models()
+            .expect("listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(models, vec![original], "a refused duplicate created a model");
+    }
+
     /// Both manager operations refuse a model this process is running. The guard
     /// is TUI state and stops at the process boundary — see
     /// [`App::model_run_in_progress`].
@@ -3412,7 +3680,11 @@ mod tests {
         app.running_model = Some(original.clone());
         app.monitor.done = false;
 
-        for action in [ModelAction::Rename, ModelAction::Delete] {
+        for action in [
+            ModelAction::Rename,
+            ModelAction::Duplicate,
+            ModelAction::Delete,
+        ] {
             app.model_actions.selected = action.index();
             app.finish_model_actions();
 
