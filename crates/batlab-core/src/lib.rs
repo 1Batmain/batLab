@@ -43,7 +43,8 @@ pub use model::training::{
     reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
 };
 pub use model::{
-    ActivationMethod, ActivationType, AttentionType, AdamHyperparameters, ConcatType, ConvolutionType, Dim3,
+    ActivationMethod, ActivationType, AttentionType, AdamHyperparameters, CheckpointLoad,
+    CheckpointWeights, ConcatType, ConvolutionType, Dim3, EmaConfig,
     FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, ModelError, OptimizerKind,
     PaddingMode, UpsampleConvType, WeightInit,
 };

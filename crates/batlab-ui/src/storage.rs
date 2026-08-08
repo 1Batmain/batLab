@@ -911,6 +911,7 @@ mod tests {
             optimizer: Default::default(),
             weight_init: Default::default(),
             loss_weighting: Default::default(),
+            ema_decay: None,
         });
         storage
             .write_model_config("before", &config)

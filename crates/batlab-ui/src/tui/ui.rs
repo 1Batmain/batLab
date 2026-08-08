@@ -1160,7 +1160,12 @@ fn random_weights_value(app: &App) -> String {
 }
 
 fn draw_training_params(f: &mut Frame, app: &App, area: Rect) {
-    let mut values: Vec<String> = app.training_params.fields[..3].to_vec();
+    // The typed rows are `fields[..4]`; the dataset trails behind them with no
+    // row of its own, and the toggle's value is derived rather than stored.
+    let mut values: Vec<String> = app.training_params.fields[..4].to_vec();
+    if values[3].trim().is_empty() {
+        values[3] = "off".to_string();
+    }
     values.push(random_weights_value(app));
     draw_form_screen(
         f,
