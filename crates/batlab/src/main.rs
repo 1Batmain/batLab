@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use batlab_ui::storage;
 use batlab_ui::tui::{
@@ -78,6 +78,19 @@ Weight averaging (EMA):
                     checkpoint carries one; this is the other arm of the
                     comparison. Both paths print which set they loaded.
 
+Where a run's weights land:
+  Every run writes its OWN file, `run-<YYYY-MM-DD_HHMM>.ckpt`, and then points
+  `latest.ckpt` at it (a hard link beside it — same bytes, no second copy).
+  Nothing overwrites the previous run any more: yesterday's weights are still
+  in `pretrained_weights/` this morning, under the date they were trained.
+  The stamp is local time and zero-padded, so sorting those names by name IS
+  sorting them by run; a second run in the same minute gets an `_02` suffix.
+  --out <ckpt>      write exactly there, exactly under that name: no date, no
+                    `latest.ckpt` beside it. Naming the file is the way to opt
+                    out of the convention. WITHOUT it a headless run writes to
+                    scratch — `$TMPDIR/batlab-<model>/run-<stamp>.ckpt` — and
+                    never into the model's saved weights.
+
 Resuming and partial checkpoints:
   --resume <ckpt>   continue a run from <ckpt>: weights, Adam moments, the
                     global step counter t, and the EMA if the file has one.
@@ -90,8 +103,11 @@ Resuming and partial checkpoints:
                     `<out stem>.partial.ckpt` — ONE file, rotated, written via
                     a temp file and an atomic rename so a kill mid-write can
                     never leave a truncated .ckpt. It is a normal checkpoint:
-                    --resume and the TUI weight selector both see it. Default:
-                    only at the end of the run, as before.
+                    --resume and the TUI weight selector both see it. Unless
+                    --out named the file, `latest.ckpt` follows each rotation,
+                    so a run killed at hour nine leaves its partial as the
+                    model's newest weights. Default: only at the end of the
+                    run, as before.
 
 Perpetual notes:
   --regime          wander (errance) | breathe (respiration) | flux. French
@@ -545,12 +561,25 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
 
     let dataset_path = flag("--dataset")
         .ok_or_else(|| "--dataset <path to .batraw or image dir> is required".to_string())?;
-    let checkpoint_path = flag("--out").unwrap_or_else(|| {
-        std::env::temp_dir()
-            .join(format!("{model_name}_headless.ckpt"))
-            .to_string_lossy()
-            .to_string()
-    });
+    // `--out` is the user's own filing: the file is written exactly where and
+    // exactly as named, with no dating and no `latest.ckpt` dropped beside it.
+    // Without it the run still writes to *scratch* — never into the model's
+    // saved weights — but under the dated name every run now carries, in a
+    // per-model scratch directory so two models cannot collide on one stamp.
+    let explicit_out = flag("--out");
+    let (checkpoint_path, maintain_latest) = match explicit_out {
+        Some(path) => (PathBuf::from(path), false),
+        None => {
+            let dir = headless_scratch_dir(&model_name);
+            std::fs::create_dir_all(&dir).map_err(|err| {
+                format!("failed to create scratch directory {}: {err}", dir.display())
+            })?;
+            (
+                storage::new_run_checkpoint_path_in(&dir, SystemTime::now()),
+                true,
+            )
+        }
+    };
 
     let train_cfg = TrainingConfig {
         lr,
@@ -561,7 +590,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             RunMode::Train(existing) => existing.loss.clone(),
             RunMode::Infer | RunMode::Perpetual(_) => tui::LossMethod::MeanSquared,
         },
-        checkpoint_path: Some(checkpoint_path),
+        checkpoint_path: Some(checkpoint_path.to_string_lossy().to_string()),
         // Fixes #1 and #4 changed the convolution operator and the data range,
         // so any pre-existing checkpoint is meaningless. Always start fresh —
         // unless `--resume` names a file, which is the explicit opt-in.
@@ -579,7 +608,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
     println!(
         "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
          optimizer={}, init={}, loss-weighting={}, ema={}, resume={}, checkpoint-every={}, \
-         dataset={}",
+         out={}, dataset={}",
         optimizer.label(),
         weight_init.label(),
         loss_weighting.label(),
@@ -595,6 +624,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             Some(steps) => steps.to_string(),
             None => "final only".to_string(),
         },
+        checkpoint_path.display(),
         train_cfg.dataset_path
     );
 
@@ -605,6 +635,9 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             let options = RunOptions {
                 resume_from,
                 checkpoint_every,
+                // The path above is already the run's own; nothing to redirect.
+                write_to: None,
+                maintain_latest,
             };
             if let Err(message) =
                 run_training(config, train_cfg, options, &tx, std::sync::mpsc::channel().1).await
@@ -1261,6 +1294,21 @@ fn run_execution_loop(mut config: ModelConfig) {
         // Both training and perpetual runs are steered while they run; a plain
         // inference has nothing to steer.
         let is_steerable = matches!(&config.run.mode, RunMode::Train(_) | RunMode::Perpetual(_));
+        // Resolved once per run — including once per restart from the monitor,
+        // so a second run of the evening gets a second file rather than
+        // reopening the first one's.
+        let run_write_path = match (&config.run.mode, config.model_name.as_deref()) {
+            (RunMode::Train(_), Some(model_name)) => {
+                match storage::new_run_checkpoint_path(model_name, SystemTime::now()) {
+                    Ok(path) => Some(path),
+                    Err(err) => {
+                        eprintln!("[checkpoint] could not prepare a run checkpoint path: {err}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
         let config_clone = config.clone();
 
         std::thread::spawn(move || {
@@ -1271,14 +1319,18 @@ fn run_execution_loop(mut config: ModelConfig) {
                         // `--resume` and `--checkpoint-every` are DEV/CI flags:
                         // the TUI walks the weight selector for the first and
                         // has `[s]` in the monitor for the second.
-                        run_training(
-                            config_clone,
-                            train_cfg,
-                            RunOptions::default(),
-                            &tx,
-                            control_rx,
-                        )
-                        .await
+                        //
+                        // What the TUI *does* set is where the run writes: its
+                        // own dated file in the model's `pretrained_weights/`,
+                        // never back over the checkpoint the weight selector
+                        // pointed it at. Losing yesterday's weights by training
+                        // again today is exactly the bug this closes.
+                        let options = RunOptions {
+                            write_to: run_write_path.clone(),
+                            maintain_latest: run_write_path.is_some(),
+                            ..RunOptions::default()
+                        };
+                        run_training(config_clone, train_cfg, options, &tx, control_rx).await
                     }
                     RunMode::Perpetual(perpetual_cfg) => {
                         run_perpetual(config_clone, perpetual_cfg, &tx, control_rx).await
@@ -1357,6 +1409,17 @@ async fn build_execution_model(
     Ok((gpu, model))
 }
 
+/// Where `--headless-train` writes when `--out` is absent: a per-model scratch
+/// directory under the system temp dir.
+///
+/// Scratch, and it must stay scratch — a CI run that trained into
+/// `Models/<name>/pretrained_weights/` would quietly become the model's weights.
+/// One directory per model so the dated names, which are only unique per
+/// directory, cannot collide between two models trained in the same minute.
+fn headless_scratch_dir(model_name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("batlab-{model_name}"))
+}
+
 /// What a run does on top of its `TrainingConfig`, and only ever from the
 /// headless entry point.
 ///
@@ -1371,6 +1434,20 @@ struct RunOptions {
     resume_from: Option<PathBuf>,
     /// `--checkpoint-every N`: how often a partial checkpoint is written.
     checkpoint_every: Option<usize>,
+    /// Where this run **writes**, when that is not where it reads.
+    ///
+    /// A run used to write back over the file it continued from, which is how
+    /// an evening of training erased the morning's. The write target is now a
+    /// dated file of the run's own (`run-<stamp>.ckpt`), while
+    /// `TrainingConfig::checkpoint_path` stays what it always was: the file the
+    /// run *loads*. `None` keeps the old behaviour — that is `--out`, where the
+    /// user named the file and nothing may rename it.
+    write_to: Option<PathBuf>,
+    /// Point `latest.ckpt` at every checkpoint this run writes, beside it.
+    ///
+    /// Set exactly when `write_to` is a name batlab chose: `--out` is the
+    /// user's own filing and gets no extra file dropped next to it.
+    maintain_latest: bool,
 }
 
 async fn run_training(
@@ -1404,6 +1481,14 @@ async fn run_training(
             .transpose()
             .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?,
     };
+    // Read here, written there. Everything below that *saves* — the final
+    // checkpoint, the `--checkpoint-every` partials, `[s]` in the monitor — goes
+    // to `write_path`, and the metrics journal follows it, so a run's diagnostics
+    // sit beside the weights that run produced.
+    let write_path = options
+        .write_to
+        .clone()
+        .or_else(|| checkpoint_path.clone());
 
     // `--resume` reads from a file of its own and writes to `--out`, so a
     // resumed run never overwrites the checkpoint it came from unless it is
@@ -1521,7 +1606,7 @@ async fn run_training(
     // temp file when no checkpoint path is configured. Truncated per run so the
     // file always describes the current run only.
     let mut metrics = {
-        let metrics_path = checkpoint_path
+        let metrics_path = write_path
             .as_ref()
             .map(|ckpt| {
                 let stem = ckpt
@@ -1590,7 +1675,8 @@ async fn run_training(
                 &mut current_lr,
                 &mut current_batch_size,
                 &mut total_steps,
-                checkpoint_path.as_deref(),
+                write_path.as_deref(),
+                options.maintain_latest,
                 tx,
             );
             if !channel_open {
@@ -1607,7 +1693,8 @@ async fn run_training(
                         &mut current_lr,
                         &mut current_batch_size,
                         &mut total_steps,
-                        checkpoint_path.as_deref(),
+                        write_path.as_deref(),
+                        options.maintain_latest,
                         tx,
                     );
                     if !channel_open {
@@ -1723,7 +1810,12 @@ async fn run_training(
             && step % every == 0
             && step < total_steps
         {
-            write_partial_checkpoint(&model, checkpoint_path.as_deref(), step);
+            write_partial_checkpoint(
+                &model,
+                write_path.as_deref(),
+                step,
+                options.maintain_latest,
+            );
         }
     }
 
@@ -1758,7 +1850,7 @@ async fn run_training(
         sample_path: Some(sample_path),
     });
 
-    if let Some(path) = checkpoint_path.as_ref() {
+    if let Some(path) = write_path.as_ref() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 format!(
@@ -1770,6 +1862,10 @@ async fn run_training(
         model
             .save_checkpoint(path)
             .map_err(|err| format!("failed to save checkpoint {}: {err}", path.display()))?;
+        println!("[checkpoint] final → {}", path.display());
+        if options.maintain_latest {
+            point_latest_at_reporting(path);
+        }
     }
 
     let _ = tx.send(tui::TrainingEvent::Done);
@@ -1806,7 +1902,12 @@ fn partial_checkpoint_path(checkpoint: &Path) -> PathBuf {
 /// Never fatal: a run does not die because a disk filled up at step 5 000. It
 /// says so on every failure, which is the loudest thing it can do without
 /// throwing the run away.
-fn write_partial_checkpoint(model: &Model<Training>, checkpoint: Option<&Path>, step: usize) {
+fn write_partial_checkpoint(
+    model: &Model<Training>,
+    checkpoint: Option<&Path>,
+    step: usize,
+    maintain_latest: bool,
+) {
     let Some(checkpoint) = checkpoint else {
         eprintln!("[checkpoint] step {step}: no checkpoint path configured, nothing written");
         return;
@@ -1842,6 +1943,28 @@ fn write_partial_checkpoint(model: &Model<Training>, checkpoint: Option<&Path>, 
         bytes.len() as f64 / 1.0e6,
         started.elapsed().as_millis()
     );
+    // `latest.ckpt` follows the rotation too: a run killed at hour nine should
+    // leave the *partial* as the model's newest weights, which is the whole
+    // reason partials exist. It also keeps the link from pinning the previous
+    // rotation's bytes on disk — a rename replaces the name, not the inode, so
+    // a stale link would keep a full extra checkpoint alive.
+    if maintain_latest {
+        point_latest_at_reporting(&target);
+    }
+}
+
+/// Point `latest.ckpt` at what was just written, and say so if it fails.
+///
+/// Never fatal: the weights are already on disk under their dated name, which
+/// is the file that must not be lost. A missing link is a listing that opens on
+/// the wrong row, not a lost run.
+fn point_latest_at_reporting(written: &Path) {
+    if let Err(err) = storage::point_latest_at(written) {
+        eprintln!(
+            "[checkpoint] could not point latest.ckpt at {}: {err}",
+            written.display()
+        );
+    }
 }
 
 fn apply_and_publish_training_state(
@@ -1852,6 +1975,7 @@ fn apply_and_publish_training_state(
     current_batch_size: &mut u32,
     total_steps: &mut usize,
     checkpoint_path: Option<&Path>,
+    maintain_latest: bool,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
 ) -> bool {
     apply_training_control_command(
@@ -1862,6 +1986,7 @@ fn apply_and_publish_training_state(
         current_batch_size,
         total_steps,
         checkpoint_path,
+        maintain_latest,
         tx,
     );
     tx.send(tui::TrainingEvent::TrainingState {
@@ -1881,6 +2006,7 @@ fn apply_training_control_command(
     current_batch_size: &mut u32,
     total_steps: &mut usize,
     checkpoint_path: Option<&Path>,
+    maintain_latest: bool,
     tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
 ) {
     match command {
@@ -1909,6 +2035,12 @@ fn apply_training_control_command(
             }
             match model.save_checkpoint(path) {
                 Ok(()) => {
+                    // The manual save is a save like any other: `latest.ckpt`
+                    // has to follow it, or the newest weights on disk stop
+                    // being the ones the name promises.
+                    if maintain_latest {
+                        point_latest_at_reporting(path);
+                    }
                     let _ = tx.send(tui::TrainingEvent::SaveStatus {
                         message: format!("checkpoint saved → {}", path.display()),
                         is_error: false,

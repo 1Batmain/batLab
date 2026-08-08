@@ -268,7 +268,7 @@ pub struct WeightSelectorState {
 /// The checkpoint a model is continued from when nothing more specific was
 /// asked for. It is the file every training run writes, so "open a model and
 /// train" means "keep training the model", not "throw the weights away".
-pub const PREFERRED_CHECKPOINT_NAME: &str = "latest.ckpt";
+pub const PREFERRED_CHECKPOINT_NAME: &str = storage::LATEST_CHECKPOINT_NAME;
 
 impl WeightSelectorState {
     /// The row the cursor should sit on given the checkpoints on disk and the

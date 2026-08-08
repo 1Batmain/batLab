@@ -8,6 +8,7 @@
 //! quarantined here rather than in the engine. The dependency arrow only ever
 //! points this way: `batlab_ui` → `batlab_core`, never back.
 
+pub mod clock;
 pub mod storage;
 pub mod tui;
 pub mod visualiser;

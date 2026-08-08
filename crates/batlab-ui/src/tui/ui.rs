@@ -6,6 +6,7 @@ use super::app::{
     PathStep, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use super::help;
+use crate::storage;
 use ratatui::{prelude::*, widgets::*};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -484,15 +485,19 @@ fn selected_style(selected: bool) -> Style {
 /// How a model's checkpoints are summarised in the list. The count first,
 /// because "does this model have trained weights at all" is the question; the
 /// names after it, because picking between them is the next one.
-fn checkpoint_summary(checkpoints: &[String]) -> String {
+fn checkpoint_summary(checkpoints: &[storage::CheckpointEntry]) -> String {
+    let names = |take: usize| -> String {
+        checkpoints[..take]
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     match checkpoints.len() {
         0 => "no checkpoints".to_string(),
-        1 => format!("1 checkpoint: {}", checkpoints[0]),
-        n if n <= 3 => format!("{n} checkpoints: {}", checkpoints.join(", ")),
-        n => format!(
-            "{n} checkpoints: {}, …",
-            checkpoints[..2].join(", ")
-        ),
+        1 => format!("1 checkpoint: {}", names(1)),
+        n if n <= 3 => format!("{n} checkpoints: {}", names(n)),
+        n => format!("{n} checkpoints: {}, …", names(2)),
     }
 }
 
@@ -601,13 +606,7 @@ fn draw_model_actions(f: &mut Frame, app: &App, area: Rect) {
                 app.layer_builder.model_input.1,
                 app.layer_builder.model_input.2,
                 app.layer_builder.layers.len(),
-                checkpoint_summary(
-                    &app.weight_selector
-                        .checkpoints
-                        .iter()
-                        .map(|entry| entry.name.clone())
-                        .collect::<Vec<_>>()
-                ),
+                checkpoint_summary(&app.weight_selector.checkpoints),
             ),
             Style::default().fg(Color::DarkGray),
         )),

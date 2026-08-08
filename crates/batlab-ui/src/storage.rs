@@ -17,12 +17,14 @@
 //! a `Storage` on a temporary directory and the workspace root is only ever the
 //! *default*.
 
+use crate::clock;
 use batlab_core::config::ModelConfig;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 pub struct SavedModelEntry {
@@ -30,10 +32,11 @@ pub struct SavedModelEntry {
     pub path: PathBuf,
     pub input_size: (u32, u32, u32),
     pub layer_count: usize,
-    /// Checkpoint file names found under `pretrained_weights/`, sorted. The
-    /// model list shows them because "which weights does this thing have?" is
-    /// the question that decides whether a model is worth opening at all.
-    pub checkpoints: Vec<String>,
+    /// Checkpoints found under `pretrained_weights/`, newest first. The model
+    /// list shows them because "which weights does this thing have?" is the
+    /// question that decides whether a model is worth opening at all — and
+    /// "when were they written?" is the one right behind it.
+    pub checkpoints: Vec<CheckpointEntry>,
     /// The stack, its cost and its reach — read off the same `config_file` the
     /// fields above come from, so the panel beside the list never re-opens a
     /// file to say what the row already knows.
@@ -44,6 +47,141 @@ pub struct SavedModelEntry {
 pub struct CheckpointEntry {
     pub name: String,
     pub path: String,
+    /// When the file was last written, if the filesystem will say. `None` is
+    /// shown as such — an invented date is worse than a missing one, since the
+    /// whole point of showing it is to pick "the one from last night".
+    pub modified: Option<SystemTime>,
+    pub size_bytes: u64,
+}
+
+impl CheckpointEntry {
+    /// Read one checkpoint's identity off disk. `None` when the path is not a
+    /// name we can show.
+    fn of(path: &Path) -> Option<Self> {
+        let name = path.file_name().and_then(|name| name.to_str())?.to_string();
+        let metadata = fs::metadata(path).ok();
+        Some(Self {
+            name,
+            path: path.to_string_lossy().to_string(),
+            modified: metadata.as_ref().and_then(|meta| meta.modified().ok()),
+            size_bytes: metadata.map(|meta| meta.len()).unwrap_or(0),
+        })
+    }
+
+    /// The date and size, as one line for a listing: `2026-08-08 10:41 · 14.2 MB`.
+    pub fn detail(&self) -> String {
+        let when = self
+            .modified
+            .and_then(clock::short)
+            .unwrap_or_else(|| "date unknown".to_string());
+        format!("{when} · {}", clock::human_bytes(self.size_bytes))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint naming
+// ---------------------------------------------------------------------------
+
+/// The name every run's checkpoint still answers to: the most recent one.
+///
+/// A run no longer *overwrites* it — it writes `run-<stamp>.ckpt` and then
+/// points this name at that file (see [`point_latest_at`]) — but the name
+/// stays, because "open a model and train" means "keep training the model" and
+/// that default is spelled `latest.ckpt` in the weight selector, in every
+/// model's `config_file`, and in three reports.
+pub const LATEST_CHECKPOINT_NAME: &str = "latest.ckpt";
+
+/// What a run's own checkpoint is called: `run-<YYYY-MM-DD_HHMM>.ckpt`.
+///
+/// The stamp is local time, zero-padded, biggest unit first, so **sorting the
+/// names is sorting the runs** — `pretrained_weights/` is listed by name in
+/// more than one place and this is what keeps "last is newest" true there.
+///
+/// Two runs in the same minute (a 20-step smoke test, twice) would collide, so
+/// a taken name gains an `_02`, `_03`… suffix. The separator is an underscore
+/// and not a dash on purpose: `-` sorts *before* `.`, so `run-…_1041-02.ckpt`
+/// would come out ahead of `run-…_1041.ckpt` and break the one property the
+/// stamp exists for. `_` sorts after `.`, so the pair stays in run order.
+pub fn new_run_checkpoint_path_in(dir: &Path, at: SystemTime) -> PathBuf {
+    let stamp = clock::stamp(at);
+    let first = dir.join(format!("run-{stamp}.ckpt"));
+    if !first.exists() {
+        return first;
+    }
+    for nth in 2..=99u32 {
+        let candidate = dir.join(format!("run-{stamp}_{nth:02}.ckpt"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("run-{stamp}_99.ckpt"))
+}
+
+/// Point `latest.ckpt` at the checkpoint just written, beside it.
+///
+/// **A hard link, not a copy.** The alternative — writing the bytes twice —
+/// doubles the cost of every save, and a save is 14 MB for the XL model and
+/// happens on every `--checkpoint-every` rotation; a night of training would
+/// pay for a second copy of every partial for no reason. A link costs a
+/// directory entry, `latest.ckpt` stays a *real file* that `fs::read` opens and
+/// `--resume` loads (unlike a symlink, nothing can dangle), and the two names
+/// simply describe the same bytes.
+///
+/// Written through a hidden scratch name and a rename, so `latest.ckpt` is
+/// never observed missing or half-linked. The scratch name starts with a dot
+/// precisely so a listing racing this call cannot offer it as weights.
+///
+/// Falls back to a copy when the filesystem refuses to link (a `Models/` spread
+/// across devices, an exotic mount): the name matters more than the trick.
+pub fn point_latest_at(written: &Path) -> io::Result<PathBuf> {
+    let parent = written.parent().ok_or_else(|| {
+        io::Error::other(format!(
+            "checkpoint {} has no parent directory",
+            written.display()
+        ))
+    })?;
+    let target = parent.join(LATEST_CHECKPOINT_NAME);
+    if written.file_name() == Some(std::ffi::OsStr::new(LATEST_CHECKPOINT_NAME)) {
+        // The run wrote `latest.ckpt` itself; there is nothing to point.
+        return Ok(target);
+    }
+    let scratch = parent.join(".latest.ckpt.tmp");
+    let _ = fs::remove_file(&scratch);
+    if fs::hard_link(written, &scratch).is_err() {
+        fs::copy(written, &scratch)?;
+    }
+    match fs::rename(&scratch, &target) {
+        Ok(()) => Ok(target),
+        Err(err) => {
+            let _ = fs::remove_file(&scratch);
+            Err(err)
+        }
+    }
+}
+
+/// Newest first, ties broken by name.
+///
+/// The selector opens on the most recent run, which is what "continue training"
+/// means; `latest.ckpt` and the dated file it points at share an mtime, and the
+/// tie-break puts `latest.ckpt` first — the row the default already sits on.
+fn sort_newest_first(entries: &mut [CheckpointEntry]) {
+    entries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
+}
+
+/// Every checkpoint in `dir`, newest first. A directory that cannot be read
+/// holds no checkpoints — listing must not have side effects.
+fn checkpoint_entries_in(dir: &Path) -> Vec<CheckpointEntry> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<CheckpointEntry> = read
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_checkpoint_file(path))
+        .filter_map(|path| CheckpointEntry::of(&path))
+        .collect();
+    sort_newest_first(&mut entries);
+    entries
 }
 
 fn serde_to_io(err: serde_json::Error) -> io::Error {
@@ -240,7 +378,24 @@ impl Storage {
     }
 
     pub fn default_model_checkpoint_path(&self, model_name: &str) -> io::Result<PathBuf> {
-        Ok(self.model_weights_dir(model_name)?.join("latest.ckpt"))
+        Ok(self
+            .model_weights_dir(model_name)?
+            .join(LATEST_CHECKPOINT_NAME))
+    }
+
+    /// Where a run starting at `at` writes its own checkpoint:
+    /// `Models/<name>/pretrained_weights/run-<stamp>.ckpt`.
+    ///
+    /// A *new* file every run — that is the whole feature. The previous run's
+    /// weights are still there afterwards, and `latest.ckpt` is pointed at this
+    /// one once it has been written ([`point_latest_at`]).
+    pub fn new_run_checkpoint_path(
+        &self,
+        model_name: &str,
+        at: SystemTime,
+    ) -> io::Result<PathBuf> {
+        let dir = self.model_weights_dir(model_name)?;
+        Ok(new_run_checkpoint_path_in(&dir, at))
     }
 
     pub fn model_config_path(&self, model_name: &str) -> io::Result<PathBuf> {
@@ -283,43 +438,18 @@ impl Storage {
 
     // --- Listing ---
 
-    /// Checkpoint files of a model, sorted by name. Read-only: a model with no
+    /// Checkpoints of a model, newest first. Read-only: a model with no
     /// `pretrained_weights/` yet reports an empty list rather than growing one.
-    fn checkpoint_names(&self, model_name: &str) -> Vec<String> {
+    fn checkpoint_entries(&self, model_name: &str) -> Vec<CheckpointEntry> {
         let dir = self.models_root().join(model_name).join("pretrained_weights");
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter(|entry| is_checkpoint_file(&entry.path()))
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .collect();
-        names.sort();
-        names
+        checkpoint_entries_in(&dir)
     }
 
+    /// The same listing the model list shows, for the weight selector — newest
+    /// first, so the cursor's default and the first row agree.
     pub fn list_model_checkpoints(&self, model_name: &str) -> io::Result<Vec<CheckpointEntry>> {
         let dir = self.model_weights_dir(model_name)?;
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !is_checkpoint_file(&path) {
-                continue;
-            }
-            let display_name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("checkpoint")
-                .to_string();
-            entries.push(CheckpointEntry {
-                name: display_name,
-                path: path.to_string_lossy().to_string(),
-            });
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
+        Ok(checkpoint_entries_in(&dir))
     }
 
     pub fn list_models(&self) -> io::Result<Vec<SavedModelEntry>> {
@@ -357,7 +487,7 @@ impl Storage {
                 path: config_path,
                 input_size: config.input_size,
                 layer_count: config.layers.len(),
-                checkpoints: self.checkpoint_names(name),
+                checkpoints: self.checkpoint_entries(name),
                 // Computed once, here, off the config that was just parsed —
                 // the panel beside the list then costs nothing per keystroke.
                 architecture: batlab_core::summarize_architecture(
@@ -625,6 +755,10 @@ pub fn default_model_checkpoint_path(model_name: &str) -> io::Result<PathBuf> {
     Storage::default().default_model_checkpoint_path(model_name)
 }
 
+pub fn new_run_checkpoint_path(model_name: &str, at: SystemTime) -> io::Result<PathBuf> {
+    Storage::default().new_run_checkpoint_path(model_name, at)
+}
+
 pub fn model_config_path(model_name: &str) -> io::Result<PathBuf> {
     Storage::default().model_config_path(model_name)
 }
@@ -741,6 +875,21 @@ mod tests {
             .expect("seeding a model should work");
     }
 
+    fn checkpoint_names(entry: &SavedModelEntry) -> Vec<String> {
+        entry
+            .checkpoints
+            .iter()
+            .map(|ckpt| ckpt.name.clone())
+            .collect()
+    }
+
+    /// A `SystemTime` for a given wall-clock instant is not something `std`
+    /// offers, so tests that need *distinct, ordered* instants build them by
+    /// offsetting a fixed epoch — which is all the naming rule needs.
+    fn at_minutes(minutes: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(minutes * 60)
+    }
+
     /// Nothing errors when the default root lands on the wrong directory — the
     /// TUI just reports an empty `Models/`. Anchor it on the directories that
     /// must be there, so a future move fails loudly instead of silently.
@@ -807,7 +956,7 @@ mod tests {
         assert_eq!(models[0].name, "alpha");
         assert_eq!(models[0].input_size, (8, 8, 1));
         assert_eq!(models[0].layer_count, 0);
-        assert_eq!(models[0].checkpoints, vec!["latest.ckpt".to_string()]);
+        assert_eq!(checkpoint_names(&models[0]), vec!["latest.ckpt".to_string()]);
     }
 
     /// Training writes `latest_metrics.jsonl` beside `latest.ckpt`, so both
@@ -825,7 +974,7 @@ mod tests {
         fs::write(weights.join("._latest.ckpt"), b"apple double").expect("sibling write");
 
         let models = storage.list_models().expect("listing should work");
-        assert_eq!(models[0].checkpoints, vec!["latest.ckpt".to_string()]);
+        assert_eq!(checkpoint_names(&models[0]), vec!["latest.ckpt".to_string()]);
 
         let offered = storage
             .list_model_checkpoints("alpha")
@@ -834,6 +983,199 @@ mod tests {
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
         assert_eq!(offered, vec!["latest.ckpt".to_string()]);
+    }
+
+    // --- Dated checkpoints ---
+
+    /// The naming rule's whole purpose: a directory listing sorted by name is
+    /// the runs in the order they happened. Checked on names alone — no
+    /// filesystem, no mtime — because that is the property external tools
+    /// (`ls`, a glob in a shell script) get for free.
+    #[test]
+    fn dated_run_names_sort_by_name_in_the_order_the_runs_happened() {
+        let dir = Path::new("/nonexistent-so-nothing-is-taken");
+        let minute = 60;
+        let hour = 60 * minute;
+        let day = 24 * hour;
+        let instants = [
+            at_minutes(0),
+            at_minutes(59),
+            at_minutes(hour),
+            at_minutes(9 * hour),
+            at_minutes(day),
+            at_minutes(40 * day),
+            at_minutes(400 * day),
+        ];
+        let names: Vec<String> = instants
+            .iter()
+            .map(|at| {
+                new_run_checkpoint_path_in(dir, *at)
+                    .file_name()
+                    .expect("a file name")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "dated names must sort chronologically: {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| name.starts_with("run-")
+                && name.ends_with(".ckpt")),
+            "unexpected shape: {names:?}"
+        );
+    }
+
+    /// Two runs in the same minute is not a hypothetical — it is two 20-step
+    /// smoke tests in a row. The second must not overwrite the first, and its
+    /// name must still sort after it.
+    #[test]
+    fn two_runs_in_the_same_minute_get_two_files() {
+        let temp = TempRoot::new("same-minute");
+        let storage = temp.storage();
+        seed_model(&storage, "alpha");
+        let at = at_minutes(12_345);
+
+        let first = storage
+            .new_run_checkpoint_path("alpha", at)
+            .expect("run path");
+        fs::write(&first, b"first").expect("write");
+        let second = storage
+            .new_run_checkpoint_path("alpha", at)
+            .expect("run path");
+        fs::write(&second, b"second").expect("write");
+
+        assert_ne!(first, second, "the second run reused the first's name");
+        assert_eq!(fs::read(&first).expect("first still there"), b"first");
+        assert!(
+            second.file_name().unwrap().to_string_lossy()
+                > first.file_name().unwrap().to_string_lossy(),
+            "{second:?} should sort after {first:?}"
+        );
+    }
+
+    /// `latest.ckpt` still exists, still holds the newest weights, and costs no
+    /// second copy on disk: it is a hard link, so the two names share one inode.
+    #[test]
+    fn latest_holds_the_newest_bytes_without_a_second_copy() {
+        let temp = TempRoot::new("latest-link");
+        let storage = temp.storage();
+        seed_model(&storage, "alpha");
+
+        let first = storage
+            .new_run_checkpoint_path("alpha", at_minutes(1))
+            .expect("run path");
+        fs::write(&first, b"weights of the first run").expect("write");
+        let latest = point_latest_at(&first).expect("pointing latest");
+        assert_eq!(latest.file_name().unwrap(), "latest.ckpt");
+        assert_eq!(
+            fs::read(&latest).expect("latest readable"),
+            b"weights of the first run"
+        );
+
+        let second = storage
+            .new_run_checkpoint_path("alpha", at_minutes(2))
+            .expect("run path");
+        fs::write(&second, b"weights of the second run").expect("write");
+        point_latest_at(&second).expect("pointing latest again");
+
+        assert_eq!(
+            fs::read(&latest).expect("latest readable"),
+            b"weights of the second run",
+            "latest.ckpt did not follow the newest run"
+        );
+        assert_eq!(
+            fs::read(&first).expect("the first run's file survived"),
+            b"weights of the first run",
+            "the previous run's weights were clobbered — that is the whole bug"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inode = |path: &Path| fs::metadata(path).expect("metadata").ino();
+            assert_eq!(
+                inode(&latest),
+                inode(&second),
+                "latest.ckpt should be a link to the newest run, not a copy"
+            );
+            assert_ne!(inode(&latest), inode(&first));
+        }
+
+        // The scratch name used while linking must never survive a call, and
+        // must never be listable as weights.
+        assert!(!temp.path().join(".latest.ckpt.tmp").exists());
+        let offered = storage
+            .list_model_checkpoints("alpha")
+            .expect("listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert!(!offered.iter().any(|name| name.starts_with('.')));
+    }
+
+    /// The selector opens on the newest, so the listing has to be ordered by
+    /// *time*, not by name — a legacy `night_run.ckpt` written yesterday sits
+    /// below today's run, whatever the alphabet says.
+    #[test]
+    fn checkpoints_are_listed_newest_first_and_carry_their_date_and_size() {
+        let temp = TempRoot::new("newest-first");
+        let storage = temp.storage();
+        seed_model(&storage, "alpha");
+        let weights = storage.model_weights_dir("alpha").expect("weights dir");
+
+        // Written oldest → newest, with a pause so the filesystem records
+        // distinct modification times.
+        for name in ["night_run.ckpt", "zzz_old.ckpt", "run-2026-08-08_1041.ckpt"] {
+            fs::write(weights.join(name), vec![0u8; 2048]).expect("write");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let listed = storage.list_model_checkpoints("alpha").expect("listing");
+        let names: Vec<&str> = listed.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["run-2026-08-08_1041.ckpt", "zzz_old.ckpt", "night_run.ckpt"],
+            "newest must come first"
+        );
+        assert!(listed[0].modified.is_some(), "no modification time read");
+        assert_eq!(listed[0].size_bytes, 2048);
+        assert!(
+            listed[0].detail().contains("2 kB"),
+            "the row should carry its size: {}",
+            listed[0].detail()
+        );
+
+        // The model list is fed by the same order, so both screens agree.
+        let models = storage.list_models().expect("model listing");
+        assert_eq!(checkpoint_names(&models[0])[0], "run-2026-08-08_1041.ckpt");
+    }
+
+    /// Checkpoints written before this convention existed — `latest.ckpt`,
+    /// `night_run.ckpt`, `one.ckpt` — are ordinary checkpoints. Nothing about
+    /// the dated naming may hide them or require a migration.
+    #[test]
+    fn checkpoints_that_predate_the_naming_convention_are_still_offered() {
+        let temp = TempRoot::new("legacy-names");
+        let storage = temp.storage();
+        seed_model(&storage, "alpha");
+        let weights = storage.model_weights_dir("alpha").expect("weights dir");
+        for name in ["latest.ckpt", "night_run.ckpt", "night2.ckpt"] {
+            fs::write(weights.join(name), b"legacy weights").expect("write");
+        }
+
+        let mut offered = storage
+            .list_model_checkpoints("alpha")
+            .expect("listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        offered.sort();
+        assert_eq!(offered, vec!["latest.ckpt", "night2.ckpt", "night_run.ckpt"]);
     }
 
     // --- Name validation ---
