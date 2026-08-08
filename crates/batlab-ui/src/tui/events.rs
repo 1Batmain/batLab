@@ -2,8 +2,8 @@
 
 use super::app::{
     App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS, PERPETUAL_PARAM_FIELD_NAMES,
-    PerpetualStatus, Screen, TRAINING_PARAM_FIELD_NAMES, TRAINING_RANDOM_WEIGHTS_FIELD,
-    TrainingControlCommand,
+    PerpetualStatus, ResourcesState, Screen, TRAINING_PARAM_FIELD_NAMES,
+    TRAINING_RANDOM_WEIGHTS_FIELD, TrainingControlCommand,
 };
 use crossterm::event::KeyCode;
 
@@ -68,6 +68,38 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::DatasetSelector => handle_dataset_selector(app, code),
         Screen::Monitor => handle_monitor(app, code),
         Screen::TrainingControl => handle_training_control(app, code),
+        Screen::Resources => handle_resources(app, code),
+    }
+}
+
+/// The Resources page.
+///
+/// `←`/`→` are the simulator — they move the batch through its stops and the
+/// totals move with them. That is why this screen is NOT on the breadcrumb's
+/// arrow path (`walks_the_path_by_arrow` is false for it): the two keys already
+/// mean something here, and the repository's rule is that the breadcrumb never
+/// steals a binding a screen already uses.
+///
+/// `[i]` swaps between the training and the inference graph — the difference is
+/// not a scale factor but a different graph, and seeing both is most of the
+/// point. `Esc` goes back up to the action menu, like every other detour.
+fn handle_resources(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.screen = Screen::ModelActions,
+        KeyCode::Left => {
+            app.resources.batch = ResourcesState::smaller(app.resources.batch);
+        }
+        KeyCode::Right => {
+            app.resources.batch = ResourcesState::larger(app.resources.batch);
+        }
+        KeyCode::Char('i') => {
+            app.resources.inference = !app.resources.inference;
+            app.resources.scroll = 0;
+        }
+        KeyCode::Down => app.resources.scroll = app.resources.scroll.saturating_add(1),
+        KeyCode::Up => app.resources.scroll = app.resources.scroll.saturating_sub(1),
+        KeyCode::Char('q') => app.should_quit = true,
+        _ => {}
     }
 }
 
@@ -108,6 +140,7 @@ fn handle_model_actions(app: &mut App, code: KeyCode) {
         KeyCode::Right => app.path_forward(),
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('e') => app.enter_layer_builder(),
+        KeyCode::Char('r') => app.enter_resources(),
         KeyCode::Up => {
             if app.model_actions.selected > 0 {
                 app.model_actions.selected -= 1;

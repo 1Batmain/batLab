@@ -40,6 +40,8 @@ pub enum Screen {
     DatasetSelector,
     Monitor,
     TrainingControl,
+    /// What this model costs on the GPU — see [`ResourcesState`].
+    Resources,
 }
 
 /// The flow, as the five steps a run actually walks through.
@@ -110,6 +112,7 @@ impl Screen {
             | Screen::DeleteConfirm
             | Screen::InputSize
             | Screen::LayerBuilder
+            | Screen::Resources
             | Screen::TrainingControl => None,
         }
     }
@@ -135,7 +138,7 @@ impl Screen {
     /// Every screen there is. A test walks the whole flow and asserts it visited
     /// all of these, so a new variant stays failing until something actually
     /// routes to it.
-    pub const ALL: [Screen; 14] = [
+    pub const ALL: [Screen; 15] = [
         Screen::ModelList,
         Screen::TemplateSelector,
         Screen::ModelActions,
@@ -150,6 +153,7 @@ impl Screen {
         Screen::DatasetSelector,
         Screen::Monitor,
         Screen::TrainingControl,
+        Screen::Resources,
     ];
 }
 
@@ -330,6 +334,55 @@ pub enum LayerBuilderMode {
     Add,
     Browse,
     Edit,
+}
+
+/// The Resources page: what this model puts on the GPU, and whether it fits.
+///
+/// The page carries almost no state, and that is deliberate — the inventory is
+/// recomputed from the architecture on every draw (a walk over ~30 layers, well
+/// under a millisecond) rather than cached. A cached inventory is a number that
+/// can go stale behind an architecture edit, which is exactly the class of bug
+/// the weight selector's derived cursor exists to avoid.
+///
+/// What *is* state is the question being asked: at which batch, and about which
+/// workload. `←`/`→` move the batch, which is the whole simulator: the answer to
+/// "what would this cost on a bigger machine" is a number that moves.
+pub struct ResourcesState {
+    /// The batch the page is sizing for. Starts at the model's own.
+    pub batch: u32,
+    /// Whether the page is sizing inference instead of training.
+    pub inference: bool,
+    /// First line drawn, for `↑`/`↓` on a page longer than the terminal.
+    pub scroll: usize,
+}
+
+impl ResourcesState {
+    /// Batches the `←`/`→` keys step through.
+    ///
+    /// Powers of two rather than `+1`: nobody trains at batch 37, the
+    /// interesting range spans two orders of magnitude, and one keypress per
+    /// sample would make the top of the range unreachable. Same reasoning as
+    /// the perpetual tempo dial, which is multiplicative for the same reason.
+    pub const STOPS: [u32; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+
+    /// The next stop above `batch`, or `batch` itself at the top.
+    pub fn larger(batch: u32) -> u32 {
+        Self::STOPS
+            .iter()
+            .copied()
+            .find(|stop| *stop > batch)
+            .unwrap_or(batch)
+    }
+
+    /// The next stop below `batch`, or `batch` itself at the bottom.
+    pub fn smaller(batch: u32) -> u32 {
+        Self::STOPS
+            .iter()
+            .copied()
+            .rev()
+            .find(|stop| *stop < batch)
+            .unwrap_or(batch)
+    }
 }
 
 pub struct TrainingParamsState {
@@ -543,6 +596,28 @@ pub struct MonitorState {
 // App
 // ---------------------------------------------------------------------------
 
+/// Open an adapter just to read its limits, and let it go.
+///
+/// The Resources page is about *this* machine, so the limits have to come off
+/// the machine. Nothing else here needs the device — the context is dropped as
+/// soon as its numbers are read, and a run creates its own later.
+///
+/// A machine with no adapter is not an error: the page falls back on the WebGPU
+/// default limits and says the profile is hypothetical. Someone reading a config
+/// on a headless box still deserves an answer.
+fn probe_device_profile() -> batlab_core::DeviceProfile {
+    let context = std::panic::catch_unwind(|| {
+        pollster::block_on(batlab_core::GpuContext::new_headless())
+    });
+    match context {
+        Ok(gpu) => batlab_core::DeviceProfile::from_gpu(&gpu),
+        Err(_) => batlab_core::DeviceProfile::hypothetical(
+            "no adapter available — WebGPU default limits",
+            None,
+        ),
+    }
+}
+
 pub struct App {
     pub screen: Screen,
     /// Where `Models/` and `datasets/` live for this session. Injected rather
@@ -562,6 +637,21 @@ pub struct App {
     pub training_params: TrainingParamsState,
     pub training_control: TrainingControlState,
     pub monitor: MonitorState,
+    pub resources: ResourcesState,
+    /// The device the Resources page judges this model against.
+    ///
+    /// Injected for the same reason [`Storage`] is: the default probes a real
+    /// adapter, and a test that walked the flow would then need a GPU to press
+    /// a key. `App::with_device_profile` hands it a stated one instead.
+    pub device_profile: batlab_core::DeviceProfile,
+    /// The dataset the page accounts for — resolved from the model's training
+    /// config when one is loaded, `None` otherwise.
+    pub resources_dataset: Option<batlab_core::DatasetSpec>,
+    /// The optimiser and the weight average the model's config asks for. They
+    /// triple the parameter posts between them, so the page reads them from the
+    /// file rather than assuming.
+    pub resources_optimizer: batlab_core::OptimizerKind,
+    pub resources_ema: bool,
     pub run_config: Option<RunConfig>,
     pub active_model_name: Option<String>,
     /// The model this process currently has a run on, if any. The manager
@@ -684,7 +774,27 @@ fn normalize_key(value: &str) -> Option<String> {
 impl App {
     /// An app on the default storage root (the workspace, or `BATLAB_ROOT`).
     pub fn new() -> Self {
-        Self::with_storage(Storage::default())
+        let mut app = Self::with_storage(Storage::default());
+        // Probed once, at startup, and only on the real entry point: the limits
+        // do not change while the process runs, and `with_storage` — the
+        // constructor the tests use — must not need an adapter to press a key.
+        app.device_profile = probe_device_profile();
+        app
+    }
+
+    /// An app that judges the Resources page against `profile` instead of
+    /// probing an adapter.
+    ///
+    /// Two uses, and the second is why it exists: answering "would this fit on
+    /// an 8 GiB card?" about a machine that is not here, and letting the
+    /// navigation tests press every key without a GPU.
+    pub fn with_device_profile(
+        storage: Storage,
+        profile: batlab_core::DeviceProfile,
+    ) -> Self {
+        let mut app = Self::with_storage(storage);
+        app.device_profile = profile;
+        app
     }
 
     /// An app on an explicit storage root. This is the constructor tests use:
@@ -818,6 +928,28 @@ impl App {
                 pending_control_commands: Vec::new(),
                 perpetual: None,
             },
+            resources: ResourcesState {
+                batch: default_batch.max(1),
+                inference: false,
+                scroll: 0,
+            },
+            // Probed once, here, rather than on every draw: opening an adapter
+            // costs tens of milliseconds and its limits do not change while the
+            // process runs. A machine with no adapter at all falls back on the
+            // WebGPU defaults, which is the honest answer — those are the limits
+            // a browser would grant — and the page says the profile is
+            // hypothetical.
+            // Until `App::new` probes a real one. On a machine with no adapter
+            // this stays, and it is the honest answer rather than a blank: the
+            // WebGPU defaults are the limits a browser grants the visitor's GPU,
+            // and the page says the profile is hypothetical.
+            device_profile: batlab_core::DeviceProfile::hypothetical(
+                "no adapter probed — WebGPU default limits",
+                None,
+            ),
+            resources_dataset: None,
+            resources_optimizer: batlab_core::OptimizerKind::default(),
+            resources_ema: false,
             run_config: None,
             active_model_name: None,
             running_model: None,
@@ -1065,6 +1197,14 @@ impl App {
 
     fn apply_loaded_model(&mut self, config: ModelConfig) {
         self.active_model_name = config.model_name.clone();
+        // Reset before the match below fills them in, so a model whose config
+        // is not a training config cannot inherit the previous model's
+        // optimiser. Adam is the default for such a model rather than SGD:
+        // `OPTIMIZER_ADAM.md` makes it the project's standard, and sizing an
+        // Adam run as an SGD one under-reports the parameter posts by 3×.
+        self.resources_optimizer = batlab_core::OptimizerKind::Adam;
+        self.resources_ema = false;
+        self.resources_dataset = None;
         self.layer_builder.model_input = config.input_size;
         self.input_size.fields = vec![
             config.input_size.0.to_string(),
@@ -1087,6 +1227,14 @@ impl App {
             }
             RunMode::Train(train) => {
                 self.model_actions.selected = ModelAction::Train.index();
+                // What the Resources page needs from a training config, and
+                // could not honestly guess: Adam doubles the parameter posts,
+                // an EMA adds another copy, and the dataset is the one post
+                // that is streamed rather than resident.
+                self.resources_optimizer = train.optimizer;
+                self.resources_ema = train.ema_decay.is_some();
+                self.resources_dataset = self.storage.dataset_spec(&train.dataset_path);
+                self.resources.batch = train.batch_size.max(1);
                 self.training_params.fields = vec![
                     train.lr.to_string(),
                     train.batch_size.to_string(),
@@ -2419,6 +2567,61 @@ impl App {
             }
         }
         self.screen = Screen::LayerBuilder;
+    }
+
+    /// Open the Resources page on the model in hand.
+    ///
+    /// The batch it opens at is the one the model's own training form carries,
+    /// not a constant: the first number someone wants is what their *current*
+    /// run costs, and only then what a different batch would.
+    pub fn enter_resources(&mut self) {
+        self.resources.scroll = 0;
+        // Slot 1 of the training form is the batch size — see the field's own
+        // comment on `TrainingParamsState::fields`.
+        if let Some(batch) = self
+            .training_params
+            .fields
+            .get(1)
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            self.resources.batch = batch.max(1);
+        }
+        self.screen = Screen::Resources;
+    }
+
+    /// The inventory the Resources page draws, for the batch and workload it is
+    /// currently asking about.
+    ///
+    /// Recomputed rather than stored — see [`ResourcesState`]. It reads the
+    /// architecture from the layer builder's own list, which is the *edited*
+    /// stack: add a layer and the page's numbers move with it, without a save.
+    pub fn resources_inventory(
+        &self,
+        batch: u32,
+    ) -> Result<batlab_core::GpuInventory, batlab_core::ModelError> {
+        batlab_core::inventory(&self.resources_request(batch), &self.device_profile)
+    }
+
+    pub fn resources_request(&self, batch: u32) -> batlab_core::InventoryRequest {
+        let workload = if self.resources.inference {
+            batlab_core::Workload::Inference
+        } else {
+            batlab_core::Workload::training(self.resources_optimizer, self.resources_ema)
+        };
+        batlab_core::InventoryRequest {
+            layers: self.layer_builder.layers.clone(),
+            input_size: self.layer_builder.model_input,
+            batch: batch.max(1),
+            workload,
+            // Inference streams nothing: the sampler holds one latent, and the
+            // dataset is not in the graph at all.
+            dataset: if self.resources.inference {
+                None
+            } else {
+                self.resources_dataset
+            },
+            live_frame: false,
+        }
     }
 
     pub fn finish_dataset_selector(&mut self) -> Result<(), String> {

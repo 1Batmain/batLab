@@ -52,6 +52,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             draw_monitor(f, app, body);
             draw_training_control(f, app, body);
         }
+        Screen::Resources => draw_resources(f, app, body),
     }
 
     if let Some(trail) = trail {
@@ -599,6 +600,132 @@ fn draw_model_list(f: &mut Frame, app: &App, area: Rect) {
 // Screen: Model Actions — what to do with the model that was just picked
 // ---------------------------------------------------------------------------
 
+/// What this model costs on the GPU.
+///
+/// Full width rather than a popup: the page is a table of figures, and the
+/// figures are the point — squeezing them into a 56-column dialog would elide
+/// exactly the numbers someone opened it for.
+///
+/// The body is the *same* text the CLI prints (`batlab_core::report_lines`, fed
+/// the terminal's own width), so a screenshot of this page and the output of
+/// `--resources` cannot disagree. Only the header and the key line are drawn
+/// here, because only they are about being a TUI.
+fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " GPU resources — {} ",
+            app.active_model_name.as_deref().unwrap_or("(no model)")
+        ))
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // One row for the keys at the bottom, one for the verdict at the top.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let inventory = match app.resources_inventory(app.resources.batch) {
+        Ok(inventory) => inventory,
+        Err(err) => {
+            f.render_widget(
+                Paragraph::new(format!("  cannot size this architecture: {err}"))
+                    .style(Style::default().fg(Color::Red)),
+                rows[1],
+            );
+            return;
+        }
+    };
+
+    // The headline, and the only line that is styled: fits or does not.
+    let (verdict, verdict_style) = if inventory.fits() {
+        (
+            format!(
+                // `inventory.batch`, not the dial: inference pins the batch to
+                // one whatever the dial says, and a header claiming batch 32
+                // over a table that says 1 is a header nobody trusts again.
+                "  {} on {} · batch {} · {}",
+                batlab_core::format_bytes(inventory.total_bytes()),
+                inventory.device.name,
+                inventory.batch,
+                inventory.workload.label(),
+            ),
+            Style::default().fg(Color::Green),
+        )
+    } else {
+        (
+            format!(
+                "  DOES NOT FIT — {} at batch {}: {}",
+                batlab_core::format_bytes(inventory.total_bytes()),
+                inventory.batch,
+                inventory
+                    .obstacles
+                    .first()
+                    .map(|obstacle| obstacle.to_string())
+                    .unwrap_or_default()
+            ),
+            Style::default().fg(Color::Red),
+        )
+    };
+    f.render_widget(
+        Paragraph::new(verdict).style(verdict_style.add_modifier(Modifier::BOLD)),
+        rows[0],
+    );
+
+    let width = rows[1].width.saturating_sub(2) as usize;
+    let lines: Vec<String> = batlab_core::report_lines(
+        &inventory,
+        None,
+        batlab_core::ReportOptions {
+            width,
+            // The layer table gets whatever is left after the fixed sections,
+            // and elides the middle if that is not enough. A short terminal
+            // shows a shorter table, never a table that scrolls off in silence.
+            max_layer_rows: Some((rows[1].height as usize).saturating_sub(28).max(3)),
+            bars: true,
+        },
+    )
+    .iter()
+    .flat_map(|line| line.split('\n').map(str::to_string).collect::<Vec<_>>())
+    .collect();
+
+    // `↑`/`↓` scroll rather than move a cursor: there is nothing to select here.
+    // The scroll is clamped to the last screenful so the page cannot be pushed
+    // off the top into an empty pane.
+    let visible = rows[1].height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let scroll = app.resources.scroll.min(max_scroll);
+    let body: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(Color::Gray))))
+        .collect();
+    f.render_widget(Paragraph::new(body), rows[1]);
+
+    let more = if max_scroll > 0 {
+        format!("  [↑↓] scroll {}/{}", scroll + 1, max_scroll + 1)
+    } else {
+        String::new()
+    };
+    f.render_widget(
+        Paragraph::new(format!(
+            "  [←→] batch  [i] {}{more}  [Esc] back",
+            if app.resources.inference {
+                "training"
+            } else {
+                "inference"
+            },
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+        rows[2],
+    );
+}
+
 fn draw_model_actions(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(56, 62, area);
     f.render_widget(Clear, popup);
@@ -657,7 +784,7 @@ fn draw_model_actions(f: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  [arrow] select  [Enter] confirm  [e] edit layers  [Esc] back  [q] quit",
+        "  [arrow] select  [Enter] confirm  [e] layers  [r] resources  [Esc] back  [q] quit",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);
