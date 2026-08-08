@@ -1,6 +1,6 @@
 //! File purpose: The on-disk layout — where `Models/`, `datasets/` and the
-//! checkpoints live, how a `config_file` is read and written, and the two
-//! destructive model-manager operations (rename, delete).
+//! checkpoints live, how a `config_file` is read and written, and the
+//! model-manager operations (rename, duplicate, delete).
 //!
 //! This is deliberately *not* in `batlab_core`. The engine takes bytes
 //! ([`ModelConfig::from_json_bytes`], [`batlab_core::Model::load_checkpoint_bytes`])
@@ -206,7 +206,7 @@ const NAME_EXTRA_CHARS: [char; 3] = ['-', '_', '.'];
 pub const MAX_MODEL_NAME_LEN: usize = 64;
 
 /// Why a model name was refused. The message is user-facing: it is shown in the
-/// rename form under the field.
+/// rename and duplicate forms under the field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameError {
     Empty,
@@ -258,7 +258,8 @@ pub fn validate_model_name(name: &str) -> Result<(), NameError> {
 // Manager errors
 // ---------------------------------------------------------------------------
 
-/// What can go wrong in [`Storage::rename_model`] / [`Storage::delete_model`].
+/// What can go wrong in [`Storage::rename_model`], [`Storage::duplicate_model`]
+/// or [`Storage::delete_model`].
 #[derive(Debug)]
 pub enum ManagerError {
     /// The name would not be a safe directory name.
@@ -267,7 +268,7 @@ pub enum ManagerError {
     NotFound(String),
     /// The destination name is taken.
     AlreadyExists(String),
-    /// Rename to the name it already has.
+    /// Rename — or duplicate — to the name it already has.
     Unchanged(String),
     /// The resolved path is not a direct child of `Models/` — a symlinked model
     /// directory, or a name that resolved somewhere it has no business being.
@@ -304,6 +305,79 @@ impl From<NameError> for ManagerError {
 impl From<io::Error> for ManagerError {
     fn from(err: io::Error) -> Self {
         ManagerError::Io(err)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicating a model
+// ---------------------------------------------------------------------------
+
+/// How much of a model travels with its duplicate.
+///
+/// Weights are the default at the call site that matters: duplicating exists so
+/// a foundation model can be *fine-tuned* under another name, and a fine-tune
+/// with no weights to start from is just a new model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightsToCopy {
+    /// The architecture alone — the copy starts from fresh weights.
+    None,
+    /// The weights the model currently answers to, and nothing else.
+    ///
+    /// **Not the history.** A model trained overnight with `--checkpoint-every`
+    /// holds dozens of `run-*.ckpt`, 14 MB each for the XL; copying the lot to
+    /// make one fine-tune would cost half a gigabyte to carry runs the copy has
+    /// no claim to. What travels is the newest run — the one `latest.ckpt`
+    /// designates — under its own dated name, with `latest.ckpt` re-linked onto
+    /// it inside the copy.
+    Newest,
+}
+
+/// What a duplication actually did, so the UI can *say* it instead of implying
+/// it. `copied_weights` is empty when nothing was carried — including when
+/// weights were asked for and the source model had none yet.
+#[derive(Debug, Clone)]
+pub struct DuplicateOutcome {
+    pub path: PathBuf,
+    /// Checkpoint file names written into the copy, in the order they appeared:
+    /// the dated run first, then `latest.ckpt` pointing at it.
+    pub copied_weights: Vec<String>,
+}
+
+/// The `(device, inode)` pair of a file, or `None` if it cannot be read.
+///
+/// Used to answer one question: *which* dated run is `latest.ckpt`? The two are
+/// one set of bytes under two names (`point_latest_at`), and comparing identity
+/// is how that pairing is recovered without reading 14 MB twice.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// The single checkpoint that carries a model's current weights, or `None` for
+/// a model that has never been trained.
+///
+/// `latest.ckpt` is the answer to "which weights?", but it is a *name*: copying
+/// it alone would drop the date the weights were made on, which is the whole
+/// point of the dated naming. So the dated file it is hard-linked to is
+/// preferred, and `latest.ckpt` is only carried on its own when there is no
+/// such sibling (a checkpoint from before the convention, or a copy of one).
+fn weights_in_hand(dir: &Path) -> Option<PathBuf> {
+    let entries = checkpoint_entries_in(dir);
+    let latest = dir.join(LATEST_CHECKPOINT_NAME);
+    match file_identity(&latest) {
+        Some(identity) => Some(
+            entries
+                .iter()
+                .filter(|entry| entry.name != LATEST_CHECKPOINT_NAME)
+                .map(|entry| PathBuf::from(&entry.path))
+                .find(|path| file_identity(path) == Some(identity))
+                .unwrap_or(latest),
+        ),
+        // No `latest.ckpt` at all: the newest checkpoint by mtime is the best
+        // answer there is, and the copy gains the `latest.ckpt` the source
+        // never had — which is what makes it openable on its weights.
+        None => entries.first().map(|entry| PathBuf::from(&entry.path)),
     }
 }
 
@@ -646,6 +720,131 @@ impl Storage {
         let bytes = config.to_json_bytes().map_err(serde_to_io)?;
         fs::write(&config_path, bytes)?;
         Ok(())
+    }
+
+    /// A free name for a copy of `from`: `<from>-copy`, then `-copy-2`,
+    /// `-copy-3`… The form opens on it, so the common case — duplicate, press
+    /// Enter — never has to be typed.
+    ///
+    /// Kept inside [`MAX_MODEL_NAME_LEN`] by trimming the *base*, not the
+    /// suffix: a name that says nothing about being a copy would be the one
+    /// thing worth keeping if only one could fit.
+    pub fn suggest_copy_name(&self, from: &str) -> String {
+        let root = self.models_root();
+        let with_suffix = |suffix: &str| -> String {
+            let room = MAX_MODEL_NAME_LEN.saturating_sub(suffix.len());
+            let base: String = from.chars().take(room).collect();
+            format!("{base}{suffix}")
+        };
+        let first = with_suffix("-copy");
+        if !root.join(&first).exists() {
+            return first;
+        }
+        for nth in 2..=99u32 {
+            let candidate = with_suffix(&format!("-copy-{nth}"));
+            if !root.join(&candidate).exists() {
+                return candidate;
+            }
+        }
+        with_suffix("-copy-99")
+    }
+
+    /// Copy `Models/<from>/` to `Models/<to>/` — a model of its own, with its
+    /// own `config_file`, that the original knows nothing about.
+    ///
+    /// This is what makes fine-tuning safe. Training a foundation model under a
+    /// second name used to mean training it *in place*: the run would write into
+    /// the same `pretrained_weights/`, and after enough steps on a narrow
+    /// dataset the general model was gone. Duplicate first, fine-tune the copy,
+    /// and the foundation is still there tomorrow — **the original is not opened
+    /// for writing at any point below**.
+    ///
+    /// The copy's config is rewritten by the same code the rename uses
+    /// ([`Storage::retarget_config`]): `model_name` becomes `to`, and every
+    /// checkpoint path that pointed inside the source directory is rebased onto
+    /// the copy. A config that still named the original would send the copy's
+    /// first run back into the directory this whole operation exists to protect.
+    ///
+    /// What `weights` carries is [`WeightsToCopy`]. Anything that fails leaves
+    /// no half-made model: the destination directory is removed and the error
+    /// returned.
+    pub fn duplicate_model(
+        &self,
+        from: &str,
+        to: &str,
+        weights: WeightsToCopy,
+    ) -> Result<DuplicateOutcome, ManagerError> {
+        validate_model_name(to)?;
+        let from_path = self.model_path_guarded(from)?;
+        if from == to {
+            return Err(ManagerError::Unchanged(to.to_string()));
+        }
+        let to_path = self.models_root().join(to);
+        // Plain `exists()`: unlike the rename, there is no "it is the same
+        // directory" case to allow through. On a case-insensitive filesystem a
+        // name that differs from an existing model only in case *is* taken, and
+        // saying so is the honest answer.
+        if to_path.exists() {
+            return Err(ManagerError::AlreadyExists(to.to_string()));
+        }
+
+        match self.fill_duplicate(from, &from_path, to, &to_path, weights) {
+            Ok(copied_weights) => Ok(DuplicateOutcome {
+                path: to_path,
+                copied_weights,
+            }),
+            Err(err) => {
+                let _ = fs::remove_dir_all(&to_path);
+                Err(err)
+            }
+        }
+    }
+
+    /// Everything `duplicate_model` writes, in one place so its failure path is
+    /// one `remove_dir_all` on a directory nothing else has touched.
+    fn fill_duplicate(
+        &self,
+        from: &str,
+        from_path: &Path,
+        to: &str,
+        to_path: &Path,
+        weights: WeightsToCopy,
+    ) -> Result<Vec<String>, ManagerError> {
+        let config_source = from_path.join("config_file");
+        if !config_source.is_file() {
+            // A directory with no config is not a model, and copying it would
+            // produce something the list cannot even show.
+            return Err(ManagerError::NotFound(from.to_string()));
+        }
+        fs::create_dir_all(to_path)?;
+        fs::copy(&config_source, to_path.join("config_file"))?;
+        self.retarget_config(from, from_path, to, to_path)?;
+
+        // Created either way: a model directory has a `pretrained_weights/`,
+        // and the copy is a model.
+        let target_dir = to_path.join("pretrained_weights");
+        fs::create_dir_all(&target_dir)?;
+
+        let mut copied = Vec::new();
+        if weights == WeightsToCopy::Newest
+            && let Some(source) = weights_in_hand(&from_path.join("pretrained_weights"))
+        {
+            let name = source
+                .file_name()
+                .ok_or_else(|| io::Error::other("checkpoint has no file name"))?;
+            let written = target_dir.join(name);
+            // A real copy, not a link into the source: the copy has to survive
+            // the original being deleted, and its disk cost has to be visible.
+            fs::copy(&source, &written)?;
+            copied.push(name.to_string_lossy().to_string());
+            // And `latest.ckpt` inside the copy designates the copy's newest
+            // run, exactly as it does for a model that trained here.
+            let latest = point_latest_at(&written)?;
+            if latest != written {
+                copied.push(LATEST_CHECKPOINT_NAME.to_string());
+            }
+        }
+        Ok(copied)
     }
 
     /// Delete `Models/<name>/` and everything under it. Irreversible.
@@ -1400,5 +1599,338 @@ mod tests {
             storage.delete_model("ghost"),
             Err(ManagerError::NotFound(_))
         ));
+    }
+
+    // --- Duplicate ---
+
+    /// A model that has trained twice: two dated runs, `latest.ckpt` linked onto
+    /// the newer, and a config that records where its weights are — the shape
+    /// the foundation model to be fine-tuned actually has on disk.
+    fn seed_trained_model(storage: &Storage, name: &str) -> PathBuf {
+        let weights = storage.model_weights_dir(name).expect("weights dir");
+        fs::write(weights.join("run-2026-08-01_0900.ckpt"), b"the older run").expect("write");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newest = weights.join("run-2026-08-08_1120.ckpt");
+        fs::write(&newest, b"the weights that matter").expect("write");
+        point_latest_at(&newest).expect("latest link");
+
+        let mut config = a_config();
+        config.inference.checkpoint = Some(
+            weights
+                .join(LATEST_CHECKPOINT_NAME)
+                .to_string_lossy()
+                .to_string(),
+        );
+        storage.write_model_config(name, &config).expect("seed");
+        newest
+    }
+
+    /// Everything about a file that must not move: its bytes, its size and when
+    /// it was last written.
+    fn fingerprint(path: &Path) -> (Vec<u8>, u64, Option<SystemTime>) {
+        let meta = fs::metadata(path).expect("metadata");
+        (
+            fs::read(path).expect("read"),
+            meta.len(),
+            meta.modified().ok(),
+        )
+    }
+
+    fn checkpoint_names_in(storage: &Storage, model: &str) -> Vec<String> {
+        let mut names = storage
+            .list_model_checkpoints(model)
+            .expect("listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// The property the whole feature exists for: after duplicating, the
+    /// original is exactly what it was. Fine-tuning the copy is only safe
+    /// because nothing here writes to the source.
+    #[test]
+    fn duplicating_a_model_leaves_the_original_untouched() {
+        let temp = TempRoot::new("duplicate-intact");
+        let storage = temp.storage();
+        let newest = seed_trained_model(&storage, "Foundation");
+        let source_dir = storage.models_root().join("Foundation");
+        let before_config = fingerprint(&source_dir.join("config_file"));
+        let before_weights = fingerprint(&newest);
+        let before_names = checkpoint_names_in(&storage, "Foundation");
+
+        storage
+            .duplicate_model("Foundation", "Elephants", WeightsToCopy::Newest)
+            .expect("duplicate should succeed");
+
+        assert_eq!(
+            fingerprint(&source_dir.join("config_file")),
+            before_config,
+            "the original's config_file was rewritten"
+        );
+        assert_eq!(
+            fingerprint(&newest),
+            before_weights,
+            "the original's weights were touched"
+        );
+        assert_eq!(
+            checkpoint_names_in(&storage, "Foundation"),
+            before_names,
+            "the original's pretrained_weights/ gained or lost a file"
+        );
+    }
+
+    /// The copy is a model in its own right: its own directory, its own
+    /// `config_file` naming *it*, and every checkpoint path rebased onto it. A
+    /// config still pointing at the source would send the copy's first run back
+    /// into the directory this operation exists to protect.
+    #[test]
+    fn a_duplicate_is_a_model_of_its_own_and_its_config_says_so() {
+        let temp = TempRoot::new("duplicate-config");
+        let storage = temp.storage();
+        seed_trained_model(&storage, "Foundation");
+
+        let outcome = storage
+            .duplicate_model("Foundation", "Elephants", WeightsToCopy::Newest)
+            .expect("duplicate should succeed");
+
+        assert_eq!(outcome.path, storage.models_root().join("Elephants"));
+        assert!(outcome.path.is_dir());
+        let config = storage
+            .load_model_config_for_model("Elephants")
+            .expect("the copy's config should load");
+        assert_eq!(config.model_name.as_deref(), Some("Elephants"));
+        let recorded = config.inference.checkpoint.expect("checkpoint recorded");
+        assert!(
+            recorded.contains("Elephants") && !recorded.contains("Foundation"),
+            "the copy's config still points into the original: {recorded}"
+        );
+        assert!(
+            Path::new(&recorded).is_file(),
+            "the path the copy's config records does not exist: {recorded}"
+        );
+
+        // And the list shows two models, both loadable.
+        let listed: Vec<String> = storage
+            .list_models()
+            .expect("listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(listed, vec!["Elephants", "Foundation"]);
+    }
+
+    /// What travels is the newest run — under its own dated name — and
+    /// `latest.ckpt` re-linked onto it *inside the copy*. Not the history: a
+    /// model with dozens of 14 MB runs would cost half a gigabyte per copy.
+    #[test]
+    fn the_newest_run_travels_with_the_copy_and_latest_points_at_it_there() {
+        let temp = TempRoot::new("duplicate-weights");
+        let storage = temp.storage();
+        let newest = seed_trained_model(&storage, "Foundation");
+
+        let outcome = storage
+            .duplicate_model("Foundation", "Elephants", WeightsToCopy::Newest)
+            .expect("duplicate should succeed");
+
+        assert_eq!(
+            outcome.copied_weights,
+            vec!["run-2026-08-08_1120.ckpt".to_string(), "latest.ckpt".to_string()],
+            "the outcome must name exactly what was written"
+        );
+        assert_eq!(
+            checkpoint_names_in(&storage, "Elephants"),
+            vec!["latest.ckpt", "run-2026-08-08_1120.ckpt"],
+            "the older run must not have been carried along"
+        );
+
+        let copied = outcome.path.join("pretrained_weights");
+        let dated = copied.join("run-2026-08-08_1120.ckpt");
+        let latest = copied.join(LATEST_CHECKPOINT_NAME);
+        assert_eq!(
+            fs::read(&dated).expect("read"),
+            fs::read(&newest).expect("read"),
+            "the copied weights are not the original's bytes"
+        );
+        assert_eq!(fs::read(&latest).expect("read"), fs::read(&dated).expect("read"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let inode = |path: &Path| fs::metadata(path).expect("metadata").ino();
+            assert_eq!(
+                inode(&latest),
+                inode(&dated),
+                "latest.ckpt in the copy must be a hard link onto the run, not a second copy"
+            );
+            assert_ne!(
+                inode(&dated),
+                inode(&newest),
+                "the copy is linked into the original — deleting one would surprise the other"
+            );
+        }
+    }
+
+    /// The other half of the choice: same architecture, fresh weights. The copy
+    /// gets a `pretrained_weights/`, and it is empty.
+    #[test]
+    fn a_duplicate_can_be_taken_without_the_weights() {
+        let temp = TempRoot::new("duplicate-config-only");
+        let storage = temp.storage();
+        seed_trained_model(&storage, "Foundation");
+
+        let outcome = storage
+            .duplicate_model("Foundation", "Fresh", WeightsToCopy::None)
+            .expect("duplicate should succeed");
+
+        assert!(outcome.copied_weights.is_empty());
+        assert!(outcome.path.join("pretrained_weights").is_dir());
+        assert!(checkpoint_names_in(&storage, "Fresh").is_empty());
+        assert_eq!(
+            storage
+                .load_model_config_for_model("Fresh")
+                .expect("config")
+                .model_name
+                .as_deref(),
+            Some("Fresh")
+        );
+    }
+
+    /// A model that has never trained duplicates as config alone even when
+    /// weights were asked for. The outcome says so rather than implying weights
+    /// arrived.
+    #[test]
+    fn asking_for_weights_a_model_does_not_have_copies_the_config_alone() {
+        let temp = TempRoot::new("duplicate-untrained");
+        let storage = temp.storage();
+        seed_model(&storage, "Untrained");
+
+        let outcome = storage
+            .duplicate_model("Untrained", "Untrained-copy", WeightsToCopy::Newest)
+            .expect("duplicate should succeed");
+
+        assert!(outcome.copied_weights.is_empty());
+        assert!(checkpoint_names_in(&storage, "Untrained-copy").is_empty());
+    }
+
+    /// A checkpoint from before the dated convention — a bare `latest.ckpt` with
+    /// no dated sibling — travels under the only name it has.
+    #[test]
+    fn a_lone_latest_travels_under_its_own_name() {
+        let temp = TempRoot::new("duplicate-legacy");
+        let storage = temp.storage();
+        seed_model(&storage, "Legacy");
+        let weights = storage.model_weights_dir("Legacy").expect("weights dir");
+        fs::write(weights.join(LATEST_CHECKPOINT_NAME), b"legacy weights").expect("write");
+
+        let outcome = storage
+            .duplicate_model("Legacy", "Legacy-copy", WeightsToCopy::Newest)
+            .expect("duplicate should succeed");
+
+        assert_eq!(outcome.copied_weights, vec!["latest.ckpt".to_string()]);
+        assert_eq!(checkpoint_names_in(&storage, "Legacy-copy"), vec!["latest.ckpt"]);
+        assert_eq!(
+            fs::read(outcome.path.join("pretrained_weights").join(LATEST_CHECKPOINT_NAME))
+                .expect("read"),
+            b"legacy weights"
+        );
+    }
+
+    #[test]
+    fn duplicating_onto_a_name_that_is_taken_changes_nothing() {
+        let temp = TempRoot::new("duplicate-collision");
+        let storage = temp.storage();
+        seed_trained_model(&storage, "Foundation");
+        seed_model(&storage, "Elephants");
+        let victim = fingerprint(&storage.models_root().join("Elephants").join("config_file"));
+
+        assert!(matches!(
+            storage.duplicate_model("Foundation", "Elephants", WeightsToCopy::Newest),
+            Err(ManagerError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            storage.duplicate_model("Foundation", "Foundation", WeightsToCopy::Newest),
+            Err(ManagerError::Unchanged(_))
+        ));
+        assert!(matches!(
+            storage.duplicate_model("ghost", "Elephants-2", WeightsToCopy::Newest),
+            Err(ManagerError::NotFound(_))
+        ));
+
+        assert_eq!(
+            fingerprint(&storage.models_root().join("Elephants").join("config_file")),
+            victim,
+            "a refused duplicate overwrote the model already holding the name"
+        );
+        assert!(checkpoint_names_in(&storage, "Elephants").is_empty());
+        assert!(!storage.models_root().join("Elephants-2").exists());
+    }
+
+    /// The same guard the delete has: a name that is not a plain child of
+    /// `Models/` cannot even be spelled, and a refusal writes nothing anywhere.
+    #[test]
+    fn a_pathological_duplicate_name_is_refused_and_writes_nothing() {
+        let temp = TempRoot::new("duplicate-guard");
+        let storage = temp.storage();
+        seed_trained_model(&storage, "Foundation");
+        let bystander = temp.path().join("precious");
+        fs::create_dir_all(&bystander).expect("bystander");
+        fs::write(bystander.join("keep-me"), b"x").expect("bystander file");
+
+        for pathological in [
+            "../evil",
+            "..",
+            "../precious",
+            "/etc",
+            "a/b",
+            "",
+            ".",
+            ".hidden",
+            "Models/Foundation",
+        ] {
+            let result = storage.duplicate_model("Foundation", pathological, WeightsToCopy::Newest);
+            assert!(
+                result.is_err(),
+                "duplicate_model(.., {pathological:?}) was accepted — it must not be"
+            );
+        }
+
+        assert_eq!(
+            fs::read(bystander.join("keep-me")).expect("read"),
+            b"x",
+            "a refused duplicate wrote outside Models/"
+        );
+        assert!(!temp.path().join("evil").exists());
+        let listed: Vec<String> = storage
+            .list_models()
+            .expect("listing")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(listed, vec!["Foundation"], "a refused duplicate left a model behind");
+    }
+
+    /// The form opens on this name, so it has to be free — and it has to stay
+    /// inside the length a model name is allowed.
+    #[test]
+    fn a_suggested_copy_name_is_free_and_short_enough() {
+        let temp = TempRoot::new("duplicate-suggest");
+        let storage = temp.storage();
+        seed_model(&storage, "Foundation");
+        assert_eq!(storage.suggest_copy_name("Foundation"), "Foundation-copy");
+
+        seed_model(&storage, "Foundation-copy");
+        assert_eq!(storage.suggest_copy_name("Foundation"), "Foundation-copy-2");
+        seed_model(&storage, "Foundation-copy-2");
+        assert_eq!(storage.suggest_copy_name("Foundation"), "Foundation-copy-3");
+
+        let long = "x".repeat(MAX_MODEL_NAME_LEN);
+        let suggested = storage.suggest_copy_name(&long);
+        assert!(suggested.ends_with("-copy"));
+        assert!(
+            validate_model_name(&suggested).is_ok(),
+            "the suggested name is not a usable model name: {suggested}"
+        );
     }
 }
