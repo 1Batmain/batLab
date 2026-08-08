@@ -298,8 +298,7 @@ impl Layer {
                         let from = weights.len().saturating_sub(tail as usize);
                         weights[from..].fill(0.0);
                     }
-                    gpu.queue
-                        .write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
+                    gpu.write_buffer(&buf, 0, bytemuck::cast_slice(&weights));
                 }
                 BufferInit::Ones => {
                     let count = binding.spec.size as usize / 4;
@@ -995,8 +994,7 @@ impl Layer {
         let Some(ema) = &self.ema_pass else {
             return false;
         };
-        gpu.queue
-            .write_buffer(&ema.specs, 0, &EmaSpecs { decay }.to_bytes());
+        gpu.write_buffer(&ema.specs, 0, &EmaSpecs { decay }.to_bytes());
         true
     }
 

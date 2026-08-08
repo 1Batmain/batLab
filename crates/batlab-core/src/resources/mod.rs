@@ -1215,5 +1215,7 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+pub mod report;
+
 #[cfg(test)]
 mod tests;

@@ -579,7 +579,6 @@ impl Model<Training> {
             .forward[1]
             .clone();
         self.gpu
-            .queue
             .write_buffer(loss_buf.as_ref(), 0, bytemuck::cast_slice(target));
 
         // Single sample, no accumulation: the gradient is already its own mean.
@@ -1031,7 +1030,6 @@ impl<State> Model<State> {
                     });
                 }
                 self.gpu
-                    .queue
                     .write_buffer(target.as_ref(), 0, bytemuck::cast_slice(values));
                 restored_any = true;
             }
@@ -1222,10 +1220,8 @@ impl<State> Model<State> {
                 _ => (&entry.weights, &entry.bias),
             };
             self.gpu
-                .queue
                 .write_buffer(weights_buf.as_ref(), 0, bytemuck::cast_slice(weights));
             self.gpu
-                .queue
                 .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(bias));
 
             // Fill this run's shadow, if it keeps one.
@@ -1239,10 +1235,8 @@ impl<State> Model<State> {
             if shadow.len() == 2 {
                 let (shadow_w, shadow_b) = averaged.unwrap_or((weights, bias));
                 self.gpu
-                    .queue
                     .write_buffer(shadow[0].as_ref(), 0, bytemuck::cast_slice(shadow_w));
                 self.gpu
-                    .queue
                     .write_buffer(shadow[1].as_ref(), 0, bytemuck::cast_slice(shadow_b));
             }
         }

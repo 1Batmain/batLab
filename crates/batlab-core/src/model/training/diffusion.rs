@@ -236,7 +236,6 @@ impl DiffusionTask {
 
         model
             .gpu
-            .queue
             .write_buffer(&pass.clean_target, 0, bytemuck::cast_slice(clean_target));
         model.gpu.write_buffer(&pass.specs, 0, &specs_bytes);
 

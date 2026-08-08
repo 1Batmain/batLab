@@ -159,6 +159,69 @@ mod tests {
         assert_eq!(first.since(second), TransferSnapshot::default());
     }
 
+    /// There must be no second door.
+    ///
+    /// The counters are only true if every host↔GPU crossing in the engine goes
+    /// through [`crate::GpuContext`]. A single `queue.write_buffer` left behind
+    /// does not fail, does not warn, and does not show up in any number — it
+    /// just makes the reported traffic quietly too small, which is the one
+    /// failure mode a traffic report must not have. So the rule is checked
+    /// mechanically rather than remembered.
+    ///
+    /// Test files are exempt: they build fixtures, and a fixture's uploads are
+    /// not the engine's traffic.
+    #[test]
+    fn nothing_in_the_engine_bypasses_the_counted_queue() {
+        fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("failed to read the engine sources") {
+                let path = entry.expect("bad directory entry").path();
+                if path.is_dir() {
+                    walk(&path, offenders);
+                    continue;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if !name.ends_with(".rs") || name.contains("test") {
+                    continue;
+                }
+                // `gpu_context.rs` is where the door is: it is the one file
+                // allowed to touch the queue, because it counts what it passes.
+                if name == "gpu_context.rs" {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("failed to read a source file");
+                // Comments name the wgpu call all over this crate; only code
+                // counts, so lines whose first non-space character starts a
+                // comment are skipped.
+                for (number, line) in source.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") || code.starts_with("///") {
+                        continue;
+                    }
+                    // Assembled from halves so that this line is not itself an
+                    // offender — the detector has to be allowed to name what it
+                    // detects.
+                    if code.contains(concat!("queue", ".write_buffer"))
+                        || code.contains(concat!("queue", ".submit"))
+                    {
+                        offenders.push(format!("{}:{}: {}", path.display(), number + 1, code));
+                    }
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut offenders,
+        );
+        assert!(
+            offenders.is_empty(),
+            "these bypass GpuContext::write_buffer/submit, so their bytes are \
+             invisible to every traffic figure the project reports:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn a_rate_is_the_total_divided_by_the_steps() {
         let counters = TransferCounters::default();
