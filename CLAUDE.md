@@ -71,8 +71,11 @@ que là où avancer est de la navigation : depuis le sélecteur de templates il 
 **inerte**, parce qu'avancer y écrirait un `config_file` sur disque.
 
 **Le défaut est de continuer depuis les poids du modèle**, pas de repartir de
-zéro : ouvrir un modèle qui a un checkpoint pointe le flux dessus (`latest.ckpt`
-d'abord — ordre alphabétique sinon), et « Start from random » est une case du
+zéro : ouvrir un modèle qui a un checkpoint pointe le flux dessus (celui que son
+`config_file` a enregistré au dernier run, `latest.ckpt` sinon), et le sélecteur
+est **trié du plus récent au plus ancien**, chaque ligne portant sa date et sa
+taille (`run-2026-08-08_1120.ckpt   2026-08-08 11:20 · 78 kB`) — choisir « celui
+d'hier soir » ne doit pas être une devinette. « Start from random » est une case du
 formulaire d'entraînement, décochée. Le curseur du sélecteur de poids est
 **dérivé** de `load_checkpoint_on_start` + `selected_checkpoint_path`, jamais
 mémorisé : c'est ce qui empêche une ligne périmée de recharger un checkpoint
@@ -116,6 +119,19 @@ Le manager, côté contrat observable :
   Gardé des deux côtés : `config::tests` sur `built_in_templates()`, et
   `every_model_created_from_a_template_is_conditionable_on_the_timestep` sur le
   fichier réellement écrit.
+- **Les sauvegardes de poids sont datées.** Un run écrit **son** fichier,
+  `run-<AAAA-MM-JJ_HHMM>.ckpt` (heure locale, zéro-padded : trier ces noms par
+  nom, c'est trier les runs par date — ne pas remplacer le `_02` de collision
+  par un `-02`, `-` trie avant `.` et casse la propriété), puis `latest.ckpt`
+  est reposé dessus : un **lien dur**, pas une copie — un checkpoint XL fait
+  14 Mo et une nuit avec `--checkpoint-every` en écrit des dizaines. Rien
+  n'écrase rien : les poids d'hier sont encore là ce matin. Le `config_file`
+  enregistre **où le run écrit**, `RunOptions::load_from` porte ce qu'il **lit**
+  (le choix du sélecteur) — les deux étaient un seul champ, d'où l'écrasement.
+  `--out` reste roi : nom exact, pas de date, pas de `latest.ckpt` à côté (tous
+  les bancs sous `bench/` en dépendent). Sans `--out`, `--headless-train` reste
+  du scratch, daté, sous `$TMPDIR/batlab-<modèle>/`. Contrat complet et e2e :
+  `docs/reports/DATED_CHECKPOINTS.md`.
 - **Un checkpoint est un `.ckpt`**, non caché, dans `pretrained_weights/` — le
   `latest_metrics.jsonl` que tout entraînement dépose à côté n'en est pas un.
   Les deux listages (compteur de la liste, sélecteur de poids) passent par
@@ -131,7 +147,9 @@ parcourt tous les écrans à la touche depuis la porte d'entrée et exige d'avoi
 Les rapports de mission, avec les contrats observables complets et les parcours
 e2e déroulés : `docs/reports/MODEL_MANAGER.md` (le manager),
 `docs/reports/IMG2IMG_DRIFT.md` (la dérive img2img, la cause racine du « pause »
-de la remontée, et le panneau d'architecture) et
+de la remontée, et le panneau d'architecture),
+`docs/reports/DATED_CHECKPOINTS.md` (les checkpoints datés, `latest.ckpt` en
+lien dur, la date à l'écran) et
 `docs/reports/UX_NAV.md` (le chemin, les poids par défaut, l'aide — et la cause
 racine du vol de focus au lancement sur macOS : winit appelle
 `activateIgnoringOtherApps(true)` au démarrage de son event loop, ce que
@@ -147,9 +165,9 @@ cargo run -p batlab -- --headless-train <model> --steps N --dataset <path> [--lr
 # ex. : cargo run -p batlab -- --headless-train Greyscale_Diffusion --steps 2000 --dataset datasets/cifar10_grey.batraw
 ```
 
-Propriétés : ne réécrit jamais le `config_file` du modèle, écrit son checkpoint dans un fichier scratch (n'écrase pas les poids sauvegardés), et part **from scratch par défaut** — `--resume <ckpt>` est l'opt-in explicite pour continuer. Marqué DEV/CI dans `crates/batlab/src/main.rs`, inatteignable depuis le TUI.
+Propriétés : ne réécrit jamais le `config_file` du modèle, écrit son checkpoint dans un fichier scratch daté (`$TMPDIR/batlab-<modèle>/run-<AAAA-MM-JJ_HHMM>.ckpt`, avec son `latest.ckpt` — n'écrase pas les poids sauvegardés, ni son propre run précédent), et part **from scratch par défaut** — `--resume <ckpt>` est l'opt-in explicite pour continuer. Marqué DEV/CI dans `crates/batlab/src/main.rs`, inatteignable depuis le TUI.
 
-`--resume <ckpt>` reprend poids + moments Adam + compteur de pas `t` + EMA, et **écrit dans `--out`** : un run repris n'écrase jamais le fichier dont il vient. Une géométrie incompatible est refusée en nommant la couche et les longueurs. `--checkpoint-every N` écrit un partiel tous les N pas dans `<out stem>.partial.ckpt` — **un seul fichier, en rotation**, via un temporaire + `rename` atomique (un kill en pleine écriture ne peut pas laisser un `.ckpt` tronqué) ; c'est un checkpoint ordinaire, que `--resume` et le sélecteur de poids voient tous les deux. Le contrat complet des flags est dans `--help` et dans `docs/reports/EMA.md` §3.
+`--resume <ckpt>` reprend poids + moments Adam + compteur de pas `t` + EMA, et **écrit dans `--out`** : un run repris n'écrase jamais le fichier dont il vient. Une géométrie incompatible est refusée en nommant la couche et les longueurs. `--checkpoint-every N` écrit un partiel tous les N pas dans `<out stem>.partial.ckpt` — **un seul fichier, en rotation**, via un temporaire + `rename` atomique (un kill en pleine écriture ne peut pas laisser un `.ckpt` tronqué) ; c'est un checkpoint ordinaire, que `--resume` et le sélecteur de poids voient tous les deux, et sauf `--out` explicite `latest.ckpt` suit chaque rotation (un run tué à la neuvième heure laisse son partiel comme poids les plus récents). Le contrat complet des flags est dans `--help` et dans `docs/reports/EMA.md` §3.
 
 Pour piloter le vrai TUI malgré tout (test end-to-end) : le lancer dans un pane tmux dédié et le piloter via `tmux send-keys`.
 

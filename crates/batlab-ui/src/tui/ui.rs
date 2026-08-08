@@ -6,6 +6,7 @@ use super::app::{
     PathStep, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
 use super::help;
+use crate::clock;
 use crate::storage;
 use ratatui::{prelude::*, widgets::*};
 
@@ -484,7 +485,10 @@ fn selected_style(selected: bool) -> Style {
 
 /// How a model's checkpoints are summarised in the list. The count first,
 /// because "does this model have trained weights at all" is the question; the
-/// names after it, because picking between them is the next one.
+/// date of the newest right after it, because "is this thing fresh, or did I
+/// last train it in June?" is the next one — and the names last.
+///
+/// The list is newest-first, so the date is `checkpoints[0]`'s.
 fn checkpoint_summary(checkpoints: &[storage::CheckpointEntry]) -> String {
     let names = |take: usize| -> String {
         checkpoints[..take]
@@ -495,9 +499,19 @@ fn checkpoint_summary(checkpoints: &[storage::CheckpointEntry]) -> String {
     };
     match checkpoints.len() {
         0 => "no checkpoints".to_string(),
-        1 => format!("1 checkpoint: {}", names(1)),
-        n if n <= 3 => format!("{n} checkpoints: {}", names(n)),
-        n => format!("{n} checkpoints: {}, …", names(2)),
+        n => {
+            let newest = checkpoints[0]
+                .modified
+                .and_then(clock::short)
+                .unwrap_or_else(|| "date unknown".to_string());
+            let plural = if n == 1 { "checkpoint" } else { "checkpoints" };
+            let listed = if n <= 3 {
+                names(n)
+            } else {
+                format!("{}, …", names(2))
+            };
+            format!("{n} {plural} (newest {newest}): {listed}")
+        }
     }
 }
 
@@ -817,6 +831,25 @@ fn draw_template_selector(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// One row of the weight selector: the file name, then when it was written and
+/// how big it is.
+///
+/// The names are padded to a common width so the dates line up as a column —
+/// scanning down for "yesterday evening" is the whole reason the date is here,
+/// and a ragged right edge makes that scan a reading exercise.
+fn checkpoint_row(
+    checkpoint: &storage::CheckpointEntry,
+    selected: bool,
+    name_width: usize,
+) -> String {
+    format!(
+        "    {} {:<name_width$}   {}",
+        if selected { ">" } else { " " },
+        checkpoint.name,
+        checkpoint.detail(),
+    )
+}
+
 fn draw_weight_selector(f: &mut Frame, app: &App, area: Rect) {
     // The weight choice is a parameter like any other now that it has a
     // default, so it gets the same panel as the forms.
@@ -871,14 +904,20 @@ fn draw_weight_selector(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
+        // Newest first (`storage::list_model_checkpoints`), and every row says
+        // when it was written and how big it is: without the date, picking "the
+        // one from last night" out of a column of `run-…` names is guesswork.
+        let widest = app
+            .weight_selector
+            .checkpoints
+            .iter()
+            .map(|entry| entry.name.chars().count())
+            .max()
+            .unwrap_or(0);
         for (idx, checkpoint) in app.weight_selector.checkpoints.iter().enumerate() {
             let selected = app.weight_selector.selected == idx + 1;
             lines.push(Line::from(Span::styled(
-                format!(
-                    "    {} {}",
-                    if selected { ">" } else { " " },
-                    checkpoint.name
-                ),
+                checkpoint_row(checkpoint, selected, widest),
                 if selected {
                     Style::default()
                         .fg(Color::Yellow)
@@ -1946,6 +1985,76 @@ mod tests {
             checkpoints: Vec::new(),
             architecture: batlab_core::summarize_architecture(&layers, input),
         }
+    }
+
+    /// A checkpoint as the listing hands it over: a name, a size, and an
+    /// instant `minutes` after the epoch — the date is then whatever the local
+    /// calendar makes of it, which is exactly what the screen shows.
+    fn checkpoint(name: &str, minutes: u64, size_bytes: u64) -> storage::CheckpointEntry {
+        storage::CheckpointEntry {
+            name: name.to_string(),
+            path: format!("Models/Test_Model/pretrained_weights/{name}"),
+            modified: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(minutes * 60),
+            ),
+            size_bytes,
+        }
+    }
+
+    /// Choosing "the one from last night" out of a column of `run-…` names is
+    /// guesswork without the date, which is the entire point of showing it.
+    #[test]
+    fn a_weight_row_carries_its_date_and_its_size() {
+        let entry = checkpoint("run-2026-08-08_1041.ckpt", 29_600_000, 14_200_000);
+        let row = checkpoint_row(&entry, false, entry.name.chars().count());
+
+        assert!(row.contains("run-2026-08-08_1041.ckpt"), "{row}");
+        assert!(row.contains("14.2 MB"), "{row}");
+        let when = clock::short(entry.modified.unwrap()).expect("a local date");
+        assert!(row.contains(&when), "{row} should carry {when}");
+    }
+
+    /// The names are a column: two rows of different name lengths must put
+    /// their dates at the same offset, or the column is not one.
+    #[test]
+    fn the_dates_line_up_whatever_the_names_are() {
+        let long = checkpoint("run-2026-08-08_1041.ckpt", 29_600_000, 1_000);
+        let short = checkpoint("latest.ckpt", 29_600_000, 1_000);
+        let width = long.name.chars().count();
+
+        let offset = |row: &str| {
+            let when = clock::short(long.modified.unwrap()).expect("a local date");
+            row.find(&when).expect("the date must be on the row")
+        };
+        assert_eq!(
+            offset(&checkpoint_row(&long, false, width)),
+            offset(&checkpoint_row(&short, true, width)),
+            "the date column drifted with the name length"
+        );
+    }
+
+    /// The model list says how fresh a model is without opening it: the count,
+    /// then the date of the newest — the listing is newest-first, so that is
+    /// the first entry's.
+    #[test]
+    fn the_model_list_summary_dates_the_newest_checkpoint() {
+        let newest = checkpoint("run-2026-08-08_1041.ckpt", 29_600_000, 1_000);
+        let when = clock::short(newest.modified.unwrap()).expect("a local date");
+        let entries = vec![
+            newest,
+            checkpoint("latest.ckpt", 29_600_000, 1_000),
+            checkpoint("night_run.ckpt", 29_000_000, 1_000),
+            checkpoint("one.ckpt", 28_000_000, 1_000),
+        ];
+
+        let summary = checkpoint_summary(&entries);
+        assert!(summary.starts_with("4 checkpoints"), "{summary}");
+        assert!(summary.contains(&when), "{summary} should date the newest");
+        // Four names do not fit; the elision must be marked, never silent.
+        assert!(summary.ends_with('…'), "{summary}");
+        assert!(!summary.contains("one.ckpt"), "{summary}");
+
+        assert_eq!(checkpoint_summary(&[]), "no checkpoints");
     }
 
     fn template_entry() -> SavedModelEntry {

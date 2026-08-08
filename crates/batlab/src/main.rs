@@ -561,25 +561,8 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
 
     let dataset_path = flag("--dataset")
         .ok_or_else(|| "--dataset <path to .batraw or image dir> is required".to_string())?;
-    // `--out` is the user's own filing: the file is written exactly where and
-    // exactly as named, with no dating and no `latest.ckpt` dropped beside it.
-    // Without it the run still writes to *scratch* — never into the model's
-    // saved weights — but under the dated name every run now carries, in a
-    // per-model scratch directory so two models cannot collide on one stamp.
-    let explicit_out = flag("--out");
-    let (checkpoint_path, maintain_latest) = match explicit_out {
-        Some(path) => (PathBuf::from(path), false),
-        None => {
-            let dir = headless_scratch_dir(&model_name);
-            std::fs::create_dir_all(&dir).map_err(|err| {
-                format!("failed to create scratch directory {}: {err}", dir.display())
-            })?;
-            (
-                storage::new_run_checkpoint_path_in(&dir, SystemTime::now()),
-                true,
-            )
-        }
-    };
+    let (checkpoint_path, maintain_latest) =
+        headless_checkpoint_target(flag("--out"), &model_name, SystemTime::now())?;
 
     let train_cfg = TrainingConfig {
         lr,
@@ -635,7 +618,9 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             let options = RunOptions {
                 resume_from,
                 checkpoint_every,
-                // The path above is already the run's own; nothing to redirect.
+                // The path above is already the run's own, and `--resume` is
+                // how a headless run names what it reads: nothing to redirect.
+                load_from: None,
                 write_to: None,
                 maintain_latest,
             };
@@ -1284,31 +1269,19 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
 
 fn run_execution_loop(mut config: ModelConfig) {
     loop {
-        if let Err(err) = normalize_config_for_models_layout(&mut config) {
-            eprintln!("failed to prepare model persistence: {err}");
-            break;
-        }
+        let prepared = match normalize_config_for_models_layout(&mut config) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                eprintln!("failed to prepare model persistence: {err}");
+                break;
+            }
+        };
 
         let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<tui::TrainingControlCommand>();
         // Both training and perpetual runs are steered while they run; a plain
         // inference has nothing to steer.
         let is_steerable = matches!(&config.run.mode, RunMode::Train(_) | RunMode::Perpetual(_));
-        // Resolved once per run — including once per restart from the monitor,
-        // so a second run of the evening gets a second file rather than
-        // reopening the first one's.
-        let run_write_path = match (&config.run.mode, config.model_name.as_deref()) {
-            (RunMode::Train(_), Some(model_name)) => {
-                match storage::new_run_checkpoint_path(model_name, SystemTime::now()) {
-                    Ok(path) => Some(path),
-                    Err(err) => {
-                        eprintln!("[checkpoint] could not prepare a run checkpoint path: {err}");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
         let config_clone = config.clone();
 
         std::thread::spawn(move || {
@@ -1320,14 +1293,13 @@ fn run_execution_loop(mut config: ModelConfig) {
                         // the TUI walks the weight selector for the first and
                         // has `[s]` in the monitor for the second.
                         //
-                        // What the TUI *does* set is where the run writes: its
-                        // own dated file in the model's `pretrained_weights/`,
-                        // never back over the checkpoint the weight selector
-                        // pointed it at. Losing yesterday's weights by training
-                        // again today is exactly the bug this closes.
+                        // The config now names where this run *writes* (its own
+                        // dated file); what the selector picked comes in beside
+                        // it as the file to *read*. Training again never writes
+                        // back over the weights it continued from.
                         let options = RunOptions {
-                            write_to: run_write_path.clone(),
-                            maintain_latest: run_write_path.is_some(),
+                            load_from: prepared.load_from.clone(),
+                            maintain_latest: prepared.maintain_latest,
                             ..RunOptions::default()
                         };
                         run_training(config_clone, train_cfg, options, &tx, control_rx).await
@@ -1354,7 +1326,20 @@ fn run_execution_loop(mut config: ModelConfig) {
     }
 }
 
-fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<(), String> {
+/// What preparing a run resolved that the config itself cannot hold.
+#[derive(Debug, Clone, Default)]
+struct PreparedRun {
+    /// The checkpoint the weight selector pointed at — the file this run
+    /// *reads*. It is not written into the `config_file`: which file tonight's
+    /// run happened to continue from is not a property of the model, and the
+    /// config's own `checkpoint_path` now records where the run *writes*.
+    load_from: Option<PathBuf>,
+    /// Whether `latest.ckpt` should follow what this run writes. True exactly
+    /// when the path below was dated here.
+    maintain_latest: bool,
+}
+
+fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<PreparedRun, String> {
     let model_name = match config.model_name.clone() {
         Some(name) => name,
         None => {
@@ -1365,20 +1350,25 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<(), St
         }
     };
 
-    if let RunMode::Train(train) = &mut config.run.mode
-        && train.checkpoint_path.is_none()
-    {
-        train.checkpoint_path = Some(
-            storage::default_model_checkpoint_path(&model_name)
-                .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?
-                .to_string_lossy()
-                .to_string(),
-        );
+    // A training run gets its own dated file, resolved once here — including
+    // once per restart from the monitor, so the evening's second run gets a
+    // second file instead of reopening the first one's. The path the selector
+    // left in the config becomes the run's *load* source; the config is then
+    // rewritten naming the file this run will write, so reopening the model
+    // tomorrow lands on the weights this run produced and not on the ones it
+    // started from.
+    let mut prepared = PreparedRun::default();
+    if let RunMode::Train(train) = &mut config.run.mode {
+        let dated = storage::new_run_checkpoint_path(&model_name, SystemTime::now())
+            .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?;
+        prepared.load_from = train.checkpoint_path.take().map(PathBuf::from);
+        prepared.maintain_latest = true;
+        train.checkpoint_path = Some(dated.to_string_lossy().to_string());
     }
 
     storage::write_model_config(&model_name, config)
         .map_err(|err| format!("failed to write model config for '{model_name}': {err}"))?;
-    Ok(())
+    Ok(prepared)
 }
 
 async fn build_execution_model(
@@ -1420,6 +1410,30 @@ fn headless_scratch_dir(model_name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("batlab-{model_name}"))
 }
 
+/// The file a headless run writes, and whether `latest.ckpt` follows it.
+///
+/// `--out` is the user's own filing: written exactly where and exactly as
+/// named, with no dating and no `latest.ckpt` dropped beside it — naming the
+/// file *is* how one opts out of the convention. Without it the run still
+/// writes to scratch, never into a model's saved weights, but under the dated
+/// name every run now carries.
+fn headless_checkpoint_target(
+    explicit_out: Option<String>,
+    model_name: &str,
+    at: SystemTime,
+) -> Result<(PathBuf, bool), String> {
+    match explicit_out {
+        Some(path) => Ok((PathBuf::from(path), false)),
+        None => {
+            let dir = headless_scratch_dir(model_name);
+            fs::create_dir_all(&dir).map_err(|err| {
+                format!("failed to create scratch directory {}: {err}", dir.display())
+            })?;
+            Ok((storage::new_run_checkpoint_path_in(&dir, at), true))
+        }
+    }
+}
+
 /// What a run does on top of its `TrainingConfig`, and only ever from the
 /// headless entry point.
 ///
@@ -1434,6 +1448,12 @@ struct RunOptions {
     resume_from: Option<PathBuf>,
     /// `--checkpoint-every N`: how often a partial checkpoint is written.
     checkpoint_every: Option<usize>,
+    /// The checkpoint this run **reads**, when that is not where it writes.
+    ///
+    /// The TUI's weight selector picks a file to continue from; the run then
+    /// writes its own dated one. `None` reads from wherever it writes, which is
+    /// what `--resume`-less headless runs and legacy configs do.
+    load_from: Option<PathBuf>,
     /// Where this run **writes**, when that is not where it reads.
     ///
     /// A run used to write back over the file it continued from, which is how
@@ -1489,6 +1509,10 @@ async fn run_training(
         .write_to
         .clone()
         .or_else(|| checkpoint_path.clone());
+    let load_path = options
+        .load_from
+        .clone()
+        .or_else(|| checkpoint_path.clone());
 
     // `--resume` reads from a file of its own and writes to `--out`, so a
     // resumed run never overwrites the checkpoint it came from unless it is
@@ -1529,7 +1553,7 @@ async fn run_training(
                 (false, false) => String::new(),
             }
         );
-    } else if let Some(path) = checkpoint_path.as_ref() {
+    } else if let Some(path) = load_path.as_ref() {
         if train_cfg.load_checkpoint {
             if !path.exists() {
                 return Err(format!(
@@ -3409,6 +3433,52 @@ mod tests {
             final_unit.contains("path 4/4") && final_unit.contains("t=0"),
             "last unit should close path 4 at t=0, got {final_unit:?}"
         );
+    }
+
+    /// `--out` is the way to opt out of the naming convention: the file is
+    /// written under the name that was asked for, and nothing else is dropped
+    /// beside it. A scripted arm that names `runs/adam_lr1e-3.ckpt` must find
+    /// exactly that file — every bench under `bench/` reads its runs back by
+    /// the path it passed.
+    #[test]
+    fn an_explicit_out_is_written_exactly_as_named() {
+        let asked = "/tmp/somewhere/adam_lr1e-3.ckpt";
+        let (path, maintain_latest) =
+            headless_checkpoint_target(Some(asked.to_string()), "Greyscale_Diffusion", now())
+                .expect("an explicit --out needs no directory prepared");
+
+        assert_eq!(path, PathBuf::from(asked));
+        assert!(
+            !maintain_latest,
+            "--out must not drop a latest.ckpt beside the file the user named"
+        );
+    }
+
+    /// Without `--out` the run is dated *and* stays in scratch: a CI run that
+    /// wrote into `Models/<name>/pretrained_weights/` would quietly become the
+    /// model's weights.
+    #[test]
+    fn a_headless_run_without_out_is_dated_and_stays_in_scratch() {
+        let (path, maintain_latest) =
+            headless_checkpoint_target(None, "Greyscale_Diffusion", now())
+                .expect("scratch directory");
+
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("run-") && name.ends_with(".ckpt"), "{name}");
+        assert_eq!(
+            path.parent(),
+            Some(headless_scratch_dir("Greyscale_Diffusion").as_path()),
+            "the scratch run escaped its directory"
+        );
+        assert!(
+            !path.starts_with(storage::project_root().join("Models")),
+            "a headless run must never write into a model's saved weights"
+        );
+        assert!(maintain_latest);
+    }
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_775_000_000)
     }
 
     /// The single-path case is the common one; naming a path there is noise.

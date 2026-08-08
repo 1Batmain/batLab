@@ -126,6 +126,12 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   en opt-out, le fil d'Ariane `Model › Action › Weights › Parameters › Run` et la
   navigation `←`/`→`, l'aide contextuelle sourcée dans ces rapports. Contient le
   contrat observable de la navigation.
+- **[DATED_CHECKPOINTS.md](DATED_CHECKPOINTS.md)** — les sauvegardes de poids portent
+  leur date : un run écrit `run-<AAAA-MM-JJ_HHMM>.ckpt` (trier ces noms par nom trie
+  les runs par date) au lieu d'écraser `latest.ckpt`, qui devient un **lien dur** sur
+  le plus récent — même octets, pas de seconde copie. Date et taille affichées dans le
+  sélecteur de poids et la liste des modèles, triés du plus récent au plus ancien.
+  Contient le contrat observable et le e2e déroulé au TUI.
 - **[IMG2IMG_DRIFT.md](IMG2IMG_DRIFT.md)** — le mode Perpetual devient une dérive
   img2img : départ sur une VRAIE image du dataset, fenêtre x̂₀ seule par défaut
   (`[x]` pour la double vue) — et la cause racine du « pause » (la remontée
