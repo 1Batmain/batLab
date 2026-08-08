@@ -126,6 +126,14 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   rebasés), le dernier run seul voyage sous son nom daté avec `latest.ckpt` relié
   dessus, et **l'original ne bouge pas d'un octet**. Contient le contrat observable et
   le e2e déroulé au TUI.
+- **[CUSTOM_DATASET.md](CUSTOM_DATASET.md)** — entraîner sur SES images : les trois
+  convertisseurs (dossier d'images, CIFAR, ImageNet 32×32), le format `BATRAW3` (payload
+  u8 élargi sur le GPU — 586 → 146 Mio sur CIFAR RGB, 15,7 → 3,94 Go sur ImageNet, et
+  une table de 256 f32 dans le shader parce que la formule divergeait du CPU d'un ULP
+  sur 111 valeurs), `--gpu-limits native|web` (le batch plafonné à 341 par une limite de
+  *binding* passe à 4096 ; un dataset qui tient devient **résident**, trafic 146,5 Mio →
+  1,9 Kio par pas), et le mode d'emploi du fine-tuning. Dit aussi ce que ça ne change
+  pas : sur cette machine à mémoire unifiée, le temps par pas est identique à 0,1 % près.
 - **[UX_NAV.md](UX_NAV.md)** — quatre retours après usage réel : le vol de focus au
   lancement (cause racine, `activateIgnoringOtherApps` de winit, que la policy
   `Accessory` ne couvre pas), les poids pré-entraînés en défaut avec « from random »

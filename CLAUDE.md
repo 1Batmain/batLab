@@ -234,7 +234,72 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
 - Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `docs/reports/INSIGHTS_TRAINING.md`).
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
-- Format dataset `.batraw` : magic `BATRAW2` = payload en [-1,1] ; les fichiers `BATRAW1` ([0,1]) restent lisibles et sont rééchelonnés au chargement.
+- **Entraîner sur ses propres images** : trois convertisseurs, un format.
+  `tools/images_to_raw.py <dossier>` (récursif, EXIF, carré `--crop center|fit`,
+  `--size`, `--mode rgb|grey`, corrompus sautés et comptés, `--min-size`,
+  `--dedup` sur l'échantillon produit, ordre déterministe par chemin relatif) ;
+  `datasets/cifar_to_raw.py` ; `tools/imagenet32_to_raw.py <dossier>` (attend
+  `train_data_batch_1..10`, **des pickles sans extension**, ne télécharge rien,
+  `--limit N`). **`--contact-sheet <png>` est l'étape à ne jamais sauter** :
+  c'est la seule façon de voir ce sur quoi on entraîne après recadrage, et les
+  erreurs qui coûtent une nuit ne lèvent aucune exception. Le piège partagé par
+  CIFAR et ImageNet : 3072 octets sont **trois plans** (R, G, B entiers), pas des
+  pixels entrelacés — lu tel quel le dataset donne des images en bandes et
+  l'entraînement ne bronche pas. Tests : `python3 tools/test_dataset_tools.py`
+  (25, images synthétiques, aucun réseau). Le mode d'emploi du **fine-tuning**
+  (dupliquer le modèle d'abord, `--resume` + `--out` + `--checkpoint-every`,
+  `--lr 1e-4`, et pourquoi sous ~1000 images le modèle mémorise) est dans
+  `docs/reports/CUSTOM_DATASET.md`.
+- **Les limites GPU sont un choix : `--gpu-limits native|web`** (défaut
+  `native`). `request_device` ne donne pas ce que l'adaptateur sait faire, il
+  donne ce qu'on **demande** — et ne rien demander, c'était demander la base
+  WebGPU : 256 Mio par tampon, 128 Mio par binding de stockage. Juste pour
+  l'**inférence** (la cible est le navigateur du visiteur, cf. la frontière
+  moteur/interface), faux pour l'**entraînement**, qui tourne ici : le même Mac
+  autorise 28 Gio par tampon et 4 Gio par binding. Mesuré sur
+  `Color_Diffusion_XL` : plafond de batch **341 → 4096** (c'était la limite de
+  *binding*, pas la mémoire), et `cifar10_rgb` en u8 (146 Mio) passe de 2 chunks
+  streamés à **UN seul chunk résident** — trafic dataset par pas **146,5 Mio →
+  1,9 Kio**. Le dimensionnement suit : si le dataset tient dans un tampon que
+  l'appareil accepte de lier ET sous le budget de résidence (`gpu_cap/4`, plus
+  généreux que le budget de streaming `gpu_cap/8` parce qu'on le paie **une
+  fois**), on prend tout. C'est ce qui rend ImageNet 32×32 u8 (3,94 Go < les
+  4 Gio de binding) entièrement résident.
+  **Honnêteté sur le gain** : sur cette machine à mémoire unifiée le trafic
+  n'était **pas** le goulot — 10 pas à batch 32 prennent 46,0 s sous les deux
+  profils, à 0,1 % près. Ce que le profil natif achète réellement ici, c'est le
+  **plafond de batch** et la possibilité de tenir un corpus entier ; le gain de
+  trafic, lui, se paierait sur une carte discrète (PCIe). Ne pas annoncer une
+  accélération non mesurée.
+  Garde-fous : l'inférence et le perpetual tournent sous les deux profils
+  (`--headless-sample` rend des stats identiques au bit près), le profil
+  **obtenu** (pas demandé) est imprimé par la bannière de run et par
+  `--resources`, un adaptateur qui refuse ses propres limites fait retomber sur
+  la base en le disant, et `--resources --no-gpu` / `--device <nom>` donnent
+  toujours le verdict **contre les limites WebGPU** (`ProfileSource::Hypothetical`)
+  pour savoir si un modèle passerait dans un navigateur.
+- **Format dataset `.batraw` : le payload est en u8 (`BATRAW3`)**, élargi en
+  [-1,1] **sur le GPU** (`training/shader/dataset_decode.wgsl`). Même en-tête
+  qu'avant ; `BATRAW2` (f32 en [-1,1]) et `BATRAW1` (f32 en [0,1], rééchelonné)
+  restent lisibles. Toutes les images de ce projet sont 8 bits à la source, donc
+  l'ancien encodage stockait quatre octets dont trois se déduisaient du premier :
+  CIFAR-10 RGB passe de 586 Mio à 146 Mio, ImageNet 32×32 de 15,7 Go à 3,9 Go.
+  Ce qui compte n'est pas le disque mais le **trafic** — un chunk résident tient
+  4× plus d'images, donc 4× moins de rechargements. Mesuré, pas déduit :
+  `--resources Color_Diffusion_XL --batch 32 --dataset … --measure` donne
+  **585,9 Mio/pas → 146,5 Mio/pas** (facteur 4,00) et 7 → 4 soumissions.
+  Le décodage est **exact** (256 valeurs, aucun arrondi) : le shader lit une
+  **table de 256 f32**, il ne recalcule pas `v/127.5 - 1` — écrite comme
+  formule elle divergeait du CPU d'1 ULP sur 111 valeurs sur 256, Metal
+  compilant la division en réciproque approchée. Ne pas « simplifier » la table
+  en une formule. Gardé au bit près des deux côtés :
+  `the_gpu_decode_agrees_with_the_cpu_one`,
+  `an_8_bit_file_decodes_to_the_same_bits_as_the_f32_one_it_replaces`, et
+  `an_8_bit_dataset_trains_exactly_like_the_f32_one_it_replaces` (mêmes pertes,
+  pas pour pas). Un fichier 8 bits dont la géométrie ne colle pas au modèle
+  retombe sur le chemin f32 : le rééchantillonnage se fait sur l'hôte de toute
+  façon. La définition du format côté Python vit dans `tools/batraw.py`, seule
+  et importée par les trois convertisseurs.
 - Tests de non-régression du pipeline : `crates/batlab-core/src/model/audit_tests.rs` (`cargo test`). Ne pas les affaiblir pour les faire passer.
 - **La racine de stockage s'injecte, elle ne se déduit pas.** `batlab_ui::storage::Storage` porte la racine de tous les chemins de données (`Models/`, `datasets/`, `perpetual_samples/`) ; `Storage::at(chemin)` en construit une ailleurs, et `App::with_storage` la fait descendre dans tout le TUI. **Tout test qui touche au stockage passe par `TempRoot`** — c'est ce qui a fait tomber la limite « `cargo test` réécrit `Models/Stable_Diffusion/config_file` » de `docs/reports/PERPETUAL_INFERENCE.md` §5. Critère de recette permanent : `cargo test --workspace` puis `git status` **propre**.
   Le défaut (`Storage::default()`, et les fonctions libres du module que le CLI utilise) reste le workspace, trouvé en remontant jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.

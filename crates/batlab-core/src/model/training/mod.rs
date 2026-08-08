@@ -12,7 +12,7 @@ use crate::model::{Dim3, Model};
 use std::error::Error;
 use std::fmt;
 
-pub use dataset::{GpuDataset, GpuDatasetError};
+pub use dataset::{DatasetPayload, GpuDataset, GpuDatasetError, decode_u8};
 pub use diffusion::DiffusionTask;
 pub use drift::{DriftFrame, DriftWalk, NoisePredictor};
 pub use metrics::{

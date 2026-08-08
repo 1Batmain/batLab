@@ -28,7 +28,7 @@ pub use config::{
     PerpetualConfig, RunConfig, RunMode, TrainingConfig, TrainingControlCommand,
     compute_inferred_input, summarize_architecture,
 };
-pub use gpu_context::GpuContext;
+pub use gpu_context::{GpuContext, GpuLimitsProfile};
 pub use resources::report::{MeasuredTransfers, ReportOptions, report_lines};
 pub use resources::{
     Allocation, DatasetPlan, DatasetSpec, DeviceProfile, GpuInventory, InventoryRequest, Kind,
@@ -42,13 +42,13 @@ pub use live_frame::{
 pub use model::Model;
 pub use model::training;
 pub use model::training::{
-    BucketStat, CLIMB_TEMPO_RATIO, DEFAULT_SNR_GAMMA, DenoiseFrame, DenoiseStepStat, DiffusionTask,
-    DriftAction, DriftFrame, DriftPhase, DriftWalk, GpuDataset, GpuDatasetError,
+    BucketStat, CLIMB_TEMPO_RATIO, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame,
+    DenoiseStepStat, DiffusionTask, DriftAction, DriftFrame, DriftPhase, DriftWalk, GpuDataset, GpuDatasetError,
     LinearNoiseSchedule, LossWeighting, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, MetricsLogger,
     NoisePredictor, PerpetualDrift, PerpetualOrigin, PerpetualRegime, ProbeConfig,
     RENOISE_DEPTH_STEP, Stats,
     TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups, compose_diffusion_input,
-    log_probe, log_train_loss, log_trajectory, predict_epsilon, probe_diffusion, reverse_step,
+    decode_u8, log_probe, log_train_loss, log_trajectory, predict_epsilon, probe_diffusion, reverse_step,
     reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
 };
 pub use model::{
