@@ -126,6 +126,78 @@ def write(path, samples_u8, count, width, height, channels, version=DEFAULT_VERS
     return os.path.getsize(path)
 
 
+class Writer:
+    """Écrit un `.batraw` par morceaux, sans tenir le dataset en mémoire.
+
+    ImageNet 32×32 fait 3,94 Go en u8 : le construire dans un `bytearray` avant
+    d'écrire demande 3,94 Go de RAM pour rien, et deux fois plus le temps que
+    Python redimensionne. Le nombre d'images n'étant connu qu'à la fin, l'en-tête
+    est écrit avec un compte provisoire, puis **corrigé au `close()`** — c'est
+    pour ça que ce writer existe plutôt qu'un simple `write()` en boucle.
+
+        with batraw.Writer(path, 32, 32, 3) as out:
+            for block in blocks:
+                out.append(block)     # octets, toujours
+        print(out.count)
+
+    Un `close()` manqué laisse un fichier dont l'en-tête ment : le
+    gestionnaire de contexte n'est pas une commodité, utilisez-le.
+    """
+
+    def __init__(self, path, width, height, channels, version=DEFAULT_VERSION):
+        if version not in MAGIC:
+            raise ValueError(f"version .batraw inconnue : {version}")
+        self.path = path
+        self.width = width
+        self.height = height
+        self.channels = channels
+        self.version = version
+        self.sample_bytes = width * height * channels
+        self.count = 0
+        self._pending = bytearray()
+        self._file = open(path, "wb")
+        self._file.write(MAGIC[version])
+        self._file.write(struct.pack("<IIII", 0, width, height, channels))
+
+    def append(self, samples_u8):
+        """Ajoute des images entières, en octets. Un reste est gardé pour la suite."""
+        self._pending.extend(bytes(samples_u8))
+        whole = len(self._pending) // self.sample_bytes
+        if whole:
+            block = bytes(self._pending[: whole * self.sample_bytes])
+            del self._pending[: whole * self.sample_bytes]
+            self._file.write(_payload(block, self.version))
+            self.count += whole
+
+    def close(self):
+        if self._file is None:
+            return os.path.getsize(self.path)
+        if self._pending:
+            raise ValueError(
+                f"{self.path} : {len(self._pending)} octet(s) en trop, "
+                f"soit une image incomplète de {self.sample_bytes} octets"
+            )
+        # Le compte, maintenant qu'on le connaît.
+        self._file.seek(8)
+        self._file.write(struct.pack("<I", self.count))
+        self._file.close()
+        self._file = None
+        return os.path.getsize(self.path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.close()
+        elif self._file is not None:
+            # Une écriture interrompue ne doit pas laisser un `.batraw` d'apparence
+            # valide dont l'en-tête annonce zéro image.
+            self._file.close()
+            self._file = None
+        return False
+
+
 def read(path):
     """Relit un `.batraw` → ``(octets, count, width, height, channels, version)``.
 

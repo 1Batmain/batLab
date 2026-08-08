@@ -234,6 +234,22 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - Les checkpoints antérieurs aux fixes du pipeline (padding `Same`, normalisation [-1,1], conditionnement temporel) sont invalidés — toujours réentraîner from scratch, ne pas charger d'anciens `.ckpt`.
 - Un modèle de diffusion DOIT être conditionné sur le timestep : `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding temporel). Sans ça, ε̂ dégénère et l'échantillonnage explose en blanc saturé (voir `docs/reports/INSIGHTS_TRAINING.md`).
 - Chaque run d'entraînement écrit un `*_metrics.jsonl` à côté du checkpoint (loss par tranche de t, stats ε̂ vs ε, trajectoires de débruitage). `--headless-sample <model> --ckpt <path>` génère des images + trajectoire depuis un checkpoint sans entraîner. Une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche de t (une loss élevée à t bas = modèle qui n'utilise pas t).
+- **Entraîner sur ses propres images** : trois convertisseurs, un format.
+  `tools/images_to_raw.py <dossier>` (récursif, EXIF, carré `--crop center|fit`,
+  `--size`, `--mode rgb|grey`, corrompus sautés et comptés, `--min-size`,
+  `--dedup` sur l'échantillon produit, ordre déterministe par chemin relatif) ;
+  `datasets/cifar_to_raw.py` ; `tools/imagenet32_to_raw.py <dossier>` (attend
+  `train_data_batch_1..10`, **des pickles sans extension**, ne télécharge rien,
+  `--limit N`). **`--contact-sheet <png>` est l'étape à ne jamais sauter** :
+  c'est la seule façon de voir ce sur quoi on entraîne après recadrage, et les
+  erreurs qui coûtent une nuit ne lèvent aucune exception. Le piège partagé par
+  CIFAR et ImageNet : 3072 octets sont **trois plans** (R, G, B entiers), pas des
+  pixels entrelacés — lu tel quel le dataset donne des images en bandes et
+  l'entraînement ne bronche pas. Tests : `python3 tools/test_dataset_tools.py`
+  (25, images synthétiques, aucun réseau). Le mode d'emploi du **fine-tuning**
+  (dupliquer le modèle d'abord, `--resume` + `--out` + `--checkpoint-every`,
+  `--lr 1e-4`, et pourquoi sous ~1000 images le modèle mémorise) est dans
+  `docs/reports/CUSTOM_DATASET.md`.
 - **Les limites GPU sont un choix : `--gpu-limits native|web`** (défaut
   `native`). `request_device` ne donne pas ce que l'adaptateur sait faire, il
   donne ce qu'on **demande** — et ne rien demander, c'était demander la base
