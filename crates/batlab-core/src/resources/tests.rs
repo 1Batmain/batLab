@@ -501,16 +501,85 @@ fn the_search_respects_its_ceiling() {
 // The dataset
 // ---------------------------------------------------------------------------
 
+/// The predicted chunk plan must be the one `GpuDataset` really allocates.
+///
+/// This test exists because the prediction was wrong, by exactly a factor of
+/// two, and nothing else noticed. `GpuDataset` sizes its chunk from
+/// `GpuSpecs::memory_size()` — the **adapter's** `max_buffer_size`, 28 GiB on
+/// this Mac — while the profile was handing `select_chunk_bytes` the
+/// **device's** 256 MiB. Two fields spelled `max_buffer_size`, four orders of
+/// magnitude apart, and the page confidently reported 64 MiB chunks against a
+/// dataset that had allocated 128 MiB ones. Every downstream figure — the
+/// resident footprint, the chunk count, the predicted traffic per step — was
+/// half of the truth.
+///
+/// So the plan is checked against an allocation, not against arithmetic.
+#[test]
+fn the_predicted_chunk_plan_is_the_one_the_dataset_allocates() {
+    pollster::block_on(async {
+        use crate::training::GpuDataset;
+        use std::sync::Arc;
+
+        let gpu = Arc::new(crate::gpu_context::GpuContext::new_headless().await);
+        let device = DeviceProfile::from_gpu(gpu.as_ref());
+
+        // The last case is the one that bites, and it has to be this big.
+        //
+        // `select_chunk_bytes` ends on `target.min(dataset_total)`, so on a
+        // dataset smaller than one chunk EVERY candidate rule agrees: the chunk
+        // is the dataset. The wrong figure and the right one only diverge above
+        // the cap — which is why the bug survived a suite full of small
+        // fixtures, and why one case here allocates a real 137 MiB.
+        let cases: [(usize, u64); 3] = [(16, 64), (1024, 64), (3072, 12_000)];
+        for (sample_len, sample_count) in cases {
+            let samples: Vec<Vec<f32>> = (0..sample_count)
+                .map(|s| vec![s as f32; sample_len])
+                .collect();
+            let dataset =
+                GpuDataset::from_samples(gpu.as_ref(), samples, sample_len).expect("dataset");
+
+            let plan = plan_dataset(
+                &device,
+                DatasetSpec {
+                    sample_count,
+                    sample_bytes: sample_len as u64 * 4,
+                },
+                16,
+            );
+            assert_eq!(
+                plan.chunk_sample_capacity as usize,
+                dataset.chunk_sample_capacity(),
+                "{sample_count}×{sample_len}: predicted {} samples per chunk, the dataset holds {}",
+                plan.chunk_sample_capacity,
+                dataset.chunk_sample_capacity()
+            );
+            // The buffer is the allocation the inventory charges for, so the
+            // prediction has to be that buffer and not merely no larger.
+            assert_eq!(
+                plan.chunk_bytes,
+                dataset.gpu_buffer_bytes(),
+                "{sample_count}×{sample_len}: predicted a chunk of {} against a buffer of {}",
+                format_bytes(plan.chunk_bytes),
+                format_bytes(dataset.gpu_buffer_bytes())
+            );
+        }
+    });
+}
+
 /// The dataset is the one post that is streamed, and the plan must say so in
 /// numbers: how big a chunk is, how many there are, and how many a shuffled
 /// batch touches.
 #[test]
 fn the_dataset_plan_counts_chunks_and_the_uploads_a_batch_costs() {
-    // The machine this project is developed on: 128 MiB storage bindings, so
-    // 64 MiB chunks, and CIFAR-10 grey is 50 000 × 4 KiB = 195.3 MiB.
+    // A device whose storage bindings cap at 128 MiB and whose adapter would
+    // allocate no more than 256 MiB in one go: the chunk rule then lands on its
+    // 64 MiB floor. Both figures are stated, because the rule reads BOTH — the
+    // adapter's for its target, the device's for its cap — and a fixture that
+    // set only one would model a machine that does not exist.
     let mut device = DeviceProfile::hypothetical("mac", None);
     device.max_storage_buffer_binding_size = 128 * 1024 * 1024;
     device.max_buffer_size = 128 * 1024 * 1024;
+    device.adapter_max_buffer_size = 256 * 1024 * 1024;
 
     let cifar_grey = DatasetSpec {
         sample_count: 50_000,
@@ -520,13 +589,50 @@ fn the_dataset_plan_counts_chunks_and_the_uploads_a_batch_costs() {
     assert_eq!(plan.chunk_bytes, 64 * 1024 * 1024);
     assert_eq!(plan.chunk_count, 4, "195 MiB in 64 MiB chunks is 4 chunks");
 
-    // `BATCH_DISPATCH.md` §5.2: a batch of 16 drawn from a permutation of the
-    // whole dataset touches 4·(1 − (3/4)^16) ≈ 3.96 distinct chunks.
-    let expected = 4.0 * (1.0 - 0.75f64.powi(16));
+    // The oracle is written out here, independently of the implementation, and
+    // per chunk — because the last chunk is short. 50 000 samples in chunks of
+    // 32 768 is 32 768 + 17 232, not two equal halves, and treating it as two
+    // equal halves is how the first version of this over-predicted the traffic.
+    let capacity = plan.chunk_sample_capacity;
+    let total_samples = 50_000f64;
+    let mut held: Vec<f64> = Vec::new();
+    let mut remaining = 50_000u64;
+    while remaining > 0 {
+        let take = remaining.min(capacity);
+        held.push(take as f64);
+        remaining -= take;
+    }
+    assert_eq!(held.len(), 4, "the fixture must exercise a short last chunk");
     assert!(
-        (plan.expected_uploads_per_step - expected).abs() < 1e-9,
-        "{} against the closed form {expected}",
+        held[3] < held[0],
+        "the last chunk holds {} of {} — a fixture where it is full proves nothing",
+        held[3],
+        held[0]
+    );
+    let expected_uploads: f64 = held
+        .iter()
+        .map(|h| 1.0 - (1.0 - h / total_samples).powi(16))
+        .sum();
+    let expected_bytes: f64 = held
+        .iter()
+        .map(|h| (1.0 - (1.0 - h / total_samples).powi(16)) * h * 4096.0)
+        .sum();
+    assert!(
+        (plan.expected_uploads_per_step - expected_uploads).abs() < 1e-9,
+        "{} against the closed form {expected_uploads}",
         plan.expected_uploads_per_step
+    );
+    assert!(
+        (plan.expected_upload_bytes_per_step - expected_bytes).abs() < 1.0,
+        "{} bytes against the closed form {expected_bytes}",
+        plan.expected_upload_bytes_per_step
+    );
+    // And it must never claim more traffic than there is dataset.
+    assert!(
+        plan.expected_upload_bytes_per_step <= plan.total_bytes as f64,
+        "predicted {} of traffic from a {} dataset",
+        format_bytes(plan.expected_upload_bytes_per_step as u64),
+        format_bytes(plan.total_bytes)
     );
 
     // A dataset that fits in one chunk is one upload, whatever the batch — and
@@ -547,6 +653,7 @@ fn only_the_resident_chunk_is_charged_not_the_whole_dataset() {
     let mut device = DeviceProfile::hypothetical("mac", None);
     device.max_storage_buffer_binding_size = 128 * 1024 * 1024;
     device.max_buffer_size = 128 * 1024 * 1024;
+    device.adapter_max_buffer_size = 256 * 1024 * 1024;
 
     let mut req = request(16, training(OptimizerKind::Adam, false));
     req.dataset = Some(DatasetSpec {

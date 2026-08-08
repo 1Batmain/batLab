@@ -113,6 +113,14 @@ fn device_section(inventory: &GpuInventory, width: usize, out: &mut Vec<String>)
         &format_bytes(device.max_storage_buffer_binding_size),
         width,
     ));
+    // Shown next to the device's, and captioned, because the two are four
+    // orders of magnitude apart on this machine and the codebase spells both
+    // `max_buffer_size`. It is what the dataset sizes its chunks from.
+    out.push(row(
+        "adapter would allow, per buffer",
+        &format_bytes(device.adapter_max_buffer_size),
+        width,
+    ));
     out.push(row(
         "max_compute_workgroups/dimension",
         &device.max_compute_workgroups_per_dimension.to_string(),
@@ -320,7 +328,7 @@ fn execution_model_section(
                 format_bytes(plan.chunk_bytes),
                 inventory.batch,
                 plan.expected_uploads_per_step,
-                format_bytes(plan.expected_upload_bytes_per_step() as u64)
+                format_bytes(plan.expected_upload_bytes_per_step as u64)
             ),
             options.width,
         )),

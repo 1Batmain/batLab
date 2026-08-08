@@ -79,8 +79,29 @@ pub struct DeviceProfile {
     /// Mac this project is developed on, and it is exactly why the numbers here
     /// flatter it relative to a discrete card.
     pub unified_memory: bool,
+    /// What the DEVICE will allocate — the limits the graph actually runs
+    /// against, which are wgpu's defaults because `request_device` asks for
+    /// defaults. On this Mac that is 256 MiB per buffer on an adapter that
+    /// would allow 28 GiB: the engine runs at the WebGPU contract on purpose,
+    /// because that contract is what the visitor's browser will hand it.
     pub max_buffer_size: u64,
     pub max_storage_buffer_binding_size: u64,
+    /// What the ADAPTER says it could allocate in one buffer.
+    ///
+    /// Kept beside the device limits, and never confused with them, because two
+    /// different numbers answer to `max_buffer_size` in this codebase and the
+    /// gap between them is four orders of magnitude. This one is what
+    /// [`GpuSpecs::memory_size`](crate::gpu_context::GpuSpecs::memory_size)
+    /// exposes and what [`crate::training::dataset::select_chunk_bytes`] sizes
+    /// chunks from — so an inventory that used the device figure here predicts
+    /// the wrong chunk size, which is exactly what it did until
+    /// `the_predicted_chunk_plan_is_the_one_the_dataset_allocates` was written.
+    ///
+    /// On Metal it comes out at about the machine's whole unified memory, which
+    /// makes it the closest thing to a capacity metric available — but it is
+    /// still a *maximum allocation size*, not a budget, and it is not reported
+    /// as one.
+    pub adapter_max_buffer_size: u64,
     pub max_compute_workgroups_per_dimension: u32,
     pub max_storage_buffers_per_shader_stage: u32,
     /// Total memory the inventory may fill, when it is known.
@@ -109,6 +130,7 @@ impl DeviceProfile {
             ),
             max_buffer_size: limits.max_buffer_size,
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
+            adapter_max_buffer_size: gpu.specs().memory_size(),
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
             memory_budget: None,
@@ -132,6 +154,9 @@ impl DeviceProfile {
             unified_memory: false,
             max_buffer_size: limits.max_buffer_size,
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
+            // Nothing better to say about a machine that is not here: a device
+            // that would allocate no more than its own limit.
+            adapter_max_buffer_size: limits.max_buffer_size,
             max_compute_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             max_storage_buffers_per_shader_stage: limits.max_storage_buffers_per_shader_stage,
             memory_budget,
@@ -343,14 +368,22 @@ pub struct DatasetPlan {
     pub chunk_bytes: u64,
     pub chunk_sample_capacity: u64,
     pub chunk_count: u64,
-    /// Expected whole-chunk uploads a shuffled batch of `batch` costs:
-    /// `C·(1 − ((C−1)/C)^batch)`, the number of *distinct* chunks it touches.
+    /// Expected chunk uploads a shuffled batch of `batch` costs — the number of
+    /// *distinct* chunks it touches.
+    ///
+    /// Summed per chunk, `Σᵢ (1 − (1 − pᵢ)^batch)` with `pᵢ` the share of the
+    /// dataset chunk `i` holds, rather than the tidy `C·(1 − ((C−1)/C)^batch)`.
+    /// The tidy form assumes equal chunks, and the last chunk never is: on
+    /// CIFAR-10 grey it holds 17 232 samples against 32 768: charging it as a
+    /// full chunk over-predicted the traffic by 31 %.
     pub expected_uploads_per_step: f64,
+    /// The same, in bytes, weighting each chunk by its own size.
+    pub expected_upload_bytes_per_step: f64,
 }
 
 impl DatasetPlan {
     pub fn expected_upload_bytes_per_step(&self) -> f64 {
-        self.expected_uploads_per_step * self.chunk_bytes as f64
+        self.expected_upload_bytes_per_step
     }
 }
 
@@ -369,27 +402,44 @@ pub fn plan_dataset(
     let chunk_bytes = crate::model::training::dataset::select_chunk_bytes(
         device.max_storage_buffer_binding_size,
         device.max_buffer_size,
-        // `GpuDataset` uses `GpuSpecs::memory_size`, which is the adapter's
-        // max_buffer_size — the same number, kept explicit here so that a
-        // future real memory metric changes both together.
-        device.max_buffer_size,
+        // The ADAPTER's figure, because that is the one `GpuDataset` reads
+        // (`GpuSpecs::memory_size`). Passing the device's instead predicted
+        // 64 MiB chunks where the dataset really allocates 128 MiB — half the
+        // right answer, on both the resident footprint and the traffic.
+        device.adapter_max_buffer_size,
         total,
     );
     let sample_bytes = spec.sample_bytes.max(1);
     let capacity = (chunk_bytes / sample_bytes).max(1);
     let chunk_count = spec.sample_count.div_ceil(capacity).max(1);
-    let c = chunk_count as f64;
-    let expected = if chunk_count <= 1 {
-        1.0
-    } else {
-        c * (1.0 - ((c - 1.0) / c).powi(batch.max(1) as i32))
-    };
+    let batch = batch.max(1) as i32;
+
+    // Per chunk, because the last one is short. `pᵢ` is the chance one drawn
+    // sample lands in chunk `i`; the chunk is uploaded unless all `batch` draws
+    // missed it.
+    let mut expected_uploads = 0.0f64;
+    let mut expected_bytes = 0.0f64;
+    let mut remaining = spec.sample_count;
+    for _ in 0..chunk_count {
+        let held = remaining.min(capacity);
+        remaining -= held;
+        let p = if spec.sample_count == 0 {
+            0.0
+        } else {
+            held as f64 / spec.sample_count as f64
+        };
+        let touched = 1.0 - (1.0 - p).powi(batch);
+        expected_uploads += touched;
+        expected_bytes += touched * (held * sample_bytes) as f64;
+    }
+
     DatasetPlan {
         total_bytes: total,
         chunk_bytes: (capacity * sample_bytes).max(4),
         chunk_sample_capacity: capacity,
         chunk_count,
-        expected_uploads_per_step: expected,
+        expected_uploads_per_step: expected_uploads,
+        expected_upload_bytes_per_step: expected_bytes,
     }
 }
 
