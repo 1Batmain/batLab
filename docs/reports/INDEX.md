@@ -120,6 +120,12 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   modèles en écran d'accueil, un menu d'actions par modèle), renommage et suppression,
   racine de stockage injectable (`BATLAB_ROOT`) — et la fin de « `cargo test` réécrit
   un fichier suivi ». Contient le contrat observable du manager.
+- **[DUPLICATE_MODEL.md](DUPLICATE_MODEL.md)** — dupliquer un modèle depuis le menu
+  d'actions, config seule ou config + poids (le défaut), pour fine-tuner une fondation
+  sans l'écraser : la copie est un modèle à part entière (config à son nom, chemins
+  rebasés), le dernier run seul voyage sous son nom daté avec `latest.ckpt` relié
+  dessus, et **l'original ne bouge pas d'un octet**. Contient le contrat observable et
+  le e2e déroulé au TUI.
 - **[UX_NAV.md](UX_NAV.md)** — quatre retours après usage réel : le vol de focus au
   lancement (cause racine, `activateIgnoringOtherApps` de winit, que la policy
   `Accessory` ne couvre pas), les poids pré-entraînés en défaut avec « from random »

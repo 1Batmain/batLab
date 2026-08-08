@@ -1,9 +1,9 @@
 //! File purpose: Implements events behavior for the terminal user interface flow.
 
 use super::app::{
-    App, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS, PERPETUAL_PARAM_FIELD_NAMES,
-    PerpetualStatus, Screen, TRAINING_PARAM_FIELD_NAMES, TRAINING_RANDOM_WEIGHTS_FIELD,
-    TrainingControlCommand,
+    App, DUPLICATE_CONTENT_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS,
+    PERPETUAL_PARAM_FIELD_NAMES, PerpetualStatus, Screen, TRAINING_PARAM_FIELD_NAMES,
+    TRAINING_RANDOM_WEIGHTS_FIELD, TrainingControlCommand,
 };
 use crossterm::event::KeyCode;
 
@@ -58,6 +58,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::TemplateSelector => handle_template_selector(app, code),
         Screen::ModelActions => handle_model_actions(app, code),
         Screen::RenameModel => handle_rename_model(app, code),
+        Screen::DuplicateModel => handle_duplicate_model(app, code),
         Screen::DeleteConfirm => handle_delete_confirm(app, code),
         Screen::WeightSelector => handle_weight_selector(app, code),
         Screen::InputSize => handle_input_size(app, code),
@@ -134,6 +135,32 @@ fn handle_rename_model(app: &mut App, code: KeyCode) {
         KeyCode::Backspace => app.handle_backspace_rename(),
         KeyCode::Enter => app.finish_rename(),
         KeyCode::Char(c) => app.handle_char_rename(c),
+        _ => {}
+    }
+}
+
+/// The name field always has focus, so every printable key is text here too —
+/// the copy of `q-experiment` has to be nameable. What the copy *carries* is
+/// picked with `↑`/`↓`, which are the only keys the field does not want.
+fn handle_duplicate_model(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            app.duplicate_model.error = None;
+            app.screen = Screen::ModelActions;
+        }
+        KeyCode::Up => {
+            if app.duplicate_model.selected > 0 {
+                app.duplicate_model.selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if app.duplicate_model.selected + 1 < DUPLICATE_CONTENT_CHOICES.len() {
+                app.duplicate_model.selected += 1;
+            }
+        }
+        KeyCode::Backspace => app.handle_backspace_duplicate(),
+        KeyCode::Enter => app.finish_duplicate(),
+        KeyCode::Char(c) => app.handle_char_duplicate(c),
         _ => {}
     }
 }
@@ -615,6 +642,17 @@ mod tests {
         }
         assert_eq!(app.rename_model.input, "q-model.2");
         assert!(!app.should_quit, "[q] must be typable in a model name");
+
+        app.screen = Screen::DuplicateModel;
+        for c in "quiet-copy".chars() {
+            handle_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.duplicate_model.input, "quiet-copy");
+        assert!(!app.should_quit, "[q] must be typable in a copy's name");
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.duplicate_model.input, "quiet-cop");
+        // …and `e` is a letter here, not the shortcut to the layer builder.
+        assert_eq!(app.screen, Screen::DuplicateModel);
 
         app.screen = Screen::DeleteConfirm;
         for c in "quiet".chars() {

@@ -49,8 +49,8 @@ Ouverture → LISTE DES MODÈLES              (l'écran d'accueil)
   chaque entrée : nom · géométrie · nb de couches · checkpoints
   dernière ligne : « New model (from template) » → flux template
   → Entrée sur un modèle → MENU D'ACTIONS
-       Train / Infer / Perpetual  → choix des poids → formulaire du mode → Monitor
-       Rename / Delete            → le manager
+       Train / Infer / Perpetual      → choix des poids → formulaire du mode → Monitor
+       Rename / Duplicate / Delete    → le manager
 ```
 
 `Esc` remonte d'exactement un cran depuis chaque écran, et ne quitte que depuis
@@ -102,15 +102,33 @@ Le manager, côté contrat observable :
 - **Renommer** déplace `Models/<ancien>/` → `Models/<nouveau>/` **et** réécrit le
   `config_file` — `model_name` plus tout chemin de checkpoint qui pointait dans
   le dossier du modèle. Si la réécriture échoue, le renommage est défait.
+- **Dupliquer** écrit `Models/<copie>/` — un modèle à part entière, dont le
+  `config_file` porte son nom et ses chemins rebasés (la **même**
+  `retarget_config` que le renommage : ne pas la réécrire) — et **n'ouvre jamais
+  la source en écriture**. C'est la propriété qui justifie la fonctionnalité :
+  fine-tuner une fondation écrivait dans SON dossier, et après assez de pas sur
+  un dataset étroit le modèle général avait disparu. On duplique, puis on
+  fine-tune la copie. Le formulaire ouvre sur un nom libre (`<nom>-copy`, puis
+  `-copy-2`…) et sur « config + poids », le défaut. Ce qui voyage est **le
+  dernier run seul**, sous son nom daté, avec `latest.ckpt` reposé dessus dans la
+  copie — pas l'historique (des dizaines de fichiers de 14 Mo). Le daté est
+  retrouvé par **identité d'inode** avec `latest.ckpt`, jamais par le nom : c'est
+  ce qui garde dans la copie la date à laquelle les poids ont été faits. Un échec
+  n'y laisse pas de modèle à moitié fait. Contrat complet et e2e :
+  `docs/reports/DUPLICATE_MODEL.md`.
 - **Supprimer** exige le nom retapé à l'identique, puis efface le dossier entier.
   Le chemin visé doit être un **enfant direct** de `Models/` (les deux côtés
-  canonicalisés) : un lien symbolique est refusé, pas suivi.
-- Les deux **refusent un modèle dont ce processus tient un run**. Ce garde-fou est
+  canonicalisés) : un lien symbolique est refusé, pas suivi. `Delete` reste **la
+  dernière ligne du menu** : y arriver au curseur doit rester une marche
+  délibérée jusqu'au bout.
+- Les trois **refusent un modèle dont ce processus tient un run**. Ce garde-fou est
   de l'état TUI : **il ne franchit pas la frontière de processus** — un second
   batlab ou un `--headless-train` dans un autre shell reste invisible. Non résolu,
   documenté sur `App::model_run_in_progress`.
-- Sur les deux écrans du manager, **toute touche imprimable est du texte**, `q`
-  compris (un modèle peut s'appeler `q-experiment`) ; `Esc` est la sortie.
+- Sur les trois écrans du manager, **toute touche imprimable est du texte**, `q`
+  compris (un modèle peut s'appeler `q-experiment`) ; `Esc` est la sortie. Sur le
+  formulaire de duplication, `↑`/`↓` choisissent ce qui est copié — ce sont les
+  seules touches dont le champ de nom ne veut pas.
 - **Tout modèle créé par un template est conditionnable sur t** (`input_size.z >
   output.z`). Les deux templates ont livré l'inverse (1→1 et 3→3, la géométrie de
   `Models/Greyscale_Diffusion_broken`) jusqu'à ce qu'un test aveugle lise le
@@ -146,6 +164,7 @@ parcourt tous les écrans à la touche depuis la porte d'entrée et exige d'avoi
 
 Les rapports de mission, avec les contrats observables complets et les parcours
 e2e déroulés : `docs/reports/MODEL_MANAGER.md` (le manager),
+`docs/reports/DUPLICATE_MODEL.md` (la duplication, et l'original intact),
 `docs/reports/IMG2IMG_DRIFT.md` (la dérive img2img, la cause racine du « pause »
 de la remontée, et le panneau d'architecture),
 `docs/reports/DATED_CHECKPOINTS.md` (les checkpoints datés, `latest.ckpt` en

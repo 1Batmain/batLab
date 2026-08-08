@@ -1,7 +1,8 @@
 //! File purpose: Implements ui behavior for the terminal user interface flow.
 
 use super::app::{
-    App, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, LayerKind,
+    App, DUPLICATE_CONTENT_CHOICES, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES,
+    LayerBuilderMode, LayerKind,
     MODEL_ACTIONS, ModelAction, MonitorImage, NEW_MODEL_ENTRY, PERPETUAL_PARAM_FIELD_NAMES,
     PathStep, RunMode, Screen, TRAINING_CONTROL_FIELD_NAMES, TRAINING_PARAM_FIELD_NAMES,
 };
@@ -39,6 +40,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::TemplateSelector => draw_template_selector(f, app, body),
         Screen::ModelActions => draw_model_actions(f, app, body),
         Screen::RenameModel => draw_rename_model(f, app, body),
+        Screen::DuplicateModel => draw_duplicate_model(f, app, body),
         Screen::DeleteConfirm => draw_delete_confirm(f, app, body),
         Screen::WeightSelector => draw_weight_selector(f, app, body),
         Screen::InputSize => draw_input_size(f, app, body),
@@ -710,6 +712,83 @@ fn draw_rename_model(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  [type] edit  [Backspace] del  [Enter] rename  [Esc] cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The copy's name, and what it carries. The weights row says what will be
+/// written rather than promising "the weights": the newest run is what travels,
+/// and the form is where that has to be legible.
+fn draw_duplicate_model(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(70, 52, area);
+    f.render_widget(Clear, popup);
+
+    let current = app.active_model_name.as_deref().unwrap_or("(no model)");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Duplicate Model ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Copy of      : {current}"),
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  New name     : ", focused_label(true)),
+            Span::styled(
+                format!("{}\u{2588}", app.duplicate_model.input),
+                focused_value(true),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  What travels with it:",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+
+    for (index, label) in DUPLICATE_CONTENT_CHOICES.iter().enumerate() {
+        let picked = index == app.duplicate_model.selected;
+        lines.push(Line::from(Span::styled(
+            format!("    {} {label}", if picked { ">" } else { " " }),
+            if picked {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {current} is left exactly as it is — weights included."),
+        Style::default().fg(Color::DarkGray),
+    )));
+    if app.duplicate_model.copies_weights() {
+        lines.push(Line::from(Span::styled(
+            "  Only the newest run travels, with latest.ckpt pointing at it.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    if let Some(error) = app.duplicate_model.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [type] name  [↑↓] what to copy  [Enter] duplicate  [Esc] cancel",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines), inner);

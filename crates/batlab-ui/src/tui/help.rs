@@ -451,6 +451,7 @@ mod tests {
             Screen::LayerBuilder,
             Screen::Monitor,
             Screen::RenameModel,
+            Screen::DuplicateModel,
         ] {
             assert!(help_for(screen, 0).is_none(), "{screen:?}");
         }
