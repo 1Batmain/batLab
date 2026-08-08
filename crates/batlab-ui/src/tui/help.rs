@@ -95,17 +95,23 @@ static INPUT_SIZE_HELP: &[HelpEntry] = &[
 static WEIGHTS_HELP: HelpEntry = HelpEntry {
     title: "Poids de départ",
     body: &[
-        "Le défaut est de CONTINUER depuis les poids du modèle — latest.ckpt, le \
-         fichier que tout entraînement réécrit.",
+        "Le défaut est de CONTINUER depuis les poids du modèle — latest.ckpt, \
+         qui désigne toujours le checkpoint le plus récent.",
         "",
-        "« Start from random weights » repart de zéro : le checkpoint n'est plus \
-         alors que la destination d'écriture du run.",
+        "Convention de nommage : un run écrit SON fichier, \
+         run-<AAAA-MM-JJ_HHMM>.ckpt, et latest.ckpt est reposé dessus (lien dur, \
+         mêmes octets, pas de seconde copie). Rien n'est écrasé : les poids \
+         d'hier sont encore là ce matin, sous leur date. La liste est triée du \
+         plus récent au plus ancien, avec la date et la taille de chacun.",
+        "",
+        "« Start from random weights » repart de zéro — le run écrit quand même \
+         son propre fichier daté.",
         "",
         "Un checkpoint d'une autre architecture est refusé par le moteur, mais \
          seulement après avoir construit le modèle sur GPU — d'où la règle : \
          éditer les couches remet ce choix sur « random ».",
     ],
-    source: None,
+    source: Some("DATED_CHECKPOINTS.md"),
 };
 
 // ---------------------------------------------------------------------------

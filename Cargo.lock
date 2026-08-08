@@ -244,6 +244,7 @@ dependencies = [
  "batlab_core",
  "bytemuck",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
