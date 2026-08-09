@@ -19,10 +19,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import json
+
 import batraw
+import gen_unet_config
 import images_to_raw
 import imagenet32_to_raw
 from PIL import Image
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def solid(path, size, colour, fmt=None, exif=None):
@@ -446,6 +451,64 @@ class Imagenet32ToRaw(unittest.TestCase):
         writer.append(bytes(6))  # une image et demie
         with self.assertRaises(ValueError):
             writer.close()
+
+
+class GenUnetConfig(unittest.TestCase):
+    """Le générateur de config U-Net : dims dérivées, étages libres."""
+
+    def test_the_default_reproduces_greyscale_L_byte_for_byte(self):
+        """Généraliser à N étages ne doit pas bouger d'un octet le défaut.
+
+        Le `config_file` de `Greyscale_Diffusion_L` est la référence : taille 32,
+        largeurs 32/64/128, trois étages. La sortie du générateur par défaut doit
+        lui être identique — c'est ce qui garde intacts les modèles qui en sont
+        nés.
+        """
+        _, config = gen_unet_config.build_config()
+        rendered = json.dumps(config, indent=2) + "\n"
+        reference = os.path.join(
+            REPO_ROOT, "Models", "Greyscale_Diffusion_L", "config_file")
+        with open(reference, "r") as fh:
+            self.assertEqual(rendered, fh.read())
+
+    def test_kernel_depth_equals_the_running_channel_count_at_every_layer(self):
+        """La raison d'être du script : `dim_kernel.z == dim_input.z` partout.
+
+        Une UpsampleConv dont la profondeur de noyau ment corrompt en silence
+        (son shader indexe les poids avec IC = dim_input.z). On le vérifie sur une
+        pile profonde à quatre étages, celle que le défaut ne couvre pas.
+        """
+        _, config = gen_unet_config.build_config(
+            size=64, widths=(48, 96, 192, 384), attention=True)
+        for layer in config["layers"]:
+            for kind in ("Convolution", "UpsampleConv"):
+                if kind in layer:
+                    spec = layer[kind]
+                    self.assertEqual(
+                        spec["dim_kernel"][2], spec["dim_input"][2],
+                        f"{kind}: kernel depth {spec['dim_kernel'][2]} != "
+                        f"input channels {spec['dim_input'][2]}")
+
+    def test_a_size_that_does_not_halve_cleanly_is_refused(self):
+        """`size` doit se diviser par 2 autant de fois qu'il y a de descentes."""
+        # 20 ne se divise pas par 2**3 = 8 : refusé.
+        with self.assertRaises(ValueError):
+            gen_unet_config.build_config(size=20, widths=(32, 64, 128, 256))
+        # 64 se divise par 8 : accepté.
+        gen_unet_config.build_config(size=64, widths=(32, 64, 128, 256))
+
+    def test_the_stack_grows_by_one_encoder_and_one_decoder_per_extra_stage(self):
+        """Un étage de plus = une descente + une remontée symétriques de plus."""
+        _, three = gen_unet_config.build_config(size=32, widths=(32, 64, 128))
+        _, four = gen_unet_config.build_config(size=64, widths=(32, 64, 128, 256))
+        downs3 = sum(1 for l in three["layers"]
+                     if "Convolution" in l and l["Convolution"]["stride"] == 2)
+        downs4 = sum(1 for l in four["layers"]
+                     if "Convolution" in l and l["Convolution"]["stride"] == 2)
+        ups3 = sum(1 for l in three["layers"] if "UpsampleConv" in l)
+        ups4 = sum(1 for l in four["layers"] if "UpsampleConv" in l)
+        self.assertEqual((downs3, ups3), (2, 2))
+        self.assertEqual((downs4, ups4), (3, 3))
 
 
 if __name__ == "__main__":

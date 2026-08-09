@@ -11,8 +11,19 @@ impossible en dérivant `dim_kernel.z` de la dim courante.
 Usage : python3 tools/gen_unet_config.py > Models/<name>/config_file
         python3 tools/gen_unet_config.py --name Color_Diffusion_L --signal-channels 3 \
                                          --widths 32 64 128 > Models/Color_Diffusion_L/config_file
+        # un U-Net 64x64 à quatre étages (64 -> 32 -> 16 -> 8) :
+        python3 tools/gen_unet_config.py --name Color_Diffusion_64 --signal-channels 3 \
+                                         --size 64 --widths 48 96 192 384 --attention \
+                                         > Models/Color_Diffusion_64/config_file
 
-Les valeurs par défaut reproduisent `Greyscale_Diffusion_L` à l'octet près.
+Le nombre d'étages est LIBRE : `--widths` prend autant de largeurs qu'on veut
+(une par étage, la dernière étant le goulot), et `--size` fixe la résolution
+d'entrée. Chaque `//2` de descente doit tomber sur un entier, donc `size` doit
+être divisible par `2**(len(widths)-1)`. Les dims restent toutes DÉRIVÉES.
+
+Les valeurs par défaut reproduisent `Greyscale_Diffusion_L` à l'octet près
+(taille 32, largeurs 32/64/128). Un garde-fou le vérifie dans
+`tools/test_dataset_tools.py`.
 """
 import argparse
 import json
@@ -22,7 +33,9 @@ DEFAULT_NAME = "Greyscale_Diffusion_L"
 DEFAULT_SIGNAL_CHANNELS = 1  # niveaux de gris ; 3 pour RGB
 TIME_CHANNELS = 4  # canaux d'embedding temporel (input.z - output.z)
 
-# Largeurs par étage : 32x32 -> 16x16 -> 8x8
+# Résolution d'entrée par défaut, carrée.
+DEFAULT_SIZE = 32
+# Largeurs par étage : 32x32 -> 16x16 -> 8x8 (le dernier étage est le goulot).
 DEFAULT_WIDTHS = (32, 64, 128)
 GROUPS = 8
 
@@ -135,46 +148,68 @@ class Builder:
 
 
 def build(signal_channels=DEFAULT_SIGNAL_CHANNELS, widths=DEFAULT_WIDTHS,
-          attention=False):
-    C1, C2, C3 = widths
-    b = Builder(32, signal_channels + TIME_CHANNELS)
+          size=DEFAULT_SIZE, attention=False):
+    """U-Net symétrique à `len(widths)` étages, résolution d'entrée `size`.
 
-    # --- stem : 32x32, C1 ---------------------------------------------------
-    b.conv(C1)                        # [32,32,32]
-    b.norm().silu(save_key="skip32")  # skip pris après activation
+    Chaque étage divise la résolution par deux (padding Same, stride 2). Le
+    DERNIER étage est le goulot : il ne sauve pas de skip et reçoit l'attention
+    optionnelle. Le décodeur remonte symétriquement, en concaténant à chaque
+    palier le skip de même résolution pris à la descente.
 
-    # --- down 32 -> 16, C2 --------------------------------------------------
-    b.conv(C2, stride=2)              # [16,16,64]
-    b.block(C2)                       # norm/silu/conv -> [16,16,64]
-    b.norm().silu(save_key="skip16")
+    Le nom du skip est sa résolution (`skip64`, `skip32`, …) : c'est ce qui rend
+    la valeur par défaut identique à l'ancienne (skip32/skip16) au caractère près.
+    """
+    widths = list(widths)
+    n = len(widths)
+    if n < 2:
+        raise ValueError("il faut au moins deux étages (un descendant + le goulot)")
+    downs = n - 1
+    if size % (1 << downs) != 0:
+        raise ValueError(
+            f"size={size} n'est pas divisible par 2**{downs}={1 << downs} : "
+            f"une descente tomberait sur une résolution non entière")
 
-    # --- down 16 -> 8, C3 (bottleneck) --------------------------------------
-    b.conv(C3, stride=2)              # [8,8,128]
-    b.block(C3)                       # [8,8,128]
+    b = Builder(size, signal_channels + TIME_CHANNELS)
+    res = size
+
+    # --- stem : pleine résolution, widths[0] --------------------------------
+    b.conv(widths[0])
+    b.norm().silu(save_key=f"skip{res}")   # skip pris après activation
+
+    # --- étages descendants intermédiaires (skip sauvé à chaque palier) -----
+    for k in range(1, n - 1):
+        res //= 2
+        b.conv(widths[k], stride=2)
+        b.block(widths[k])                 # norm/silu/conv
+        b.norm().silu(save_key=f"skip{res}")
+
+    # --- goulot : dernier étage, pas de skip --------------------------------
+    res //= 2
+    b.conv(widths[-1], stride=2)
+    b.block(widths[-1])
     if attention:
         # GroupNorm PUIS attention : la pré-normalisation est la couche
         # GroupNorm existante placée devant, pas une normalisation interne à
-        # l'attention. C'est ici que le contenu global se décide — 64 positions
-        # qui se voient toutes, ce qui manque au modèle pour composer un objet
-        # plutôt qu'une texture.
+        # l'attention. C'est ici que le contenu global se décide — les positions
+        # du goulot se voient toutes, ce qui manque au modèle pour composer un
+        # objet plutôt qu'une texture. Le scratch `probs` étant en N² par
+        # échantillon, garder le goulot à 8x8 (64 positions) : le monter à 16x16
+        # quadruplerait les positions et x16 le scratch.
         b.norm().attention()
     b.norm().silu()
 
-    # --- up 8 -> 16 ---------------------------------------------------------
-    b.upsample(C2)                    # [16,16,64]
-    b.concat("skip16")                # [16,16,128]
-    b.block(C2)                       # [16,16,64]
-
-    # --- up 16 -> 32 --------------------------------------------------------
-    b.upsample(C1)                    # [32,32,32]
-    b.concat("skip32")                # [32,32,64]
-    b.block(C1)                       # [32,32,32]
+    # --- décodeur : remonte jusqu'à chaque résolution sauvée ----------------
+    for k in range(n - 2, -1, -1):
+        res *= 2
+        b.upsample(widths[k])
+        b.concat(f"skip{res}")
+        b.block(widths[k])
 
     # --- tête : retour au signal -------------------------------------------
     b.norm().silu()
-    b.conv(signal_channels)           # [32,32,C_signal]
+    b.conv(signal_channels)
 
-    assert b.dim == [32, 32, signal_channels], b.dim
+    assert b.dim == [size, size, signal_channels], b.dim
     return b
 
 
@@ -195,23 +230,17 @@ def macs(layers):
     return total
 
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--name", default=DEFAULT_NAME, help="model_name du config")
-    p.add_argument("--signal-channels", type=int, default=DEFAULT_SIGNAL_CHANNELS,
-                   help="canaux image : 1 (grey) ou 3 (RGB)")
-    p.add_argument("--widths", type=int, nargs=3, default=list(DEFAULT_WIDTHS),
-                   metavar=("C1", "C2", "C3"),
-                   help="largeurs des trois étages 32x32 / 16x16 / 8x8")
-    p.add_argument("--attention", action="store_true",
-                   help="insère GroupNorm + Attention au goulot 8x8")
-    args = p.parse_args()
+def build_config(name=DEFAULT_NAME, signal_channels=DEFAULT_SIGNAL_CHANNELS,
+                 widths=DEFAULT_WIDTHS, size=DEFAULT_SIZE, attention=False):
+    """Le dict config complet — la seule source de l'octet écrit sur disque.
 
-    b = build(args.signal_channels, args.widths, args.attention)
-    config = {
-        "model_name": args.name,
-        "input_size": [32, 32, args.signal_channels + TIME_CHANNELS],
+    Isolé de `__main__` pour qu'un test puisse le comparer au `config_file`
+    d'un modèle de référence (cf. `tools/test_dataset_tools.py`).
+    """
+    b = build(signal_channels, widths, size, attention)
+    return b, {
+        "model_name": name,
+        "input_size": [size, size, signal_channels + TIME_CHANNELS],
         "layers": b.layers,
         "inference": {
             "random_seed": False,
@@ -221,6 +250,27 @@ if __name__ == "__main__":
         },
         "run": {"mode": "Infer"},
     }
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--name", default=DEFAULT_NAME, help="model_name du config")
+    p.add_argument("--signal-channels", type=int, default=DEFAULT_SIGNAL_CHANNELS,
+                   help="canaux image : 1 (grey) ou 3 (RGB)")
+    p.add_argument("--size", type=int, default=DEFAULT_SIZE,
+                   help=f"résolution d'entrée carrée (défaut {DEFAULT_SIZE}) ; "
+                        f"doit être divisible par 2**(len(widths)-1)")
+    p.add_argument("--widths", type=int, nargs="+", default=list(DEFAULT_WIDTHS),
+                   metavar="C",
+                   help="largeur par étage (nombre libre) ; la dernière est le "
+                        "goulot. Défaut 32 64 128 (trois étages 32/16/8)")
+    p.add_argument("--attention", action="store_true",
+                   help="insère GroupNorm + Attention au goulot")
+    args = p.parse_args()
+
+    b, config = build_config(args.name, args.signal_channels, args.widths,
+                             args.size, args.attention)
     attn = sum(1 for l in b.layers if "Attention" in l)
     print(f"# {len(b.layers)} couches ({attn} attention), "
           f"{macs(b.layers)/1e6:.1f} MMACs/échantillon (convolutions seules)",
