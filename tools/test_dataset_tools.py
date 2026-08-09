@@ -24,7 +24,7 @@ import json
 import batraw
 import gen_unet_config
 import images_to_raw
-import imagenet32_to_raw
+import imagenet_to_raw
 from PIL import Image
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -345,17 +345,22 @@ class Imagenet32ToRaw(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def write_batch(self, name, count, first=0, keys_as_bytes=False):
-        """Un batch au format de l'archive : pickle, `data` en PLANS (n, 3072)."""
+    def write_batch(self, name, count, first=0, keys_as_bytes=False, side=32):
+        """Un batch au format de l'archive : pickle, `data` en PLANS (n, 3·côté²).
+
+        `side` par défaut 32 (release historique) ; 64 fabrique une batche de la
+        release 64×64, dont seule la longueur de ligne change.
+        """
         import pickle
 
         import numpy as np
 
+        plane = side * side
         rows = []
         for i in range(count):
             value = (first + i) % 256
             rows.append(
-                [value] * 1024 + [(value + 1) % 256] * 1024 + [(value + 2) % 256] * 1024
+                [value] * plane + [(value + 1) % 256] * plane + [(value + 2) % 256] * plane
             )
         data = np.asarray(rows, dtype=np.uint8)
         payload = {"data": data, "labels": list(range(1, count + 1))}
@@ -376,7 +381,7 @@ class Imagenet32ToRaw(unittest.TestCase):
         """
         self.write_batch("train_data_batch_1", 2, first=10)
         out = os.path.join(self.dir, "planes.batraw")
-        imagenet32_to_raw.convert(self.src, out, mode="rgb")
+        imagenet_to_raw.convert(self.src, out, mode="rgb")
 
         payload, count, w, h, c = batraw.read(out)[:5]
         self.assertEqual((count, w, h, c), (2, 32, 32, 3))
@@ -384,6 +389,36 @@ class Imagenet32ToRaw(unittest.TestCase):
         self.assertEqual(set(first_image[0::3]), {10})
         self.assertEqual(set(first_image[1::3]), {11})
         self.assertEqual(set(first_image[2::3]), {12})
+
+    def test_a_64x64_archive_is_detected_from_the_row_length(self):
+        """La release 64×64 a le même format ; seule la ligne passe à 12288.
+
+        La taille se déduit de `data.shape[1]`, elle n'est pas demandée. Une
+        image à plans constants doit ressortir en pixels (v, v+1, v+2) sur une
+        grille 64×64.
+        """
+        self.write_batch("train_data_batch_1", 1, first=5, side=64)
+        out = os.path.join(self.dir, "big.batraw")
+        report = imagenet_to_raw.convert(self.src, out, mode="rgb")
+        self.assertEqual(report["side"], 64)
+        payload, count, w, h, c = batraw.read(out)[:5]
+        self.assertEqual((count, w, h, c), (1, 64, 64, 3))
+        self.assertEqual((payload[0], payload[1], payload[2]), (5, 6, 7))
+
+    def test_a_row_that_is_not_three_square_planes_is_refused(self):
+        """Une longueur qui n'est pas 3·côté² n'est pas un ImageNet — refus net."""
+        with self.assertRaises(ValueError):
+            imagenet_to_raw.side_from_row(3000)  # 1000 pixels, pas un carré
+        self.assertEqual(imagenet_to_raw.side_from_row(3072), 32)
+        self.assertEqual(imagenet_to_raw.side_from_row(12288), 64)
+
+    def test_a_folder_may_not_mix_two_sizes(self):
+        """Un dossier 32×32 + 64×64 donnerait un .batraw incohérent : refus."""
+        self.write_batch("train_data_batch_1", 1, side=32)
+        self.write_batch("train_data_batch_2", 1, side=64)
+        out = os.path.join(self.dir, "mixed.batraw")
+        with self.assertRaises(ValueError):
+            imagenet_to_raw.convert(self.src, out, mode="rgb")
 
     def test_batches_are_read_in_numeric_order(self):
         """`_10` vient après `_2`, pas entre `_1` et `_2`.
@@ -396,7 +431,7 @@ class Imagenet32ToRaw(unittest.TestCase):
         self.write_batch("train_data_batch_10", 1, first=200)
 
         out = os.path.join(self.dir, "order.batraw")
-        report = imagenet32_to_raw.convert(self.src, out, mode="rgb")
+        report = imagenet_to_raw.convert(self.src, out, mode="rgb")
         self.assertEqual(report["written"], 3)
         payload = batraw.read(out)[0]
         firsts = [payload[i * 3072] for i in range(3)]
@@ -406,7 +441,7 @@ class Imagenet32ToRaw(unittest.TestCase):
         self.write_batch("train_data_batch_1", 5)
         self.write_batch("train_data_batch_2", 5)
         out = os.path.join(self.dir, "small.batraw")
-        report = imagenet32_to_raw.convert(self.src, out, mode="rgb", limit=7)
+        report = imagenet_to_raw.convert(self.src, out, mode="rgb", limit=7)
         self.assertEqual(report["written"], 7)
         # Le compte de l'en-tête est corrigé au close() : il doit coller.
         self.assertEqual(batraw.read(out)[1], 7)
@@ -415,13 +450,13 @@ class Imagenet32ToRaw(unittest.TestCase):
         """Selon la façon dont l'archive a été picklée, les clés diffèrent."""
         self.write_batch("train_data_batch_1", 1, keys_as_bytes=True)
         out = os.path.join(self.dir, "bytes_keys.batraw")
-        self.assertEqual(imagenet32_to_raw.convert(self.src, out)["written"], 1)
+        self.assertEqual(imagenet_to_raw.convert(self.src, out)["written"], 1)
 
     def test_a_missing_folder_says_what_it_expected(self):
         empty = os.path.join(self.dir, "empty")
         os.makedirs(empty)
         with self.assertRaises(FileNotFoundError) as caught:
-            imagenet32_to_raw.convert(empty, os.path.join(self.dir, "x.batraw"))
+            imagenet_to_raw.convert(empty, os.path.join(self.dir, "x.batraw"))
         self.assertIn("train_data_batch", str(caught.exception))
 
     def test_a_batch_of_the_wrong_shape_is_refused(self):
@@ -433,13 +468,13 @@ class Imagenet32ToRaw(unittest.TestCase):
         with open(path, "wb") as fh:
             pickle.dump({"data": np.zeros((2, 100), dtype=np.uint8), "labels": [1, 2]}, fh)
         with self.assertRaises(ValueError):
-            imagenet32_to_raw.convert(self.src, os.path.join(self.dir, "x.batraw"))
+            imagenet_to_raw.convert(self.src, os.path.join(self.dir, "x.batraw"))
 
     def test_grey_matches_the_cifar_converter(self):
         """Les deux fondations doivent définir « gris » de la même façon."""
         self.write_batch("train_data_batch_1", 1, first=200)
         out = os.path.join(self.dir, "grey.batraw")
-        imagenet32_to_raw.convert(self.src, out, mode="grey")
+        imagenet_to_raw.convert(self.src, out, mode="grey")
         payload, count, w, h, c = batraw.read(out)[:5]
         self.assertEqual((count, w, h, c), (1, 32, 32, 1))
         self.assertEqual(payload[0], round(0.299 * 200 + 0.587 * 201 + 0.114 * 202))

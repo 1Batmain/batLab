@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""« Downsampled ImageNet 32×32 » → un `.batraw` BATRAW3.
+"""« Downsampled ImageNet » (32×32 **ou** 64×64) → un `.batraw` BATRAW3.
 
-Une fondation plus large que CIFAR-10 : 1 281 160 images contre 50 000, mêmes
-32×32, même géométrie de modèle. C'est le jeu à partir duquel fine-tuner vers un
-corpus étroit (voir `docs/reports/CUSTOM_DATASET.md`).
+Une fondation plus large que CIFAR-10 : 1 281 160 images contre 50 000, même
+géométrie de plans. C'est le jeu à partir duquel fine-tuner vers un corpus
+étroit (voir `docs/reports/CUSTOM_DATASET.md`).
 
-    python3 tools/imagenet32_to_raw.py ~/Downloads/Imagenet32_train \\
-        --out datasets/imagenet32_rgb.batraw
+    python3 tools/imagenet_to_raw.py ~/Downloads/Imagenet64_train \\
+        --out datasets/imagenet64_rgb.batraw
 
-    # Un sous-ensemble, pour un premier essai qui ne coûte pas 4 Go :
-    python3 tools/imagenet32_to_raw.py ~/Downloads/Imagenet32_train \\
-        --out datasets/imagenet32_small.batraw --limit 50000
+    # Un sous-ensemble, pour un premier essai qui ne coûte pas des Go :
+    python3 tools/imagenet_to_raw.py ~/Downloads/Imagenet64_train \\
+        --out datasets/imagenet64_small.batraw --limit 50000
+
+**La résolution est déduite, pas demandée.** Les deux releases officielles —
+32×32 et 64×64 — ont le **même format** : seul le nombre de valeurs par ligne
+change (3072 = 32²·3, ou 12288 = 64²·3). Le script lit `data.shape[1]`, en tire
+le côté (`√(cols/3)`), et refuse une ligne qui n'est pas trois plans carrés.
+Toutes les batches d'un dossier doivent porter la même taille.
 
 **Ce script ne télécharge rien.** Il attend, dans le dossier donné, les fichiers
 de l'archive officielle :
@@ -18,7 +24,7 @@ de l'archive officielle :
     train_data_batch_1 … train_data_batch_10      (SANS extension)
 
 Ce sont des **pickles** Python, pas des `.npz` : chacun est un dict portant
-`data` — un `ndarray` uint8 de forme (n, 3072) — et `labels`, dont ce projet
+`data` — un `ndarray` uint8 de forme (n, 3·côté²) — et `labels`, dont ce projet
 n'a que faire (la diffusion ici est inconditionnelle). Les clés sont parfois des
 `str`, parfois des `bytes` selon la façon dont l'archive a été produite ; les
 deux sont acceptées. Si les fichiers manquent, le script dit lesquels et
@@ -26,26 +32,28 @@ s'arrête — il n'invente rien.
 
 Le piège, le même que pour CIFAR
 --------------------------------
-Les 3072 octets d'une image sont **trois plans** de 1024 (R entier, puis G
-entier, puis B entier), pas des pixels entrelacés. Le moteur attend l'inverse :
-canaux contigus, pixel par pixel. Lu tel quel, le dataset donne des images dont
-le tiers haut est rouge, le tiers médian vert et le tiers bas bleu — et
-l'entraînement ne lève aucune erreur. La conversion se fait ici, et le test
-`test_batches_are_read_in_numeric_order_and_interleaved` la tient.
+Les octets d'une image sont **trois plans** (R entier, puis G entier, puis B
+entier), pas des pixels entrelacés. Le moteur attend l'inverse : canaux
+contigus, pixel par pixel. Lu tel quel, le dataset donne des images dont le tiers
+haut est rouge, le tiers médian vert et le tiers bas bleu — et l'entraînement ne
+lève aucune erreur. La conversion se fait ici, et le test
+`test_the_three_planes_become_pixels` la tient.
 
 La taille, et pourquoi BATRAW3
 ------------------------------
-3,94 Go en u8 contre 15,7 Go en f32. Ce n'est pas qu'une question de disque :
-15,7 Go de f32 doivent aussi tenir en RAM hôte pendant tout le run, alors que
-3,94 Go tiennent en plus **entièrement dans un tampon GPU résident** sous
-`--gpu-limits native` (le binding de cette machine plafonne à 4 Gio) — donc zéro
-transfert hôte→GPU par pas. C'est la configuration cible pour un run de
-fondation.
+En 32×32, 3,94 Go en u8 contre 15,7 Go en f32 ; en 64×64, quatre fois plus. Ce
+n'est pas qu'une question de disque : le f32 doit aussi tenir en RAM hôte pendant
+tout le run, alors que l'u8 tient en plus **entièrement dans un tampon GPU
+résident** sous `--gpu-limits native` (le binding de cette machine plafonne à
+4 Gio) — donc zéro transfert hôte→GPU par pas. C'est la configuration cible pour
+un run de fondation. (ImageNet 64×64 en u8 fait ~15,7 Go : au-delà du binding, il
+sera streamé par chunks — regarder la bannière du run.)
 
 Dépendance : numpy.
 """
 
 import argparse
+import math
 import os
 import pickle
 import re
@@ -60,13 +68,28 @@ except ImportError:  # pragma: no cover
     print("numpy est requis : pip install numpy", file=sys.stderr)
     raise
 
-WIDTH = HEIGHT = 32
-PIXELS = WIDTH * HEIGHT
 PLANES = 3
-SAMPLE_VALUES = PIXELS * PLANES  # 3072
 
 #: Les noms attendus. Nommés en clair pour que l'erreur soit actionnable.
 BATCH_PATTERN = re.compile(r"^train_data_batch_(\d+)$")
+
+
+def side_from_row(cols):
+    """Le côté carré d'une ligne de `cols` valeurs en trois plans.
+
+    Refuse ce qui n'est pas exactement `3·côté²` : une ligne de la mauvaise
+    longueur n'est pas un « Downsampled ImageNet », et deviner produirait des
+    images tordues sans erreur.
+    """
+    if cols % PLANES != 0:
+        raise ValueError(f"{cols} valeurs/ligne non divisibles par {PLANES} plans")
+    pixels = cols // PLANES
+    side = int(round(math.isqrt(pixels)))
+    if side * side != pixels:
+        raise ValueError(
+            f"{cols} valeurs/ligne → {pixels} pixels, qui n'est pas un carré "
+            f"(attendu 3·côté², p. ex. 3072=32² ou 12288=64²)")
+    return side
 
 #: Images traitées d'un coup. Un batch entier en float64 pour la luminance
 #: coûterait ~1 Go de pic ; par blocs, le pic est négligeable et la progression
@@ -103,8 +126,13 @@ def collect_batches(directory):
     return [path for _, path in sorted(found)]
 
 
-def load_batch(path):
-    """Le tableau `(n, 3072)` uint8 d'un batch."""
+def load_batch(path, expected_cols=None):
+    """Le tableau `(n, cols)` uint8 d'un batch.
+
+    `expected_cols`, s'il est donné, impose que cette batche porte la même taille
+    d'image que les précédentes : mélanger du 32×32 et du 64×64 dans un dossier
+    produirait un `.batraw` incohérent.
+    """
     with open(path, "rb") as fh:
         # `encoding='bytes'` pour les pickles produits sous Python 2 ; les clés
         # ressortent alors en bytes sur certaines archives et en str sur
@@ -117,20 +145,25 @@ def load_batch(path):
         raise ValueError(f"{path} : pas de clé 'data' (clés présentes : {keys})")
 
     data = np.asarray(data, dtype=np.uint8)
-    if data.ndim != 2 or data.shape[1] != SAMPLE_VALUES:
+    if data.ndim != 2:
         raise ValueError(
-            f"{path} : data a la forme {data.shape}, attendu (n, {SAMPLE_VALUES}) — "
-            f"est-ce bien du « Downsampled ImageNet 32×32 » ?"
-        )
+            f"{path} : data a la forme {data.shape}, attendu (n, 3·côté²) — "
+            f"est-ce bien un « Downsampled ImageNet » ?")
+    side_from_row(data.shape[1])  # rejette une ligne qui n'est pas 3 plans carrés
+    if expected_cols is not None and data.shape[1] != expected_cols:
+        raise ValueError(
+            f"{path} : {data.shape[1]} valeurs/ligne, mais une batche précédente "
+            f"en portait {expected_cols} — un dossier ne peut pas mêler deux tailles")
     return data
 
 
 def to_samples(block, mode):
-    """Un bloc `(n, 3072)` en plans → les octets attendus par le moteur.
+    """Un bloc `(n, 3·côté²)` en plans → les octets attendus par le moteur.
 
     C'est ici que les trois plans deviennent des pixels.
     """
-    planes = block.reshape(-1, PLANES, PIXELS)
+    pixels = block.shape[1] // PLANES
+    planes = block.reshape(-1, PLANES, pixels)
     if mode == "grey":
         # float64 puis `rint`, exactement comme `cifar_to_raw.py` : les deux
         # convertisseurs doivent donner le même gris, sans quoi un fine-tune de
@@ -146,18 +179,26 @@ def to_samples(block, mode):
 
 def convert(directory, out_path, mode="rgb", limit=0, version=batraw.DEFAULT_VERSION,
             verbose=False):
-    """Convertit et rend un rapport chiffré."""
+    """Convertit et rend un rapport chiffré. La résolution est déduite du 1er batch."""
     batches = collect_batches(directory)
     channels = 1 if mode == "grey" else PLANES
-    report = {"batches": len(batches), "written": 0}
 
-    with batraw.Writer(out_path, WIDTH, HEIGHT, channels, version=version) as out:
-        for path in batches:
+    # La taille vient des données, pas d'un flag : lire une ligne du premier
+    # batch, en tirer le côté, et l'imposer à tous les suivants.
+    first = load_batch(batches[0])
+    side = side_from_row(first.shape[1])
+    expected_cols = first.shape[1]
+    report = {"batches": len(batches), "written": 0, "side": side}
+
+    with batraw.Writer(out_path, side, side, channels, version=version) as out:
+        for i, path in enumerate(batches):
             if limit and out.count >= limit:
                 break
-            data = load_batch(path)
+            data = first if i == 0 else load_batch(path, expected_cols)
+            first = None
             if verbose:
-                print(f"  {os.path.basename(path)} : {len(data)} images", flush=True)
+                print(f"  {os.path.basename(path)} : {len(data)} images "
+                      f"({side}×{side})", flush=True)
             for start in range(0, len(data), BLOCK):
                 if limit and out.count >= limit:
                     break
@@ -165,8 +206,8 @@ def convert(directory, out_path, mode="rgb", limit=0, version=batraw.DEFAULT_VER
                 if limit:
                     block = block[: limit - out.count]
                 out.append(to_samples(block, mode))
-            # Le batch pèse ~400 Mo : le lâcher avant d'ouvrir le suivant garde
-            # le pic à un batch, pas à deux.
+            # Le batch pèse plusieurs centaines de Mo : le lâcher avant d'ouvrir
+            # le suivant garde le pic à un batch, pas à deux.
             del data
         report["written"] = out.count
         report["bytes"] = None
@@ -179,7 +220,7 @@ def convert(directory, out_path, mode="rgb", limit=0, version=batraw.DEFAULT_VER
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convertit « Downsampled ImageNet 32×32 » en .batraw pour batLab.",
+        description="Convertit « Downsampled ImageNet » (32×32 ou 64×64) en .batraw pour batLab.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -217,15 +258,16 @@ def main():
         sys.exit(1)
 
     channels = 1 if args.mode == "grey" else PLANES
+    side = report["side"]
     print(
-        f"{report['written']} image(s) ({WIDTH}×{HEIGHT}×{channels}, {args.format}) "
+        f"{report['written']} image(s) ({side}×{side}×{channels}, {args.format}) "
         f"depuis {report['batches']} batch(es) → {args.out}"
         f"  [{report['bytes'] / 1e9:.2f} Go]"
     )
     print(
         "  Regarder la planche avant d'entraîner :\n"
         f"    python3 -c \"import sys; sys.path.insert(0,'tools'); import images_to_raw; \"\\\n"
-        f"      \"images_to_raw.contact_sheet('{args.out}', 'imagenet32_sheet.png')\""
+        f"      \"images_to_raw.contact_sheet('{args.out}', 'imagenet_sheet.png')\""
     )
 
 
