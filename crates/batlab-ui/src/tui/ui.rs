@@ -49,6 +49,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::PerpetualParams => draw_perpetual_params(f, app, body),
         Screen::TrainingParams => draw_training_params(f, app, body),
         Screen::DatasetSelector => draw_dataset_selector(f, app, body),
+        Screen::SeedDatasetSelector => draw_seed_dataset_selector(f, app, body),
         Screen::Monitor => draw_monitor(f, app, body),
         Screen::TrainingControl => {
             draw_monitor(f, app, body);
@@ -1461,6 +1462,7 @@ fn draw_perpetual_params(f: &mut Frame, app: &App, area: Rect) {
         app.perpetual_params.fields[1].clone(),
         app.perpetual_params.fields[2].clone(),
         app.perpetual_params.fields[3].clone(),
+        app.seed_dataset_label(),
         app.perpetual_params.regime.label().to_string(),
     ];
     draw_form_screen(
@@ -1555,6 +1557,88 @@ fn draw_dataset_selector(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  [arrow] select dataset  [<- / ->] cycle  [Enter] start training  [Esc] back  [q] quit",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+// ---------------------------------------------------------------------------
+// Screen: Seed Dataset Selector
+// ---------------------------------------------------------------------------
+
+/// The dataset a perpetual drift sets out from.
+///
+/// Every row carries its geometry, and a row whose channels do not match the
+/// model's output is marked as refused *before* it is chosen — the point of a
+/// chooser over a typed path. The first row hands the decision back to the
+/// channel convention, and says which file that convention will pick.
+fn draw_seed_dataset_selector(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(72, 70, area);
+    f.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Seed Dataset — where the drift sets out from ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let target = app.seed_dataset_target();
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(
+                "  Le modèle émet {}×{}×{} — un dataset d'un autre nombre de canaux est refusé.",
+                target.0, target.1, target.2
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    let row = |index: usize, text: String, refused: bool| {
+        let selected = index == app.seed_dataset_selector.selected;
+        let style = match (selected, refused) {
+            (true, true) => Style::default().fg(Color::Red),
+            (true, false) => Style::default().fg(Color::Yellow),
+            (false, true) => Style::default().fg(Color::DarkGray),
+            (false, false) => Style::default().fg(Color::Gray),
+        };
+        let marker = if selected { ">" } else { " " };
+        Line::from(Span::styled(format!("    {marker} {text}"), style))
+    };
+
+    lines.push(row(
+        0,
+        format!("(défaut) {}", app.seed_dataset_default_label()),
+        false,
+    ));
+    for (index, (path, geometry)) in app.seed_dataset_selector.datasets.iter().enumerate() {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let (shape, refused) = match geometry {
+            Some((w, h, c)) => (format!("{w}×{h}×{c}"), *c != target.2),
+            // No header to read: a directory of images, whose channels the
+            // loader decides on purpose. Not refused, not vouched for either.
+            None => ("géométrie inconnue".to_string(), false),
+        };
+        let suffix = if refused { "  ✗ canaux" } else { "" };
+        lines.push(row(index + 1, format!("{name}   {shape}{suffix}"), refused));
+    }
+
+    if let Some(err) = app.seed_dataset_selector.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  [up/down] choose  [Enter] take it  [Esc] back unchanged  [q] quit",
         Style::default().fg(Color::DarkGray),
     )));
 

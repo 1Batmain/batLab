@@ -78,41 +78,7 @@ fn run_builder_loop(
         }
 
         if let Some(run) = app.run_config.take() {
-            let denoising_paths = app
-                .inference_params
-                .fields
-                .get(1)
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(1)
-                .max(1);
-            let denoise_magnitude = app
-                .inference_params
-                .fields
-                .get(2)
-                .and_then(|value| value.parse::<f32>().ok())
-                .unwrap_or(1.0)
-                .max(1e-6);
-            let inference = InferenceConfig {
-                random_seed: app.inference_params.random_seed,
-                seed: if app.inference_params.random_seed {
-                    None
-                } else {
-                    app.inference_params
-                        .fields
-                        .first()
-                        .and_then(|value| value.parse::<u64>().ok())
-                },
-                denoising_paths,
-                denoise_magnitude,
-                checkpoint: app.selected_checkpoint_path.clone(),
-            };
-            return Ok(ModelConfig {
-                model_name: app.active_model_name.clone(),
-                input_size: app.layer_builder.model_input,
-                layers: app.layer_builder.layers.clone(),
-                inference,
-                run,
-            });
+            return Ok(app.compose_run_config(run));
         }
     }
 }
@@ -138,6 +104,9 @@ pub fn run_monitor(
     // actually holds the model's directory.
     app.running_model = config.model_name.clone();
     app.monitor.model_config = Some(config.clone());
+    // Model-level, so it is read whatever the run mode — same reason
+    // `apply_loaded_model` reads it outside the match.
+    app.seed_dataset = config.seed_dataset.clone();
     match &config.run.mode {
         RunMode::Infer => {
             app.model_actions.selected = ModelAction::Infer.index();
@@ -158,7 +127,6 @@ pub fn run_monitor(
             app.perpetual_params.fields[3] = pc.tempo.to_string();
             app.perpetual_params.field_idx = 0;
             app.perpetual_params.error = None;
-            app.perpetual_params.seed_dataset = pc.seed_dataset.clone();
             app.selected_checkpoint_path = pc.checkpoint.clone();
         }
         RunMode::Train(tc) => {

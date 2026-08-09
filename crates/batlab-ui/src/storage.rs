@@ -574,6 +574,51 @@ impl Storage {
         Ok(models)
     }
 
+    /// **THE** resolution of the dataset a perpetual drift sets out from —
+    /// the one place the three sources are ranked, and the only one allowed to
+    /// know that ranking.
+    ///
+    /// `flag` (`--seed-dataset`) beats `configured` (`ModelConfig::seed_dataset`)
+    /// beats the convention derived from the model's **output channels**. The
+    /// convention is a last resort, not a default: it is how a model that has
+    /// never been told anything still drifts away from a picture, and it is the
+    /// behaviour that predates the other two.
+    ///
+    /// It resolves a *name*, never a file's contents, and it does not care
+    /// whether the file exists — the caller decides what a missing one means,
+    /// and the answer differs by source: named and missing is an error, derived
+    /// and missing is a fallback onto pure noise.
+    ///
+    /// Relative paths resolve by source, and the two rules are not an
+    /// inconsistency: a **flag** is typed at a shell and keeps the shell's
+    /// meaning (relative to the working directory), while a **config** entry is
+    /// stored and re-read from wherever the binary happens to run, so it is
+    /// taken against the project root — that is what lets a `config_file` say
+    /// `datasets/elephants256.batraw` and still mean it tomorrow.
+    pub fn resolve_seed_dataset(
+        &self,
+        flag: Option<&str>,
+        configured: Option<&str>,
+        output_channels: u32,
+    ) -> Option<SeedDatasetChoice> {
+        let (named, source) = match (flag, configured) {
+            (Some(path), _) => (PathBuf::from(path), SeedSource::Flag),
+            (None, Some(path)) => (PathBuf::from(path), SeedSource::Config),
+            (None, None) => (
+                PathBuf::from(default_seed_dataset_name(output_channels)?),
+                SeedSource::Convention,
+            ),
+        };
+        let path = match (named.is_absolute(), source) {
+            (true, _) | (false, SeedSource::Flag) => named,
+            (false, SeedSource::Config) => self.root.join(named),
+            // The convention names a bare file, and `datasets/` is where this
+            // host keeps them.
+            (false, SeedSource::Convention) => self.root.join("datasets").join(named),
+        };
+        Some(SeedDatasetChoice { path, source })
+    }
+
     pub fn list_datasets(&self) -> io::Result<Vec<String>> {
         let mut datasets = Vec::new();
         let dir = self.datasets_dir()?;
@@ -607,9 +652,13 @@ impl Storage {
     /// `None` when the file is missing or is not a `.batraw` — the inventory
     /// then simply has no streamed post, which is the truth rather than a zero.
     pub fn dataset_spec(&self, path: &str) -> Option<batlab_core::DatasetSpec> {
-        read_batraw_header(Path::new(path)).map(|header| batlab_core::DatasetSpec {
+        let header = read_batraw_header(Path::new(path))?;
+        Some(batlab_core::DatasetSpec {
             sample_count: header.0,
-            sample_bytes: header.1 as u64 * header.2 as u64 * header.3 as u64 * 4,
+            // Times the payload's own width, not a hard-coded 4. A BATRAW3
+            // sample is a quarter of the f32 one it replaces, and the residency
+            // budget is decided on this number.
+            sample_bytes: header.1 as u64 * header.2 as u64 * header.3 as u64 * header.4,
         })
     }
 
@@ -1017,20 +1066,88 @@ pub fn list_datasets() -> io::Result<Vec<String>> {
     Storage::default().list_datasets()
 }
 
-/// `(sample_count, width, height, channels)` from a `.batraw` header.
+pub fn resolve_seed_dataset(
+    flag: Option<&str>,
+    configured: Option<&str>,
+    output_channels: u32,
+) -> Option<SeedDatasetChoice> {
+    Storage::default().resolve_seed_dataset(flag, configured, output_channels)
+}
+
+/// Which of the three sources named the dataset a drift sets out from.
+///
+/// Carried rather than recomputed, so the banner and the monitor panel can say
+/// *why* the run is looking at these pictures. "origine → image du dataset X"
+/// alone left the one question a surprised user actually has — "why THAT
+/// dataset?" — unanswered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSource {
+    /// `--seed-dataset` on the command line.
+    Flag,
+    /// `seed_dataset` in the model's `config_file`.
+    Config,
+    /// Neither: derived from the model's output channels.
+    Convention,
+}
+
+impl SeedSource {
+    /// How the banner names this source. Short, and unambiguous about which of
+    /// the three won — that is the whole reason it is printed.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SeedSource::Flag => "--seed-dataset",
+            SeedSource::Config => "config_file",
+            SeedSource::Convention => "défaut par canaux",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedDatasetChoice {
+    pub path: PathBuf,
+    pub source: SeedSource,
+}
+
+/// The dataset a model of `channels` output channels drifts away from when
+/// nothing names one.
+///
+/// Derived from the model's **output** geometry rather than guessed: handing a
+/// greyscale drift the RGB file would not error — the loader would flatten it —
+/// and the run would quietly set out from a mangled picture.
+///
+/// `None` for a geometry neither file matches: there is nothing to default to,
+/// and inventing one would drift away from the wrong images.
+pub const fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
+    match channels {
+        1 => Some("cifar10_grey.batraw"),
+        3 => Some("cifar10_rgb.batraw"),
+        _ => None,
+    }
+}
+
+/// `(sample_count, width, height, channels, value_bytes)` from a `.batraw`
+/// header.
 ///
 /// The header only: CIFAR-10 is 195 MiB on disk, and reading it whole to answer
 /// "how many chunks does this become on the GPU?" would make the answer cost
-/// more than the run it describes. Both magics are accepted — `BATRAW1` differs
-/// from `BATRAW2` in the *range* of its payload, not in its shape.
-pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32)> {
+/// more than the run it describes.
+///
+/// All three magics are accepted. `BATRAW1` differs from `BATRAW2` in the
+/// *range* of its payload, not in its shape; `BATRAW3` differs in its **width**
+/// — one byte per value instead of four — which is why the width is part of the
+/// answer rather than assumed. Left out, this function returned `None` for every
+/// file the current converters write, and the Resources page then reported no
+/// streamed dataset at all for them.
+pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32, u64)> {
     use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
     let mut header = [0u8; 24];
     file.read_exact(&mut header).ok()?;
-    if &header[..8] != b"BATRAW2\0" && &header[..8] != b"BATRAW1\0" {
-        return None;
-    }
+    let value_bytes: u64 = match &header[..8] {
+        b"BATRAW3\0" => 1,
+        b"BATRAW2\0" | b"BATRAW1\0" => 4,
+        _ => return None,
+    };
     let word = |i: usize| {
         u32::from_le_bytes([
             header[8 + i * 4],
@@ -1039,7 +1156,7 @@ pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32)> {
             header[11 + i * 4],
         ])
     };
-    Some((word(0) as u64, word(1), word(2), word(3)))
+    Some((word(0) as u64, word(1), word(2), word(3), value_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,10 +1215,152 @@ mod tests {
             input_size: (8, 8, 1),
             layers: Vec::new(),
             inference: InferenceConfig::default(),
+            seed_dataset: None,
             run: RunConfig {
                 mode: RunMode::Infer,
             },
         }
+    }
+
+    /// A `.batraw` of `count` samples of the given geometry, under `magic`.
+    /// Only the header is ever read back, but the payload is written full size
+    /// so a reader that checked the length would still be satisfied.
+    fn write_batraw(path: &Path, magic: &[u8; 8], count: u32, geometry: (u32, u32, u32)) {
+        let value_bytes = if magic == b"BATRAW3\0" { 1 } else { 4 };
+        let mut bytes = magic.to_vec();
+        for word in [count, geometry.0, geometry.1, geometry.2] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let values = (count * geometry.0 * geometry.1 * geometry.2) as usize;
+        bytes.resize(bytes.len() + values * value_bytes, 0);
+        fs::write(path, bytes).expect("writing a test dataset should work");
+    }
+
+    /// `BATRAW3` is what every converter in `tools/` writes today, and this
+    /// reader refused it — so `dataset_spec` answered `None` for every current
+    /// dataset and the Resources page reported no streamed post at all where
+    /// there were gigabytes of one.
+    ///
+    /// The second half is the reason the payload width is returned rather than
+    /// assumed: the same 32×32×3 images are a quarter of the bytes in 8-bit,
+    /// and that number is what the residency budget is decided on.
+    #[test]
+    fn the_header_reader_accepts_every_magic_and_reports_the_payload_width() {
+        let temp = TempRoot::new("batraw-magics");
+        let geometry = (32, 32, 3);
+        let expected_f32 = 32 * 32 * 3 * 4;
+
+        for (magic, value_bytes) in [
+            (b"BATRAW3\0", 1u64),
+            (b"BATRAW2\0", 4),
+            (b"BATRAW1\0", 4),
+        ] {
+            let path = temp.path().join(format!(
+                "{}.batraw",
+                std::str::from_utf8(&magic[..7]).unwrap()
+            ));
+            write_batraw(&path, magic, 7, geometry);
+
+            let header = read_batraw_header(&path).unwrap_or_else(|| {
+                panic!(
+                    "{} was refused — every dataset in this format would report no \
+                     size at all",
+                    std::str::from_utf8(&magic[..7]).unwrap()
+                )
+            });
+            assert_eq!((header.0, header.1, header.2, header.3), (7, 32, 32, 3));
+            assert_eq!(header.4, value_bytes);
+
+            let spec = Storage::at(temp.path())
+                .dataset_spec(&path.to_string_lossy())
+                .expect("a readable header must yield a spec");
+            assert_eq!(spec.sample_count, 7);
+            assert_eq!(
+                spec.sample_bytes,
+                expected_f32 / (4 / value_bytes),
+                "an 8-bit sample must not be accounted as an f32 one"
+            );
+        }
+
+        let bogus = temp.path().join("not-a-dataset.batraw");
+        fs::write(&bogus, b"BATRAWX\0            ").expect("write");
+        assert!(
+            read_batraw_header(&bogus).is_none(),
+            "an unknown magic must stay refused"
+        );
+    }
+
+    /// The convention is derived from the model's **output** channels, and it
+    /// answers for exactly the two geometries this project has files for.
+    /// A wrong answer here does not error anywhere — the loader would flatten
+    /// or replicate — it just drifts away from a mangled picture.
+    #[test]
+    fn the_convention_follows_the_models_output_channels() {
+        assert_eq!(default_seed_dataset_name(1), Some("cifar10_grey.batraw"));
+        assert_eq!(default_seed_dataset_name(3), Some("cifar10_rgb.batraw"));
+        assert_eq!(default_seed_dataset_name(2), None);
+        assert_eq!(default_seed_dataset_name(0), None);
+    }
+
+    /// **The ranking, in the one place that owns it**: flag, then config, then
+    /// the channel convention.
+    ///
+    /// And the relative-path rules that go with it, which are not the same for
+    /// the two named sources on purpose: a flag is typed at a shell and keeps
+    /// the shell's meaning, a config entry is stored and re-read from wherever
+    /// the binary runs, so it is anchored to the project root.
+    #[test]
+    fn the_seed_dataset_ranking_is_flag_then_config_then_convention() {
+        let temp = TempRoot::new("seed-ranking");
+        let storage = temp.storage();
+        let root = temp.path();
+
+        let choice = storage
+            .resolve_seed_dataset(Some("/abs/flag.batraw"), Some("datasets/config.batraw"), 3)
+            .expect("a flag always resolves");
+        assert_eq!(choice.source, SeedSource::Flag);
+        assert_eq!(choice.path, PathBuf::from("/abs/flag.batraw"));
+
+        let choice = storage
+            .resolve_seed_dataset(None, Some("datasets/elephants256.batraw"), 3)
+            .expect("a configured dataset resolves");
+        assert_eq!(choice.source, SeedSource::Config);
+        assert_eq!(
+            choice.path,
+            root.join("datasets/elephants256.batraw"),
+            "a relative config path is anchored to the project root, or a \
+             config_file stops meaning the same thing tomorrow"
+        );
+
+        let choice = storage
+            .resolve_seed_dataset(None, None, 3)
+            .expect("three channels have a convention");
+        assert_eq!(choice.source, SeedSource::Convention);
+        assert_eq!(choice.path, root.join("datasets/cifar10_rgb.batraw"));
+
+        let choice = storage
+            .resolve_seed_dataset(None, None, 1)
+            .expect("one channel has a convention");
+        assert_eq!(choice.path, root.join("datasets/cifar10_grey.batraw"));
+
+        assert!(
+            storage.resolve_seed_dataset(None, None, 7).is_none(),
+            "a geometry no built-in file matches must resolve to nothing rather \
+             than to the wrong pictures"
+        );
+
+        // A flag keeps the shell's meaning: relative stays relative.
+        let choice = storage
+            .resolve_seed_dataset(Some("some/where.batraw"), None, 3)
+            .expect("a relative flag resolves");
+        assert_eq!(choice.path, PathBuf::from("some/where.batraw"));
+
+        // An absolute config path is taken as it stands.
+        let absolute = root.join("elsewhere.batraw");
+        let choice = storage
+            .resolve_seed_dataset(None, Some(&absolute.to_string_lossy()), 3)
+            .expect("an absolute config path resolves");
+        assert_eq!(choice.path, absolute);
     }
 
     fn seed_model(storage: &Storage, name: &str) {

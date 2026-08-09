@@ -206,12 +206,30 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
 - **`inter_seed_std` n'est pas un critère de diversité lisible seul** : il est proportionnel à `--magnitude` (±6 % sur 0,3/0,6/1,0), donc il mesure surtout le bruit du sampler non débruité. Le lire à magnitude fixée, avec `intra_image_std` (doit approcher 0,206 par le bas, pas le dépasser) et `banding_ratio`.
 
 - **Perpetual est une dérive img2img** : le run part d'une **vraie image du
-  dataset** (`PerpetualOrigin::Image`, dataset dérivé des canaux de sortie —
-  1 → `cifar10_grey`, 3 → `cifar10_rgb` — ou nommé par `seed_dataset` /
-  `--seed-dataset`), et `[r]` en tire une autre. Introuvable → repli sur le bruit
-  pur, annoncé ; **nommé et manquant → erreur**. `--seed-noise` rend l'ancienne
-  ouverture. L'index de l'image est **avalanché** depuis la graine, jamais
-  `seed % len` (même raison que `gaussian_at`).
+  dataset** (`PerpetualOrigin::Image`), et `[r]` en tire une autre. Introuvable →
+  repli sur le bruit pur, annoncé ; **nommé et manquant → erreur**.
+  `--seed-noise` rend l'ancienne ouverture. L'index de l'image est **avalanché**
+  depuis la graine, jamais `seed % len` (même raison que `gaussian_at`).
+- **D'où vient la graine : trois sources, un classement, UNE fonction.**
+  `--seed-dataset` > `ModelConfig::seed_dataset` > défaut par canaux de sortie
+  (1 → `cifar10_grey`, 3 → `cifar10_rgb`). Le classement vit une seule fois, dans
+  `storage::Storage::resolve_seed_dataset` ; `SeedImages::resolve` est la seule
+  porte et prend le `ModelConfig` **entier**, pas un chemin déjà choisi — un
+  appelant ne *peut* pas oublier la config. C'était le bug :
+  `--headless-perpetual` résolvait sa graine à sa façon et ne lisait donc jamais
+  `seed_dataset`, si bien qu'`Elephants_XL` dérivait depuis un camion CIFAR.
+  Gardé par `every_path_that_starts_a_drift_resolves_its_seed_the_same_way`, qui
+  balaye la source et **nomme** toute fonction ouvrant une dérive sans passer par
+  la porte (même discipline que `nothing_in_the_engine_opens_an_untimed_pass`).
+  `seed_dataset` est **au niveau de `ModelConfig`**, pas dans `PerpetualConfig` :
+  c'est une propriété du modèle, et `run.mode` ne garde que le dernier run —
+  rangé là, une nuit d'entraînement l'effaçait. Se règle dans le formulaire
+  Perpetual (`Screen::SeedDatasetSelector`, un **sélecteur** : il montre la
+  géométrie de chaque candidat, et un dataset dont les **canaux** ne collent pas
+  est **refusé**, pas redimensionné — largeur et hauteur, elles, le sont).
+  Bannière et panneau nomment la source qui a gagné, pas seulement le fichier.
+  Contrat complet, et les deux autres champs « documentés mais jamais lus »
+  trouvés au passage : `docs/reports/SEED_DATASET.md`.
 - **En remontée, le modèle est appelé aussi.** C'était le « pause » : la montée
   est arithmétique pure (`forward_from`), donc x̂₀ restait figé `t_r + 1` frames —
   mesuré **294/294 frames de remontée gelées avant, 0/294 après**

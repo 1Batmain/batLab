@@ -985,14 +985,6 @@ pub struct PerpetualConfig {
     pub tempo: f32,
     #[serde(default)]
     pub checkpoint: Option<String>,
-    /// The dataset a run drifts away from — `Models/<name>/config_file` may
-    /// name one, otherwise it is derived from the model's output channels
-    /// (grey → `cifar10_grey.batraw`, colour → `cifar10_rgb.batraw`).
-    ///
-    /// A run whose dataset cannot be found falls back on pure noise at the top
-    /// of the schedule, which is what perpetual runs did before this existed.
-    #[serde(default)]
-    pub seed_dataset: Option<String>,
 }
 
 impl PerpetualConfig {
@@ -1041,7 +1033,6 @@ impl Default for PerpetualConfig {
             regime: PerpetualRegime::default(),
             tempo: Self::default_tempo(),
             checkpoint: None,
-            seed_dataset: None,
         }
     }
 }
@@ -1096,6 +1087,24 @@ pub struct ModelConfig {
     pub layers: Vec<LayerDraft>,
     #[serde(default)]
     pub inference: InferenceConfig,
+    /// The dataset this model's images come from — what a perpetual drift sets
+    /// out from, and the one thing a specialised model must not have to be told
+    /// twice. A path, absolute or relative to the project root.
+    ///
+    /// **Top-level, not inside [`PerpetualConfig`].** It belongs to the *model*
+    /// — "what do this model's pictures look like" — not to one run of it, and
+    /// `run.mode` only ever holds the last run: parked under
+    /// `RunMode::Perpetual`, a single training run would erase it, and the next
+    /// drift would set out from CIFAR again. Same reason [`InferenceConfig`] is
+    /// a section of its own rather than a payload of `RunMode::Infer`.
+    ///
+    /// `None` falls back on the model's **output channels** (grey →
+    /// `cifar10_grey.batraw`, colour → `cifar10_rgb.batraw`); a run whose
+    /// dataset cannot be found falls back on pure noise at the top of the
+    /// schedule and says so. Read on every path that starts a drift — the
+    /// ranking flag > this > convention is resolved in exactly one function.
+    #[serde(default)]
+    pub seed_dataset: Option<String>,
     pub run: RunConfig,
 }
 

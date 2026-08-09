@@ -6,11 +6,12 @@
 //! describe a model without a terminal anywhere in sight. What is left here is
 //! genuinely terminal state.
 
-use crate::storage::{self, SavedModelEntry, Storage};
+use crate::storage::{self, SavedModelEntry, Storage, default_seed_dataset_name};
 pub use batlab_core::config::*;
 use batlab_core::model::training::{LossWeighting, MIN_RENOISE_DEPTH, PerpetualRegime};
 use batlab_core::model::{OptimizerKind, WeightInit};
 use std::collections::HashMap;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Screens
@@ -39,6 +40,10 @@ pub enum Screen {
     PerpetualParams,
     TrainingParams,
     DatasetSelector,
+    /// The dataset a perpetual drift sets out from — a chooser, not a typed
+    /// path, so the geometry of each candidate can be shown next to it and an
+    /// incompatible one refused before the run rather than resized in silence.
+    SeedDatasetSelector,
     Monitor,
     TrainingControl,
     /// What this model costs on the GPU — see [`ResourcesState`].
@@ -107,7 +112,8 @@ impl Screen {
             Screen::TrainingParams
             | Screen::DatasetSelector
             | Screen::InferenceParams
-            | Screen::PerpetualParams => Some(PathStep::Parameters),
+            | Screen::PerpetualParams
+            | Screen::SeedDatasetSelector => Some(PathStep::Parameters),
             Screen::Monitor => Some(PathStep::Run),
             Screen::RenameModel
             | Screen::DuplicateModel
@@ -140,7 +146,7 @@ impl Screen {
     /// Every screen there is. A test walks the whole flow and asserts it visited
     /// all of these, so a new variant stays failing until something actually
     /// routes to it.
-    pub const ALL: [Screen; 16] = [
+    pub const ALL: [Screen; 17] = [
         Screen::ModelList,
         Screen::TemplateSelector,
         Screen::ModelActions,
@@ -154,6 +160,7 @@ impl Screen {
         Screen::PerpetualParams,
         Screen::TrainingParams,
         Screen::DatasetSelector,
+        Screen::SeedDatasetSelector,
         Screen::Monitor,
         Screen::TrainingControl,
         Screen::Resources,
@@ -528,25 +535,41 @@ pub struct PerpetualParamsState {
     pub regime: PerpetualRegime,
     /// [seed, magnitude, renoise depth, tempo]
     pub fields: Vec<String>,
-    /// 0=random toggle, 1=seed, 2=magnitude, 3=depth, 4=tempo, 5=regime toggle
+    /// 0=random toggle, 1=seed, 2=magnitude, 3=depth, 4=tempo,
+    /// 5=seed dataset (opens the chooser), 6=regime toggle
     pub field_idx: usize,
     pub error: Option<String>,
-    /// The dataset the drift sets out from, when the model's `config_file`
-    /// names one. Not a form field — it is carried through untouched so that
-    /// opening a model and starting it does not quietly erase a setting the
-    /// form cannot show. The default (no entry) is derived from the model's
-    /// output channels by the worker.
-    pub seed_dataset: Option<String>,
 }
 
-pub const PERPETUAL_PARAM_FIELD_NAMES: [&str; 6] = [
+pub const PERPETUAL_PARAM_FIELD_NAMES: [&str; 7] = [
     "Random Seed",
     "Seed",
     "Magnitude",
     "Renoise Depth (t_r)",
     "Steps / second",
+    "Seed Dataset",
     "Regime",
 ];
+
+/// The row that opens [`Screen::SeedDatasetSelector`]. Not typed: a path is
+/// long, and the chooser can show each candidate's geometry — which is the
+/// whole point, since a mismatched one is refused rather than resized.
+pub const PERPETUAL_SEED_DATASET_FIELD: usize = 5;
+
+/// The chooser behind the "Seed Dataset" row.
+///
+/// Row 0 is always "(défaut — selon les canaux de sortie)", which stores `None`
+/// and hands the choice back to the convention. The rest are the files
+/// `datasets/` holds, each with the geometry read from its header.
+#[derive(Default)]
+pub struct SeedDatasetSelectorState {
+    /// `(path, geometry)` — geometry `None` when the header could not be read
+    /// (a directory of images, say), which is not a reason to hide the entry.
+    pub datasets: Vec<(String, Option<(u32, u32, u32)>)>,
+    /// 0 = the default row; `index - 1` indexes `datasets`.
+    pub selected: usize,
+    pub error: Option<String>,
+}
 
 pub struct TrainingControlState {
     pub fields: Vec<String>, // [lr, batch_size, total_steps]
@@ -693,6 +716,7 @@ pub struct App {
     pub layer_builder: LayerBuilderState,
     pub inference_params: InferenceParamsState,
     pub perpetual_params: PerpetualParamsState,
+    pub seed_dataset_selector: SeedDatasetSelectorState,
     pub training_params: TrainingParamsState,
     pub training_control: TrainingControlState,
     pub monitor: MonitorState,
@@ -710,8 +734,21 @@ pub struct App {
     /// triple the parameter posts between them, so the page reads them from the
     /// file rather than assuming.
     pub resources_optimizer: batlab_core::OptimizerKind,
+    /// The three training knobs the model's `config_file` carries and no form
+    /// field shows. Held so that launching a run **preserves** them: they are
+    /// read back into the `TrainingConfig` the run is given, rather than reset
+    /// to their defaults on the way past.
+    pub training_optimizer: batlab_core::OptimizerKind,
+    pub training_weight_init: batlab_core::WeightInit,
+    pub training_loss_weighting: LossWeighting,
     pub resources_ema: bool,
     pub run_config: Option<RunConfig>,
+    /// The model's own seed dataset, as its `config_file` holds it — a property
+    /// of the model, not of one run, which is why it lives here beside
+    /// `active_model_name` and not in `perpetual_params`. Written back into
+    /// every `ModelConfig` this TUI builds, so a training run does not erase
+    /// what a perpetual run set. `None` = fall back on the channel convention.
+    pub seed_dataset: Option<String>,
     pub active_model_name: Option<String>,
     /// The model this process currently has a run on, if any. The manager
     /// refuses to rename or delete it — see [`App::model_run_in_progress`] for
@@ -947,8 +984,8 @@ impl App {
                 ],
                 field_idx: 0,
                 error: None,
-                seed_dataset: None,
             },
+            seed_dataset_selector: SeedDatasetSelectorState::default(),
             training_params: TrainingParamsState {
                 fields: vec![
                     default_lr.to_string(),
@@ -1013,8 +1050,12 @@ impl App {
             ),
             resources_dataset: None,
             resources_optimizer: batlab_core::OptimizerKind::default(),
+            training_optimizer: batlab_core::OptimizerKind::default(),
+            training_weight_init: batlab_core::WeightInit::default(),
+            training_loss_weighting: LossWeighting::default(),
             resources_ema: false,
             run_config: None,
+            seed_dataset: None,
             active_model_name: None,
             running_model: None,
             selected_checkpoint_path: None,
@@ -1242,10 +1283,14 @@ impl App {
             input_size: template.input_size,
             layers: template.layers.clone(),
             inference: InferenceConfig::default(),
+            // A template names no dataset of its own: a fresh model falls back
+            // on the channel convention until someone chooses otherwise.
+            seed_dataset: None,
             run: RunConfig {
                 mode: RunMode::Infer,
             },
         };
+        self.seed_dataset = None;
         self.storage
             .write_model_config(&template.key, &config)
             .map_err(|err| format!("Failed to write template config_file: {err}"))?;
@@ -1267,6 +1312,9 @@ impl App {
         // `OPTIMIZER_ADAM.md` makes it the project's standard, and sizing an
         // Adam run as an SGD one under-reports the parameter posts by 3×.
         self.resources_optimizer = batlab_core::OptimizerKind::Adam;
+        self.training_optimizer = batlab_core::OptimizerKind::default();
+        self.training_weight_init = batlab_core::WeightInit::default();
+        self.training_loss_weighting = LossWeighting::default();
         self.resources_ema = false;
         self.resources_dataset = None;
         self.layer_builder.model_input = config.input_size;
@@ -1280,6 +1328,13 @@ impl App {
         self.input_size.error = None;
         self.refresh_datasets();
         self.sync_inference_params_from_config(&config.inference);
+        // Unconditional, and it has to be: the seed dataset is a property of
+        // the model, so it is read whatever `run.mode` the file last recorded.
+        // Read only under `RunMode::Perpetual` it would have done two wrong
+        // things at once — lost the setting the moment a training run rewrote
+        // the mode, and left the *previous* model's dataset in place when the
+        // one being opened has none.
+        self.seed_dataset = config.seed_dataset.clone();
 
         // Whichever path the model's own `config_file` last recorded. It is a
         // preference, not a verdict: `preselect_pretrained_weights` honours it
@@ -1296,6 +1351,9 @@ impl App {
                 // an EMA adds another copy, and the dataset is the one post
                 // that is streamed rather than resident.
                 self.resources_optimizer = train.optimizer;
+                self.training_optimizer = train.optimizer;
+                self.training_weight_init = train.weight_init;
+                self.training_loss_weighting = train.loss_weighting;
                 self.resources_ema = train.ema_decay.is_some();
                 self.resources_dataset = self.storage.dataset_spec(&train.dataset_path);
                 self.resources.batch = train.batch_size.max(1);
@@ -2559,7 +2617,6 @@ impl App {
         self.perpetual_params.fields[1] = cfg.denoise_magnitude.to_string();
         self.perpetual_params.fields[2] = cfg.renoise_depth.to_string();
         self.perpetual_params.fields[3] = cfg.tempo.to_string();
-        self.perpetual_params.seed_dataset = cfg.seed_dataset.clone();
         self.perpetual_params.field_idx = 0;
         self.perpetual_params.error = None;
     }
@@ -2605,7 +2662,6 @@ impl App {
             regime: self.perpetual_params.regime,
             tempo,
             checkpoint: self.selected_checkpoint_path.clone(),
-            seed_dataset: self.perpetual_params.seed_dataset.clone(),
         };
 
         self.perpetual_params.error = None;
@@ -2617,7 +2673,183 @@ impl App {
         });
         if let Some(config) = self.monitor.model_config.as_mut() {
             config.run.mode = RunMode::Perpetual(perpetual);
+            config.seed_dataset = self.seed_dataset.clone();
         }
+        Ok(())
+    }
+
+    /// The `ModelConfig` a run is launched with — and, since
+    /// `normalize_config_for_models_layout` writes it back, the one that lands
+    /// in `Models/<name>/config_file`.
+    ///
+    /// On [`App`] rather than inline in the event loop so that what a run is
+    /// given, and what the file keeps, can be asserted without a terminal.
+    /// That matters here: `seed_dataset` is carried through **whatever the run
+    /// mode is**, which is a claim worth a test rather than a comment.
+    pub fn compose_run_config(&self, run: RunConfig) -> ModelConfig {
+        let denoising_paths = self
+            .inference_params
+            .fields
+            .get(1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let denoise_magnitude = self
+            .inference_params
+            .fields
+            .get(2)
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .max(1e-6);
+        let inference = InferenceConfig {
+            random_seed: self.inference_params.random_seed,
+            seed: if self.inference_params.random_seed {
+                None
+            } else {
+                self.inference_params
+                    .fields
+                    .first()
+                    .and_then(|value| value.parse::<u64>().ok())
+            },
+            denoising_paths,
+            denoise_magnitude,
+            checkpoint: self.selected_checkpoint_path.clone(),
+        };
+        ModelConfig {
+            model_name: self.active_model_name.clone(),
+            input_size: self.layer_builder.model_input,
+            layers: self.layer_builder.layers.clone(),
+            inference,
+            // Whatever the mode. It belongs to the model, so a training run has
+            // to carry it through rather than drop it: this is the line that
+            // keeps a specialised model's seed from being erased by the next
+            // night of training.
+            seed_dataset: self.seed_dataset.clone(),
+            run,
+        }
+    }
+
+    // --- The seed dataset ---
+
+    /// The model's own output geometry — what a seed dataset has to agree with.
+    pub fn seed_dataset_target(&self) -> (u32, u32, u32) {
+        self.inferred_input()
+    }
+
+    /// Whether `path` can seed a drift of this model, and why not when it
+    /// cannot.
+    ///
+    /// **Channels only.** Width and height are resampled on the host on the way
+    /// in, which is a deliberate and visible thing to do to a picture — a 64×64
+    /// photograph scaled down to 32×32 is still that photograph. Channels are
+    /// not: a greyscale file handed to a colour model is replicated across R, G
+    /// and B, and a colour one handed to a greyscale model is flattened. Both
+    /// *succeed*, which is exactly what makes them worth refusing — the repo
+    /// already lost time to that silence once.
+    pub fn seed_dataset_verdict(&self, path: &str) -> Result<(), String> {
+        let Some((_, _, _, channels, _)) = storage::read_batraw_header(Path::new(path)) else {
+            // Not a `.batraw`: a directory of images has no header to check,
+            // and its channels are decided by the loader on purpose.
+            return Ok(());
+        };
+        let wanted = self.seed_dataset_target().2;
+        if channels == wanted {
+            return Ok(());
+        }
+        Err(format!(
+            "{} has {channels} channel(s), the model emits {wanted} — it would be \
+             replicated or flattened without a word, not resized",
+            Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string())
+        ))
+    }
+
+    /// What the channel convention would pick if nothing else named a dataset —
+    /// spelled out rather than left as "default", because "default" is exactly
+    /// the word that let a colour model drift away from CIFAR trucks without
+    /// anyone noticing.
+    pub fn seed_dataset_default_label(&self) -> String {
+        match default_seed_dataset_name(self.seed_dataset_target().2) {
+            Some(name) => name.to_string(),
+            None => "aucun — bruit pur".to_string(),
+        }
+    }
+
+    /// What the "Seed Dataset" row shows: the chosen file, or what the
+    /// convention will pick in its place.
+    pub fn seed_dataset_label(&self) -> String {
+        match self.seed_dataset.as_deref() {
+            Some(path) => Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string()),
+            None => format!("(défaut — {})", self.seed_dataset_default_label()),
+        }
+    }
+
+    pub fn open_seed_dataset_selector(&mut self) {
+        self.seed_dataset_selector.datasets = self
+            .storage
+            .list_datasets()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|path| {
+                let geometry = storage::read_batraw_header(Path::new(&path))
+                    .map(|header| (header.1, header.2, header.3));
+                (path, geometry)
+            })
+            .collect();
+        // The cursor opens on what the model already holds, so confirming
+        // without moving is a no-op rather than a silent change of dataset.
+        self.seed_dataset_selector.selected = match self.seed_dataset.as_deref() {
+            Some(current) => self
+                .seed_dataset_selector
+                .datasets
+                .iter()
+                .position(|(path, _)| path == current)
+                .map(|index| index + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        self.seed_dataset_selector.error = None;
+        self.screen = Screen::SeedDatasetSelector;
+    }
+
+    /// One past the last row: row 0 is the default, then one row per dataset.
+    pub fn seed_dataset_row_count(&self) -> usize {
+        self.seed_dataset_selector.datasets.len() + 1
+    }
+
+    pub fn move_seed_dataset_cursor(&mut self, delta: isize) {
+        let last = self.seed_dataset_row_count().saturating_sub(1);
+        let next = self.seed_dataset_selector.selected as isize + delta;
+        self.seed_dataset_selector.selected = next.clamp(0, last as isize) as usize;
+        self.seed_dataset_selector.error = None;
+    }
+
+    /// Takes the row under the cursor. An incompatible dataset is **refused
+    /// here**, on the screen that chose it — not swallowed and turned into a
+    /// mangled opening picture three screens later.
+    pub fn finish_seed_dataset_selector(&mut self) -> Result<(), String> {
+        let selected = self.seed_dataset_selector.selected;
+        let chosen = match selected {
+            0 => None,
+            index => match self.seed_dataset_selector.datasets.get(index - 1) {
+                Some((path, _)) => Some(path.clone()),
+                None => return Err("That row is not a dataset.".to_string()),
+            },
+        };
+        if let Some(path) = chosen.as_deref() {
+            self.seed_dataset_verdict(path)?;
+        }
+        self.seed_dataset = chosen;
+        self.seed_dataset_selector.error = None;
+        self.screen = Screen::PerpetualParams;
+        // Onto the next row, so walking the form with Enter walks *through*
+        // this one instead of reopening the chooser it just closed.
+        self.perpetual_params.field_idx = PERPETUAL_SEED_DATASET_FIELD + 1;
         Ok(())
     }
 
@@ -2775,9 +3007,16 @@ impl App {
                 loss: LossMethod::MeanSquared,
                 checkpoint_path: self.selected_checkpoint_path.clone(),
                 load_checkpoint: self.load_checkpoint_on_start,
-                optimizer: OptimizerKind::default(),
-                weight_init: WeightInit::default(),
-                loss_weighting: LossWeighting::default(),
+                // Carried from the model's own config, not reset to the
+                // defaults. These three have no form field, so `::default()`
+                // here meant that starting a run from the TUI silently
+                // downgraded `--optimizer adam` to SGD — and then wrote that
+                // back to `config_file`, making the loss permanent. Worse, the
+                // Resources page one screen earlier reads the *file's* value,
+                // so it sized an Adam run while launching an SGD one.
+                optimizer: self.training_optimizer,
+                weight_init: self.training_weight_init,
+                loss_weighting: self.training_loss_weighting,
                 ema_decay,
             }),
         });
@@ -2939,7 +3178,8 @@ impl App {
 mod tests {
     use super::{
         App, DUPLICATE_CONTENT_CHOICES, InferenceConfig, LayerKind, LossMethod, LossWeighting,
-        MIN_RENOISE_DEPTH, ModelAction, ModelConfig, OptimizerKind, PerpetualRegime, RunConfig,
+        MIN_RENOISE_DEPTH, ModelAction, ModelConfig, OptimizerKind, PERPETUAL_SEED_DATASET_FIELD,
+        PerpetualRegime, RunConfig,
         RunMode, Screen, TRAINING_DATASET_FIELD, TRAINING_EMA_FIELD, TrainingConfig,
         TrainingControlCommand, WeightInit, parse_ema_decay_field, storage,
     };
@@ -3031,6 +3271,7 @@ mod tests {
                 denoise_magnitude: 0.35,
                 checkpoint: None,
             },
+            seed_dataset: None,
             run: RunConfig {
                 mode: RunMode::Infer,
             },
@@ -3047,6 +3288,307 @@ mod tests {
         // offers what it was last used for.
         assert_eq!(app.model_actions.selected, ModelAction::Infer.index());
         assert_eq!(app.screen, Screen::ModelActions);
+    }
+
+    /// Starting a training run from the TUI must **preserve** the three knobs
+    /// the config file carries and no form shows.
+    ///
+    /// Same defect class as the seed dataset, one step over: the field is read
+    /// at run time, but the only interactive way to launch destroyed it first.
+    /// `--optimizer adam` converges ~20× faster per step
+    /// (`OPTIMIZER_ADAM.md`), and a run started from the TUI silently became
+    /// SGD — then wrote that back to `config_file`, so the loss was permanent
+    /// and invisible.
+    #[test]
+    fn starting_a_run_from_the_form_keeps_the_optimizer_the_config_asked_for() {
+        let (_temp, mut app) = test_app("keep-training-knobs");
+        let dataset = a_dataset(&app, "train.batraw", (32, 32, 3));
+        let config = ModelConfig {
+            model_name: Some("unit-test-load".to_string()),
+            input_size: (32, 32, 7),
+            layers: Vec::new(),
+            inference: InferenceConfig::default(),
+            seed_dataset: None,
+            run: RunConfig {
+                mode: RunMode::Train(TrainingConfig {
+                    lr: 0.001,
+                    batch_size: 4,
+                    steps: 100,
+                    dataset_path: dataset.clone(),
+                    loss: LossMethod::MeanSquared,
+                    checkpoint_path: None,
+                    load_checkpoint: false,
+                    optimizer: OptimizerKind::Adam,
+                    weight_init: WeightInit::He,
+                    ema_decay: None,
+                    loss_weighting: LossWeighting::Snr { gamma: 1.0 },
+                }),
+            },
+        };
+        app.apply_loaded_model(config);
+
+        app.training_params.fields[TRAINING_DATASET_FIELD] = dataset;
+        app.sync_selected_dataset_from_field();
+        app.finish_dataset_selector()
+            .expect("the form should validate");
+
+        let RunMode::Train(train) = app
+            .run_config
+            .clone()
+            .expect("finishing arms a run")
+            .mode
+        else {
+            panic!("the training form must arm a training run");
+        };
+        assert_eq!(
+            train.optimizer,
+            OptimizerKind::Adam,
+            "the run must use the optimiser the config asked for, not SGD"
+        );
+        assert_eq!(train.weight_init, WeightInit::He);
+        assert_eq!(train.loss_weighting, LossWeighting::Snr { gamma: 1.0 });
+    }
+
+    // -- The seed dataset ----------------------------------------------------
+
+    /// Writes a `.batraw` of the given geometry under the test root and returns
+    /// its path. Only the header is ever read by the chooser.
+    fn a_dataset(app: &App, name: &str, geometry: (u32, u32, u32)) -> String {
+        let dir = app
+            .storage
+            .datasets_dir()
+            .expect("the test root must have a datasets/ dir");
+        let path = dir.join(name);
+        let mut bytes = b"BATRAW3\0".to_vec();
+        for word in [1u32, geometry.0, geometry.1, geometry.2] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.resize(
+            bytes.len() + (geometry.0 * geometry.1 * geometry.2) as usize,
+            0,
+        );
+        std::fs::write(&path, bytes).expect("writing a test dataset should work");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// **The form sets it, the `config_file` keeps it, reopening reads it
+    /// back** — the round trip the whole feature is for. A specialised model
+    /// that has to be told its own dataset at every launch has not been fixed.
+    #[test]
+    fn a_seed_dataset_chosen_in_the_form_survives_being_written_and_reopened() {
+        let (_temp, mut app, name) = app_on_a_model("seed-roundtrip");
+        // The template model emits 3 channels, so a 3-channel dataset fits.
+        let chosen = a_dataset(&app, "elephants.batraw", (32, 32, 3));
+
+        app.model_actions.selected = ModelAction::Perpetual.index();
+        app.finish_model_actions();
+        app.finish_weight_selector();
+        assert_eq!(app.screen, Screen::PerpetualParams);
+
+        app.perpetual_params.field_idx = PERPETUAL_SEED_DATASET_FIELD;
+        app.open_seed_dataset_selector();
+        assert_eq!(app.screen, Screen::SeedDatasetSelector);
+        let row = app
+            .seed_dataset_selector
+            .datasets
+            .iter()
+            .position(|(path, _)| path == &chosen)
+            .expect("the chooser must list the datasets/ directory");
+        app.seed_dataset_selector.selected = row + 1;
+        app.finish_seed_dataset_selector()
+            .expect("a fitting dataset must be accepted");
+        assert_eq!(app.seed_dataset.as_deref(), Some(chosen.as_str()));
+
+        // What a run would be launched with, and what gets written to disk.
+        app.finish_perpetual_params()
+            .expect("the form should validate");
+        let run = app
+            .run_config
+            .clone()
+            .expect("finishing the form arms a run");
+        let written = app.compose_run_config(run);
+        app.storage
+            .write_model_config(&name, &written)
+            .expect("writing the config should work");
+
+        // Reopen it the way the model list does.
+        let reloaded = app
+            .storage
+            .load_model_config_for_model(&name)
+            .expect("the config should load back");
+        assert_eq!(
+            reloaded.seed_dataset.as_deref(),
+            Some(chosen.as_str()),
+            "the seed dataset must survive the round trip through the config_file"
+        );
+        let (_temp2, mut fresh) = test_app("seed-roundtrip-reopen");
+        fresh.storage = app.storage.clone();
+        fresh.apply_loaded_model(reloaded);
+        assert_eq!(
+            fresh.seed_dataset.as_deref(),
+            Some(chosen.as_str()),
+            "reopening the model must point the drift back at its own dataset"
+        );
+    }
+
+    /// It is a property of the **model**, so a training run must carry it
+    /// through rather than drop it.
+    ///
+    /// Parked inside `RunMode::Perpetual` — where it was declared — a single
+    /// night of training rewrote `run.mode` and the setting was gone, with
+    /// nothing on screen to say so. That is why it sits at the top level of
+    /// `ModelConfig`, beside `inference`.
+    #[test]
+    fn a_training_run_does_not_erase_the_models_seed_dataset() {
+        let (_temp, mut app) = test_app("seed-survives-training");
+        let config = ModelConfig {
+            model_name: Some("unit-test-load".to_string()),
+            input_size: (32, 32, 7),
+            layers: Vec::new(),
+            inference: InferenceConfig::default(),
+            seed_dataset: Some("datasets/elephants256.batraw".to_string()),
+            run: RunConfig {
+                mode: RunMode::Train(TrainingConfig {
+                    lr: 0.01,
+                    batch_size: 2,
+                    steps: 10,
+                    dataset_path: ".".to_string(),
+                    loss: LossMethod::MeanSquared,
+                    checkpoint_path: None,
+                    load_checkpoint: false,
+                    optimizer: OptimizerKind::default(),
+                    weight_init: WeightInit::default(),
+                    ema_decay: None,
+                    loss_weighting: LossWeighting::default(),
+                }),
+            },
+        };
+
+        app.apply_loaded_model(config);
+        assert_eq!(
+            app.seed_dataset.as_deref(),
+            Some("datasets/elephants256.batraw"),
+            "a model whose last run was training still has a seed dataset, and \
+             the form has to find it"
+        );
+
+        // And launching a *training* run writes it straight back, which is the
+        // half that was lost when it lived inside `RunMode::Perpetual`.
+        for mode in [
+            RunMode::Infer,
+            RunMode::Train(TrainingConfig {
+                lr: 0.01,
+                batch_size: 2,
+                steps: 10,
+                dataset_path: ".".to_string(),
+                loss: LossMethod::MeanSquared,
+                checkpoint_path: None,
+                load_checkpoint: false,
+                optimizer: OptimizerKind::default(),
+                weight_init: WeightInit::default(),
+                ema_decay: None,
+                loss_weighting: LossWeighting::default(),
+            }),
+        ] {
+            let composed = app.compose_run_config(RunConfig { mode });
+            assert_eq!(
+                composed.seed_dataset.as_deref(),
+                Some("datasets/elephants256.batraw"),
+                "every run mode has to carry the model's seed dataset through"
+            );
+        }
+    }
+
+    /// Opening a model that names **no** dataset must not leave the previous
+    /// model's in place. The state is per-model, so it is read outside the
+    /// `run.mode` match — read inside it, a stale value would survive.
+    #[test]
+    fn opening_a_model_without_a_seed_dataset_clears_the_previous_ones() {
+        let (_temp, mut app) = test_app("seed-not-sticky");
+        let mut config = ModelConfig {
+            model_name: Some("first".to_string()),
+            input_size: (32, 32, 7),
+            layers: Vec::new(),
+            inference: InferenceConfig::default(),
+            seed_dataset: Some("datasets/elephants256.batraw".to_string()),
+            run: RunConfig {
+                mode: RunMode::Infer,
+            },
+        };
+        app.apply_loaded_model(config.clone());
+        assert!(app.seed_dataset.is_some());
+
+        config.model_name = Some("second".to_string());
+        config.seed_dataset = None;
+        app.apply_loaded_model(config);
+        assert_eq!(
+            app.seed_dataset, None,
+            "the second model names none, so it must drift from the convention — \
+             not from the first model's elephants"
+        );
+    }
+
+    /// A dataset whose **channels** disagree with the model is refused by the
+    /// chooser, with the reason on screen, and the setting is left alone.
+    ///
+    /// Refusing here rather than at run time is the point: the loader would
+    /// have replicated a greyscale file across R, G and B and succeeded, and
+    /// the only symptom would have been a drift away from a grey picture.
+    #[test]
+    fn the_chooser_refuses_a_dataset_of_the_wrong_channels() {
+        let (_temp, mut app, _name) = app_on_a_model("seed-wrong-channels");
+        let grey = a_dataset(&app, "grey.batraw", (32, 32, 1));
+        assert_eq!(app.seed_dataset_target().2, 3, "the template emits colour");
+
+        app.open_seed_dataset_selector();
+        let row = app
+            .seed_dataset_selector
+            .datasets
+            .iter()
+            .position(|(path, _)| path == &grey)
+            .expect("the chooser lists it, marked");
+        app.seed_dataset_selector.selected = row + 1;
+
+        let err = app
+            .finish_seed_dataset_selector()
+            .expect_err("a 1-channel dataset must not seed a 3-channel model");
+        assert!(
+            err.contains('1') && err.contains('3'),
+            "the refusal must name both counts: {err}"
+        );
+        assert_eq!(app.seed_dataset, None, "a refused row must change nothing");
+        assert_eq!(
+            app.screen,
+            Screen::SeedDatasetSelector,
+            "a refusal stays on the screen that can act on it"
+        );
+    }
+
+    /// The first row hands the choice back to the convention, and says which
+    /// file that is. "Default" without naming the file is how a colour model
+    /// drifted away from CIFAR trucks with nothing on screen looking wrong.
+    #[test]
+    fn the_default_row_clears_the_choice_and_names_what_takes_over() {
+        let (_temp, mut app, _name) = app_on_a_model("seed-default-row");
+        let chosen = a_dataset(&app, "mine.batraw", (32, 32, 3));
+        app.seed_dataset = Some(chosen);
+
+        app.open_seed_dataset_selector();
+        assert!(
+            app.seed_dataset_selector.selected > 0,
+            "the chooser must open on what the model already holds"
+        );
+        app.seed_dataset_selector.selected = 0;
+        app.finish_seed_dataset_selector()
+            .expect("the default row is always available");
+
+        assert_eq!(app.seed_dataset, None);
+        assert_eq!(app.seed_dataset_default_label(), "cifar10_rgb.batraw");
+        assert!(
+            app.seed_dataset_label().contains("cifar10_rgb.batraw"),
+            "the form row has to name the file the convention will pick: {}",
+            app.seed_dataset_label()
+        );
     }
 
     #[test]
@@ -3577,6 +4119,7 @@ mod tests {
             input_size: (32, 32, 3),
             layers: Vec::new(),
             inference: InferenceConfig::default(),
+            seed_dataset: None,
             run: RunConfig {
                 mode: RunMode::Train(TrainingConfig {
                     lr: 0.01,
