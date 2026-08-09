@@ -505,17 +505,19 @@ impl GpuDataset {
         });
 
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("dataset_decode_pass"),
-                timestamp_writes: None,
-            });
-            compute.set_pipeline(&pass.pipeline);
-            compute.set_bind_group(0, &bind_group, &[]);
-            let threads = (sample_len * group.len()) as u32;
-            let (x, y) = crate::model::layer::dispatch_grid(threads.div_ceil(64));
-            compute.dispatch_workgroups(x, y, 1);
-        }
+        let threads = (sample_len * group.len()) as u32;
+        let workgroups = threads.div_ceil(64);
+        gpu.compute_pass(
+            &mut encoder,
+            workgroups,
+            || "dataset · decode_u8".to_string(),
+            |compute| {
+                compute.set_pipeline(&pass.pipeline);
+                compute.set_bind_group(0, &bind_group, &[]);
+                let (x, y) = crate::model::layer::dispatch_grid(workgroups);
+                compute.dispatch_workgroups(x, y, 1);
+            },
+        );
         gpu.submit([encoder.finish()]);
     }
 

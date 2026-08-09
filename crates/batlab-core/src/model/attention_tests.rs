@@ -577,7 +577,7 @@ fn a_batched_pass_equals_the_same_samples_run_separately() {
         );
         let mut encoder = batched.gpu.device.create_command_encoder(&Default::default());
         for layer in &batched.layers {
-            layer.encode_pass(&mut encoder);
+            layer.encode_pass(batched.gpu.as_ref(), &mut encoder);
         }
         batched.gpu.queue.submit([encoder.finish()]);
 
@@ -641,7 +641,7 @@ fn one_samples_data_cannot_reach_another_samples_output() {
             );
             let mut encoder = model.gpu.device.create_command_encoder(&Default::default());
             for layer in &model.layers {
-                layer.encode_pass(&mut encoder);
+                layer.encode_pass(model.gpu.as_ref(), &mut encoder);
             }
             model.gpu.queue.submit([encoder.finish()]);
             let buffer = model.layers.last().unwrap().buffers.forward.last().unwrap();
@@ -925,7 +925,7 @@ fn the_row_passes_survive_the_two_dimensional_dispatch_grid() {
 
         let mut encoder = model.gpu.device.create_command_encoder(&Default::default());
         for layer in &model.layers {
-            layer.encode_pass(&mut encoder);
+            layer.encode_pass(model.gpu.as_ref(), &mut encoder);
         }
         model.gpu.queue.submit([encoder.finish()]);
 

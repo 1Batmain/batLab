@@ -1,6 +1,8 @@
 //! File purpose: Creates and configures the shared headless WGPU context used by training and rendering paths.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use crate::profile::{PassProfiler, ProfileRun};
 
 /// Which limits this process asks the device for.
 ///
@@ -91,6 +93,30 @@ impl GpuLimitsProfile {
 
 static PROCESS_DEFAULT: AtomicU8 = AtomicU8::new(0);
 
+/// Whether [`GpuContext::new_headless`] should open a device able to time its
+/// own compute passes.
+///
+/// A process-wide switch for the same reason the limits profile is one: the
+/// `TIMESTAMP_QUERY` feature belongs to the *device*, this application opens
+/// exactly one, and the choice is made from the command line before anything is
+/// built. Off by default, and off means the query set is never created and
+/// [`GpuContext::compute_pass`] is what it always was.
+static PROFILING_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Ask every later [`GpuContext::new_headless`] for pass timing.
+///
+/// Must be called before the first device is opened; afterwards it has no
+/// effect, because features cannot be added to a live device.
+pub fn request_pass_profiling(enabled: bool) {
+    PROFILING_REQUESTED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether pass profiling has been asked for. Asked for, not granted — an
+/// adapter without `TIMESTAMP_QUERY` leaves [`GpuContext::can_profile`] false.
+pub fn pass_profiling_requested() -> bool {
+    PROFILING_REQUESTED.load(Ordering::Relaxed)
+}
+
 #[derive(Debug)]
 pub struct GpuSpecs {
     pub(crate) device_name: String,
@@ -138,6 +164,9 @@ pub struct GpuContext {
     /// the trainer and the dataset separately, and would miss whichever of them
     /// was added next.
     transfers: crate::transfers::TransferCounters,
+    /// Present only when the process asked for profiling *and* the adapter
+    /// granted `TIMESTAMP_QUERY`. `None` is the normal, zero-cost state.
+    profiler: Option<PassProfiler>,
 }
 
 impl GpuContext {
@@ -148,6 +177,19 @@ impl GpuContext {
     }
 
     pub async fn new_headless_with(profile: GpuLimitsProfile) -> Self {
+        Self::open(profile, pass_profiling_requested()).await
+    }
+
+    /// A context that times its compute passes, whatever the process default.
+    ///
+    /// Tests that need the instrument say so here rather than mutating the
+    /// process-wide switch, which would leak into whatever else the harness runs
+    /// in the same process.
+    pub async fn new_headless_profiling() -> Self {
+        Self::open(GpuLimitsProfile::process_default(), true).await
+    }
+
+    async fn open(profile: GpuLimitsProfile, want_profiling: bool) -> Self {
         let adapter_options = wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
@@ -173,8 +215,26 @@ impl GpuContext {
                 (fallback_instance, adapter)
             }
         };
+        // Asked for only when the command line asked for it, and only when the
+        // adapter has it. A missing `TIMESTAMP_QUERY` is not a reason to refuse
+        // to run: it is a reason to say the instrument is unavailable, which the
+        // harness does, rather than to hand back an approximation dressed as a
+        // measurement.
+        let timestamps = want_profiling && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        if want_profiling && !timestamps {
+            eprintln!(
+                "[gpu] this adapter does not expose TIMESTAMP_QUERY — per-pass GPU timing is \
+                 unavailable on this backend."
+            );
+        }
+        let required_features = if timestamps {
+            wgpu::Features::TIMESTAMP_QUERY
+        } else {
+            wgpu::Features::empty()
+        };
         let descriptor = wgpu::DeviceDescriptor {
             required_limits: profile.limits(&adapter),
+            required_features,
             ..Default::default()
         };
         // The fallback is not decoration. `adapter.limits()` is what the
@@ -194,6 +254,7 @@ impl GpuContext {
                 let (device, queue) = adapter
                     .request_device(&wgpu::DeviceDescriptor {
                         required_limits: GpuLimitsProfile::Web.limits(&adapter),
+                        required_features,
                         ..Default::default()
                     })
                     .await
@@ -206,6 +267,7 @@ impl GpuContext {
             eprintln!("[gpu] uncaptured wgpu error: {err}");
         }));
         let gpu_specs = GpuSpecs::new(&adapter);
+        let profiler = timestamps.then(|| PassProfiler::new(&device, &queue));
 
         Self {
             _instance: instance,
@@ -215,6 +277,7 @@ impl GpuContext {
             gpu_specs,
             limits_profile,
             transfers: Default::default(),
+            profiler,
         }
     }
 
@@ -258,6 +321,98 @@ impl GpuContext {
     /// A reading of the counters — see [`crate::transfers::TransferSnapshot`].
     pub fn transfers(&self) -> crate::transfers::TransferSnapshot {
         self.transfers.snapshot()
+    }
+
+    // -----------------------------------------------------------------------
+    // Compute passes
+    // -----------------------------------------------------------------------
+
+    /// Begin a compute pass, time it when the profiler is armed, and run `body`
+    /// inside it.
+    ///
+    /// Every `begin_compute_pass` in the engine goes through here, for exactly
+    /// the reason every `write_buffer` does: a timing table is only true if
+    /// there is no second door, and `nothing_in_the_engine_opens_an_untimed_pass`
+    /// is the mechanical check that there is not.
+    ///
+    /// `label` is a **closure**: building `L13 Convolution · conv_back_weights`
+    /// allocates a String, and a step encodes 151 passes. With profiling off the
+    /// closure is never called, so an unprofiled run allocates nothing here and
+    /// the descriptor is the same `Default::default()` it always was.
+    ///
+    /// `workgroups` is the logical dispatch count *before* [`crate::model`]'s
+    /// 2-D folding — it is carried so the table can tell a pass that is slow
+    /// because it is big from one that is slow because it is starved.
+    pub fn compute_pass<L, F>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        workgroups: u32,
+        label: L,
+        body: F,
+    ) where
+        L: FnOnce() -> String,
+        F: FnOnce(&mut wgpu::ComputePass<'_>),
+    {
+        match self.profiler.as_ref().and_then(|p| p.reserve(label, workgroups)) {
+            Some(timestamp_writes) => {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: Some(timestamp_writes),
+                });
+                body(&mut pass);
+            }
+            None => {
+                let mut pass = encoder.begin_compute_pass(&Default::default());
+                body(&mut pass);
+            }
+        }
+    }
+
+    /// Block until the GPU has finished everything submitted so far.
+    ///
+    /// The engine never needs this — a training step is fire-and-forget and only
+    /// the loss readback synchronises. A *measurement* does: without it, host
+    /// time around a step measures how long it took to encode, not how long it
+    /// took to run.
+    pub fn wait_idle(&self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// Whether this device can time its passes at all.
+    pub fn can_profile(&self) -> bool {
+        self.profiler.is_some()
+    }
+
+    /// Start timing: passes encoded from now on carry timestamps.
+    ///
+    /// Returns `false` when the device has no timing instrument, so a caller
+    /// cannot mistake "nothing was recorded" for "nothing took any time".
+    pub fn arm_profiler(&self) -> bool {
+        match self.profiler.as_ref() {
+            Some(profiler) => {
+                profiler.arm();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Encode the query resolve. Called on the same encoder as the passes, right
+    /// before `finish()`; a no-op when the profiler is off or not armed.
+    pub fn resolve_profiler(&self, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(profiler) = self.profiler.as_ref() {
+            profiler.resolve(encoder);
+        }
+    }
+
+    /// Read the timings back and disarm. Blocks until the GPU is done with the
+    /// submission the passes were in.
+    pub fn collect_profile(&self) -> Option<ProfileRun> {
+        let profiler = self.profiler.as_ref()?;
+        if !profiler.is_armed() {
+            return None;
+        }
+        Some(profiler.collect(&self.device))
     }
 
     /// Access to the underlying wgpu device for callers outside the crate.

@@ -204,7 +204,7 @@ fn run_forward(model: &Model<Training>, batch: u32) {
         .device
         .create_command_encoder(&Default::default());
     for layer in &model.layers {
-        layer.encode_pass_with_batch(&mut encoder, batch);
+        layer.encode_pass_with_batch(model.gpu.as_ref(), &mut encoder, batch);
     }
     model.gpu.queue.submit([encoder.finish()]);
 }

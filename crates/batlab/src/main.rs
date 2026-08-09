@@ -329,6 +329,19 @@ fn main() {
             eprintln!("{err}");
             std::process::exit(1);
         }
+        // -----------------------------------------------------------------
+        // DEV/CI ONLY — where a training step's 4.4 seconds go.
+        //
+        //   cargo run --release -p batlab -- --profile-step <model> \
+        //       --dataset <path> [--batch N] [--rounds N] [--top N]
+        // -----------------------------------------------------------------
+        if args.iter().any(|arg| arg == "--profile-step") {
+            if let Err(err) = run_profile_step(&args) {
+                eprintln!("profile: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
         if args.iter().any(|arg| arg == "--headless-train") {
             if let Err(err) = run_headless_train(&args) {
                 eprintln!("headless training failed: {err}");
@@ -1830,6 +1843,263 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<Prepar
     storage::write_model_config(&model_name, config)
         .map_err(|err| format!("failed to write model config for '{model_name}': {err}"))?;
     Ok(prepared)
+}
+
+// ---------------------------------------------------------------------------
+// DEV/CI ONLY — where a training step's time goes, pass by pass.
+// ---------------------------------------------------------------------------
+
+/// `--profile-step <model>`: one training step, timed by the GPU itself.
+///
+/// Why a subcommand of its own rather than a `--profile` on `--headless-train`:
+/// the training loop reports a loss, runs a per-bucket probe and samples an
+/// image on a schedule, all of which submit their own GPU work. A profile of
+/// "one step" that silently included a 256-step denoising chain every 200 steps
+/// would be a profile of something else. This harness runs the *same*
+/// production call the trainer runs — `DiffusionTask::train_step_batch` — and
+/// nothing else, the way `measure_transfers` does for traffic.
+fn run_profile_step(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    reject_unknown_flags(
+        args,
+        &[
+            "--profile-step",
+            "--batch",
+            "--dataset",
+            "--optimizer",
+            "--lr",
+            "--rounds",
+            "--warmup",
+            "--top",
+            "--gpu-limits",
+        ],
+        &["--ema"],
+    )?;
+
+    let model_name =
+        flag("--profile-step").ok_or_else(|| "--profile-step requires a model name".to_string())?;
+    let config_path = storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    let config_batch = match &config.run.mode {
+        RunMode::Train(train) => train.batch_size.max(1),
+        _ => 16,
+    };
+    let batch = match flag("--batch") {
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|_| format!("--batch takes an integer, got `{value}`"))?
+            .max(1),
+        None => config_batch,
+    };
+    let optimizer = match flag("--optimizer") {
+        Some(value) => OptimizerKind::parse(&value)
+            .ok_or_else(|| format!("invalid value for --optimizer: {value} (want sgd|adam)"))?,
+        None => OptimizerKind::Adam,
+    };
+    let lr = match flag("--lr") {
+        Some(value) => value
+            .parse::<f32>()
+            .map_err(|_| format!("--lr takes a number, got `{value}`"))?,
+        None => 1e-3,
+    };
+    let rounds = match flag("--rounds") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("--rounds takes an integer, got `{value}`"))?
+            .max(1),
+        None => 5,
+    };
+    // Two warmups is not a ritual: the first step compiles every pipeline (see
+    // `PERF_CONVOLUTION.md` §1, where the compile of the first dispatch was
+    // charged to the first layer and inverted the whole profile), and the first
+    // step is also the one that uploads the dataset chunk.
+    let warmup = match flag("--warmup") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("--warmup takes an integer, got `{value}`"))?,
+        None => 3,
+    };
+    let top = match flag("--top") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| format!("--top takes an integer, got `{value}`"))?,
+        None => usize::MAX,
+    };
+    let dataset_path = flag("--dataset")
+        .ok_or_else(|| "--profile-step needs --dataset <path to .batraw>".to_string())?;
+    let ema = args.iter().any(|arg| arg == "--ema");
+
+    // Before the first adapter request — the feature belongs to the device.
+    batlab_core::request_pass_profiling(true);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+    rt.block_on(async move {
+        let (gpu, mut model) = build_execution_model(
+            &config,
+            lr,
+            batch,
+            optimizer,
+            WeightInit::default(),
+            ema.then(|| EmaConfig::new(0.999).expect("0.999 is a valid decay")),
+        )
+        .await?;
+
+        let output_dims = model
+            .output_dim()
+            .ok_or_else(|| "model has no output dimensions".to_string())?;
+        let output_size = (output_dims.x, output_dims.y, output_dims.z);
+        let dataset = load_dataset(&dataset_path, output_size)?;
+        let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+        let mut gpu_dataset = GpuDataset::from_payload(gpu.as_ref(), dataset.payload, sample_len)
+            .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
+
+        let schedule = LinearNoiseSchedule::new_linear(
+            DIFFUSION_SCHEDULE_STEPS,
+            DIFFUSION_BETA_START,
+            DIFFUSION_BETA_END,
+        );
+        let mut task = DiffusionTask::new(schedule);
+
+        println!(
+            "PASS PROFILE  {model_name} · batch {batch} · {} · {rounds} armed steps after \
+             {warmup} warmup · limits={} · dataset {}",
+            optimizer.label(),
+            gpu.limits_profile().label(),
+            if gpu_dataset.is_resident() {
+                "resident".to_string()
+            } else {
+                format!("{} chunks", gpu_dataset.chunk_count())
+            }
+        );
+        if !gpu.can_profile() {
+            return Err(
+                "this device has no TIMESTAMP_QUERY, so there is no per-pass GPU time to \
+                 report. Rather than print host-side guesses dressed as GPU measurements, \
+                 this command stops here: use `--headless-train` and time whole steps."
+                    .to_string(),
+            );
+        }
+
+        let mut step = 0usize;
+        for _ in 0..warmup {
+            task.train_step_batch(&mut model, &mut gpu_dataset, step, batch as usize, 7)
+                .map_err(|err| format!("training step failed: {err}"))?;
+            step += 1;
+        }
+        // The warmups are asynchronous — nothing above waited for the GPU. Drain
+        // the queue before the first armed round, or its host wall clock would
+        // include three steps of somebody else's work.
+        gpu.wait_idle();
+
+        let mut runs = Vec::with_capacity(rounds);
+        let mut walls = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            gpu.arm_profiler();
+            let started = std::time::Instant::now();
+            task.train_step_batch(&mut model, &mut gpu_dataset, step, batch as usize, 7)
+                .map_err(|err| format!("training step failed: {err}"))?;
+            let encoded = started.elapsed();
+            // `collect_profile` blocks on the submission, so the wall clock
+            // below is host time around a step that has actually finished.
+            let run = gpu
+                .collect_profile()
+                .ok_or_else(|| "the profiler recorded nothing".to_string())?;
+            walls.push((started.elapsed(), encoded));
+            runs.push(run);
+            step += 1;
+        }
+
+        print_pass_profile(&batlab_core::ProfileSummary::reduce(&runs), &walls, top);
+        Ok(())
+    })
+}
+
+/// The table the mission asks for: sorted by cost, with the budget under it.
+fn print_pass_profile(
+    summary: &batlab_core::ProfileSummary,
+    walls: &[(Duration, Duration)],
+    top: usize,
+) {
+    let ms = |nanos: u64| nanos as f64 / 1e6;
+    let floor = summary.attributed_floor_nanos();
+    println!();
+    println!(
+        "{:>9}  {:>6}  {:>5}  {:>9}  {:>3}  {}",
+        "min ms", "% Σ", "max/min", "workgroups", "n", "pass"
+    );
+    let shown = summary.passes.len().min(top);
+    for pass in summary.passes.iter().take(shown) {
+        println!(
+            "{:>9.3}  {:>5.1}%  {:>6.2}×  {:>10}  {:>3}  {}",
+            ms(pass.min_nanos),
+            100.0 * pass.min_nanos as f64 / floor.max(1) as f64,
+            pass.max_nanos as f64 / pass.min_nanos.max(1) as f64,
+            pass.workgroups,
+            pass.invocations,
+            pass.label
+        );
+    }
+    if shown < summary.passes.len() {
+        let rest: u64 = summary.passes[shown..].iter().map(|p| p.min_nanos).sum();
+        println!(
+            "{:>9.3}  {:>5.1}%  {:>7}  {:>10}  {:>3}  … {} more passes",
+            ms(rest),
+            100.0 * rest as f64 / floor.max(1) as f64,
+            "",
+            "",
+            summary.passes.len() - shown,
+            summary.passes.len() - shown
+        );
+    }
+
+    // The budget. Read it top to bottom: each line is the one above plus what
+    // that layer of the stack adds, and the arrows are the differences the
+    // diagnosis is about.
+    let min_span = summary.round_span.iter().copied().min().unwrap_or(0);
+    let min_attributed = summary.round_attributed.iter().copied().min().unwrap_or(0);
+    let min_wall = walls.iter().map(|(w, _)| *w).min().unwrap_or_default();
+    let min_encode = walls.iter().map(|(_, e)| *e).min().unwrap_or_default();
+    println!();
+    println!("BUDGET  (minimum over {} armed steps)", summary.rounds);
+    println!(
+        "  Σ pass minima              {:>10.1} ms   {} passes timed",
+        ms(floor),
+        summary.passes.iter().map(|p| p.invocations).sum::<u32>()
+    );
+    println!(
+        "  Σ passes, best round       {:>10.1} ms",
+        ms(min_attributed)
+    );
+    println!(
+        "  GPU span, best round       {:>10.1} ms   → {:.1} ms ({:.1}%) BETWEEN the passes",
+        ms(min_span),
+        ms(min_span.saturating_sub(min_attributed)),
+        100.0 * min_span.saturating_sub(min_attributed) as f64 / min_span.max(1) as f64,
+    );
+    println!(
+        "  host wall, best round      {:>10.1} ms   → {:.1} ms outside the GPU span",
+        min_wall.as_secs_f64() * 1e3,
+        min_wall.as_secs_f64() * 1e3 - ms(min_span),
+    );
+    println!(
+        "  of which CPU encoding      {:>10.1} ms   (the step returns here; the GPU is still running)",
+        min_encode.as_secs_f64() * 1e3,
+    );
+    if summary.dropped > 0 {
+        println!(
+            "  ⚠ {} passes could not be timed (query set full) — every total above is a \
+             LOWER bound and the gap between them is overstated.",
+            summary.dropped
+        );
+    }
 }
 
 async fn build_execution_model(

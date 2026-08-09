@@ -231,3 +231,22 @@ pub enum LayerTypes {
     UpsampleConv(UpsampleConvType),
     Loss(LossType),
 }
+
+impl LayerTypes {
+    /// The variant's name, for humans reading a profile or a debug dump.
+    ///
+    /// Written as a match rather than derived from `Debug`: `Debug` on these
+    /// variants prints the whole type, and a table column has to stay a word.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            LayerTypes::Convolution(_) => "Convolution",
+            LayerTypes::Activation(_) => "Activation",
+            LayerTypes::Attention(_) => "Attention",
+            LayerTypes::Concat(_) => "Concat",
+            LayerTypes::FullyConnected(_) => "FullyConnected",
+            LayerTypes::GroupNorm(_) => "GroupNorm",
+            LayerTypes::UpsampleConv(_) => "UpsampleConv",
+            LayerTypes::Loss(_) => "Loss",
+        }
+    }
+}
