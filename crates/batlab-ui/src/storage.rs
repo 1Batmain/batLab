@@ -607,9 +607,13 @@ impl Storage {
     /// `None` when the file is missing or is not a `.batraw` — the inventory
     /// then simply has no streamed post, which is the truth rather than a zero.
     pub fn dataset_spec(&self, path: &str) -> Option<batlab_core::DatasetSpec> {
-        read_batraw_header(Path::new(path)).map(|header| batlab_core::DatasetSpec {
+        let header = read_batraw_header(Path::new(path))?;
+        Some(batlab_core::DatasetSpec {
             sample_count: header.0,
-            sample_bytes: header.1 as u64 * header.2 as u64 * header.3 as u64 * 4,
+            // Times the payload's own width, not a hard-coded 4. A BATRAW3
+            // sample is a quarter of the f32 one it replaces, and the residency
+            // budget is decided on this number.
+            sample_bytes: header.1 as u64 * header.2 as u64 * header.3 as u64 * header.4,
         })
     }
 
@@ -1017,20 +1021,29 @@ pub fn list_datasets() -> io::Result<Vec<String>> {
     Storage::default().list_datasets()
 }
 
-/// `(sample_count, width, height, channels)` from a `.batraw` header.
+/// `(sample_count, width, height, channels, value_bytes)` from a `.batraw`
+/// header.
 ///
 /// The header only: CIFAR-10 is 195 MiB on disk, and reading it whole to answer
 /// "how many chunks does this become on the GPU?" would make the answer cost
-/// more than the run it describes. Both magics are accepted — `BATRAW1` differs
-/// from `BATRAW2` in the *range* of its payload, not in its shape.
-pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32)> {
+/// more than the run it describes.
+///
+/// All three magics are accepted. `BATRAW1` differs from `BATRAW2` in the
+/// *range* of its payload, not in its shape; `BATRAW3` differs in its **width**
+/// — one byte per value instead of four — which is why the width is part of the
+/// answer rather than assumed. Left out, this function returned `None` for every
+/// file the current converters write, and the Resources page then reported no
+/// streamed dataset at all for them.
+pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32, u64)> {
     use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
     let mut header = [0u8; 24];
     file.read_exact(&mut header).ok()?;
-    if &header[..8] != b"BATRAW2\0" && &header[..8] != b"BATRAW1\0" {
-        return None;
-    }
+    let value_bytes: u64 = match &header[..8] {
+        b"BATRAW3\0" => 1,
+        b"BATRAW2\0" | b"BATRAW1\0" => 4,
+        _ => return None,
+    };
     let word = |i: usize| {
         u32::from_le_bytes([
             header[8 + i * 4],
@@ -1039,7 +1052,7 @@ pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32)> {
             header[11 + i * 4],
         ])
     };
-    Some((word(0) as u64, word(1), word(2), word(3)))
+    Some((word(0) as u64, word(1), word(2), word(3), value_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,6 +1115,74 @@ mod tests {
                 mode: RunMode::Infer,
             },
         }
+    }
+
+    /// A `.batraw` of `count` samples of the given geometry, under `magic`.
+    /// Only the header is ever read back, but the payload is written full size
+    /// so a reader that checked the length would still be satisfied.
+    fn write_batraw(path: &Path, magic: &[u8; 8], count: u32, geometry: (u32, u32, u32)) {
+        let value_bytes = if magic == b"BATRAW3\0" { 1 } else { 4 };
+        let mut bytes = magic.to_vec();
+        for word in [count, geometry.0, geometry.1, geometry.2] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let values = (count * geometry.0 * geometry.1 * geometry.2) as usize;
+        bytes.resize(bytes.len() + values * value_bytes, 0);
+        fs::write(path, bytes).expect("writing a test dataset should work");
+    }
+
+    /// `BATRAW3` is what every converter in `tools/` writes today, and this
+    /// reader refused it — so `dataset_spec` answered `None` for every current
+    /// dataset and the Resources page reported no streamed post at all where
+    /// there were gigabytes of one.
+    ///
+    /// The second half is the reason the payload width is returned rather than
+    /// assumed: the same 32×32×3 images are a quarter of the bytes in 8-bit,
+    /// and that number is what the residency budget is decided on.
+    #[test]
+    fn the_header_reader_accepts_every_magic_and_reports_the_payload_width() {
+        let temp = TempRoot::new("batraw-magics");
+        let geometry = (32, 32, 3);
+        let expected_f32 = 32 * 32 * 3 * 4;
+
+        for (magic, value_bytes) in [
+            (b"BATRAW3\0", 1u64),
+            (b"BATRAW2\0", 4),
+            (b"BATRAW1\0", 4),
+        ] {
+            let path = temp.path().join(format!(
+                "{}.batraw",
+                std::str::from_utf8(&magic[..7]).unwrap()
+            ));
+            write_batraw(&path, magic, 7, geometry);
+
+            let header = read_batraw_header(&path).unwrap_or_else(|| {
+                panic!(
+                    "{} was refused — every dataset in this format would report no \
+                     size at all",
+                    std::str::from_utf8(&magic[..7]).unwrap()
+                )
+            });
+            assert_eq!((header.0, header.1, header.2, header.3), (7, 32, 32, 3));
+            assert_eq!(header.4, value_bytes);
+
+            let spec = Storage::at(temp.path())
+                .dataset_spec(&path.to_string_lossy())
+                .expect("a readable header must yield a spec");
+            assert_eq!(spec.sample_count, 7);
+            assert_eq!(
+                spec.sample_bytes,
+                expected_f32 / (4 / value_bytes),
+                "an 8-bit sample must not be accounted as an f32 one"
+            );
+        }
+
+        let bogus = temp.path().join("not-a-dataset.batraw");
+        fs::write(&bogus, b"BATRAWX\0            ").expect("write");
+        assert!(
+            read_batraw_header(&bogus).is_none(),
+            "an unknown magic must stay refused"
+        );
     }
 
     fn seed_model(storage: &Storage, name: &str) {
