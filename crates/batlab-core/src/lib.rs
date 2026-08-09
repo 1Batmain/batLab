@@ -58,7 +58,7 @@ pub use model::training::{
 };
 pub use model::{
     ActivationMethod, ActivationType, AttentionType, AdamHyperparameters, CheckpointLoad,
-    CheckpointWeights, ConcatType, ConvolutionType, Dim3, EmaConfig,
+    AddType, CheckpointWeights, ConcatType, ConvolutionType, Dim3, EmaConfig,
     FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, ModelError, OptimizerKind,
     PaddingMode, UpsampleConvType, WeightInit,
 };

@@ -45,6 +45,14 @@ pub enum ModelError {
         input: Dim3,
         skip: Dim3,
     },
+    /// A residual `Add` was handed two tensors of different shape. Unlike
+    /// `Concat`, addition cannot widen: the two sides must match on every axis,
+    /// channels included. Refused here, by name, rather than indexing past a
+    /// buffer — the same silent-corruption trap `UpsampleConv` documents.
+    ResidualDimMismatch {
+        input: Dim3,
+        skip: Dim3,
+    },
     CheckpointIo {
         path: String,
         message: String,
@@ -117,6 +125,13 @@ impl Display for ModelError {
             ModelError::ConcatSpatialMismatch { input, skip } => write!(
                 f,
                 "concat requires matching spatial dimensions: input=({}, {}, {}), skip=({}, {}, {})",
+                input.x, input.y, input.z, skip.x, skip.y, skip.z
+            ),
+            ModelError::ResidualDimMismatch { input, skip } => write!(
+                f,
+                "residual Add requires identical dimensions on both sides: \
+                 input=({}, {}, {}), skip=({}, {}, {}) — a block that changes width needs a \
+                 1x1 convolution on the shortcut to realign it",
                 input.x, input.y, input.z, skip.x, skip.y, skip.z
             ),
             ModelError::CheckpointIo { path, message } => {

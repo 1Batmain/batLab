@@ -163,6 +163,15 @@ pub enum LayerDraft {
         skip_key: String,
         save_key: Option<String>,
     },
+    /// Short-range residual: `output = input + skip`, the two summed elementwise.
+    /// Where `Concat` widens, `Add` demands identical shapes and is refused at
+    /// build otherwise — see [`crate::model::layer_types::AddType`].
+    Add {
+        dim_input: (u32, u32, u32),
+        dim_skip: (u32, u32, u32),
+        skip_key: String,
+        save_key: Option<String>,
+    },
 }
 
 pub fn compute_out_conv(
@@ -228,7 +237,8 @@ impl LayerDraft {
             | LayerDraft::Attention { save_key, .. }
             | LayerDraft::FullyConnected { save_key, .. }
             | LayerDraft::UpsampleConv { save_key, .. }
-            | LayerDraft::Concat { save_key, .. } => save_key.as_deref(),
+            | LayerDraft::Concat { save_key, .. }
+            | LayerDraft::Add { save_key, .. } => save_key.as_deref(),
         }
     }
 
@@ -265,6 +275,8 @@ impl LayerDraft {
                 dim_skip,
                 ..
             } => (dim_input.0, dim_input.1, dim_input.2 + dim_skip.2),
+            // Shape-preserving: the sum has the shape both sides share.
+            LayerDraft::Add { dim_input, .. } => *dim_input,
         }
     }
 
@@ -396,6 +408,27 @@ impl LayerDraft {
                     display_save_key(save_key)
                 )
             }
+            LayerDraft::Add {
+                dim_input,
+                dim_skip,
+                skip_key,
+                save_key,
+            } => {
+                format!(
+                    "Add({}) {}x{}x{} + {}x{}x{} -> {}x{}x{}{}",
+                    skip_key,
+                    dim_input.0,
+                    dim_input.1,
+                    dim_input.2,
+                    dim_skip.0,
+                    dim_skip.1,
+                    dim_skip.2,
+                    dim_input.0,
+                    dim_input.1,
+                    dim_input.2,
+                    display_save_key(save_key)
+                )
+            }
         }
     }
 
@@ -408,6 +441,7 @@ impl LayerDraft {
             LayerDraft::FullyConnected { .. } => "Perceptron",
             LayerDraft::UpsampleConv { .. } => "UpsampleConv",
             LayerDraft::Concat { .. } => "Concat",
+            LayerDraft::Add { .. } => "Add",
         }
     }
 
@@ -419,7 +453,8 @@ impl LayerDraft {
             | LayerDraft::Attention { dim_input, .. }
             | LayerDraft::FullyConnected { dim_input, .. }
             | LayerDraft::UpsampleConv { dim_input, .. }
-            | LayerDraft::Concat { dim_input, .. } => *dim_input,
+            | LayerDraft::Concat { dim_input, .. }
+            | LayerDraft::Add { dim_input, .. } => *dim_input,
         };
         format!("{}x{}x{}", x, y, z)
     }
@@ -522,7 +557,9 @@ impl LayerDraft {
                 nb_neurons,
                 ..
             } => product(*dim_input) * *nb_neurons as u64 + *nb_neurons as u64,
-            LayerDraft::Activation { .. } | LayerDraft::Concat { .. } => 0,
+            LayerDraft::Activation { .. }
+            | LayerDraft::Concat { .. }
+            | LayerDraft::Add { .. } => 0,
         }
     }
 
@@ -532,6 +569,7 @@ impl LayerDraft {
             LayerDraft::Attention { .. } => Some("attention"),
             LayerDraft::UpsampleConv { .. } => Some("upsample"),
             LayerDraft::Concat { .. } => Some("skip"),
+            LayerDraft::Add { .. } => Some("residual"),
             _ => None,
         }
     }
@@ -685,6 +723,17 @@ pub fn update_layer_dim_input(layer: &LayerDraft, new_input: (u32, u32, u32)) ->
             skip_key: skip_key.clone(),
             save_key: save_key.clone(),
         },
+        LayerDraft::Add {
+            dim_skip,
+            skip_key,
+            save_key,
+            ..
+        } => LayerDraft::Add {
+            dim_input: new_input,
+            dim_skip: *dim_skip,
+            skip_key: skip_key.clone(),
+            save_key: save_key.clone(),
+        },
     }
 }
 
@@ -708,6 +757,7 @@ pub enum LayerKind {
     FullyConnected,
     UpsampleConv,
     Concat,
+    Add,
 }
 
 impl fmt::Display for LayerKind {
@@ -720,6 +770,7 @@ impl fmt::Display for LayerKind {
             LayerKind::FullyConnected => write!(f, "Perceptron"),
             LayerKind::UpsampleConv => write!(f, "UpConv"),
             LayerKind::Concat => write!(f, "Concat"),
+            LayerKind::Add => write!(f, "Add"),
         }
     }
 }

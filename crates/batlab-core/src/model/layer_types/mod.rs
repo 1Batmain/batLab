@@ -5,6 +5,7 @@ use crate::model::types::{BufferSpec, Dim3};
 use enum_dispatch::enum_dispatch;
 
 mod activation;
+mod add;
 mod attention;
 mod concat;
 mod convolution;
@@ -15,6 +16,7 @@ mod pooling;
 mod upsample_conv;
 
 pub use activation::{ActivationMethod, ActivationType};
+pub use add::AddType;
 pub use attention::AttentionType;
 pub use concat::ConcatType;
 pub use convolution::ConvolutionType;
@@ -226,6 +228,7 @@ pub enum LayerTypes {
     Activation(ActivationType),
     Attention(AttentionType),
     Concat(ConcatType),
+    Add(AddType),
     FullyConnected(FullyConnectedType),
     GroupNorm(GroupNormType),
     UpsampleConv(UpsampleConvType),
@@ -243,6 +246,7 @@ impl LayerTypes {
             LayerTypes::Activation(_) => "Activation",
             LayerTypes::Attention(_) => "Attention",
             LayerTypes::Concat(_) => "Concat",
+            LayerTypes::Add(_) => "Add",
             LayerTypes::FullyConnected(_) => "FullyConnected",
             LayerTypes::GroupNorm(_) => "GroupNorm",
             LayerTypes::UpsampleConv(_) => "UpsampleConv",

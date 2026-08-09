@@ -5,7 +5,7 @@ use crate::model::debug::{LayerDebugView, read_back_f32, read_back_f32_at};
 use crate::model::ema::EmaConfig;
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
-use crate::model::layer_types::{ConcatType, LayerType, LayerTypes, LossMethod, LossType};
+use crate::model::layer_types::{AddType, ConcatType, LayerType, LayerTypes, LossMethod, LossType};
 use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
 use crate::model::weight_init::WeightInit;
@@ -1343,6 +1343,9 @@ impl<State> Model<State> {
             crate::config::LayerDraft::Concat { skip_key, .. } => {
                 self.add_concat(skip_key.clone())?;
             }
+            crate::config::LayerDraft::Add { skip_key, .. } => {
+                self.add_residual(skip_key.clone())?;
+            }
             other => {
                 self.add_layer(crate::resources::layer_type_of(other, None))?;
             }
@@ -1393,6 +1396,29 @@ impl<State> Model<State> {
             last_output,
         )?;
         let mut layer = layer;
+        layer.index = self.layers.len();
+        self.layers.push(layer);
+        Ok(())
+    }
+
+    /// The residual sibling of [`Self::add_concat`]: it resolves the saved output
+    /// the same way, but the layer it inserts SUMS the skip into the main path
+    /// instead of concatenating it. A shape mismatch is refused by
+    /// [`crate::model::layer_types::AddType::set_dim_output`] during build.
+    pub fn add_residual(&mut self, key: impl Into<String>) -> Result<(), ModelError> {
+        let key = key.into();
+        let source_index = self
+            .saved_outputs
+            .get(&key)
+            .copied()
+            .ok_or_else(|| ModelError::MissingSavedOutput { key: key.clone() })?;
+        let skip_dim = self.layers[source_index].ty.get_dim_output();
+        let last_output = self.layers.last().map(|l| l.ty.get_dim_output());
+        let mut layer = Layer::new(
+            &self.gpu.device,
+            LayerTypes::Add(AddType::new(key, Dim3::default(), skip_dim)),
+            last_output,
+        )?;
         layer.index = self.layers.len();
         self.layers.push(layer);
         Ok(())
