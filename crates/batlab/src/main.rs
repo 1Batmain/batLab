@@ -2064,19 +2064,27 @@ fn print_pass_profile(
     let floor = summary.attributed_floor_nanos();
     println!();
     println!(
-        "{:>9}  {:>6}  {:>5}  {:>9}  {:>3}  {}",
+        "{:>9}  {:>6}  {:>7}  {:>10}  {:>3}  {}",
         "min ms", "% Σ", "max/min", "workgroups", "n", "pass"
     );
     let shown = summary.passes.len().min(top);
     for pass in summary.passes.iter().take(shown) {
         println!(
-            "{:>9.3}  {:>5.1}%  {:>6.2}×  {:>10}  {:>3}  {}",
+            "{:>9.3}  {:>5.1}%  {:>6.2}×  {:>10}  {:>3}  {}{}",
             ms(pass.min_nanos),
             100.0 * pass.min_nanos as f64 / floor.max(1) as f64,
             pass.max_nanos as f64 / pass.min_nanos.max(1) as f64,
             pass.workgroups,
             pass.invocations,
-            pass.label
+            pass.label,
+            // Never silently: a pass the backend refused to time reads 0.000 ms,
+            // which is indistinguishable from a fast one unless it says so.
+            match pass.rounds_sampled {
+                0 => "   ⚠ NEVER TIMED by this backend".to_string(),
+                n if (n as usize) < summary.rounds =>
+                    format!("   (timed in {n}/{} rounds)", summary.rounds),
+                _ => String::new(),
+            }
         );
     }
     if shown < summary.passes.len() {
@@ -2092,44 +2100,79 @@ fn print_pass_profile(
         );
     }
 
-    // The budget. Read it top to bottom: each line is the one above plus what
-    // that layer of the stack adds, and the arrows are the differences the
-    // diagnosis is about.
-    let min_span = summary.round_span.iter().copied().min().unwrap_or(0);
-    let min_attributed = summary.round_attributed.iter().copied().min().unwrap_or(0);
-    let min_wall = walls.iter().map(|(w, _)| *w).min().unwrap_or_default();
-    let min_encode = walls.iter().map(|(_, e)| *e).min().unwrap_or_default();
+    // The budget, and the budget is the point.
+    //
+    // ONE round, not three minima. The estimator everywhere else in this project
+    // is the minimum over rounds, and it is the right one for a *single* number
+    // — but Σ passes, span and wall are three views of the SAME step, and
+    // minimising each independently mixes rounds. It printed "−0.9 ms outside
+    // the GPU span" on the first sweep: a host clock that finished before the
+    // GPU started, which is not a discovery about latency, it is two different
+    // steps subtracted from each other. So the reference round is picked once —
+    // the fastest by wall clock, the closest thing to an uncontended step — and
+    // all three lines come from it. The spread across rounds is printed beside
+    // the span so a reader can see how much that choice was worth.
+    let reference = walls
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (wall, _))| *wall)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let span = summary.round_span.get(reference).copied().unwrap_or(0);
+    let attributed = summary.round_attributed.get(reference).copied().unwrap_or(0);
+    let (wall, encode) = walls.get(reference).copied().unwrap_or_default();
+    let span_lo = summary.round_span.iter().copied().min().unwrap_or(0);
+    let span_hi = summary.round_span.iter().copied().max().unwrap_or(0);
     println!();
-    println!("BUDGET  (minimum over {} armed steps)", summary.rounds);
     println!(
-        "  Σ pass minima              {:>10.1} ms   {} passes timed",
+        "BUDGET  (round {} of {}, the fastest by wall clock)",
+        reference + 1,
+        summary.rounds
+    );
+    println!(
+        "  Σ pass minima              {:>10.1} ms   {} passes timed, over all rounds",
         ms(floor),
         summary.passes.iter().map(|p| p.invocations).sum::<u32>()
     );
+    println!("  Σ passes, this round       {:>10.1} ms", ms(attributed));
     println!(
-        "  Σ passes, best round       {:>10.1} ms",
-        ms(min_attributed)
+        "  GPU span, this round       {:>10.1} ms   → {:.1} ms ({:.1}%) BETWEEN the passes",
+        ms(span),
+        ms(span.saturating_sub(attributed)),
+        100.0 * span.saturating_sub(attributed) as f64 / span.max(1) as f64,
     );
     println!(
-        "  GPU span, best round       {:>10.1} ms   → {:.1} ms ({:.1}%) BETWEEN the passes",
-        ms(min_span),
-        ms(min_span.saturating_sub(min_attributed)),
-        100.0 * min_span.saturating_sub(min_attributed) as f64 / min_span.max(1) as f64,
-    );
-    println!(
-        "  host wall, best round      {:>10.1} ms   → {:.1} ms outside the GPU span",
-        min_wall.as_secs_f64() * 1e3,
-        min_wall.as_secs_f64() * 1e3 - ms(min_span),
+        "  host wall, this round      {:>10.1} ms   → {:.1} ms outside the GPU span",
+        wall.as_secs_f64() * 1e3,
+        wall.as_secs_f64() * 1e3 - ms(span),
     );
     println!(
         "  of which CPU encoding      {:>10.1} ms   (the step returns here; the GPU is still running)",
-        min_encode.as_secs_f64() * 1e3,
+        encode.as_secs_f64() * 1e3,
+    );
+    println!(
+        "  span across all rounds     {:>10.1} ms … {:.1} ms  (spread {:.1}%)",
+        ms(span_lo),
+        ms(span_hi),
+        100.0 * (span_hi.saturating_sub(span_lo)) as f64 / span_lo.max(1) as f64,
     );
     if summary.dropped > 0 {
         println!(
             "  ⚠ {} passes could not be timed (query set full) — every total above is a \
              LOWER bound and the gap between them is overstated.",
             summary.dropped
+        );
+    }
+    let unsampled = summary
+        .round_unsampled
+        .get(reference)
+        .copied()
+        .unwrap_or(0);
+    if unsampled > 0 {
+        println!(
+            "  ⚠ {unsampled} of this round's passes were NOT sampled by the backend (Metal \n\
+             \x20   drops counter samples on some small dispatches). They are excluded from the \n\
+             \x20   span and contribute 0 to Σ, so 'BETWEEN the passes' is an OVERestimate here."
         );
     }
 }

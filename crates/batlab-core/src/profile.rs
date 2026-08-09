@@ -56,6 +56,17 @@ pub struct PassTiming {
     /// because it is *big* and a pass that is slow because it is *starved* look
     /// identical in the time column alone.
     pub workgroups: u32,
+    /// Whether the GPU actually wrote this pass's two timestamps.
+    ///
+    /// It does not always. Metal drops counter samples for some compute
+    /// encoders — observed here on three of the twenty Adam passes, roughly one
+    /// armed step in four, always on tiny dispatches — and returns a pair of
+    /// zeros instead. Zero is not a plausible reading of a clock that is
+    /// currently at 3.76e15, so an unsampled pass is *named* as unsampled
+    /// rather than silently counted as free. Counting it as free is exactly the
+    /// mistake this module exists to prevent: it would show up as time between
+    /// the passes, which is the one quantity the whole diagnosis turns on.
+    pub sampled: bool,
 }
 
 /// Everything one armed step yielded.
@@ -68,6 +79,8 @@ pub struct ProfileRun {
     /// makes every other number in the run a lower bound, so the harness must
     /// say so rather than print a total that quietly omits work.
     pub dropped: u32,
+    /// Passes the backend declined to sample — see [`PassTiming::sampled`].
+    pub unsampled: u32,
 }
 
 impl ProfileRun {
@@ -206,12 +219,14 @@ impl PassProfiler {
             state.armed = false;
             (std::mem::take(&mut state.labels), state.dropped)
         };
+        let empty = |dropped| ProfileRun {
+            passes: vec![],
+            span_nanos: 0,
+            dropped,
+            unsampled: 0,
+        };
         if labels.is_empty() {
-            return ProfileRun {
-                passes: vec![],
-                span_nanos: 0,
-                dropped,
-            };
+            return empty(dropped);
         }
         let bytes = labels.len() as u64 * QUERIES_PER_PASS as u64 * 8;
         let slice = self.readback.slice(0..bytes);
@@ -220,21 +235,11 @@ impl PassProfiler {
             let _ = tx.send(r);
         });
         if device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
-            return ProfileRun {
-                passes: vec![],
-                span_nanos: 0,
-                dropped,
-            };
+            return empty(dropped);
         }
         match pollster::block_on(async { rx.await }) {
             Ok(Ok(())) => {}
-            _ => {
-                return ProfileRun {
-                    passes: vec![],
-                    span_nanos: 0,
-                    dropped,
-                };
-            }
+            _ => return empty(dropped),
         }
         let ticks: Vec<u64> = {
             let view = slice.get_mapped_range();
@@ -243,25 +248,55 @@ impl PassProfiler {
         self.readback.unmap();
 
         let period = self.period_ns as f64;
+        let mut first_begin = u64::MAX;
+        let mut last_end = 0u64;
+        let mut unsampled = 0u32;
         let passes: Vec<PassTiming> = labels
             .iter()
             .enumerate()
             .map(|(i, (label, workgroups))| {
                 let begin = ticks[i * 2];
                 let end = ticks[i * 2 + 1];
+                // A clock currently reading 3.7e15 does not return 0, and
+                // Metal's own sentinel for a failed sample is `u64::MAX`. Either
+                // value means "not sampled", and an unsampled pass is excluded
+                // from the span rather than dragging its start down to zero —
+                // which is exactly what produced a span of 3 761 240 032 ms on
+                // the first sweep of this instrument. `end < begin` is rejected
+                // on the same grounds.
+                let sampled = begin != 0
+                    && end != 0
+                    && begin != u64::MAX
+                    && end != u64::MAX
+                    && end >= begin;
+                if sampled {
+                    first_begin = first_begin.min(begin);
+                    last_end = last_end.max(end);
+                } else {
+                    unsampled += 1;
+                }
                 PassTiming {
                     label: label.clone(),
-                    nanos: ((end.saturating_sub(begin)) as f64 * period) as u64,
+                    nanos: if sampled {
+                        ((end - begin) as f64 * period) as u64
+                    } else {
+                        0
+                    },
                     workgroups: *workgroups,
+                    sampled,
                 }
             })
             .collect();
-        let first_begin = ticks.iter().step_by(2).copied().min().unwrap_or(0);
-        let last_end = ticks.iter().skip(1).step_by(2).copied().max().unwrap_or(0);
+        let span_nanos = if first_begin == u64::MAX {
+            0
+        } else {
+            ((last_end - first_begin) as f64 * period) as u64
+        };
         ProfileRun {
             passes,
-            span_nanos: ((last_end.saturating_sub(first_begin)) as f64 * period) as u64,
+            span_nanos,
             dropped,
+            unsampled,
         }
     }
 }
@@ -284,6 +319,9 @@ pub struct PassSummary {
     /// that share an entry point name are counted together, and the column says
     /// so.
     pub invocations: u32,
+    /// Rounds in which every occurrence of this label was sampled. `0` means the
+    /// backend never timed it and `min_nanos` is meaningless, not zero.
+    pub rounds_sampled: u32,
 }
 
 /// Several armed steps, reduced.
@@ -291,11 +329,13 @@ pub struct PassSummary {
 pub struct ProfileSummary {
     pub passes: Vec<PassSummary>,
     pub rounds: usize,
-    /// Per round: Σ passes, span, and the two derived gaps. Kept per round
-    /// rather than only reduced, because `min(Σ) ≠ Σ(min)` and mixing the two
-    /// silently would make the percentages not add up.
+    /// Per round: Σ passes and span. Kept per round rather than only reduced,
+    /// because `min(Σ) ≠ Σ(min)` and mixing the two silently would make the
+    /// percentages not add up — and because the three views of one step have to
+    /// be read off the SAME step to mean anything.
     pub round_attributed: Vec<u64>,
     pub round_span: Vec<u64>,
+    pub round_unsampled: Vec<u32>,
     pub dropped: u32,
 }
 
@@ -309,20 +349,34 @@ impl ProfileSummary {
         // occurrences *within* a round, then take the min of the per-round sums
         // across rounds. Otherwise a label that appears twice would report the
         // cost of one of its two dispatches.
+        //
+        // A round in which any occurrence went unsampled contributes NOTHING to
+        // that label: its sum would be short by a whole dispatch, and being
+        // short is exactly what the minimum estimator would prefer. That is how
+        // a dropped counter sample turns into a fast kernel.
         for run in runs {
-            let mut per_round: HashMap<&str, (u64, u32, u32)> = HashMap::new();
+            let mut per_round: HashMap<&str, (u64, u32, u32, bool)> = HashMap::new();
             for pass in &run.passes {
                 let slot = per_round
                     .entry(pass.label.as_str())
-                    .or_insert((0, pass.workgroups, 0));
+                    .or_insert((0, pass.workgroups, 0, true));
                 slot.0 += pass.nanos;
                 slot.2 += 1;
+                slot.3 &= pass.sampled;
             }
-            for (label, (nanos, workgroups, invocations)) in per_round {
+            for (label, (nanos, workgroups, invocations, sampled)) in per_round {
                 match acc.get_mut(label) {
                     Some(entry) => {
-                        entry.min_nanos = entry.min_nanos.min(nanos);
-                        entry.max_nanos = entry.max_nanos.max(nanos);
+                        if sampled {
+                            if entry.rounds_sampled == 0 {
+                                entry.min_nanos = nanos;
+                                entry.max_nanos = nanos;
+                            } else {
+                                entry.min_nanos = entry.min_nanos.min(nanos);
+                                entry.max_nanos = entry.max_nanos.max(nanos);
+                            }
+                            entry.rounds_sampled += 1;
+                        }
                     }
                     None => {
                         order.push(label.to_string());
@@ -330,10 +384,11 @@ impl ProfileSummary {
                             label.to_string(),
                             PassSummary {
                                 label: label.to_string(),
-                                min_nanos: nanos,
-                                max_nanos: nanos,
+                                min_nanos: if sampled { nanos } else { 0 },
+                                max_nanos: if sampled { nanos } else { 0 },
                                 workgroups,
                                 invocations,
+                                rounds_sampled: u32::from(sampled),
                             },
                         );
                     }
@@ -350,6 +405,7 @@ impl ProfileSummary {
             rounds: runs.len(),
             round_attributed: runs.iter().map(|r| r.attributed_nanos()).collect(),
             round_span: runs.iter().map(|r| r.span_nanos).collect(),
+            round_unsampled: runs.iter().map(|r| r.unsampled).collect(),
             dropped: runs.iter().map(|r| r.dropped).max().unwrap_or(0),
         }
     }
@@ -373,10 +429,12 @@ mod tests {
                     label: label.to_string(),
                     nanos: *nanos,
                     workgroups: *workgroups,
+                    sampled: true,
                 })
                 .collect(),
             span_nanos: span,
             dropped: 0,
+            unsampled: 0,
         }
     }
 
@@ -412,6 +470,37 @@ mod tests {
         assert_eq!(b.min_nanos, 50);
         // Sorted by cost, most expensive first — that is what the table is for.
         assert_eq!(s.passes[0].label, "a");
+    }
+
+    /// A pass the backend declined to time must not be reported as a fast one.
+    ///
+    /// Metal drops counter samples on some compute encoders (observed on the
+    /// small Adam dispatches, roughly one armed step in four). Those arrive as a
+    /// pair of zeros. Two things must NOT happen: the pass must not enter the
+    /// minimum with a time of 0, and — worse — the missing time must not
+    /// reappear as "between the passes", which is the one quantity this whole
+    /// instrument exists to measure.
+    #[test]
+    fn a_pass_the_backend_did_not_time_is_not_a_free_pass() {
+        let mut good = run(&[("a", 100, 4), ("b", 50, 2)], 160);
+        let mut bad = run(&[("a", 0, 4), ("b", 60, 2)], 70);
+        bad.passes[0].sampled = false;
+        bad.unsampled = 1;
+        good.dropped = 0;
+        bad.dropped = 0;
+
+        let s = ProfileSummary::reduce(&[good, bad]);
+        let a = s.passes.iter().find(|p| p.label == "a").unwrap();
+        assert_eq!(
+            a.min_nanos, 100,
+            "the unsampled round must not become this pass's fastest round"
+        );
+        assert_eq!(a.rounds_sampled, 1, "one of the two rounds timed it");
+        // The pass that WAS sampled in both rounds still takes its minimum from
+        // both — the exclusion is per label, not per round.
+        let b = s.passes.iter().find(|p| p.label == "b").unwrap();
+        assert_eq!(b.min_nanos, 50);
+        assert_eq!(b.rounds_sampled, 2);
     }
 
     /// There must be no second door — the same rule as
