@@ -734,6 +734,13 @@ pub struct App {
     /// triple the parameter posts between them, so the page reads them from the
     /// file rather than assuming.
     pub resources_optimizer: batlab_core::OptimizerKind,
+    /// The three training knobs the model's `config_file` carries and no form
+    /// field shows. Held so that launching a run **preserves** them: they are
+    /// read back into the `TrainingConfig` the run is given, rather than reset
+    /// to their defaults on the way past.
+    pub training_optimizer: batlab_core::OptimizerKind,
+    pub training_weight_init: batlab_core::WeightInit,
+    pub training_loss_weighting: LossWeighting,
     pub resources_ema: bool,
     pub run_config: Option<RunConfig>,
     /// The model's own seed dataset, as its `config_file` holds it — a property
@@ -1043,6 +1050,9 @@ impl App {
             ),
             resources_dataset: None,
             resources_optimizer: batlab_core::OptimizerKind::default(),
+            training_optimizer: batlab_core::OptimizerKind::default(),
+            training_weight_init: batlab_core::WeightInit::default(),
+            training_loss_weighting: LossWeighting::default(),
             resources_ema: false,
             run_config: None,
             seed_dataset: None,
@@ -1302,6 +1312,9 @@ impl App {
         // `OPTIMIZER_ADAM.md` makes it the project's standard, and sizing an
         // Adam run as an SGD one under-reports the parameter posts by 3×.
         self.resources_optimizer = batlab_core::OptimizerKind::Adam;
+        self.training_optimizer = batlab_core::OptimizerKind::default();
+        self.training_weight_init = batlab_core::WeightInit::default();
+        self.training_loss_weighting = LossWeighting::default();
         self.resources_ema = false;
         self.resources_dataset = None;
         self.layer_builder.model_input = config.input_size;
@@ -1338,6 +1351,9 @@ impl App {
                 // an EMA adds another copy, and the dataset is the one post
                 // that is streamed rather than resident.
                 self.resources_optimizer = train.optimizer;
+                self.training_optimizer = train.optimizer;
+                self.training_weight_init = train.weight_init;
+                self.training_loss_weighting = train.loss_weighting;
                 self.resources_ema = train.ema_decay.is_some();
                 self.resources_dataset = self.storage.dataset_spec(&train.dataset_path);
                 self.resources.batch = train.batch_size.max(1);
@@ -2991,9 +3007,16 @@ impl App {
                 loss: LossMethod::MeanSquared,
                 checkpoint_path: self.selected_checkpoint_path.clone(),
                 load_checkpoint: self.load_checkpoint_on_start,
-                optimizer: OptimizerKind::default(),
-                weight_init: WeightInit::default(),
-                loss_weighting: LossWeighting::default(),
+                // Carried from the model's own config, not reset to the
+                // defaults. These three have no form field, so `::default()`
+                // here meant that starting a run from the TUI silently
+                // downgraded `--optimizer adam` to SGD — and then wrote that
+                // back to `config_file`, making the loss permanent. Worse, the
+                // Resources page one screen earlier reads the *file's* value,
+                // so it sized an Adam run while launching an SGD one.
+                optimizer: self.training_optimizer,
+                weight_init: self.training_weight_init,
+                loss_weighting: self.training_loss_weighting,
                 ema_decay,
             }),
         });
@@ -3265,6 +3288,65 @@ mod tests {
         // offers what it was last used for.
         assert_eq!(app.model_actions.selected, ModelAction::Infer.index());
         assert_eq!(app.screen, Screen::ModelActions);
+    }
+
+    /// Starting a training run from the TUI must **preserve** the three knobs
+    /// the config file carries and no form shows.
+    ///
+    /// Same defect class as the seed dataset, one step over: the field is read
+    /// at run time, but the only interactive way to launch destroyed it first.
+    /// `--optimizer adam` converges ~20× faster per step
+    /// (`OPTIMIZER_ADAM.md`), and a run started from the TUI silently became
+    /// SGD — then wrote that back to `config_file`, so the loss was permanent
+    /// and invisible.
+    #[test]
+    fn starting_a_run_from_the_form_keeps_the_optimizer_the_config_asked_for() {
+        let (_temp, mut app) = test_app("keep-training-knobs");
+        let dataset = a_dataset(&app, "train.batraw", (32, 32, 3));
+        let config = ModelConfig {
+            model_name: Some("unit-test-load".to_string()),
+            input_size: (32, 32, 7),
+            layers: Vec::new(),
+            inference: InferenceConfig::default(),
+            seed_dataset: None,
+            run: RunConfig {
+                mode: RunMode::Train(TrainingConfig {
+                    lr: 0.001,
+                    batch_size: 4,
+                    steps: 100,
+                    dataset_path: dataset.clone(),
+                    loss: LossMethod::MeanSquared,
+                    checkpoint_path: None,
+                    load_checkpoint: false,
+                    optimizer: OptimizerKind::Adam,
+                    weight_init: WeightInit::He,
+                    ema_decay: None,
+                    loss_weighting: LossWeighting::Snr { gamma: 1.0 },
+                }),
+            },
+        };
+        app.apply_loaded_model(config);
+
+        app.training_params.fields[TRAINING_DATASET_FIELD] = dataset;
+        app.sync_selected_dataset_from_field();
+        app.finish_dataset_selector()
+            .expect("the form should validate");
+
+        let RunMode::Train(train) = app
+            .run_config
+            .clone()
+            .expect("finishing arms a run")
+            .mode
+        else {
+            panic!("the training form must arm a training run");
+        };
+        assert_eq!(
+            train.optimizer,
+            OptimizerKind::Adam,
+            "the run must use the optimiser the config asked for, not SGD"
+        );
+        assert_eq!(train.weight_init, WeightInit::He);
+        assert_eq!(train.loss_weighting, LossWeighting::Snr { gamma: 1.0 });
     }
 
     // -- The seed dataset ----------------------------------------------------
