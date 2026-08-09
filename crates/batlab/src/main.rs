@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime};
 
-use batlab_ui::storage;
+use batlab_ui::storage::{self, SeedSource};
 use batlab_ui::tui::{
     self, LayerDraft, ModelConfig, MonitorOutcome, PerpetualConfig,
     RunMode, TrainingConfig,
@@ -448,20 +448,6 @@ fn main() {
     });
 }
 
-/// The dataset a model of `channels` output channels drifts away from, when its
-/// config names none.
-///
-/// Derived from the model's **output** geometry rather than guessed: feeding a
-/// greyscale drift the RGB file would not error — `try_load_raw_dataset` resizes
-/// — and the run would quietly set out from a mangled picture.
-fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
-    match channels {
-        1 => Some("cifar10_grey.batraw"),
-        3 => Some("cifar10_rgb.batraw"),
-        _ => None,
-    }
-}
-
 /// Where a perpetual run's opening picture comes from.
 ///
 /// The dataset is loaded once, on the CPU, and kept as plain tensors: a run
@@ -477,50 +463,84 @@ fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
 struct SeedImages {
     samples: Dataset,
     path: PathBuf,
+    source: SeedSource,
 }
 
 impl SeedImages {
-    /// Finds the dataset a model should drift away from.
+    /// Loads the dataset a model drifts away from — **the one entry point every
+    /// path that starts a drift goes through**.
     ///
-    /// `explicit` wins when given (`--seed-dataset`, or `seed_dataset` in the
-    /// model's `config_file`). Otherwise the choice follows the model's own
-    /// **output** geometry: a 1-channel model wants `cifar10_grey.batraw`, a
-    /// 3-channel one `cifar10_rgb.batraw`. Feeding a greyscale drift the RGB
-    /// file would not error — `try_load_raw_dataset` would resize and the run
-    /// would drift away from a mangled picture — so the default is derived
-    /// rather than guessed at.
+    /// It takes the whole `config`, not a pre-chosen path, and that is the
+    /// point: a caller cannot forget to consult the model's own
+    /// `seed_dataset` the way `--headless-perpetual` did for an entire
+    /// campaign, drifting `Elephants_XL` away from CIFAR trucks. The ranking
+    /// itself — flag, then config, then the channel convention — lives once, in
+    /// [`storage::Storage::resolve_seed_dataset`].
     ///
-    /// `Ok(None)` when there is nothing to load: a missing dataset is not a
-    /// reason to refuse to run, it is a reason to fall back on pure noise and
-    /// say so.
+    /// Three outcomes, and they differ by source:
+    ///
+    /// - `Ok(Some(_))` — a dataset was found and it fits the model.
+    /// - `Ok(None)` — nothing to load, and nothing was promised: no convention
+    ///   for this geometry, or the derived file is not on this machine. A
+    ///   missing dataset is not a reason to refuse to run, it is a reason to
+    ///   fall back on pure noise and say so.
+    /// - `Err(_)` — something *named* it (flag or config) and it is missing,
+    ///   empty, or has the wrong channels. Falling back to noise there would
+    ///   look exactly like the setting being ignored, which is the bug this
+    ///   whole function exists to close.
     fn resolve(
-        explicit: Option<&str>,
+        flag: Option<&str>,
+        config: &ModelConfig,
         output_size: (u32, u32, u32),
     ) -> Result<Option<Self>, String> {
-        let candidate = match explicit {
-            Some(path) => PathBuf::from(path),
-            None => match default_seed_dataset_name(output_size.2) {
-                Some(name) => storage::project_root().join("datasets").join(name),
-                // A geometry neither file matches: nothing to default to, and
-                // inventing one would drift away from the wrong images.
-                None => return Ok(None),
-            },
+        let Some(choice) =
+            storage::resolve_seed_dataset(flag, config.seed_dataset.as_deref(), output_size.2)
+        else {
+            return Ok(None);
         };
-        if !candidate.exists() {
-            // Named explicitly, a missing file IS an error — silently drifting
-            // from noise would look like the flag was ignored.
-            return match explicit {
-                Some(path) => Err(format!("--seed-dataset {path}: no such file")),
-                None => Ok(None),
+        // What to say when it goes wrong, naming the source that asked for it:
+        // "--seed-dataset x: …" and "config_file seed_dataset x: …" send the
+        // reader to two different places.
+        let blame = |reason: &str| {
+            format!(
+                "{} {}: {reason}",
+                choice.source.label(),
+                choice.path.display()
+            )
+        };
+        let named = choice.source != SeedSource::Convention;
+        if !choice.path.exists() {
+            return match named {
+                true => Err(blame("no such file")),
+                false => Ok(None),
             };
         }
-        let samples = load_dataset(&candidate.to_string_lossy(), output_size)?;
+        // Refused, not resized. Width and height are resampled on the host on
+        // the way in, which is a visible thing to do to a picture; channels are
+        // not — a greyscale file handed to a colour model is replicated across
+        // R, G and B and *succeeds*, which is what makes it worth refusing. The
+        // convention cannot land here (it is derived from these very channels),
+        // so this only ever fires on something a human named.
+        if let Some((_, _, _, channels, _)) = storage::read_batraw_header(&choice.path) {
+            if channels != output_size.2 {
+                return Err(blame(&format!(
+                    "{channels} channel(s) for a model that emits {} — it would be \
+                     replicated or flattened without a word, not resized",
+                    output_size.2
+                )));
+            }
+        }
+        let samples = load_dataset(&choice.path.to_string_lossy(), output_size)?;
         if samples.is_empty() {
-            return Ok(None);
+            return match named {
+                true => Err(blame("holds no images")),
+                false => Ok(None),
+            };
         }
         Ok(Some(Self {
             samples,
-            path: candidate,
+            path: choice.path,
+            source: choice.source,
         }))
     }
 
@@ -530,6 +550,12 @@ impl SeedImages {
 
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Which of the three sources won. Printed, never re-derived: the banner
+    /// has to report what the run actually resolved.
+    fn source(&self) -> SeedSource {
+        self.source
     }
 
     /// The `x₀` a run sets out from: one image of the dataset, drawn from
@@ -1538,7 +1564,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         );
         let seed_images = match seed_from_noise {
             true => None,
-            false => SeedImages::resolve(seed_dataset.as_deref(), output_size)?,
+            // The model's `config_file` is consulted here too — it is handed
+            // over whole, so this path cannot quietly skip it.
+            false => SeedImages::resolve(seed_dataset.as_deref(), &config, output_size)?,
         };
         let mut drift = match seed_images.as_ref() {
             Some(_) => PerpetualDrift::from_image(schedule.len(), regime, depth, seed),
@@ -1575,13 +1603,25 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             },
             checkpoint_path.display(),
         );
+        // Which of the three sources won is part of the answer, not a detail:
+        // "origine → image du dataset X" alone leaves the one question a
+        // surprised reader has — why THAT dataset — unanswered, and that is
+        // precisely how a specialised model drifted away from CIFAR trucks
+        // without anything on screen looking wrong.
         match seed_images.as_ref() {
             Some(images) => println!(
-                "origine → image du dataset {} ({} images) — dérive img2img",
+                "origine → image du dataset {} ({} images) [{}] — dérive img2img",
                 images.path().display(),
-                images.len()
+                images.len(),
+                images.source().label()
             ),
-            None => println!("origine → bruit pur en haut du schedule (--seed-noise)"),
+            None => println!(
+                "origine → bruit pur en haut du schedule ({})",
+                match seed_from_noise {
+                    true => "--seed-noise",
+                    false => "aucun dataset de graine trouvable",
+                }
+            ),
         }
         // Announced only when something will actually land there. A PNG is
         // written when a cycle closes; flux closes none, so naming a directory
@@ -3126,7 +3166,9 @@ async fn run_perpetual(
     // The picture the drift sets out from. A dataset that cannot be found is
     // not fatal: the run falls back on the pure-noise opening perpetual runs
     // always had, and says which one it is doing on the status line.
-    let seed_images = SeedImages::resolve(cfg.seed_dataset.as_deref(), output_size)?;
+    // No flag on this path — the TUI has no command line — so the model's own
+    // `seed_dataset` is what decides, and the convention behind it.
+    let seed_images = SeedImages::resolve(None, &config, output_size)?;
     let mut drift = match seed_images.as_ref() {
         Some(_) => PerpetualDrift::from_image(schedule.len(), cfg.regime, cfg.renoise_depth, seed),
         None => PerpetualDrift::new(schedule.len(), cfg.regime, cfg.renoise_depth, seed),
@@ -3200,8 +3242,19 @@ async fn run_perpetual(
     let mut pace = PaceMeter::new();
     let mut last_published = std::time::Instant::now();
 
+    // Names the file AND the source that chose it. The panel is the only place
+    // a TUI run says where its pictures come from, and "image du dataset" alone
+    // answered neither which one nor why.
     let origin_label = match seed_images.as_ref() {
-        Some(_) => "image du dataset".to_string(),
+        Some(images) => format!(
+            "{} [{}]",
+            images
+                .path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| images.path().display().to_string()),
+            images.source().label()
+        ),
         None => "bruit pur (aucun dataset)".to_string(),
     };
     let publish = |tx: &std::sync::mpsc::Sender<tui::TrainingEvent>,
@@ -4484,6 +4537,7 @@ mod tests {
                 input_size: template.input_size,
                 layers: template.layers.clone(),
                 inference: batlab_core::InferenceConfig::default(),
+                seed_dataset: None,
                 run: batlab_core::RunConfig {
                     mode: RunMode::Infer,
                 },
@@ -4544,6 +4598,113 @@ mod tests {
 
     // -- The img2img seed ----------------------------------------------------
 
+    /// A model config of the given output channels and nothing else — enough
+    /// for `SeedImages::resolve`, which reads only `seed_dataset` off it.
+    fn a_model_naming(seed_dataset: Option<&str>) -> ModelConfig {
+        ModelConfig {
+            model_name: Some("seed-test".to_string()),
+            input_size: (2, 2, 3),
+            layers: Vec::new(),
+            inference: batlab_core::InferenceConfig::default(),
+            seed_dataset: seed_dataset.map(str::to_string),
+            run: batlab_core::RunConfig {
+                mode: RunMode::Infer,
+            },
+        }
+    }
+
+    /// **The ranking**: `--seed-dataset` beats the model's `seed_dataset`,
+    /// which beats the convention derived from the output channels.
+    ///
+    /// Each source names a *different* file of distinguishable images, so the
+    /// answer says which one won rather than merely that something loaded. The
+    /// middle rung is the one that did not exist: `--headless-perpetual` read
+    /// the flag or nothing at all, so `Models/Elephants_XL` set out from a
+    /// CIFAR truck for an entire campaign.
+    #[test]
+    fn the_flag_beats_the_config_which_beats_the_convention() {
+        let by_flag = tmp_path("seed_rank_flag.batraw");
+        let by_config = tmp_path("seed_rank_config.batraw");
+        // One constant sample each, its value identifying the file.
+        write_batraw(&by_flag, 1, 2, 2, 1, &[vec![0.25; 4]]);
+        write_batraw(&by_config, 1, 2, 2, 1, &[vec![-0.75; 4]]);
+
+        let flag = by_flag.to_string_lossy().into_owned();
+        let config = a_model_naming(Some(&by_config.to_string_lossy()));
+
+        let both = SeedImages::resolve(Some(&flag), &config, (2, 2, 1))
+            .expect("both present")
+            .expect("a dataset");
+        assert_eq!(both.source(), SeedSource::Flag);
+        assert_eq!(both.path(), by_flag, "the flag must win over the config");
+
+        let config_only = SeedImages::resolve(None, &config, (2, 2, 1))
+            .expect("config present")
+            .expect("a dataset");
+        assert_eq!(config_only.source(), SeedSource::Config);
+        assert_eq!(
+            config_only.path(),
+            by_config,
+            "the model's own seed_dataset must be honoured when no flag is given — \
+             this is the whole defect: it was declared, documented, and never read"
+        );
+
+        // Neither: the convention takes over, and it is derived from the output
+        // channels. `7` matches no built-in file, so it resolves to nothing at
+        // all rather than to one of the other two.
+        let neither = a_model_naming(None);
+        assert!(
+            matches!(SeedImages::resolve(None, &neither, (2, 2, 7)), Ok(None)),
+            "with nothing named, the convention decides — and it has no answer \
+             for a 7-channel model"
+        );
+
+        let _ = std::fs::remove_file(&by_flag);
+        let _ = std::fs::remove_file(&by_config);
+    }
+
+    /// A seed dataset whose **channels** disagree with the model is refused,
+    /// naming both counts — not resized.
+    ///
+    /// Width and height are resampled on the host, which is a visible thing to
+    /// do to a picture. Channels are not: a greyscale file handed to a colour
+    /// model is replicated across R, G and B and the run *succeeds*, drifting
+    /// away from a grey picture pretending to be colour. That silence has cost
+    /// this repository time before, on the training path.
+    ///
+    /// Checked on both named sources, because both are a human's decision and
+    /// both used to be swallowed.
+    #[test]
+    fn a_seed_dataset_of_the_wrong_channels_is_refused_not_resized() {
+        let grey = tmp_path("seed_wrong_channels.batraw");
+        let samples: Vec<Vec<f32>> = (0..4).map(|_| vec![0.5; 4]).collect();
+        write_batraw(&grey, 4, 2, 2, 1, &samples);
+        let named = grey.to_string_lossy().into_owned();
+
+        // The model emits three channels; the file holds one.
+        for (flag, config) in [
+            (Some(named.as_str()), a_model_naming(None)),
+            (None, a_model_naming(Some(&named))),
+        ] {
+            let err = match SeedImages::resolve(flag, &config, (2, 2, 3)) {
+                Err(err) => err,
+                Ok(_) => panic!("a 1-channel file must not seed a 3-channel model"),
+            };
+            assert!(
+                err.contains('1') && err.contains('3'),
+                "the refusal must name both counts, or it cannot be acted on: {err}"
+            );
+        }
+
+        // And the same file is fine for the model it actually fits.
+        assert!(
+            SeedImages::resolve(Some(&named), &a_model_naming(None), (2, 2, 1))
+                .expect("matching channels must load")
+                .is_some()
+        );
+        let _ = std::fs::remove_file(&grey);
+    }
+
     /// **The claim of the mode**: the latent a perpetual run sets out from is a
     /// real image of the dataset, bit for bit — not noise, not a resized
     /// approximation of one, not a blend.
@@ -4560,7 +4721,7 @@ mod tests {
             .collect();
         write_batraw(&out, 8, 2, 2, 1, &samples);
 
-        let images = SeedImages::resolve(Some(&out.to_string_lossy()), (2, 2, 1))
+        let images = SeedImages::resolve(Some(&out.to_string_lossy()), &a_model_naming(None), (2, 2, 1))
             .expect("load should succeed")
             .expect("an explicit path must yield a source");
         assert_eq!(images.len(), 8);
@@ -4593,7 +4754,7 @@ mod tests {
         let out = tmp_path("seed_images_spread.batraw");
         let samples: Vec<Vec<f32>> = (0..8).map(|s| vec![s as f32 / 8.0 - 0.5; 4]).collect();
         write_batraw(&out, 8, 2, 2, 1, &samples);
-        let images = SeedImages::resolve(Some(&out.to_string_lossy()), (2, 2, 1))
+        let images = SeedImages::resolve(Some(&out.to_string_lossy()), &a_model_naming(None), (2, 2, 1))
             .expect("load")
             .expect("source");
         let _ = std::fs::remove_file(&out);
@@ -4621,26 +4782,98 @@ mod tests {
         let missing = tmp_path("no_such_dataset.batraw");
         let _ = std::fs::remove_file(&missing);
         assert!(
-            SeedImages::resolve(Some(&missing.to_string_lossy()), (2, 2, 1)).is_err(),
+            SeedImages::resolve(Some(&missing.to_string_lossy()), &a_model_naming(None), (2, 2, 1))
+                .is_err(),
             "a named dataset that is not there must be reported, not swallowed"
         );
         // A geometry no built-in dataset matches: nothing to derive, no error.
         assert!(
-            matches!(SeedImages::resolve(None, (2, 2, 7)), Ok(None)),
+            matches!(
+                SeedImages::resolve(None, &a_model_naming(None), (2, 2, 7)),
+                Ok(None)
+            ),
             "a 7-channel model has no default dataset and must not fail for it"
         );
     }
 
-    /// The default follows the model's own output channels. Handing a
-    /// greyscale drift the RGB file does not error — the loader resizes — so a
-    /// wrong default would show up as a drift away from a mangled picture and
-    /// nothing else.
+    /// **One resolution, and every drift start goes through it.**
+    ///
+    /// This is the mechanical half of the fix, and the half that keeps it
+    /// fixed. The defect was never that the ranking was wrong — it was that
+    /// `--headless-perpetual` resolved its opening picture *its own way* and so
+    /// never learned about `seed_dataset`, while the TUI path did. Two ways to
+    /// answer one question is how they drifted apart, and a reviewer reading
+    /// either one in isolation sees nothing wrong.
+    ///
+    /// So: any function that opens a drift — one that mentions
+    /// `PerpetualDrift::from_image`, the constructor that means "set out from a
+    /// picture" — must also call [`SeedImages::resolve`]. A third perpetual
+    /// entry point that resolved its own seed would fail here, by name.
+    ///
+    /// Same discipline as `load_sampling_checkpoint` for weights, and as
+    /// `nothing_in_the_engine_opens_an_untimed_pass` for compute passes.
     #[test]
-    fn the_default_dataset_follows_the_models_output_channels() {
-        assert_eq!(default_seed_dataset_name(1), Some("cifar10_grey.batraw"));
-        assert_eq!(default_seed_dataset_name(3), Some("cifar10_rgb.batraw"));
-        assert_eq!(default_seed_dataset_name(2), None);
-        assert_eq!(default_seed_dataset_name(0), None);
+    fn every_path_that_starts_a_drift_resolves_its_seed_the_same_way() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs"),
+        )
+        .expect("this binary's own source must be readable");
+
+        // Split into top-level items: a line starting at column 0 with `fn`,
+        // `async fn` or `pub fn` opens one, and it runs to the next such line.
+        let mut blocks: Vec<(String, String)> = Vec::new();
+        for line in source.lines() {
+            let opens = line.starts_with("fn ")
+                || line.starts_with("async fn ")
+                || line.starts_with("pub fn ")
+                || line.starts_with("pub async fn ");
+            if opens {
+                let name = line
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or(line)
+                    .rsplit(' ')
+                    .next()
+                    .unwrap_or(line)
+                    .to_string();
+                blocks.push((name, String::new()));
+            }
+            if let Some(block) = blocks.last_mut() {
+                block.1.push('\n');
+                block.1.push_str(line);
+            }
+        }
+
+        // Assembled from halves, so this test is not itself an offender — the
+        // detector has to be allowed to name what it detects.
+        let starts_a_drift = concat!("PerpetualDrift", "::from_image");
+        let the_one_door = concat!("SeedImages", "::resolve");
+
+        let mut offenders: Vec<&str> = Vec::new();
+        let mut checked = 0usize;
+        for (name, body) in &blocks {
+            if !body.contains(starts_a_drift) || name.starts_with("a_")
+            // the test module's own helpers
+            {
+                continue;
+            }
+            checked += 1;
+            if !body.contains(the_one_door) {
+                offenders.push(name);
+            }
+        }
+
+        assert!(
+            checked >= 2,
+            "only {checked} function(s) open a drift — the scan stopped seeing the \
+             two perpetual paths, so it is no longer proving anything"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these start a perpetual drift without going through SeedImages::resolve, \
+             so they answer 'which pictures?' their own way and will drift from the \
+             common ranking exactly as --headless-perpetual did: {offenders:?}"
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@
 
 use super::app::{
     App, DUPLICATE_CONTENT_CHOICES, INPUT_SIZE_FIELD_NAMES, LayerBuilderMode, MODEL_ACTIONS,
-    PERPETUAL_PARAM_FIELD_NAMES, PerpetualStatus, ResourcesState, Screen,
+    PERPETUAL_PARAM_FIELD_NAMES, PERPETUAL_SEED_DATASET_FIELD, PerpetualStatus, ResourcesState,
+    Screen,
     TRAINING_PARAM_FIELD_NAMES,
     TRAINING_RANDOM_WEIGHTS_FIELD, TrainingControlCommand,
 };
@@ -68,6 +69,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) {
         Screen::PerpetualParams => handle_perpetual_params(app, code),
         Screen::TrainingParams => handle_training_params(app, code),
         Screen::DatasetSelector => handle_dataset_selector(app, code),
+        Screen::SeedDatasetSelector => handle_seed_dataset_selector(app, code),
         Screen::Monitor => handle_monitor(app, code),
         Screen::TrainingControl => handle_training_control(app, code),
         Screen::Resources => handle_resources(app, code),
@@ -402,6 +404,24 @@ fn handle_dataset_selector(app: &mut App, code: KeyCode) {
     }
 }
 
+/// The seed-dataset chooser. `Esc` goes back to the form having changed
+/// nothing; `Enter` takes the row under the cursor, and an incompatible one is
+/// refused right here with the reason on screen.
+fn handle_seed_dataset_selector(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => app.screen = Screen::PerpetualParams,
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Up => app.move_seed_dataset_cursor(-1),
+        KeyCode::Down => app.move_seed_dataset_cursor(1),
+        KeyCode::Enter => {
+            if let Err(e) = app.finish_seed_dataset_selector() {
+                app.seed_dataset_selector.error = Some(e);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_inference_params(app: &mut App, code: KeyCode) {
     let max_field = 3;
     match code {
@@ -437,11 +457,15 @@ fn handle_inference_params(app: &mut App, code: KeyCode) {
 
 fn handle_perpetual_params(app: &mut App, code: KeyCode) {
     let max_field = PERPETUAL_PARAM_FIELD_NAMES.len() - 1;
-    // The two toggles are the first and last field; the four in between are typed.
+    // The two toggles are the first and last field; the four typed ones and the
+    // seed-dataset row sit between them.
     let seed_toggle = 0;
     let regime_toggle = max_field;
+    let seed_dataset = PERPETUAL_SEED_DATASET_FIELD;
     match code {
         KeyCode::Esc => app.screen = Screen::WeightSelector,
+        // `q` still quits from this form, and may: the seed-dataset row is a
+        // door to a chooser, not a text field, so no path is ever typed here.
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Up => {
             if app.perpetual_params.field_idx > 0 {
@@ -463,9 +487,17 @@ fn handle_perpetual_params(app: &mut App, code: KeyCode) {
         {
             app.toggle_perpetual_regime();
         }
+        // `→`/`space` open the chooser from the row that names it, the same
+        // gesture the two toggles answer to — the row is not typed, so those
+        // keys are free here.
+        KeyCode::Right | KeyCode::Char(' ') if app.perpetual_params.field_idx == seed_dataset => {
+            app.open_seed_dataset_selector();
+        }
         KeyCode::Backspace => app.handle_backspace_perpetual(),
         KeyCode::Enter => {
-            if app.perpetual_params.field_idx < max_field {
+            if app.perpetual_params.field_idx == seed_dataset {
+                app.open_seed_dataset_selector();
+            } else if app.perpetual_params.field_idx < max_field {
                 app.perpetual_params.field_idx += 1;
             } else if let Err(e) = app.finish_perpetual_params() {
                 app.perpetual_params.error = Some(e);
@@ -611,6 +643,7 @@ mod tests {
             input_size: (32, 32, 5),
             layers: Vec::new(),
             inference: InferenceConfig::default(),
+            seed_dataset: None,
             run: RunConfig { mode },
         });
         (temp, app)

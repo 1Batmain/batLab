@@ -89,6 +89,13 @@ fn walk_the_builder(app: &mut App) -> HashSet<Screen> {
     select_action(app, ModelAction::Perpetual);
     step(app, &mut visited, KeyCode::Enter, Screen::WeightSelector);
     step(app, &mut visited, KeyCode::Enter, Screen::PerpetualParams);
+    handle_key(app, KeyCode::Enter); // random-seed toggle → seed
+    handle_key(app, KeyCode::Enter); // seed → magnitude
+    handle_key(app, KeyCode::Enter); // magnitude → renoise depth
+    handle_key(app, KeyCode::Enter); // renoise depth → tempo
+    handle_key(app, KeyCode::Enter); // tempo → seed dataset
+    step(app, &mut visited, KeyCode::Enter, Screen::SeedDatasetSelector);
+    step(app, &mut visited, KeyCode::Esc, Screen::PerpetualParams);
     step(app, &mut visited, KeyCode::Esc, Screen::WeightSelector);
     step(app, &mut visited, KeyCode::Esc, Screen::ModelActions);
 
@@ -231,6 +238,7 @@ fn esc_parent(screen: Screen) -> Option<Screen> {
         Screen::PerpetualParams => Some(Screen::WeightSelector),
         Screen::TrainingParams => Some(Screen::WeightSelector),
         Screen::DatasetSelector => Some(Screen::TrainingParams),
+        Screen::SeedDatasetSelector => Some(Screen::PerpetualParams),
         Screen::Monitor => None,
         Screen::TrainingControl => Some(Screen::Monitor),
         Screen::Resources => Some(Screen::ModelActions),
@@ -507,6 +515,7 @@ fn the_existing_arrow_bindings_still_do_what_they_did() {
         input_size: (32, 32, 5),
         layers: Vec::new(),
         inference: InferenceConfig::default(),
+        seed_dataset: None,
         run: RunConfig {
             mode: RunMode::Perpetual(PerpetualConfig::default()),
         },

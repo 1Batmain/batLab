@@ -574,6 +574,51 @@ impl Storage {
         Ok(models)
     }
 
+    /// **THE** resolution of the dataset a perpetual drift sets out from —
+    /// the one place the three sources are ranked, and the only one allowed to
+    /// know that ranking.
+    ///
+    /// `flag` (`--seed-dataset`) beats `configured` (`ModelConfig::seed_dataset`)
+    /// beats the convention derived from the model's **output channels**. The
+    /// convention is a last resort, not a default: it is how a model that has
+    /// never been told anything still drifts away from a picture, and it is the
+    /// behaviour that predates the other two.
+    ///
+    /// It resolves a *name*, never a file's contents, and it does not care
+    /// whether the file exists — the caller decides what a missing one means,
+    /// and the answer differs by source: named and missing is an error, derived
+    /// and missing is a fallback onto pure noise.
+    ///
+    /// Relative paths resolve by source, and the two rules are not an
+    /// inconsistency: a **flag** is typed at a shell and keeps the shell's
+    /// meaning (relative to the working directory), while a **config** entry is
+    /// stored and re-read from wherever the binary happens to run, so it is
+    /// taken against the project root — that is what lets a `config_file` say
+    /// `datasets/elephants256.batraw` and still mean it tomorrow.
+    pub fn resolve_seed_dataset(
+        &self,
+        flag: Option<&str>,
+        configured: Option<&str>,
+        output_channels: u32,
+    ) -> Option<SeedDatasetChoice> {
+        let (named, source) = match (flag, configured) {
+            (Some(path), _) => (PathBuf::from(path), SeedSource::Flag),
+            (None, Some(path)) => (PathBuf::from(path), SeedSource::Config),
+            (None, None) => (
+                PathBuf::from(default_seed_dataset_name(output_channels)?),
+                SeedSource::Convention,
+            ),
+        };
+        let path = match (named.is_absolute(), source) {
+            (true, _) | (false, SeedSource::Flag) => named,
+            (false, SeedSource::Config) => self.root.join(named),
+            // The convention names a bare file, and `datasets/` is where this
+            // host keeps them.
+            (false, SeedSource::Convention) => self.root.join("datasets").join(named),
+        };
+        Some(SeedDatasetChoice { path, source })
+    }
+
     pub fn list_datasets(&self) -> io::Result<Vec<String>> {
         let mut datasets = Vec::new();
         let dir = self.datasets_dir()?;
@@ -1021,6 +1066,65 @@ pub fn list_datasets() -> io::Result<Vec<String>> {
     Storage::default().list_datasets()
 }
 
+pub fn resolve_seed_dataset(
+    flag: Option<&str>,
+    configured: Option<&str>,
+    output_channels: u32,
+) -> Option<SeedDatasetChoice> {
+    Storage::default().resolve_seed_dataset(flag, configured, output_channels)
+}
+
+/// Which of the three sources named the dataset a drift sets out from.
+///
+/// Carried rather than recomputed, so the banner and the monitor panel can say
+/// *why* the run is looking at these pictures. "origine → image du dataset X"
+/// alone left the one question a surprised user actually has — "why THAT
+/// dataset?" — unanswered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedSource {
+    /// `--seed-dataset` on the command line.
+    Flag,
+    /// `seed_dataset` in the model's `config_file`.
+    Config,
+    /// Neither: derived from the model's output channels.
+    Convention,
+}
+
+impl SeedSource {
+    /// How the banner names this source. Short, and unambiguous about which of
+    /// the three won — that is the whole reason it is printed.
+    pub const fn label(self) -> &'static str {
+        match self {
+            SeedSource::Flag => "--seed-dataset",
+            SeedSource::Config => "config_file",
+            SeedSource::Convention => "défaut par canaux",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedDatasetChoice {
+    pub path: PathBuf,
+    pub source: SeedSource,
+}
+
+/// The dataset a model of `channels` output channels drifts away from when
+/// nothing names one.
+///
+/// Derived from the model's **output** geometry rather than guessed: handing a
+/// greyscale drift the RGB file would not error — the loader would flatten it —
+/// and the run would quietly set out from a mangled picture.
+///
+/// `None` for a geometry neither file matches: there is nothing to default to,
+/// and inventing one would drift away from the wrong images.
+pub const fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
+    match channels {
+        1 => Some("cifar10_grey.batraw"),
+        3 => Some("cifar10_rgb.batraw"),
+        _ => None,
+    }
+}
+
 /// `(sample_count, width, height, channels, value_bytes)` from a `.batraw`
 /// header.
 ///
@@ -1111,6 +1215,7 @@ mod tests {
             input_size: (8, 8, 1),
             layers: Vec::new(),
             inference: InferenceConfig::default(),
+            seed_dataset: None,
             run: RunConfig {
                 mode: RunMode::Infer,
             },
@@ -1183,6 +1288,79 @@ mod tests {
             read_batraw_header(&bogus).is_none(),
             "an unknown magic must stay refused"
         );
+    }
+
+    /// The convention is derived from the model's **output** channels, and it
+    /// answers for exactly the two geometries this project has files for.
+    /// A wrong answer here does not error anywhere — the loader would flatten
+    /// or replicate — it just drifts away from a mangled picture.
+    #[test]
+    fn the_convention_follows_the_models_output_channels() {
+        assert_eq!(default_seed_dataset_name(1), Some("cifar10_grey.batraw"));
+        assert_eq!(default_seed_dataset_name(3), Some("cifar10_rgb.batraw"));
+        assert_eq!(default_seed_dataset_name(2), None);
+        assert_eq!(default_seed_dataset_name(0), None);
+    }
+
+    /// **The ranking, in the one place that owns it**: flag, then config, then
+    /// the channel convention.
+    ///
+    /// And the relative-path rules that go with it, which are not the same for
+    /// the two named sources on purpose: a flag is typed at a shell and keeps
+    /// the shell's meaning, a config entry is stored and re-read from wherever
+    /// the binary runs, so it is anchored to the project root.
+    #[test]
+    fn the_seed_dataset_ranking_is_flag_then_config_then_convention() {
+        let temp = TempRoot::new("seed-ranking");
+        let storage = temp.storage();
+        let root = temp.path();
+
+        let choice = storage
+            .resolve_seed_dataset(Some("/abs/flag.batraw"), Some("datasets/config.batraw"), 3)
+            .expect("a flag always resolves");
+        assert_eq!(choice.source, SeedSource::Flag);
+        assert_eq!(choice.path, PathBuf::from("/abs/flag.batraw"));
+
+        let choice = storage
+            .resolve_seed_dataset(None, Some("datasets/elephants256.batraw"), 3)
+            .expect("a configured dataset resolves");
+        assert_eq!(choice.source, SeedSource::Config);
+        assert_eq!(
+            choice.path,
+            root.join("datasets/elephants256.batraw"),
+            "a relative config path is anchored to the project root, or a \
+             config_file stops meaning the same thing tomorrow"
+        );
+
+        let choice = storage
+            .resolve_seed_dataset(None, None, 3)
+            .expect("three channels have a convention");
+        assert_eq!(choice.source, SeedSource::Convention);
+        assert_eq!(choice.path, root.join("datasets/cifar10_rgb.batraw"));
+
+        let choice = storage
+            .resolve_seed_dataset(None, None, 1)
+            .expect("one channel has a convention");
+        assert_eq!(choice.path, root.join("datasets/cifar10_grey.batraw"));
+
+        assert!(
+            storage.resolve_seed_dataset(None, None, 7).is_none(),
+            "a geometry no built-in file matches must resolve to nothing rather \
+             than to the wrong pictures"
+        );
+
+        // A flag keeps the shell's meaning: relative stays relative.
+        let choice = storage
+            .resolve_seed_dataset(Some("some/where.batraw"), None, 3)
+            .expect("a relative flag resolves");
+        assert_eq!(choice.path, PathBuf::from("some/where.batraw"));
+
+        // An absolute config path is taken as it stands.
+        let absolute = root.join("elsewhere.batraw");
+        let choice = storage
+            .resolve_seed_dataset(None, Some(&absolute.to_string_lossy()), 3)
+            .expect("an absolute config path resolves");
+        assert_eq!(choice.path, absolute);
     }
 
     fn seed_model(storage: &Storage, name: &str) {

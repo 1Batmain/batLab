@@ -341,6 +341,32 @@ static PERPETUAL_HELP: &[HelpEntry] = &[
         source: Some("PERPETUAL_INFERENCE.md"),
     },
     HelpEntry {
+        title: "Seed Dataset",
+        body: &[
+            "Le dataset dont la dérive tire son image de départ — et [r] la \
+             suivante. C'est ce qui rend un modèle spécialisé cohérent : \
+             Elephants_XL partait d'un camion CIFAR au hasard tant que ce \
+             réglage existait dans le format de config sans être lu nulle part.",
+            "",
+            "Trois sources, dans cet ordre : le drapeau --seed-dataset, puis ce \
+             réglage (enregistré dans le config_file du modèle, donc à régler \
+             UNE fois), puis le défaut par canaux de sortie — 1 → \
+             cifar10_grey.batraw, 3 → cifar10_rgb.batraw. La bannière et le \
+             panneau du moniteur disent laquelle des trois a gagné.",
+            "",
+            "[Entrée] ou [→] ouvre la liste de datasets/. Un dataset dont les \
+             CANAUX ne collent pas au modèle y est refusé, pas redimensionné : \
+             un fichier gris donné à un modèle couleur serait répliqué sur R, G \
+             et B — ça « marche », et la dérive part d'une image grise qui se \
+             fait passer pour de la couleur. La largeur et la hauteur, elles, \
+             sont rééchantillonnées : c'est visible.",
+            "",
+            "Rien de trouvable → repli sur l'ancienne ouverture, bruit pur en \
+             haut du schedule, annoncé à l'écran.",
+        ],
+        source: Some("SEED_DATASET.md, IMG2IMG_DRIFT.md"),
+    },
+    HelpEntry {
         title: "Regime",
         body: &[
             "errance — descend jusqu'à t=0, l'image se résout complètement, puis \
