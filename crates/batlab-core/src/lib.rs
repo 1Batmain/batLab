@@ -60,5 +60,5 @@ pub use model::{
     ActivationMethod, ActivationType, AttentionType, AdamHyperparameters, CheckpointLoad,
     AddType, CheckpointWeights, ConcatType, ConvolutionType, Dim3, EmaConfig,
     FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, ModelError, OptimizerKind,
-    PaddingMode, UpsampleConvType, WeightInit,
+    PaddingMode, TimeBiasType, UpsampleConvType, WeightInit,
 };

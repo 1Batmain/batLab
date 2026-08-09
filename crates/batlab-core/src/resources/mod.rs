@@ -35,7 +35,7 @@ use crate::model::error::ModelError;
 use crate::model::layer_types::{
     ActivationType, AddType, AttentionType, BackwardBufferSource, ConcatType, ConvolutionType,
     ForwardBufferSource, FullyConnectedType, GroupNormType, LayerType, LayerTypes, LossMethod,
-    LossType, UpsampleConvType,
+    LossType, TimeBiasType, UpsampleConvType,
 };
 use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
@@ -901,6 +901,17 @@ pub fn plan_graph(
                         key: skip_key.clone(),
                     })?,
             ),
+            // TimeBias resolves its referenced tensor the same way; `skip_dim`
+            // carries that tensor's geometry so layer_type_of can size the
+            // per-sample stride into the embedding.
+            LayerDraft::TimeBias { time_key, .. } => Some(
+                saved
+                    .get(time_key)
+                    .map(|&index| layers[index].get_dim_output())
+                    .ok_or_else(|| ModelError::MissingSavedOutput {
+                        key: time_key.clone(),
+                    })?,
+            ),
             _ => None,
         };
         let mut ty = layer_type_of(draft, skip_dim);
@@ -995,6 +1006,22 @@ pub fn layer_type_of(draft: &LayerDraft, skip_dim: Option<Dim3>) -> LayerTypes {
             Dim3::default(),
             skip_dim.unwrap_or_else(|| Dim3::new(*dim_skip)),
         )),
+        LayerDraft::TimeBias {
+            time_key,
+            embed_offset,
+            embed_channels,
+            ..
+        } => {
+            let time_dim = skip_dim.unwrap_or_default();
+            let time_sample_len = time_dim.x * time_dim.y * time_dim.z;
+            LayerTypes::TimeBias(TimeBiasType::new(
+                time_key.clone(),
+                Dim3::default(),
+                *embed_offset,
+                *embed_channels,
+                time_sample_len,
+            ))
+        }
     }
 }
 

@@ -53,6 +53,12 @@ pub enum ModelError {
         input: Dim3,
         skip: Dim3,
     },
+    /// A `TimeBias` was declared with nothing to project — zero embedding
+    /// channels. Its whole purpose is to carry the timestep into the block, so
+    /// an empty projection is a mis-wire, refused rather than built as a no-op.
+    TimeBiasNoEmbedding {
+        time_key: String,
+    },
     CheckpointIo {
         path: String,
         message: String,
@@ -133,6 +139,11 @@ impl Display for ModelError {
                  input=({}, {}, {}), skip=({}, {}, {}) — a block that changes width needs a \
                  1x1 convolution on the shortcut to realign it",
                 input.x, input.y, input.z, skip.x, skip.y, skip.z
+            ),
+            ModelError::TimeBiasNoEmbedding { time_key } => write!(
+                f,
+                "TimeBias('{time_key}') has zero embedding channels to project — nothing to \
+                 inject; set embed_channels to the timestep channels of the referenced tensor"
             ),
             ModelError::CheckpointIo { path, message } => {
                 write!(f, "checkpoint I/O error at '{path}': {message}")

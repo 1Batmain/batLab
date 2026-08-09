@@ -858,6 +858,17 @@ fn add_field_defaults() -> Vec<String> {
     vec!["".into(), "".into()]
 }
 
+// TimeBias reads the timestep embedding from a saved tensor (Time Key) and
+// projects channels [Embed Offset, Embed Offset + Embed Channels) into a
+// per-channel bias.
+fn time_bias_field_names() -> Vec<&'static str> {
+    vec!["Time Key", "Embed Offset", "Embed Channels", "Save As"]
+}
+
+fn time_bias_field_defaults() -> Vec<String> {
+    vec!["".into(), "1".into(), "3".into(), "".into()]
+}
+
 fn is_toggle_field(name: &str) -> bool {
     matches!(name, "Padding" | "Method")
 }
@@ -1453,6 +1464,7 @@ impl App {
             LayerKind::UpsampleConv => upsample_conv_field_names(),
             LayerKind::Concat => concat_field_names(),
             LayerKind::Add => add_field_names(),
+            LayerKind::TimeBias => time_bias_field_names(),
         }
     }
 
@@ -1466,6 +1478,7 @@ impl App {
             LayerKind::UpsampleConv => upsample_conv_field_defaults(),
             LayerKind::Concat => concat_field_defaults(),
             LayerKind::Add => add_field_defaults(),
+            LayerKind::TimeBias => time_bias_field_defaults(),
         };
         self.layer_builder.field_idx = 0;
         self.layer_builder.error = None;
@@ -1586,6 +1599,14 @@ impl App {
                 if dim_skip != inferred {
                     return None;
                 }
+                Some(inferred)
+            }
+            // Shape-preserving as long as the referenced tensor exists.
+            LayerKind::TimeBias => {
+                let names = self.layer_field_names();
+                let idx = names.iter().position(|&n| n == "Time Key")?;
+                let time_key = normalize_key(lb.fields.get(idx)?)?;
+                self.saved_output_dims().get(&time_key)?;
                 Some(inferred)
             }
         }
@@ -1795,6 +1816,34 @@ impl App {
                     save_key: parse_save_key()?,
                 })
             }
+            LayerKind::TimeBias => {
+                let key_idx = names.iter().position(|&n| n == "Time Key").unwrap();
+                let time_key = normalize_key(&fields[key_idx])
+                    .ok_or_else(|| "Time Key must not be empty".to_string())?;
+                let time_dim = existing_saved
+                    .get(&time_key)
+                    .copied()
+                    .ok_or_else(|| format!("Unknown time key '{time_key}'"))?;
+                let embed_offset = parse_u32("Embed Offset")?;
+                let embed_channels = parse_u32("Embed Channels")?;
+                if embed_channels == 0 {
+                    return Err("Embed Channels must be > 0".into());
+                }
+                if embed_offset + embed_channels > time_dim.2 {
+                    return Err(format!(
+                        "Embed Offset+Channels ({}) exceeds the {}-channel tensor '{time_key}'",
+                        embed_offset + embed_channels,
+                        time_dim.2
+                    ));
+                }
+                Ok(LayerDraft::TimeBias {
+                    dim_input: inferred,
+                    time_key,
+                    embed_offset,
+                    embed_channels,
+                    save_key: parse_save_key()?,
+                })
+            }
         }
     }
 
@@ -1825,6 +1874,7 @@ impl App {
             LayerDraft::UpsampleConv { .. } => LayerKind::UpsampleConv,
             LayerDraft::Concat { .. } => LayerKind::Concat,
             LayerDraft::Add { .. } => LayerKind::Add,
+            LayerDraft::TimeBias { .. } => LayerKind::TimeBias,
         };
         self.layer_builder.fields = match &layer {
             LayerDraft::Convolution {
@@ -1894,6 +1944,18 @@ impl App {
                 skip_key, save_key, ..
             } => vec![
                 skip_key.clone(),
+                save_key.as_deref().unwrap_or("").to_string(),
+            ],
+            LayerDraft::TimeBias {
+                time_key,
+                embed_offset,
+                embed_channels,
+                save_key,
+                ..
+            } => vec![
+                time_key.clone(),
+                embed_offset.to_string(),
+                embed_channels.to_string(),
                 save_key.as_deref().unwrap_or("").to_string(),
             ],
         };
@@ -2124,14 +2186,15 @@ impl App {
             LayerKind::FullyConnected => LayerKind::UpsampleConv,
             LayerKind::UpsampleConv => LayerKind::Concat,
             LayerKind::Concat => LayerKind::Add,
-            LayerKind::Add => LayerKind::Convolution,
+            LayerKind::Add => LayerKind::TimeBias,
+            LayerKind::TimeBias => LayerKind::Convolution,
         };
         self.reset_layer_form();
     }
 
     pub fn cycle_kind_backward(&mut self) {
         self.layer_builder.current_kind = match self.layer_builder.current_kind {
-            LayerKind::Convolution => LayerKind::Add,
+            LayerKind::Convolution => LayerKind::TimeBias,
             LayerKind::GroupNorm => LayerKind::Convolution,
             LayerKind::Attention => LayerKind::GroupNorm,
             LayerKind::Activation => LayerKind::Attention,
@@ -2139,6 +2202,7 @@ impl App {
             LayerKind::UpsampleConv => LayerKind::FullyConnected,
             LayerKind::Concat => LayerKind::UpsampleConv,
             LayerKind::Add => LayerKind::Concat,
+            LayerKind::TimeBias => LayerKind::Add,
         };
         self.reset_layer_form();
     }
@@ -3263,13 +3327,13 @@ mod tests {
         let (_temp, mut app) = test_app("cycle-kind");
         app.layer_builder.current_kind = LayerKind::Convolution;
 
-        // Add is the last kind in the ring, so stepping back from the first
-        // (Convolution) lands on it, then on Concat.
+        // TimeBias is the last kind in the ring, so stepping back from the first
+        // (Convolution) lands on it, then on Add.
         app.cycle_kind_backward();
-        assert_eq!(app.layer_builder.current_kind, LayerKind::Add);
+        assert_eq!(app.layer_builder.current_kind, LayerKind::TimeBias);
 
         app.cycle_kind_backward();
-        assert_eq!(app.layer_builder.current_kind, LayerKind::Concat);
+        assert_eq!(app.layer_builder.current_kind, LayerKind::Add);
     }
 
     /// The front door is the model list. `Screen::LoadPath` — its ancestor —

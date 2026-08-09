@@ -5,7 +5,9 @@ use crate::model::debug::{LayerDebugView, read_back_f32, read_back_f32_at};
 use crate::model::ema::EmaConfig;
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
-use crate::model::layer_types::{AddType, ConcatType, LayerType, LayerTypes, LossMethod, LossType};
+use crate::model::layer_types::{
+    AddType, ConcatType, LayerType, LayerTypes, LossMethod, LossType, TimeBiasType,
+};
 use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
 use crate::model::weight_init::WeightInit;
@@ -1346,6 +1348,14 @@ impl<State> Model<State> {
             crate::config::LayerDraft::Add { skip_key, .. } => {
                 self.add_residual(skip_key.clone())?;
             }
+            crate::config::LayerDraft::TimeBias {
+                time_key,
+                embed_offset,
+                embed_channels,
+                ..
+            } => {
+                self.add_time_bias(time_key.clone(), *embed_offset, *embed_channels)?;
+            }
             other => {
                 self.add_layer(crate::resources::layer_type_of(other, None))?;
             }
@@ -1417,6 +1427,41 @@ impl<State> Model<State> {
         let mut layer = Layer::new(
             &self.gpu.device,
             LayerTypes::Add(AddType::new(key, Dim3::default(), skip_dim)),
+            last_output,
+        )?;
+        layer.index = self.layers.len();
+        self.layers.push(layer);
+        Ok(())
+    }
+
+    /// Insert a `TimeBias`: it reads the timestep embedding from a saved tensor
+    /// (`time_key`, a copy of the model input) and adds a learned per-channel
+    /// bias. The referenced tensor's geometry gives the per-sample stride the
+    /// shader needs to find each sample's embedding.
+    pub fn add_time_bias(
+        &mut self,
+        time_key: impl Into<String>,
+        embed_offset: u32,
+        embed_channels: u32,
+    ) -> Result<(), ModelError> {
+        let key = time_key.into();
+        let source_index = self
+            .saved_outputs
+            .get(&key)
+            .copied()
+            .ok_or_else(|| ModelError::MissingSavedOutput { key: key.clone() })?;
+        let time_dim = self.layers[source_index].ty.get_dim_output();
+        let time_sample_len = time_dim.x * time_dim.y * time_dim.z;
+        let last_output = self.layers.last().map(|l| l.ty.get_dim_output());
+        let mut layer = Layer::new(
+            &self.gpu.device,
+            LayerTypes::TimeBias(TimeBiasType::new(
+                key,
+                Dim3::default(),
+                embed_offset,
+                embed_channels,
+                time_sample_len,
+            )),
             last_output,
         )?;
         layer.index = self.layers.len();
