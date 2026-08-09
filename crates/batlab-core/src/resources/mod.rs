@@ -33,9 +33,9 @@ use crate::gpu_context::{GpuContext, GpuLimitsProfile};
 use crate::model::ema::EmaSpecs;
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
-    ActivationType, AttentionType, BackwardBufferSource, ConcatType, ConvolutionType,
+    ActivationType, AddType, AttentionType, BackwardBufferSource, ConcatType, ConvolutionType,
     ForwardBufferSource, FullyConnectedType, GroupNormType, LayerType, LayerTypes, LossMethod,
-    LossType, UpsampleConvType,
+    LossType, TimeBiasType, UpsampleConvType,
 };
 use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
@@ -893,12 +893,23 @@ pub fn plan_graph(
     for draft in drafts {
         let last_output = layers.last().map(|l: &LayerTypes| l.get_dim_output());
         let skip_dim = match draft {
-            LayerDraft::Concat { skip_key, .. } => Some(
+            LayerDraft::Concat { skip_key, .. } | LayerDraft::Add { skip_key, .. } => Some(
                 saved
                     .get(skip_key)
                     .map(|&index| layers[index].get_dim_output())
                     .ok_or_else(|| ModelError::MissingSavedOutput {
                         key: skip_key.clone(),
+                    })?,
+            ),
+            // TimeBias resolves its referenced tensor the same way; `skip_dim`
+            // carries that tensor's geometry so layer_type_of can size the
+            // per-sample stride into the embedding.
+            LayerDraft::TimeBias { time_key, .. } => Some(
+                saved
+                    .get(time_key)
+                    .map(|&index| layers[index].get_dim_output())
+                    .ok_or_else(|| ModelError::MissingSavedOutput {
+                        key: time_key.clone(),
                     })?,
             ),
             _ => None,
@@ -988,6 +999,29 @@ pub fn layer_type_of(draft: &LayerDraft, skip_dim: Option<Dim3>) -> LayerTypes {
             Dim3::default(),
             skip_dim.unwrap_or_else(|| Dim3::new(*dim_skip)),
         )),
+        LayerDraft::Add {
+            dim_skip, skip_key, ..
+        } => LayerTypes::Add(AddType::new(
+            skip_key.clone(),
+            Dim3::default(),
+            skip_dim.unwrap_or_else(|| Dim3::new(*dim_skip)),
+        )),
+        LayerDraft::TimeBias {
+            time_key,
+            embed_offset,
+            embed_channels,
+            ..
+        } => {
+            let time_dim = skip_dim.unwrap_or_default();
+            let time_sample_len = time_dim.x * time_dim.y * time_dim.z;
+            LayerTypes::TimeBias(TimeBiasType::new(
+                time_key.clone(),
+                Dim3::default(),
+                *embed_offset,
+                *embed_channels,
+                time_sample_len,
+            ))
+        }
     }
 }
 

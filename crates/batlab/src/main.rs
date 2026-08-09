@@ -14,10 +14,11 @@ use batlab_ui::tui::{
 };
 use batlab_core::{
     CheckpointWeights, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame, DiffusionTask, DriftAction,
-    DriftWalk, EmaConfig, GpuContext, GpuDataset, GpuLimitsProfile, LinearNoiseSchedule, LiveFrame,
+    DriftWalk, EmaConfig, EvalConfig, EvalReport, GpuContext, GpuDataset, GpuLimitsProfile,
+    LinearNoiseSchedule, LiveFrame,
     LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind, PerpetualDrift,
-    ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, log_probe, log_train_loss,
-    log_trajectory, model::Training, probe_diffusion, sample_diffusion,
+    ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, evaluate, log_probe,
+    log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
@@ -64,6 +65,9 @@ are not reachable from the TUI and never write back a model's config_file.
       [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
       [--frames N] [--actions N] [--window] [--climb-frames N] [--out <dir>]
       [--raw-weights]
+
+  --eval <model> --ckpt <path> [--ckpt <path> ...] --dataset <path>
+      [--samples N] [--buckets N] [--t-per-bucket N] [--seed N] [--raw-weights]
 
   --resources <model> [--batch N] [--dataset <path>] [--measure] [--steps N]
       [--inference] [--vram GiB] [--device <name>] [--no-gpu] [--width N]
@@ -129,6 +133,32 @@ What the model costs on the GPU:
                     limits (128 MiB storage bindings, 256 MiB buffers) — which
                     is what a browser grants the visitor's GPU.
   --no-gpu          same, unnamed: never opens an adapter.
+
+How good a checkpoint actually is (architecture arbitration):
+  --eval            score one or more checkpoints on a HELD-OUT, DETERMINISTIC
+                    slice — the same images, timesteps and noise fields every
+                    time and for every checkpoint, so a difference in the numbers
+                    is a difference in the weights and nothing else. Reports
+                    MSE(ε̂, ε) per timestep bucket AND the same error carried into
+                    image space (x₀-MSE = (1-ᾱ)/ᾱ · ε-MSE), because ε-MSE alone
+                    inverts the schedule's importance: at high t a copy of the
+                    input is already near-exact. Each row is set against the three
+                    zero-parameter baselines of tools/trivial_baselines.py
+                    (ε̂=0, ε̂=x_t, ε̂=mean) — a model that does not beat ε̂=mean in
+                    x₀ has only learned the dataset average.
+  --ckpt <path>     a checkpoint to score. Repeatable: pass several to get one
+                    comparison table across them (this is how two architectures
+                    are compared after paired training).
+  --dataset <path>  the .batraw the held-out images and the mean image come from.
+  --samples N       held-out images (default 256), taken from the TAIL of the
+                    dataset; the mean image is built from the head, so the two do
+                    not overlap.
+  --buckets N       timestep buckets the schedule is split into (default 4).
+  --t-per-bucket N  timesteps drawn inside each bucket (default 4).
+  --seed N          base seed for the noise draws (default 7). Fixed across
+                    checkpoints — that is what makes them comparable.
+  --raw-weights     score the last iterate; by default the average is used when
+                    the checkpoint carries one, exactly as sampling does.
 
 Which GPU limits the run asks for:
   --gpu-limits native|web
@@ -434,6 +464,15 @@ fn main() {
         if args.iter().any(|arg| arg == "--headless-perpetual") {
             if let Err(err) = run_headless_perpetual(&args) {
                 eprintln!("headless perpetual failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
+        // DEV/CI ONLY — held-out ε/x₀ evaluation of one or more checkpoints.
+        if args.iter().any(|arg| arg == "--eval") {
+            if let Err(err) = run_eval(&args) {
+                eprintln!("eval failed: {err}");
                 std::process::exit(1);
             }
             return;
@@ -965,6 +1004,355 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         );
         Ok::<(), String>(())
     })
+}
+
+/// See the DEV/CI note in `main`. Not reachable from the TUI.
+///
+/// The instrument the architecture mission is built on: a way to say *this
+/// checkpoint is better than that one* that is not "look at the picture". It
+/// scores one or more checkpoints on a held-out, deterministic slice — the same
+/// images, the same timesteps, the same noise fields for every checkpoint — so a
+/// difference in the numbers is a difference in the weights and nothing else.
+///
+/// Reports MSE(ε̂, ε) per timestep bucket and the same error in image space
+/// (x₀), against the three trivial baselines of `tools/trivial_baselines.py`.
+/// Every arbitration later in the mission goes through this, exactly because the
+/// EMA one could not — the repo had no ε evaluator, so a 4.9 % weight change
+/// could only be judged by eye (`docs/reports/EMA.md`).
+fn run_eval(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    reject_unknown_flags(
+        args,
+        &[
+            "--eval",
+            "--ckpt",
+            "--dataset",
+            "--samples",
+            "--buckets",
+            "--t-per-bucket",
+            "--seed",
+            "--gpu-limits",
+        ],
+        &["--raw-weights"],
+    )?;
+
+    let model_name = flag("--eval").ok_or_else(|| "--eval requires a model name".to_string())?;
+
+    // Every `--ckpt <path>`, in order — this is the flag that makes the table a
+    // comparison rather than a single score.
+    let checkpoints: Vec<PathBuf> = args
+        .iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == "--ckpt")
+        .filter_map(|(i, _)| args.get(i + 1))
+        .map(PathBuf::from)
+        .collect();
+    if checkpoints.is_empty() {
+        return Err("--eval requires at least one --ckpt <path>".to_string());
+    }
+    for ckpt in &checkpoints {
+        if !ckpt.exists() {
+            return Err(format!("checkpoint does not exist: {}", ckpt.display()));
+        }
+    }
+
+    let dataset_path =
+        flag("--dataset").ok_or_else(|| "--dataset <path to .batraw> is required".to_string())?;
+    let requested_samples = flag("--samples")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256)
+        .max(1);
+    let buckets = flag("--buckets")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    let t_per_bucket = flag("--t-per-bucket")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        .max(1);
+    let seed = flag("--seed").and_then(|v| v.parse::<u64>().ok()).unwrap_or(7);
+    let weights = weights_source(args);
+
+    let config_path = storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+    rt.block_on(async {
+        let (_gpu, mut model) = build_execution_model(
+            &config,
+            INFERENCE_RUNTIME_LR,
+            INFERENCE_RUNTIME_BATCH_SIZE,
+            OptimizerKind::default(),
+            WeightInit::default(),
+            None,
+        )
+        .await?;
+
+        let input_dims = model
+            .input_dim()
+            .ok_or_else(|| "model has no input dimensions".to_string())?;
+        let output_dims = model
+            .output_dim()
+            .ok_or_else(|| "model has no output dimensions".to_string())?;
+        let output_size = (output_dims.x, output_dims.y, output_dims.z);
+        let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
+
+        let dataset = load_dataset(&dataset_path, output_size)?;
+        let total = dataset.len();
+        if total == 0 {
+            return Err(format!("dataset {dataset_path} is empty"));
+        }
+        let eval_count = requested_samples.min(total);
+        // Held-out images from the TAIL; the mean image from the HEAD, so the
+        // two do not overlap. When the dataset is smaller than the ask, the head
+        // is empty and the mean falls back to the whole set (said out loud).
+        let held_start = total - eval_count;
+        let held: Vec<Vec<f32>> = (0..eval_count)
+            .map(|k| dataset.sample(held_start + k))
+            .collect();
+        let mean_count = if held_start == 0 {
+            total
+        } else {
+            held_start.min(20_000)
+        };
+        let mut mean_image = vec![0.0f64; output_len];
+        for index in 0..mean_count {
+            for (acc, value) in mean_image.iter_mut().zip(dataset.sample(index).iter()) {
+                *acc += *value as f64;
+            }
+        }
+        let mean_image: Vec<f32> = mean_image
+            .iter()
+            .map(|v| (*v / mean_count as f64) as f32)
+            .collect();
+        if held_start == 0 {
+            eprintln!(
+                "[eval] note: dataset has {total} images but {requested_samples} were asked for; \
+                 the held-out set and the mean-image pool overlap."
+            );
+        }
+
+        let schedule = LinearNoiseSchedule::new_linear(
+            DIFFUSION_SCHEDULE_STEPS,
+            DIFFUSION_BETA_START,
+            DIFFUSION_BETA_END,
+        );
+        let cfg = EvalConfig {
+            buckets,
+            t_per_bucket,
+            seed,
+        };
+
+        let mut reports: Vec<(PathBuf, EvalReport)> = Vec::with_capacity(checkpoints.len());
+        for ckpt in &checkpoints {
+            load_sampling_checkpoint(&mut model, ckpt, weights)?;
+            let report = evaluate(
+                &schedule,
+                &held,
+                &mean_image,
+                input_dims.z as usize,
+                output_dims.z as usize,
+                &cfg,
+                |input| model.predict(input),
+            );
+            reports.push((ckpt.clone(), report));
+        }
+
+        print_eval_table(
+            &model_name,
+            &dataset_path,
+            eval_count,
+            mean_count,
+            &cfg,
+            weights,
+            &reports,
+        );
+        Ok::<(), String>(())
+    })
+}
+
+/// The comparison table `--eval` prints. Presentation only: every number comes
+/// from the engine's [`evaluate`], so the host decides layout, never arithmetic.
+///
+/// Two blocks, both against the same baselines (which are identical across
+/// checkpoints — same draws — so they are read off the first report):
+///   - ε-MSE per bucket, the training objective resolved per timestep range;
+///   - x₀-RMSE per bucket, the error in image units [-1, 1], where the high-t
+///     buckets are where the global content of a sample is actually decided.
+/// The verdict a reader wants is the last line: does the checkpoint beat the
+/// "learned only the mean" baseline in x₀ at high t.
+fn print_eval_table(
+    model_name: &str,
+    dataset_path: &str,
+    eval_count: usize,
+    mean_count: usize,
+    cfg: &EvalConfig,
+    weights: CheckpointWeights,
+    reports: &[(PathBuf, EvalReport)],
+) {
+    let weight_label = match weights {
+        CheckpointWeights::Ema => "average when present (--raw-weights to force the iterate)",
+        CheckpointWeights::Raw => "raw iterate (--raw-weights)",
+    };
+    println!(
+        "\neval '{model_name}': {eval_count} held-out images (tail), mean image over {mean_count} \
+         (head)\n  dataset={dataset_path}  buckets={}  t/bucket={}  seed={}  weights={weight_label}",
+        cfg.buckets, cfg.t_per_bucket, cfg.seed
+    );
+
+    let Some((_, first)) = reports.first() else {
+        return;
+    };
+    let bucket_headers: Vec<String> = first
+        .model
+        .iter()
+        .map(|b| format!("t[{}-{})", b.t_lo, b.t_hi))
+        .collect();
+
+    // A run label short enough for a table: the file stem, trimmed on the left
+    // (the date/suffix that distinguishes two runs lives at the end).
+    let label_of = |path: &Path| -> String {
+        let stem = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("<ckpt>")
+            .to_string();
+        if stem.len() > 22 {
+            format!("…{}", &stem[stem.len() - 21..])
+        } else {
+            stem
+        }
+    };
+
+    let name_w = reports
+        .iter()
+        .map(|(p, _)| label_of(p).len())
+        .chain(std::iter::once("ε̂=mean".len()))
+        .max()
+        .unwrap_or(12)
+        .max(12);
+    let col_w = 11usize;
+    let header_cell = |s: &str| format!("{s:>col_w$}");
+
+    // ---- ε-MSE ---------------------------------------------------------
+    println!("\nε-MSE per timestep bucket (lower is better; the training objective):");
+    let mut head = format!("{:<name_w$}", "checkpoint");
+    for h in &bucket_headers {
+        head.push_str(&header_cell(h));
+    }
+    head.push_str(&header_cell("all"));
+    println!("{head}");
+    for (path, report) in reports {
+        let mut row = format!("{:<name_w$}", label_of(path));
+        for b in &report.model {
+            row.push_str(&header_cell(&format!("{:.4}", b.eps_mse())));
+        }
+        row.push_str(&header_cell(&format!("{:.4}", report.total_eps_mse())));
+        println!("{row}");
+    }
+    println!("{}", "-".repeat(name_w + col_w * (bucket_headers.len() + 1)));
+    let baseline_eps_row = |label: &str, pick: &dyn Fn(&batlab_core::BaselineBucket) -> f64| {
+        let mut row = format!("{:<name_w$}", label);
+        for b in &first.baselines {
+            row.push_str(&header_cell(&format!("{:.4}", pick(b))));
+        }
+        row
+    };
+    println!("{}", baseline_eps_row("ε̂=x_t", &|b| b.eps_copy()));
+    println!("{}", baseline_eps_row("ε̂=mean", &|b| b.eps_mean()));
+    println!("{}", baseline_eps_row("ε̂=0", &|b| b.eps_zero()));
+
+    // ---- x₀-RMSE (clipped reconstruction) ------------------------------
+    // Element-weighted mean of the per-bucket MSE — every bucket carries the
+    // same number of terms, so a plain mean is the whole-schedule error.
+    let overall = |vals: &[f64]| -> f64 {
+        if vals.is_empty() {
+            0.0
+        } else {
+            (vals.iter().sum::<f64>() / vals.len() as f64).sqrt()
+        }
+    };
+    println!(
+        "\nx₀-RMSE per bucket (clipped reconstruction, image units [-1,1]; lower is better):"
+    );
+    let mut head = format!("{:<name_w$}", "checkpoint");
+    for h in &bucket_headers {
+        head.push_str(&header_cell(h));
+    }
+    head.push_str(&header_cell("all"));
+    println!("{head}");
+    for (path, report) in reports {
+        let mut row = format!("{:<name_w$}", label_of(path));
+        let per: Vec<f64> = report.model.iter().map(|b| b.x0_mse()).collect();
+        for m in &per {
+            row.push_str(&header_cell(&format!("{:.4}", m.sqrt())));
+        }
+        row.push_str(&header_cell(&format!("{:.4}", overall(&per))));
+        println!("{row}");
+    }
+    println!("{}", "-".repeat(name_w + col_w * (bucket_headers.len() + 1)));
+    let baseline_x0_row = |label: &str, pick: &dyn Fn(&batlab_core::BaselineBucket) -> f64| {
+        let mut row = format!("{:<name_w$}", label);
+        let per: Vec<f64> = first.baselines.iter().map(|b| pick(b)).collect();
+        for v in &per {
+            row.push_str(&header_cell(&format!("{:.4}", v.sqrt())));
+        }
+        row.push_str(&header_cell(&format!("{:.4}", overall(&per))));
+        row
+    };
+    println!("{}", baseline_x0_row("ε̂=mean", &|b| b.x0_mean()));
+    println!("{}", baseline_x0_row("ε̂=x_t", &|b| b.x0_copy()));
+    println!("{}", baseline_x0_row("ε̂=0", &|b| b.x0_zero()));
+
+    // ---- verdict -------------------------------------------------------
+    // Two honest facts, no single pass/fail. The PRIMARY rank is whole-schedule
+    // ε-MSE, the training objective and what the full multi-step sampler tracks
+    // — that is the number to compare two architectures on. The SECONDARY read
+    // is per-bucket reconstruction against the "learned only the mean" baseline:
+    // a model beats it at the buckets where content is recoverable and cannot at
+    // the very top, where a one-shot x̂₀ is unlearnable for ANY model (which is
+    // why generation takes 256 steps, not one). An overall x₀ average would let
+    // that unlearnable bucket flip the verdict, so it is deliberately not one.
+    println!("\nverdict — primary rank: whole-schedule ε-MSE (lower is better):");
+    let mut ranked: Vec<(&PathBuf, f64)> = reports
+        .iter()
+        .map(|(p, r)| (p, r.total_eps_mse()))
+        .collect();
+    ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (rank, (path, eps)) in ranked.iter().enumerate() {
+        let marker = if rank == 0 { "  ← best" } else { "" };
+        println!("  {:>8.4}  {}{}", eps, label_of(path), marker);
+    }
+    println!("\n         reconstruction vs ε̂=mean (x₀-RMSE beaten, per bucket):");
+    for (path, report) in reports {
+        let beaten: Vec<&str> = report
+            .model
+            .iter()
+            .zip(first.baselines.iter())
+            .zip(bucket_headers.iter())
+            .filter(|((m, b), _)| m.x0_mse() < b.x0_mean())
+            .map(|((_, _), h)| h.as_str())
+            .collect();
+        let where_beaten = if beaten.is_empty() {
+            "none".to_string()
+        } else {
+            beaten.join(", ")
+        };
+        println!(
+            "  {}: beats the mean at {}/{} buckets ({})",
+            label_of(path),
+            beaten.len(),
+            bucket_headers.len(),
+            where_beaten
+        );
+    }
 }
 
 /// Every frame of a headless drift, both panes, as raw `f32`.

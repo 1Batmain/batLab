@@ -5,6 +5,7 @@ use crate::model::types::{BufferSpec, Dim3};
 use enum_dispatch::enum_dispatch;
 
 mod activation;
+mod add;
 mod attention;
 mod concat;
 mod convolution;
@@ -12,9 +13,11 @@ mod fully_connected;
 mod group_norm;
 mod loss;
 mod pooling;
+mod time_bias;
 mod upsample_conv;
 
 pub use activation::{ActivationMethod, ActivationType};
+pub use add::AddType;
 pub use attention::AttentionType;
 pub use concat::ConcatType;
 pub use convolution::ConvolutionType;
@@ -22,6 +25,7 @@ pub use fully_connected::FullyConnectedType;
 pub use group_norm::GroupNormType;
 pub use loss::{LossMethod, LossType};
 pub use pooling::PoolingType;
+pub use time_bias::TimeBiasType;
 pub use upsample_conv::UpsampleConvType;
 
 #[derive(Debug, Clone, Copy)]
@@ -226,6 +230,8 @@ pub enum LayerTypes {
     Activation(ActivationType),
     Attention(AttentionType),
     Concat(ConcatType),
+    Add(AddType),
+    TimeBias(TimeBiasType),
     FullyConnected(FullyConnectedType),
     GroupNorm(GroupNormType),
     UpsampleConv(UpsampleConvType),
@@ -243,6 +249,8 @@ impl LayerTypes {
             LayerTypes::Activation(_) => "Activation",
             LayerTypes::Attention(_) => "Attention",
             LayerTypes::Concat(_) => "Concat",
+            LayerTypes::Add(_) => "Add",
+            LayerTypes::TimeBias(_) => "TimeBias",
             LayerTypes::FullyConnected(_) => "FullyConnected",
             LayerTypes::GroupNorm(_) => "GroupNorm",
             LayerTypes::UpsampleConv(_) => "UpsampleConv",

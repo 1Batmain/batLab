@@ -15,8 +15,9 @@ pub mod weight_init;
 pub use ema::EmaConfig;
 pub use error::ModelError;
 pub use layer_types::{
-    ActivationMethod, ActivationType, AttentionType, ConcatType, ConvolutionType, FullyConnectedType,
-    GroupNormType, LayerTypes, LossMethod, LossType, UpsampleConvType,
+    ActivationMethod, ActivationType, AddType, AttentionType, ConcatType, ConvolutionType,
+    FullyConnectedType, GroupNormType, LayerTypes, LossMethod, LossType, TimeBiasType,
+    UpsampleConvType,
 };
 pub use model::{CheckpointLoad, CheckpointWeights, Infer, Model, Training};
 pub use optimizer::{AdamHyperparameters, OptimizerKind};
@@ -25,6 +26,8 @@ pub use weight_init::WeightInit;
 
 #[cfg(test)]
 mod adam_tests;
+#[cfg(test)]
+mod add_equivalence_tests;
 #[cfg(test)]
 mod attention_tests;
 #[cfg(test)]
@@ -37,5 +40,7 @@ mod conv_equivalence_tests;
 mod ema_tests;
 #[cfg(test)]
 mod group_norm_equivalence_tests;
+#[cfg(test)]
+mod time_bias_equivalence_tests;
 #[cfg(test)]
 mod upsample_conv_equivalence_tests;

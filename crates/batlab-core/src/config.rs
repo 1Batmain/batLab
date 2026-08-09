@@ -163,6 +163,27 @@ pub enum LayerDraft {
         skip_key: String,
         save_key: Option<String>,
     },
+    /// Short-range residual: `output = input + skip`, the two summed elementwise.
+    /// Where `Concat` widens, `Add` demands identical shapes and is refused at
+    /// build otherwise — see [`crate::model::layer_types::AddType`].
+    Add {
+        dim_input: (u32, u32, u32),
+        dim_skip: (u32, u32, u32),
+        skip_key: String,
+        save_key: Option<String>,
+    },
+    /// Per-channel bias projected from the timestep embedding and added to every
+    /// spatial position — DDPM's per-block timestep conditioning. Reads the
+    /// embedding from a saved copy of the model input (`time_key`), channels
+    /// `[embed_offset, embed_offset + embed_channels)`. Shape-preserving.
+    /// See [`crate::model::layer_types::TimeBiasType`].
+    TimeBias {
+        dim_input: (u32, u32, u32),
+        time_key: String,
+        embed_offset: u32,
+        embed_channels: u32,
+        save_key: Option<String>,
+    },
 }
 
 pub fn compute_out_conv(
@@ -228,7 +249,9 @@ impl LayerDraft {
             | LayerDraft::Attention { save_key, .. }
             | LayerDraft::FullyConnected { save_key, .. }
             | LayerDraft::UpsampleConv { save_key, .. }
-            | LayerDraft::Concat { save_key, .. } => save_key.as_deref(),
+            | LayerDraft::Concat { save_key, .. }
+            | LayerDraft::Add { save_key, .. }
+            | LayerDraft::TimeBias { save_key, .. } => save_key.as_deref(),
         }
     }
 
@@ -265,6 +288,10 @@ impl LayerDraft {
                 dim_skip,
                 ..
             } => (dim_input.0, dim_input.1, dim_input.2 + dim_skip.2),
+            // Shape-preserving: the sum has the shape both sides share.
+            LayerDraft::Add { dim_input, .. } => *dim_input,
+            // Shape-preserving: only adds a per-channel bias.
+            LayerDraft::TimeBias { dim_input, .. } => *dim_input,
         }
     }
 
@@ -396,6 +423,45 @@ impl LayerDraft {
                     display_save_key(save_key)
                 )
             }
+            LayerDraft::Add {
+                dim_input,
+                dim_skip,
+                skip_key,
+                save_key,
+            } => {
+                format!(
+                    "Add({}) {}x{}x{} + {}x{}x{} -> {}x{}x{}{}",
+                    skip_key,
+                    dim_input.0,
+                    dim_input.1,
+                    dim_input.2,
+                    dim_skip.0,
+                    dim_skip.1,
+                    dim_skip.2,
+                    dim_input.0,
+                    dim_input.1,
+                    dim_input.2,
+                    display_save_key(save_key)
+                )
+            }
+            LayerDraft::TimeBias {
+                dim_input,
+                time_key,
+                embed_offset,
+                embed_channels,
+                save_key,
+            } => {
+                format!(
+                    "TimeBias({}) {}x{}x{} [emb {}@{}]{}",
+                    time_key,
+                    dim_input.0,
+                    dim_input.1,
+                    dim_input.2,
+                    embed_channels,
+                    embed_offset,
+                    display_save_key(save_key)
+                )
+            }
         }
     }
 
@@ -408,6 +474,8 @@ impl LayerDraft {
             LayerDraft::FullyConnected { .. } => "Perceptron",
             LayerDraft::UpsampleConv { .. } => "UpsampleConv",
             LayerDraft::Concat { .. } => "Concat",
+            LayerDraft::Add { .. } => "Add",
+            LayerDraft::TimeBias { .. } => "TimeBias",
         }
     }
 
@@ -419,7 +487,9 @@ impl LayerDraft {
             | LayerDraft::Attention { dim_input, .. }
             | LayerDraft::FullyConnected { dim_input, .. }
             | LayerDraft::UpsampleConv { dim_input, .. }
-            | LayerDraft::Concat { dim_input, .. } => *dim_input,
+            | LayerDraft::Concat { dim_input, .. }
+            | LayerDraft::Add { dim_input, .. }
+            | LayerDraft::TimeBias { dim_input, .. } => *dim_input,
         };
         format!("{}x{}x{}", x, y, z)
     }
@@ -522,7 +592,15 @@ impl LayerDraft {
                 nb_neurons,
                 ..
             } => product(*dim_input) * *nb_neurons as u64 + *nb_neurons as u64,
-            LayerDraft::Activation { .. } | LayerDraft::Concat { .. } => 0,
+            LayerDraft::Activation { .. }
+            | LayerDraft::Concat { .. }
+            | LayerDraft::Add { .. } => 0,
+            // W is embed_channels × C, plus a per-channel bias.
+            LayerDraft::TimeBias {
+                dim_input,
+                embed_channels,
+                ..
+            } => *embed_channels as u64 * dim_input.2 as u64 + dim_input.2 as u64,
         }
     }
 
@@ -532,6 +610,8 @@ impl LayerDraft {
             LayerDraft::Attention { .. } => Some("attention"),
             LayerDraft::UpsampleConv { .. } => Some("upsample"),
             LayerDraft::Concat { .. } => Some("skip"),
+            LayerDraft::Add { .. } => Some("residual"),
+            LayerDraft::TimeBias { .. } => Some("timestep"),
             _ => None,
         }
     }
@@ -685,6 +765,30 @@ pub fn update_layer_dim_input(layer: &LayerDraft, new_input: (u32, u32, u32)) ->
             skip_key: skip_key.clone(),
             save_key: save_key.clone(),
         },
+        LayerDraft::Add {
+            dim_skip,
+            skip_key,
+            save_key,
+            ..
+        } => LayerDraft::Add {
+            dim_input: new_input,
+            dim_skip: *dim_skip,
+            skip_key: skip_key.clone(),
+            save_key: save_key.clone(),
+        },
+        LayerDraft::TimeBias {
+            time_key,
+            embed_offset,
+            embed_channels,
+            save_key,
+            ..
+        } => LayerDraft::TimeBias {
+            dim_input: new_input,
+            time_key: time_key.clone(),
+            embed_offset: *embed_offset,
+            embed_channels: *embed_channels,
+            save_key: save_key.clone(),
+        },
     }
 }
 
@@ -708,6 +812,8 @@ pub enum LayerKind {
     FullyConnected,
     UpsampleConv,
     Concat,
+    Add,
+    TimeBias,
 }
 
 impl fmt::Display for LayerKind {
@@ -720,6 +826,8 @@ impl fmt::Display for LayerKind {
             LayerKind::FullyConnected => write!(f, "Perceptron"),
             LayerKind::UpsampleConv => write!(f, "UpConv"),
             LayerKind::Concat => write!(f, "Concat"),
+            LayerKind::Add => write!(f, "Add"),
+            LayerKind::TimeBias => write!(f, "TimeBias"),
         }
     }
 }

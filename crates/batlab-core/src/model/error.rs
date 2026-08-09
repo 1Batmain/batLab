@@ -45,6 +45,20 @@ pub enum ModelError {
         input: Dim3,
         skip: Dim3,
     },
+    /// A residual `Add` was handed two tensors of different shape. Unlike
+    /// `Concat`, addition cannot widen: the two sides must match on every axis,
+    /// channels included. Refused here, by name, rather than indexing past a
+    /// buffer — the same silent-corruption trap `UpsampleConv` documents.
+    ResidualDimMismatch {
+        input: Dim3,
+        skip: Dim3,
+    },
+    /// A `TimeBias` was declared with nothing to project — zero embedding
+    /// channels. Its whole purpose is to carry the timestep into the block, so
+    /// an empty projection is a mis-wire, refused rather than built as a no-op.
+    TimeBiasNoEmbedding {
+        time_key: String,
+    },
     CheckpointIo {
         path: String,
         message: String,
@@ -118,6 +132,18 @@ impl Display for ModelError {
                 f,
                 "concat requires matching spatial dimensions: input=({}, {}, {}), skip=({}, {}, {})",
                 input.x, input.y, input.z, skip.x, skip.y, skip.z
+            ),
+            ModelError::ResidualDimMismatch { input, skip } => write!(
+                f,
+                "residual Add requires identical dimensions on both sides: \
+                 input=({}, {}, {}), skip=({}, {}, {}) — a block that changes width needs a \
+                 1x1 convolution on the shortcut to realign it",
+                input.x, input.y, input.z, skip.x, skip.y, skip.z
+            ),
+            ModelError::TimeBiasNoEmbedding { time_key } => write!(
+                f,
+                "TimeBias('{time_key}') has zero embedding channels to project — nothing to \
+                 inject; set embed_channels to the timestep channels of the referenced tensor"
             ),
             ModelError::CheckpointIo { path, message } => {
                 write!(f, "checkpoint I/O error at '{path}': {message}")

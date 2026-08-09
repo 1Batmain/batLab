@@ -1308,6 +1308,8 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
         LayerKind::FullyConnected,
         LayerKind::UpsampleConv,
         LayerKind::Concat,
+        LayerKind::Add,
+        LayerKind::TimeBias,
     ];
     let mut kind_spans: Vec<Span> = kinds
         .iter()
