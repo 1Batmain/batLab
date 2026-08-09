@@ -25,10 +25,21 @@ pub struct ConvolutionUniform {
     pub nb_kernel: u32,
     pub stride: u32,
     pub padding_mode: u32, // 0 = Valid, 1 = Same
-    /// Cooperating threads per `grad_weights` / `grad_bias` sum. Occupies the
-    /// word that used to be explicit padding, so the uniform's size and every
-    /// other field offset are unchanged — the legacy fixtures still bind this
-    /// very same buffer and simply ignore the word.
+    /// Cooperating threads per sum, for the **two** reductions: the
+    /// `grad_weights` split in the low half of the word, the `grad_bias` split
+    /// in the high half (see [`ConvolutionType::pack_lanes`]).
+    ///
+    /// One word and not two because this uniform's layout is pinned: bytes
+    /// 48..64 are a `Dim3` whose trailing word WGSL reads as `vec3` padding, so
+    /// there is no free slot at the end to grow into without moving offsets the
+    /// legacy fixtures bind against. It occupies the word that used to be
+    /// explicit padding, so the uniform's size and every other field offset are
+    /// unchanged.
+    ///
+    /// The two halves differ because the two reductions do: `grad_weights` has
+    /// thousands of independent sums and wants few lanes, `grad_bias` has as
+    /// many sums as there are kernels — 48 on the layer that cost 9,8 ms on a
+    /// single workgroup — and wants as many lanes as it can get.
     pub reduction_lanes: u32,
     pub dim_kernel: Dim3,
     pub dim_input: Dim3,
@@ -147,20 +158,51 @@ impl ConvolutionType {
         lanes
     }
 
-    /// Independent sums a single workgroup carries (`lanes * slots == 64`).
-    /// The two passes reduce different numbers of sums, so they get different
-    /// splits; the uniform therefore carries the `grad_weights` value and the
-    /// bias pass reuses it (its sum count, `nb_kernel`, is always tiny, so the
-    /// weights-driven choice is never worse for it than not splitting).
-    fn reduction_lanes_for_weights(&self) -> u32 {
+    /// Lanes for the `grad_weights` reduction: one sum per weight, and there
+    /// are thousands of them, so the rule usually answers "barely split".
+    pub(crate) fn reduction_lanes_for_weights(&self) -> u32 {
         Self::reduction_lanes(
             self.dim_kernel.length() * self.nb_kernel,
             self.output_positions(),
         )
     }
 
+    /// Lanes for the `grad_bias` reduction — its **own** count, not the
+    /// weights' one.
+    ///
+    /// The bias pass has exactly `nb_kernel` sums: 48 on `Color_Diffusion_XL`'s
+    /// L26, against 41 472 for its weights. Feeding the weights' choice to both
+    /// (which is what this did) left the bias with `nb_kernel / slots`
+    /// workgroups — **one** workgroup, 48 threads, on the UpsampleConv of the
+    /// same shape, walking 32 768 positions each. Measured 9,8 ms for a pass
+    /// that reads 6,3 Mio: 0,6 Gio/s, i.e. latency-bound on a thread count that
+    /// cannot cover it. The same rule fed the bias's own sum count answers 32
+    /// lanes and 24 workgroups instead of 1.
+    ///
+    /// What this deliberately does **not** do is split the position axis across
+    /// workgroups, which would need a scratch buffer and a second pass to
+    /// combine them. Costed rather than assumed: 1 → 1536 threads already
+    /// recovers essentially the whole pass, and the remaining ~0,3 ms of the
+    /// step is not worth a buffer and a dispatch per layer.
+    pub(crate) fn reduction_lanes_for_bias(&self) -> u32 {
+        Self::reduction_lanes(self.nb_kernel, self.output_positions())
+    }
+
+    /// The two lane counts as the shader reads them: `grad_weights` in the low
+    /// half of the word, `grad_bias` in the high half. Both are powers of two
+    /// no greater than 32, so neither can ever overflow its half.
+    pub(crate) fn pack_lanes(weight_lanes: u32, bias_lanes: u32) -> u32 {
+        debug_assert!(weight_lanes <= WG_SIZE && bias_lanes <= WG_SIZE);
+        (weight_lanes & 0xffff) | (bias_lanes << 16)
+    }
+
+    /// Independent sums a single workgroup carries (`lanes * slots == 64`).
     fn reduction_slots(&self) -> u32 {
         WG_SIZE / self.reduction_lanes_for_weights()
+    }
+
+    fn bias_slots(&self) -> u32 {
+        WG_SIZE / self.reduction_lanes_for_bias()
     }
 }
 
@@ -273,11 +315,14 @@ impl LayerType for ConvolutionType {
         //     the kernel, as `batch * OH * OW` positions to reduce instead of
         //     `OH * OW`. That is the whole point of the exercise: one `+=` per
         //     weight and per step instead of one per weight and per sample.
-        let slots = self.reduction_slots();
+        //
+        // The bias pass gets its own slot count: it reduces `nb_kernel` sums,
+        // not `dim_kernel.length() * nb_kernel` of them, and inheriting the
+        // weights' split was what left it on a single workgroup.
         vec![
             (self.dim_input.length() * batch).div_ceil(WG_SIZE),
-            (self.dim_kernel.length() * self.nb_kernel).div_ceil(slots),
-            self.nb_kernel.div_ceil(slots),
+            (self.dim_kernel.length() * self.nb_kernel).div_ceil(self.reduction_slots()),
+            self.nb_kernel.div_ceil(self.bias_slots()),
         ]
     }
 
@@ -489,7 +534,10 @@ impl LayerType for ConvolutionType {
                 PaddingMode::Valid => 0,
                 PaddingMode::Same => 1,
             },
-            reduction_lanes: self.reduction_lanes_for_weights(),
+            reduction_lanes: Self::pack_lanes(
+                self.reduction_lanes_for_weights(),
+                self.reduction_lanes_for_bias(),
+            ),
             dim_kernel: self.dim_kernel,
             dim_input: self.dim_input,
             dim_output: self.dim_output,

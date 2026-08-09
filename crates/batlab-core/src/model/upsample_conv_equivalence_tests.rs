@@ -405,6 +405,67 @@ fn worst_relative_to_reference(got: &[f32], reference: &[f64]) -> f64 {
 // The tests
 // ---------------------------------------------------------------------------
 
+/// The lane count the bias kernel reads out of the uniform and the slot count
+/// the Rust side sizes its dispatch with are two views of one decision. If they
+/// drift, the dispatch silently under-covers `grad_bias` and some gradients are
+/// never written — a bug no shape-independent assertion would notice.
+///
+/// It also pins **where** the count sits: word 3, the one the legacy fixture
+/// declares as `_pad` and never reads. Moving it would shift every field the
+/// fixture binds against, and the fixture would then compare garbage without
+/// failing to compile.
+#[test]
+fn upsample_bias_lanes_agree_with_dispatch() {
+    for shape in SHAPES {
+        let mut ty = shape.layer_type();
+        ty.set_dim_output().unwrap();
+
+        let bytes = ty.get_spec_uniform_bytes();
+        assert_eq!(
+            bytes.len(),
+            64,
+            "\n{}: the uniform changed size — the legacy fixture binds a \
+             64-byte struct at fixed offsets\n",
+            shape.label
+        );
+        let lanes = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+
+        assert!(
+            lanes.is_power_of_two() && (1..=64).contains(&lanes),
+            "\n{}: bias lanes = {lanes}, must be a power of two in 1..=64 \
+             (the tree reduction halves it down to 1)\n",
+            shape.label
+        );
+
+        let dim_out = shape.dim_output();
+        let positions = dim_out.x * dim_out.y;
+        assert!(
+            lanes == 1 || positions / lanes >= 16,
+            "\n{}: {lanes} lanes over {positions} positions leaves {} per lane \
+             — the reduction would cost more than the sum\n",
+            shape.label,
+            positions / lanes
+        );
+
+        let slots = 64 / lanes;
+        let counts = ty.get_back_workgroup_counts(1);
+        assert_eq!(
+            counts[2],
+            shape.nb_kernel.div_ceil(slots),
+            "\n{}: grad_bias dispatch is {} workgroups x {slots} slots for {} \
+             biases\n",
+            shape.label,
+            counts[2],
+            shape.nb_kernel
+        );
+        assert!(
+            counts[2] * slots >= shape.nb_kernel,
+            "\n{}: grad_bias dispatch leaves biases unwritten\n",
+            shape.label
+        );
+    }
+}
+
 /// The forward was not touched, and this pins that: any drift in the shared
 /// uniform, the shared bind group or the padding rule would show here first,
 /// on an implementation that has no "old" to be compared against.

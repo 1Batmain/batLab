@@ -26,10 +26,40 @@ struct UpsampleConvSpec {
     nb_kernel:    u32,
     scale_factor: u32,
     padding_mode: u32,
-    _pad:         u32,
+    // Cooperating threads per grad_bias sum. Sits in the word that used to be
+    // padding, so the uniform's size and layout are unchanged and the legacy
+    // fixture still binds the very same buffer.
+    bias_lanes:   u32,
     dim_kernel:   vec3<u32>,
     dim_input:    vec3<u32>,
     dim_output:   vec3<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative reduction layout — the same one back_convolution.wgsl uses, and
+// for the same reason. A workgroup of 64 threads is split into `slots`
+// independent sums of `lanes` threads each (lanes * slots == 64); each lane
+// walks the position axis in strides of `lanes`, then the lanes of a slot are
+// tree-reduced. `lanes` comes from the uniform, so the dispatch on the Rust
+// side and the split in here cannot drift apart.
+// ---------------------------------------------------------------------------
+const WG_SIZE: u32 = 64u;
+var<workgroup> partial: array<f32, WG_SIZE>;
+
+// Tree-reduce `partial` within each slot. `tid == lane * slots + slot`, so the
+// partner of a lane sits `stride * slots` further along. The barriers sit in
+// uniform control flow: `stride` and `slots` are the same for every invocation.
+fn reduce_slot(tid: u32, lane: u32, lanes: u32, slots: u32) {
+    workgroupBarrier();
+    var stride: u32 = lanes / 2u;
+    loop {
+        if stride == 0u { break; }
+        if lane < stride {
+            partial[tid] += partial[tid + stride * slots];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
 }
 
 fn upsampled_height() -> u32 {
@@ -187,27 +217,50 @@ fn upsample_conv_back_weights(
     grad_weights[idx] += g;
 }
 
+// grad_bias[k] += Σ_{b,oy,ox} grad_output[b][oy][ox][k]
+//
+// One slot per kernel. Consecutive slots are consecutive `k`, which is the
+// fastest-varying axis of `grad_output`.
+//
+// This pass used to give each bias a single thread. With 48 kernels that is
+// `48.div_ceil(64)` = ONE workgroup — 48 threads walking 32 768 positions each,
+// 9,8 ms to read 6,3 Mio. Nothing about the arithmetic was wrong: 48 threads
+// simply cannot cover the memory latency of any GPU. The sum is unchanged; only
+// how many threads carry it is.
+//
+// The position axis is walked flat — `p / positions` is the sample and
+// `p % positions` the position within it — which is what turns `batch`
+// sequential accumulations into one tree reduction.
 @compute @workgroup_size(64)
 fn upsample_conv_back_bias(
-    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let k = gid.y * nwg.x * 64u + gid.x;
     let K = layer_spec.dim_output.z;
-    if k >= K { return; }
-
     let OH = layer_spec.dim_output.x;
     let OW = layer_spec.dim_output.y;
-    let out_len = OH * OW * K;
-    let batch = arrayLength(&grad_output) / out_len;
+    let positions = OH * OW;
+    let batch = arrayLength(&grad_output) / (positions * K);
+    let work = positions * batch;
+
+    let lanes = layer_spec.bias_lanes;
+    let slots = WG_SIZE / lanes;
+    let tid   = lid.x;
+    let slot  = tid % slots;
+    let lane  = tid / slots;
+    let k     = (wid.y * nwg.x + wid.x) * slots + slot;
 
     var g: f32 = 0.0;
-    for (var b: u32 = 0u; b < batch; b++) {
-        for (var oy: u32 = 0u; oy < OH; oy++) {
-            for (var ox: u32 = 0u; ox < OW; ox++) {
-                g += grad_output[b * out_len + oy * OW * K + ox * K + k];
-            }
+    if k < K {
+        for (var p: u32 = lane; p < work; p += lanes) {
+            g += grad_output[p * K + k];
         }
     }
-    grad_bias[k] += g;
+
+    partial[tid] = g;
+    reduce_slot(tid, lane, lanes, slots);
+    if lane == 0u && k < K {
+        grad_bias[k] += partial[slot];
+    }
 }

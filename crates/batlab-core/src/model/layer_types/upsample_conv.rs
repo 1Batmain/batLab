@@ -25,7 +25,14 @@ pub struct UpsampleConvUniform {
     pub nb_kernel: u32,
     pub scale_factor: u32,
     pub padding_mode: u32, // 0 = Valid, 1 = Same
-    pub _padding: u32,
+    /// Cooperating threads per `grad_bias` sum. Occupies the word that used to
+    /// be explicit padding, so the uniform's size and every other field offset
+    /// are unchanged — `legacy/back_upsample_conv_naive.wgsl` still binds this
+    /// very same buffer and simply ignores the word.
+    ///
+    /// `grad_weights` has no such split: it already has tens of thousands of
+    /// independent sums (41 472 on L22), which is why only the bias needs one.
+    pub bias_lanes: u32,
     pub dim_kernel: Dim3,
     pub dim_input: Dim3,
     pub dim_output: Dim3,
@@ -60,7 +67,32 @@ impl UpsampleConvType {
     fn kernel_bytes(&self) -> u32 {
         self.dim_kernel.bytes_size() * self.nb_kernel
     }
+
+    /// How many threads cooperate on one `grad_bias` sum, and therefore how
+    /// many independent sums a 64-thread workgroup carries
+    /// (`lanes * slots == 64`).
+    ///
+    /// The very same rule the convolution uses, fed this pass's own sum count
+    /// — `nb_kernel`, which is 48 on `Color_Diffusion_XL`'s L22. Before, this
+    /// pass had no split at all: one thread per bias, `48.div_ceil(64)` = **one
+    /// workgroup**, each thread walking 32 768 positions. It cost 9,8 ms of a
+    /// 264 ms step (3,7 %) to read 6,3 Mio — 0,6 Gio/s, which is what a GPU
+    /// does when 48 threads have to cover all of its memory latency. §1 of
+    /// `KERNEL_HUNT.md`.
+    pub(crate) fn reduction_lanes_for_bias(&self) -> u32 {
+        crate::model::layer_types::ConvolutionType::reduction_lanes(
+            self.nb_kernel,
+            self.dim_output.x * self.dim_output.y,
+        )
+    }
+
+    fn bias_slots(&self) -> u32 {
+        WG_SIZE / self.reduction_lanes_for_bias()
+    }
 }
+
+/// `@workgroup_size(64)` in every upsample-conv shader.
+const WG_SIZE: u32 = 64;
 
 impl LayerType for UpsampleConvType {
     fn get_forward_shader(&self) -> ShaderDescriptor {
@@ -163,10 +195,14 @@ impl LayerType for UpsampleConvType {
         // Same split as ConvolutionType: grad_input is per-activation,
         // grad_weights / grad_bias are per-parameter and fold the batch into
         // their reduction loop.
+        //
+        // The bias pass carries `bias_slots()` independent sums per workgroup
+        // instead of 64 threads each owning one: with 48 biases that was a
+        // single workgroup for the whole reduction.
         vec![
-            (self.dim_input.length() * batch).div_ceil(64),
-            (self.dim_kernel.length() * self.nb_kernel).div_ceil(64),
-            self.nb_kernel.div_ceil(64),
+            (self.dim_input.length() * batch).div_ceil(WG_SIZE),
+            (self.dim_kernel.length() * self.nb_kernel).div_ceil(WG_SIZE),
+            self.nb_kernel.div_ceil(self.bias_slots()),
         ]
     }
 
@@ -355,7 +391,7 @@ impl LayerType for UpsampleConvType {
                 PaddingMode::Valid => 0,
                 PaddingMode::Same => 1,
             },
-            _padding: 0,
+            bias_lanes: self.reduction_lanes_for_bias(),
             dim_kernel: self.dim_kernel,
             dim_input: self.dim_input,
             dim_output: self.dim_output,

@@ -43,13 +43,26 @@ struct ConvSpec {
     nb_kernel:       u32,
     stride:          u32,
     padding_mode:    u32,
-    // Cooperating threads per grad_weights / grad_bias sum. Sits in the word
-    // that used to be padding, so the uniform's size and layout are unchanged
-    // and the legacy fixtures still bind the very same buffer.
+    // Cooperating threads per sum, for BOTH reductions: grad_weights in the low
+    // half of the word, grad_bias in the high half. Sits in the word that used
+    // to be padding, so the uniform's size and layout are unchanged and the
+    // legacy fixtures still bind the very same buffer.
+    //
+    // Two counts and not one because the two reductions have wildly different
+    // sum counts: `KH*KW*IC*K` weights against `K` biases. Giving the bias the
+    // weights' split left it on ONE workgroup — see `reduction_lanes_for_bias`.
     reduction_lanes: u32,
     dim_kernel:      vec3<u32>,
     dim_input:       vec3<u32>,
     dim_output:      vec3<u32>,
+}
+
+fn weight_lanes() -> u32 {
+    return layer_spec.reduction_lanes & 0xffffu;
+}
+
+fn bias_lanes() -> u32 {
+    return layer_spec.reduction_lanes >> 16u;
 }
 
 // Must mirror convolution.wgsl exactly: the forward maps
@@ -204,7 +217,7 @@ fn conv_back_weights(
     let batch = arrayLength(&grad_output) / (OH * OW * K);
     let work = positions * batch;
 
-    let lanes = layer_spec.reduction_lanes;
+    let lanes = weight_lanes();
     let slots = WG_SIZE / lanes;
     let tid   = lid.x;
     let slot  = tid % slots;
@@ -266,21 +279,23 @@ fn conv_back_bias(
     let batch = arrayLength(&grad_output) / (OH * OW * K);
     let work = positions * batch;
 
-    let lanes = layer_spec.reduction_lanes;
+    let lanes = bias_lanes();
     let slots = WG_SIZE / lanes;
     let tid   = lid.x;
     let slot  = tid % slots;
     let lane  = tid / slots;
     let k     = (wid.y * nwg.x + wid.x) * slots + slot;
 
+    // `sample*OH*OW*K + oy*OW*K + ox*K` is `(sample*positions + oy*OW + ox)*K`,
+    // which is `p*K` — the flat position index the loop already carries. The
+    // decomposition into (sample, oy, ox) and its four integer divisions only
+    // existed to be reassembled into the number it started from. Same taps,
+    // same order, bit-identical sum; four divisions and two multiplications per
+    // element less.
     var g: f32 = 0.0;
     if k < K {
         for (var p: u32 = lane; p < work; p += lanes) {
-            let sample = p / positions;
-            let pos    = p % positions;
-            let oy = pos / OW;
-            let ox = pos % OW;
-            g += grad_output[sample * OH * OW * K + oy * OW * K + ox * K + k];
+            g += grad_output[p * K + k];
         }
     }
 
