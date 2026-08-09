@@ -8,6 +8,17 @@ résiduels exprimables ; (3) l'**injection du timestep** dans chaque bloc ; (4)
 qui a rendu et ce qui n'a **rien** rendu — un NO-GO chiffré valant autant qu'un
 gain.
 
+**Résumé** : l'instrument (`--eval`), l'addition (`Add`) et l'injection-t
+(`TimeBias`) sont livrés, câblés dans le TUI et éprouvés au standard kernel du
+dépôt (trois bugs moteur Metal réels corrigés au passage). Passés au banc
+elephants (from scratch, 6000 pas, mêmes hyperparamètres), les trois leviers
+d'architecture — injection-t, largeur ×1.5, résidu profond — donnent un **NO-GO
+complet sur le critère de succès** (aucun ne passe la tranche t-haut sous 0.4366) ;
+seule la largeur rend un gain modeste, à 2× le coût. Le défaut central est en
+partie **structurel** (x̂₀ mono-pas) et en partie un **manque de pas
+d'entraînement**, pas un manque d'expressivité — laquelle est désormais disponible
+si une mesure future la réclame.
+
 ---
 
 ## Item 1 — `--eval`, l'instrument (commit `feat(eval)`)
@@ -133,91 +144,112 @@ l'item 1 — empêcher qu'un déplacement inerte passe pour un progrès.
 images) où le modèle **généralise déjà**, le t injecté à l'entrée (3 canaux
 d'embedding) se propage assez ; le chemin profond redondant n'a pas de raison de
 s'activer et reste près de l'identité. Le défaut Elephants (t-haut battu par la
-moyenne) est mesuré sur **1300 images en régime de mémorisation** — un régime que
-CIFAR n'atteint pas. **Le NO-GO CIFAR ne transfère donc pas mécaniquement à
-Elephants**, et l'inverse non plus : c'est exactement pourquoi l'item 4 doit se
-mesurer **sur `elephants_all`**.
+moyenne) est mesuré sur **1300 images**. Il fallait donc le mesurer sur elephants
+avant de conclure — c'est fait à l'item 4 ci-dessous, et **le NO-GO se confirme
+sur la vraie cible** : B ≈ A (ε-MSE 0,0713 = 0,0713 ; t-haut 0,935 vs 0,949).
+Injecter t en profondeur ne rend rien, ni sur CIFAR, ni sur elephants.
 
 ---
 
-## Item 4 — Grossir et recommander
+## Item 4 — Grossir et mesurer (banc elephants)
 
-### Blocage
+Banc committé (`tools/gen_archi32_bench.py`, `Models/Archi32_{A,B,C,D}_*`), quatre
+archi 32×32 RGB entraînées **from scratch, mêmes pas (6000) / lr (1e-3) / batch
+(32) / graine**, sur `elephants_all` (1300 images), jugées par `--eval`.
 
-`datasets/elephants_all.batraw` (les images de l'utilisateur) **n'est pas dans ce
-worktree** — l'architecte l'a mesuré ailleurs. L'A/B décisif (ancienne archi vs
-nouvelle, from scratch sur elephants) doit donc être lancé là où le dataset vit.
-Les deux configs sont prêtes et l'outil est en place ; voir la recette ci-dessous.
+| candidat | params | ckpt | ms/pas | ε-MSE all |
+|---|---|---|---|---|
+| **A** baseline (archi actuelle, attention 8×8) | 1,18 M | 4,5 Mo | 163 | 0,0713 |
+| **B** = A + TimeBias (blocs profonds) | 1,20 M | 4,6 Mo | 220 | 0,0713 |
+| **C** = A largeur ×1.5 (72/144/288) | 2,68 M | 10,2 Mo | 342 | 0,0722 |
+| **D** = A + 1 bloc résiduel/étage (Add) | 1,63 M | 6,2 Mo | 208 | 0,0712 |
 
-### Recette recommandée pour le run long (elephants, from scratch)
+**x₀-RMSE par tranche, sur `elephants_all` (queue tenue à l'écart)** — plus bas
+meilleur ; ε̂=mean = **0,4366** partout, la cible à passer :
 
-- **Pas** : ≥ 8000 (le projet note que sous ~10 000 pas la valeur nominale d'EMA
-  ne lie pas — c'est la rampe qui compte). Sur 1300 images, surveiller l'écart
-  vu/inconnu à t bas comme signal de mémorisation.
-- **lr** 1e-3, **optimiseur** adam, **batch** 32.
-- **EMA** : à cette échelle (< 10 000 pas), inutile — la rampe domine la valeur
-  nominale, et le rapport EMA la classe NO-GO sur run court. Ne pas l'activer
-  « pour faire propre ».
-- **Coût estimé** sur cette machine : le pas TimeBias mesuré ~86 ms (2× le
-  baseline à cause du backend `grad_params` en `@workgroup_size(1)`, optimisable
-  — voir plus bas). 8000 pas ≈ 11–12 min.
+| | t[0-64) | t[64-128) | t[128-192) | **t[192-256)** | bat la moyenne |
+|---|---|---|---|---|---|
+| A baseline | 0,1132 | 0,2362 | 0,4496 | **0,9492** | 2/4 |
+| B TimeBias | 0,1130 | 0,2359 | 0,4414 | **0,9350** | 2/4 |
+| **C wide** | 0,1148 | 0,2401 | **0,4167** | **0,8821** | **3/4** |
+| D résiduel | 0,1129 | 0,2377 | 0,4533 | **0,9248** | 2/4 |
 
-### A/B à lancer (sur elephants_all)
+### Verdict : NO-GO complet sur le critère de succès
 
-```
-# entraîner les deux, mêmes pas / lr / seed, from scratch
-cargo run --release -p batlab -- --headless-train <Baseline>  --steps 8000 \
-    --dataset datasets/elephants_all.batraw --lr 1e-3 --optimizer adam --out A.ckpt
-cargo run --release -p batlab -- --headless-train <TimeBias> --steps 8000 \
-    --dataset datasets/elephants_all.batraw --lr 1e-3 --optimizer adam --out B.ckpt
-# juger, sur la queue tenue à l'écart
-cargo run --release -p batlab -- --eval <TimeBias> --ckpt A.ckpt --ckpt B.ckpt \
-    --dataset datasets/elephants_all.batraw --samples 256
-```
+**Aucun candidat ne passe t[192-256) sous 0.4366.** Le meilleur, C, est à 0,882 —
+deux fois la cible. Détail :
 
-Critère : la tranche **t[192-256)** de B passe-t-elle **sous 0.4366** (la
-moyenne) ? Et l'écart vu/inconnu à t bas se réduit-il ?
+- **B (TimeBias) : NO-GO, confirmé sur la vraie cible.** Identique à A sur
+  l'objectif (ε-MSE 0,0713 = 0,0713), gain infime en x₀ (t-haut 0,935 vs 0,949).
+  Exactement le NO-GO CIFAR de l'item 3, reproduit sur elephants. +35 % de coût
+  d'entraînement, alourdit l'inférence, ne rend rien : **ne va pas en production.**
+- **D (résidu profond) : NO-GO.** À peine mieux que A (t-haut 0,925 vs 0,949),
+  ε-MSE identique. Approfondir avec `Add` sans élargir ne bouge pas l'aiguille ici.
+- **C (largeur ×1.5) : le seul gain mesurable, et il est modeste.** Bat la moyenne
+  à **3/4** tranches (gagne t[128-192) à 0,417), meilleur t-haut (0,882) et
+  meilleur x₀-all (0,506 vs 0,541). Mais : ε-MSE all *légèrement pire* (0,0722),
+  gain purement dans la repondération x₀, pour **2,3× les params et 2× le coût**.
 
-### Recommandation
+### Écart vu/inconnu (mémorisation) : plat à 6000 pas
 
-1. **Lancer d'abord l'A/B elephants ci-dessus — ne pas présumer du gain.** Le
-   NO-GO CIFAR n'invalide pas TimeBias sur elephants (régimes différents :
-   généralisation vs mémorisation), mais il retire toute raison d'y croire *a
-   priori*. Le banc elephants tranche ; il coûte ~25 min (deux runs 8000 pas +
-   deux `--eval`). Si t[192-256) de B ne passe pas sous 0.4366, **TimeBias est
-   un NO-GO tout court** et ne va pas en production (il coûte 2× à
-   l'entraînement et alourdit l'inférence — contrainte web).
+Évalué sur `elephants256` (vu, recouvrement total) ET `elephants_all` (queue
+inconnue), t[0-64) :
 
-2. **La tranche t-haut battue par la moyenne est en partie structurelle, pas
-   seulement un défaut de conditionnement.** Un x̂₀ **mono-pas** au sommet du
-   schedule est inapprenable : l'image moyenne (lisse, en gamme) bat toujours un
-   pari saturé. C'est pourquoi la génération prend 256 pas. `--eval` mesure le
-   mono-pas ; la *vraie* silhouette se juge sur la chaîne complète (l'œil, ou une
-   MSE sur ε moyennée sur la trajectoire — non implémentée). **Ne pas sur-lire la
-   tranche t-haut de `--eval` comme le seul juge de la silhouette.**
+| | vu (256) | inconnu (all) | écart |
+|---|---|---|---|
+| A | 0,1122 | 0,1132 | ~0 |
+| C | 0,1141 | 0,1148 | ~0 |
 
-3. **Le levier le plus sûr reste la CAPACITÉ, mais le constat le nuance.** Le
-   DDPM de référence fait ~35 M params contre 1,19 M ici (30×). Mais sur CIFAR
-   grey, ce petit modèle atteint déjà ε-MSE 0.083 et bat la moyenne à 3/4
-   tranches — il n'est pas manifestement sous-dimensionné *sur ce banc*. Sur
-   elephants (1300 images), le constat note que « dataset plus petit que la
-   mémoire n'est pas atteint, mais ce n'est pas le facteur dominant ». Donc :
-   grossir est plausible mais **doit être mesuré**, pas supposé — exactement
-   comme TimeBias. Deux candidats à passer au banc elephants, à côté du baseline :
-   **(a) largeur ×1.5** (32→48 canaux à l'entrée, proportionnel ensuite) ;
-   **(b) un bloc résiduel de plus par étage** (avec l'`Add` de l'item 2 :
-   `Conv→GN→SiLU→Conv→GN→SiLU→Add(entrée)`), qui approfondit sans exploser la
-   largeur ni le champ réceptif. Mesurer les deux avec `--eval` sur
-   `elephants_all`, coût ckpt et ms/pas relevés, et ne retenir que ce qui bat le
-   baseline **sur elephants**.
+**Aucune mémorisation à 6000 pas** (≈150 époques) — les modèles généralisent
+encore. C'est un **régime différent** de l'Elephants_XL de l'architecte (écart
+0,165 vu / 0,770 inconnu, 4,7×), qui a dû tourner bien plus longtemps. Deux
+conséquences : (1) l'indicateur vu/inconnu ne départage pas les candidats à ce
+budget ; (2) le t-haut de mon A (0,949) est **pire** que l'Elephants_XL de
+l'architecte (0,695) — donc **plus de pas améliore le t-haut davantage que
+n'importe quelle de ces trois modifications d'archi.**
 
-**En une phrase** : l'instrument et l'expressivité (addition, injection-t) sont
-livrés et éprouvés ; la seule chose qui a été *mesurée* comme rendant quelque
-chose reste à établir — sur elephants, pas sur CIFAR — et le banc pour le faire
-est en place. Livrer une archi « plus grosse + t profond » sans le banc elephants
-serait répéter l'erreur que l'item 1 existe pour empêcher.
+### Ce que la mesure dit, franchement
 
----
+1. **Le t-haut « battu par la moyenne » est d'abord STRUCTUREL, pas un défaut
+   d'archi.** Aucun des trois leviers (injection-t, largeur, profondeur) ne
+   l'approche de 0,4366 ; le meilleur reste à 2× la cible. Un x̂₀ **mono-pas** au
+   sommet du schedule est inapprenable — l'image moyenne, lisse et en gamme, bat
+   toujours un pari saturé, et c'est pourquoi la génération prend 256 pas.
+   `--eval` mesure le mono-pas ; **il ne faut pas le lire comme le juge unique de
+   la silhouette**, qui se décide sur la chaîne complète (l'œil, ou une MSE sur ε
+   moyennée sur la trajectoire — non implémentée, cf. le manque signalé par le
+   rapport EMA).
+2. **Sur l'objectif d'entraînement (ε-MSE), les quatre sont à égalité** (0,071–
+   0,072). Les seules différences vivent dans la reconstruction x₀, et seule la
+   largeur (C) les déplace de façon lisible.
+3. **Le levier dominant à ce stade est le NOMBRE DE PAS, pas l'archi** : mon A à
+   6000 pas est plus loin de la cible que l'Elephants_XL bien plus entraîné.
+
+### Recommandation pour le run long
+
+**Ne pas partir sur TimeBias ni sur le résidu profond** — mesurés NO-GO, ils
+coûtent sans rendre. Deux options défendables :
+
+- **A (baseline), ~15 000 pas** — le meilleur rapport qualité/coût. L'archi
+  actuelle n'est pas le goulot mesurable ici ; le budget de calcul est mieux
+  dépensé en pas qu'en paramètres. Coût : 163 ms/pas × 15 000 ≈ **41 min**.
+  Au-delà de ~10 000 pas, l'EMA (`--ema 0.999`) reprend un sens (la rampe cesse
+  de dominer la valeur nominale, cf. CLAUDE.md) et la mémorisation apparaît —
+  surveiller alors l'écart vu/inconnu et le `--checkpoint-every` pour garder le
+  meilleur avant sur-mémorisation.
+- **C (largeur ×1.5), ~15 000 pas** — si l'on veut le petit gain de
+  reconstruction mesuré (bat la moyenne à 3/4), au prix de 2× le calcul
+  (**~85 min**) et 2,3× les params — ce qui pèse sur la cible web (inférence dans
+  le navigateur du visiteur). À ne prendre que si le gain x₀ modeste vaut ce
+  doublement ; sur ces chiffres, **je penche pour A + plus de pas.**
+
+**En une phrase** : l'instrument (item 1) a fait son travail — il a transformé
+« l'hypothèse la plus prometteuse » (injection-t) et deux paris de capacité en
+chiffres, et le verdict est un **NO-GO complet sur le critère t-haut < 0.4366**,
+avec un seul gain modeste (largeur) qui ne le justifie pas à 2× le coût. Le
+défaut central est en partie structurel (x̂₀ mono-pas) et en partie un manque de
+pas d'entraînement, pas un manque d'expressivité de l'archi — qui est désormais,
+elle, disponible (addition, injection-t) si une mesure future la réclame.
 
 ## Notes pour après les merges
 
