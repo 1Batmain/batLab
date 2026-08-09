@@ -68,6 +68,38 @@ are not reachable from the TUI and never write back a model's config_file.
   --resources <model> [--batch N] [--dataset <path>] [--measure] [--steps N]
       [--inference] [--vram GiB] [--device <name>] [--no-gpu] [--width N]
 
+  --profile-step <model> --dataset <path> [--batch N] [--optimizer sgd|adam]
+      [--lr F] [--rounds N] [--warmup N] [--top N] [--ema]
+
+Where a training step's time actually goes:
+  --profile-step    run ONE training step and report the GPU time of EVERY
+                    compute pass it encodes, named by layer and entry point,
+                    sorted by cost. The numbers come from the GPU's own clock
+                    (`TIMESTAMP_QUERY` written at each pass's beginning and
+                    end), not from host timing around a submit.
+                    Under the table is the budget, and the budget is the point:
+                    the sum of the passes, the GPU SPAN of the whole step (last
+                    end minus first begin, so barriers and pass setup are inside
+                    it), and the host wall clock. Span minus sum is what the step
+                    spends BETWEEN its passes — the per-pass floor that
+                    PERF_CONVOLUTION.md §5.4 hypothesised and could not measure.
+                    Runs the same production call the trainer runs and nothing
+                    else: no loss readback, no probe, no periodic sampling, all
+                    of which submit GPU work of their own and would be profiled
+                    as if they were part of a step.
+  --rounds N        armed steps (default 5). The estimator is the MINIMUM over
+                    them, the same rule the rest of this project's benchmarks
+                    use: contention can only add time.
+  --warmup N        unarmed steps first (default 3). On Metal the first dispatch
+                    of a pipeline pays its compilation, which would otherwise be
+                    charged to whichever pass ran first.
+  --top N           show only the N most expensive passes; the rest are summed
+                    into one line rather than dropped.
+  --ema             also encode the weight-average passes, as `--ema` does.
+                    Requires a device with TIMESTAMP_QUERY; without one the
+                    command says so and stops rather than substitute host-side
+                    estimates for GPU measurements.
+
 What the model costs on the GPU:
   --resources       print the itemised GPU inventory: weights, gradients, Adam
                     moments, EMA, activations, attention's N² scratch, the
