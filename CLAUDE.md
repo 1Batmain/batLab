@@ -256,9 +256,11 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
   `tools/images_to_raw.py <dossier>` (récursif, EXIF, carré `--crop center|fit`,
   `--size`, `--mode rgb|grey`, corrompus sautés et comptés, `--min-size`,
   `--dedup` sur l'échantillon produit, ordre déterministe par chemin relatif) ;
-  `datasets/cifar_to_raw.py` ; `tools/imagenet32_to_raw.py <dossier>` (attend
+  `datasets/cifar_to_raw.py` ; `tools/imagenet_to_raw.py <dossier>` (attend
   `train_data_batch_1..10`, **des pickles sans extension**, ne télécharge rien,
-  `--limit N`). **`--contact-sheet <png>` est l'étape à ne jamais sauter** :
+  `--limit N` ; la résolution — 32×32 **ou** 64×64 — est **déduite** de la
+  longueur de ligne, pas demandée, et un dossier ne peut pas mêler deux tailles).
+  **`--contact-sheet <png>` est l'étape à ne jamais sauter** :
   c'est la seule façon de voir ce sur quoi on entraîne après recadrage, et les
   erreurs qui coûtent une nuit ne lèvent aucune exception. Le piège partagé par
   CIFAR et ImageNet : 3072 octets sont **trois plans** (R, G, B entiers), pas des

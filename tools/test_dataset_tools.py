@@ -19,10 +19,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import json
+
 import batraw
+import gen_unet_config
 import images_to_raw
-import imagenet32_to_raw
+import imagenet_to_raw
 from PIL import Image
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def solid(path, size, colour, fmt=None, exif=None):
@@ -340,17 +345,22 @@ class Imagenet32ToRaw(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def write_batch(self, name, count, first=0, keys_as_bytes=False):
-        """Un batch au format de l'archive : pickle, `data` en PLANS (n, 3072)."""
+    def write_batch(self, name, count, first=0, keys_as_bytes=False, side=32):
+        """Un batch au format de l'archive : pickle, `data` en PLANS (n, 3·côté²).
+
+        `side` par défaut 32 (release historique) ; 64 fabrique une batche de la
+        release 64×64, dont seule la longueur de ligne change.
+        """
         import pickle
 
         import numpy as np
 
+        plane = side * side
         rows = []
         for i in range(count):
             value = (first + i) % 256
             rows.append(
-                [value] * 1024 + [(value + 1) % 256] * 1024 + [(value + 2) % 256] * 1024
+                [value] * plane + [(value + 1) % 256] * plane + [(value + 2) % 256] * plane
             )
         data = np.asarray(rows, dtype=np.uint8)
         payload = {"data": data, "labels": list(range(1, count + 1))}
@@ -371,7 +381,7 @@ class Imagenet32ToRaw(unittest.TestCase):
         """
         self.write_batch("train_data_batch_1", 2, first=10)
         out = os.path.join(self.dir, "planes.batraw")
-        imagenet32_to_raw.convert(self.src, out, mode="rgb")
+        imagenet_to_raw.convert(self.src, out, mode="rgb")
 
         payload, count, w, h, c = batraw.read(out)[:5]
         self.assertEqual((count, w, h, c), (2, 32, 32, 3))
@@ -379,6 +389,36 @@ class Imagenet32ToRaw(unittest.TestCase):
         self.assertEqual(set(first_image[0::3]), {10})
         self.assertEqual(set(first_image[1::3]), {11})
         self.assertEqual(set(first_image[2::3]), {12})
+
+    def test_a_64x64_archive_is_detected_from_the_row_length(self):
+        """La release 64×64 a le même format ; seule la ligne passe à 12288.
+
+        La taille se déduit de `data.shape[1]`, elle n'est pas demandée. Une
+        image à plans constants doit ressortir en pixels (v, v+1, v+2) sur une
+        grille 64×64.
+        """
+        self.write_batch("train_data_batch_1", 1, first=5, side=64)
+        out = os.path.join(self.dir, "big.batraw")
+        report = imagenet_to_raw.convert(self.src, out, mode="rgb")
+        self.assertEqual(report["side"], 64)
+        payload, count, w, h, c = batraw.read(out)[:5]
+        self.assertEqual((count, w, h, c), (1, 64, 64, 3))
+        self.assertEqual((payload[0], payload[1], payload[2]), (5, 6, 7))
+
+    def test_a_row_that_is_not_three_square_planes_is_refused(self):
+        """Une longueur qui n'est pas 3·côté² n'est pas un ImageNet — refus net."""
+        with self.assertRaises(ValueError):
+            imagenet_to_raw.side_from_row(3000)  # 1000 pixels, pas un carré
+        self.assertEqual(imagenet_to_raw.side_from_row(3072), 32)
+        self.assertEqual(imagenet_to_raw.side_from_row(12288), 64)
+
+    def test_a_folder_may_not_mix_two_sizes(self):
+        """Un dossier 32×32 + 64×64 donnerait un .batraw incohérent : refus."""
+        self.write_batch("train_data_batch_1", 1, side=32)
+        self.write_batch("train_data_batch_2", 1, side=64)
+        out = os.path.join(self.dir, "mixed.batraw")
+        with self.assertRaises(ValueError):
+            imagenet_to_raw.convert(self.src, out, mode="rgb")
 
     def test_batches_are_read_in_numeric_order(self):
         """`_10` vient après `_2`, pas entre `_1` et `_2`.
@@ -391,7 +431,7 @@ class Imagenet32ToRaw(unittest.TestCase):
         self.write_batch("train_data_batch_10", 1, first=200)
 
         out = os.path.join(self.dir, "order.batraw")
-        report = imagenet32_to_raw.convert(self.src, out, mode="rgb")
+        report = imagenet_to_raw.convert(self.src, out, mode="rgb")
         self.assertEqual(report["written"], 3)
         payload = batraw.read(out)[0]
         firsts = [payload[i * 3072] for i in range(3)]
@@ -401,7 +441,7 @@ class Imagenet32ToRaw(unittest.TestCase):
         self.write_batch("train_data_batch_1", 5)
         self.write_batch("train_data_batch_2", 5)
         out = os.path.join(self.dir, "small.batraw")
-        report = imagenet32_to_raw.convert(self.src, out, mode="rgb", limit=7)
+        report = imagenet_to_raw.convert(self.src, out, mode="rgb", limit=7)
         self.assertEqual(report["written"], 7)
         # Le compte de l'en-tête est corrigé au close() : il doit coller.
         self.assertEqual(batraw.read(out)[1], 7)
@@ -410,13 +450,13 @@ class Imagenet32ToRaw(unittest.TestCase):
         """Selon la façon dont l'archive a été picklée, les clés diffèrent."""
         self.write_batch("train_data_batch_1", 1, keys_as_bytes=True)
         out = os.path.join(self.dir, "bytes_keys.batraw")
-        self.assertEqual(imagenet32_to_raw.convert(self.src, out)["written"], 1)
+        self.assertEqual(imagenet_to_raw.convert(self.src, out)["written"], 1)
 
     def test_a_missing_folder_says_what_it_expected(self):
         empty = os.path.join(self.dir, "empty")
         os.makedirs(empty)
         with self.assertRaises(FileNotFoundError) as caught:
-            imagenet32_to_raw.convert(empty, os.path.join(self.dir, "x.batraw"))
+            imagenet_to_raw.convert(empty, os.path.join(self.dir, "x.batraw"))
         self.assertIn("train_data_batch", str(caught.exception))
 
     def test_a_batch_of_the_wrong_shape_is_refused(self):
@@ -428,13 +468,13 @@ class Imagenet32ToRaw(unittest.TestCase):
         with open(path, "wb") as fh:
             pickle.dump({"data": np.zeros((2, 100), dtype=np.uint8), "labels": [1, 2]}, fh)
         with self.assertRaises(ValueError):
-            imagenet32_to_raw.convert(self.src, os.path.join(self.dir, "x.batraw"))
+            imagenet_to_raw.convert(self.src, os.path.join(self.dir, "x.batraw"))
 
     def test_grey_matches_the_cifar_converter(self):
         """Les deux fondations doivent définir « gris » de la même façon."""
         self.write_batch("train_data_batch_1", 1, first=200)
         out = os.path.join(self.dir, "grey.batraw")
-        imagenet32_to_raw.convert(self.src, out, mode="grey")
+        imagenet_to_raw.convert(self.src, out, mode="grey")
         payload, count, w, h, c = batraw.read(out)[:5]
         self.assertEqual((count, w, h, c), (1, 32, 32, 1))
         self.assertEqual(payload[0], round(0.299 * 200 + 0.587 * 201 + 0.114 * 202))
@@ -446,6 +486,64 @@ class Imagenet32ToRaw(unittest.TestCase):
         writer.append(bytes(6))  # une image et demie
         with self.assertRaises(ValueError):
             writer.close()
+
+
+class GenUnetConfig(unittest.TestCase):
+    """Le générateur de config U-Net : dims dérivées, étages libres."""
+
+    def test_the_default_reproduces_greyscale_L_byte_for_byte(self):
+        """Généraliser à N étages ne doit pas bouger d'un octet le défaut.
+
+        Le `config_file` de `Greyscale_Diffusion_L` est la référence : taille 32,
+        largeurs 32/64/128, trois étages. La sortie du générateur par défaut doit
+        lui être identique — c'est ce qui garde intacts les modèles qui en sont
+        nés.
+        """
+        _, config = gen_unet_config.build_config()
+        rendered = json.dumps(config, indent=2) + "\n"
+        reference = os.path.join(
+            REPO_ROOT, "Models", "Greyscale_Diffusion_L", "config_file")
+        with open(reference, "r") as fh:
+            self.assertEqual(rendered, fh.read())
+
+    def test_kernel_depth_equals_the_running_channel_count_at_every_layer(self):
+        """La raison d'être du script : `dim_kernel.z == dim_input.z` partout.
+
+        Une UpsampleConv dont la profondeur de noyau ment corrompt en silence
+        (son shader indexe les poids avec IC = dim_input.z). On le vérifie sur une
+        pile profonde à quatre étages, celle que le défaut ne couvre pas.
+        """
+        _, config = gen_unet_config.build_config(
+            size=64, widths=(48, 96, 192, 384), attention=True)
+        for layer in config["layers"]:
+            for kind in ("Convolution", "UpsampleConv"):
+                if kind in layer:
+                    spec = layer[kind]
+                    self.assertEqual(
+                        spec["dim_kernel"][2], spec["dim_input"][2],
+                        f"{kind}: kernel depth {spec['dim_kernel'][2]} != "
+                        f"input channels {spec['dim_input'][2]}")
+
+    def test_a_size_that_does_not_halve_cleanly_is_refused(self):
+        """`size` doit se diviser par 2 autant de fois qu'il y a de descentes."""
+        # 20 ne se divise pas par 2**3 = 8 : refusé.
+        with self.assertRaises(ValueError):
+            gen_unet_config.build_config(size=20, widths=(32, 64, 128, 256))
+        # 64 se divise par 8 : accepté.
+        gen_unet_config.build_config(size=64, widths=(32, 64, 128, 256))
+
+    def test_the_stack_grows_by_one_encoder_and_one_decoder_per_extra_stage(self):
+        """Un étage de plus = une descente + une remontée symétriques de plus."""
+        _, three = gen_unet_config.build_config(size=32, widths=(32, 64, 128))
+        _, four = gen_unet_config.build_config(size=64, widths=(32, 64, 128, 256))
+        downs3 = sum(1 for l in three["layers"]
+                     if "Convolution" in l and l["Convolution"]["stride"] == 2)
+        downs4 = sum(1 for l in four["layers"]
+                     if "Convolution" in l and l["Convolution"]["stride"] == 2)
+        ups3 = sum(1 for l in three["layers"] if "UpsampleConv" in l)
+        ups4 = sum(1 for l in four["layers"] if "UpsampleConv" in l)
+        self.assertEqual((downs3, ups3), (2, 2))
+        self.assertEqual((downs4, ups4), (3, 3))
 
 
 if __name__ == "__main__":
