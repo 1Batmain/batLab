@@ -4,7 +4,7 @@ use std::fmt;
 
 use crate::gpu_context::GpuContext;
 use crate::model::layer::Layer;
-use crate::model::layer_types::{LayerType, LayerTypes};
+use crate::model::layer_types::LayerType;
 
 // ---------------------------------------------------------------------------
 // GPU buffer readback
@@ -148,16 +148,7 @@ impl fmt::Debug for LayerDebugView<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let layer = self.layer;
 
-        let ty_name = match &layer.ty {
-            LayerTypes::Convolution(_) => "Convolution",
-            LayerTypes::Activation(_) => "Activation",
-            LayerTypes::Attention(_) => "Attention",
-            LayerTypes::Concat(_) => "Concat",
-            LayerTypes::FullyConnected(_) => "FullyConnected",
-            LayerTypes::GroupNorm(_) => "GroupNorm",
-            LayerTypes::UpsampleConv(_) => "UpsampleConv",
-            LayerTypes::Loss(_) => "Loss",
-        };
+        let ty_name = layer.ty.variant_name();
 
         let dim_in = layer.ty.get_dim_input();
         let dim_out = layer.ty.get_dim_output();

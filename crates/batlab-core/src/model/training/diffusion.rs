@@ -4,6 +4,7 @@ use super::weighting::{LossWeighting, TimestepSampler};
 use super::{
     GpuDataset, LinearNoiseSchedule, TaskPassSpec, TrainingTask, TrainingTaskError, Workgroups,
 };
+use crate::gpu_context::GpuContext;
 use crate::model::{Dim3, Model, Training};
 use encase::{ShaderSize, ShaderType, StorageBuffer};
 use std::sync::Arc;
@@ -241,8 +242,9 @@ impl DiffusionTask {
 
         // One sample, whatever the graph was built for: this entry point takes
         // a single CPU-side target and fills slot 0.
+        let gpu = model.gpu.clone();
         let loss = model.train_step_report_with_prepass(|encoder| {
-            pass.encode_with_batch(encoder, 1);
+            pass.encode_with_batch(gpu.as_ref(), encoder, 1);
         });
         Ok(loss)
     }
@@ -383,7 +385,7 @@ impl DiffusionTask {
         // optimiser update for the whole batch. This is the change the mission
         // is about — it used to be `1 + 16 + 1` submits at batch 16.
         let loss = model.train_step_report_batched(batch_size, report_last_loss, |encoder| {
-            pass.encode(encoder);
+            pass.encode(gpu.as_ref(), encoder);
         });
 
         Ok(loss)
@@ -457,11 +459,11 @@ impl DiffusionTask {
 
             if batch_offset + 1 == batch_size {
                 last_loss = model.train_step_report_with_prepass_no_opt(|encoder| {
-                    pass.encode_with_batch(encoder, 1);
+                    pass.encode_with_batch(gpu.as_ref(), encoder, 1);
                 });
             } else {
                 model.train_step_with_prepass_no_opt(|encoder| {
-                    pass.encode_with_batch(encoder, 1);
+                    pass.encode_with_batch(gpu.as_ref(), encoder, 1);
                 });
             }
         }
@@ -653,21 +655,24 @@ impl DiffusionTask {
 }
 
 impl DiffusionPreparePass {
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        self.encode_with_batch(encoder, self.batch);
+    fn encode(&self, gpu: &GpuContext, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_with_batch(gpu, encoder, self.batch);
     }
 
-    fn encode_with_batch(&self, encoder: &mut wgpu::CommandEncoder, batch: u32) {
+    fn encode_with_batch(&self, gpu: &GpuContext, encoder: &mut wgpu::CommandEncoder, batch: u32) {
         let batch = batch.clamp(1, self.batch.max(1));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("diffusion_prepare_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        let (x, y) =
-            crate::model::layer::dispatch_grid(self.workgroups_per_sample * batch);
-        pass.dispatch_workgroups(x, y, 1);
+        let workgroups = self.workgroups_per_sample * batch;
+        gpu.compute_pass(
+            encoder,
+            workgroups,
+            || "prepass · diffusion_prepare".to_string(),
+            |pass| {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                let (x, y) = crate::model::layer::dispatch_grid(workgroups);
+                pass.dispatch_workgroups(x, y, 1);
+            },
+        );
     }
 }
 

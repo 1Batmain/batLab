@@ -16,6 +16,7 @@ pub mod config;
 pub mod gpu_context;
 pub mod live_frame;
 pub mod model;
+pub mod profile;
 pub mod resources;
 pub mod transfers;
 
@@ -28,7 +29,8 @@ pub use config::{
     PerpetualConfig, RunConfig, RunMode, TrainingConfig, TrainingControlCommand,
     compute_inferred_input, summarize_architecture,
 };
-pub use gpu_context::{GpuContext, GpuLimitsProfile};
+pub use gpu_context::{GpuContext, GpuLimitsProfile, pass_profiling_requested, request_pass_profiling};
+pub use profile::{PassSummary, PassTiming, ProfileRun, ProfileSummary};
 pub use resources::report::{MeasuredTransfers, ReportOptions, report_lines};
 pub use resources::{
     Allocation, DatasetPlan, DatasetSpec, DeviceProfile, GpuInventory, InventoryRequest, Kind,

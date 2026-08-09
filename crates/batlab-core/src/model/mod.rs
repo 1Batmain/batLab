@@ -37,3 +37,5 @@ mod conv_equivalence_tests;
 mod ema_tests;
 #[cfg(test)]
 mod group_norm_equivalence_tests;
+#[cfg(test)]
+mod upsample_conv_equivalence_tests;

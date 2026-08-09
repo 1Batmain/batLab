@@ -84,52 +84,28 @@ fn upsample_conv_back_input(
     let up_y_max = up_y_min + scale;
     let up_x_min = ix * scale;
     let up_x_max = up_x_min + scale;
-
-    // The map is INVERTED here, not scanned.
-    //
-    // The forward writes `output[oy,ox,k] += input[up_y/scale, up_x/scale, kz]
-    // * w[k,ky,kx,kz]` with `up_y = oy + ky - pad_y`. This kernel used to walk
-    // the ENTIRE output map — `k × OH × OW × KH × KW` iterations — and `continue`
-    // on the ones that did not land in this thread's `scale × scale` window.
-    // On `Color_Diffusion_XL`'s second UpsampleConv (16×16×96 → 32×32×48) that
-    // is 48·32·32·9 = 442 368 iterations per thread to accumulate 48·2·2·9 =
-    // 1728 products: **256 useless iterations for every useful one**, and the
-    // ratio is `OH·OW / scale²`, so it grows with the resolution of the layer.
-    // Measured cost of the two such passes: 4 140 ms of a 4 400 ms training
-    // step (`GPU_PROFILE.md`).
-    //
-    // The window is known in closed form. `up_y` ranges over exactly
-    // `[iy·scale, (iy+1)·scale)` — inside `[0, up_h)` by construction, which is
-    // why the two bounds tests on `up_y`/`up_x` are gone rather than merely
-    // moved — and `oy = up_y + pad_y - ky` is the inverse of the forward map,
-    // the same inversion `conv_back_input` performs (and the same one the f64
-    // oracle validates instead of repeating).
-    //
-    // `k` innermost, as in `conv_back_input` and for the same two reasons: the
-    // tap geometry depends only on `(up_y, ky, up_x, kx)` and would otherwise be
-    // recomputed `K` times, and `grad_output` is then walked contiguously along
-    // `k`, the fastest axis of the HWK layout.
-    let py = pad_y();
-    let px = pad_x();
-    let stride_w = KH * KW * IC;
+    let up_h = i32(upsampled_height());
+    let up_w = i32(upsampled_width());
 
     var g: f32 = 0.0;
-    for (var up_y: u32 = up_y_min; up_y < up_y_max; up_y++) {
-        for (var ky: u32 = 0u; ky < KH; ky++) {
-            let sy = i32(up_y) + py - i32(ky);
-            if sy < 0 || sy >= i32(OH) { continue; }
-            let oy = u32(sy);
-            for (var up_x: u32 = up_x_min; up_x < up_x_max; up_x++) {
-                for (var kx: u32 = 0u; kx < KW; kx++) {
-                    let sx = i32(up_x) + px - i32(kx);
-                    if sx < 0 || sx >= i32(OW) { continue; }
-                    let ox = u32(sx);
-
-                    let go_base = go_sample + oy * OW * K + ox * K;
-                    var w_i = ky * KW * IC + kx * IC + iz;
-                    for (var k: u32 = 0u; k < K; k++) {
-                        g += grad_output[go_base + k] * weights[w_i];
-                        w_i += stride_w;
+    for (var k: u32 = 0u; k < K; k++) {
+        for (var oy: u32 = 0u; oy < OH; oy++) {
+            for (var ox: u32 = 0u; ox < OW; ox++) {
+                let go_i = go_sample + oy * OW * K + ox * K + k;
+                for (var ky: u32 = 0u; ky < KH; ky++) {
+                    for (var kx: u32 = 0u; kx < KW; kx++) {
+                        let up_y = i32(oy) + i32(ky) - pad_y();
+                        let up_x = i32(ox) + i32(kx) - pad_x();
+                        if up_y < 0 || up_y >= up_h || up_x < 0 || up_x >= up_w {
+                            continue;
+                        }
+                        let up_y_u = u32(up_y);
+                        let up_x_u = u32(up_x);
+                        if up_y_u < up_y_min || up_y_u >= up_y_max || up_x_u < up_x_min || up_x_u >= up_x_max {
+                            continue;
+                        }
+                        let w_i = k * KH * KW * IC + ky * KW * IC + kx * IC + iz;
+                        g += grad_output[go_i] * weights[w_i];
                     }
                 }
             }

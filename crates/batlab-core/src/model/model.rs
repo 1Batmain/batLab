@@ -302,6 +302,8 @@ impl Model<Training> {
         let mut loss_layer = Layer::new(&self.gpu.device, LayerTypes::Loss(loss_spec), None)
             .expect("failed to create loss layer");
         loss_layer.batch = self.batch;
+        // Positioned after the network so its passes sort last in a profile.
+        loss_layer.index = self.layers.len();
 
         // create_buffers shares last_fwd_output as binding 0 (model_result) and
         // allocates [1] target, [2] loss_terms, [3] grad_output, [4] specs.
@@ -526,6 +528,9 @@ impl Model<Training> {
         self.encode_zero_optimizer_gradients(&mut encoder);
         prepass(&mut encoder);
         self.encode_train_graph(&mut encoder);
+        // Must be the last thing in this encoder: it copies out the timestamps
+        // the passes above wrote. A no-op unless the profiler is armed.
+        self.gpu.resolve_profiler(&mut encoder);
         self.gpu.submit([encoder.finish()]);
 
         if report_loss {
@@ -617,28 +622,31 @@ impl Model<Training> {
     fn encode_train_graph_without_opt(&self, encoder: &mut wgpu::CommandEncoder) {
         // Forward
         for layer in &self.layers {
-            layer.encode_pass(encoder);
+            layer.encode_pass(&self.gpu, encoder);
         }
         // Loss / initial gradient computation
-        self.loss_layer.as_ref().unwrap().encode_pass(encoder);
+        self.loss_layer
+            .as_ref()
+            .unwrap()
+            .encode_pass(&self.gpu, encoder);
 
         // Backward (reverse order)
         for layer in self.layers.iter().rev() {
-            layer.encode_merge_pass(encoder);
-            layer.encode_back_pass(encoder);
+            layer.encode_merge_pass(&self.gpu, encoder);
+            layer.encode_back_pass(&self.gpu, encoder);
         }
     }
 
     fn encode_train_optimizer_graph(&self, encoder: &mut wgpu::CommandEncoder) {
         // SGD weight updates
         for layer in &self.layers {
-            layer.encode_opt_pass(encoder);
+            layer.encode_opt_pass(&self.gpu, encoder);
         }
         // …then the weight average, in the same encoder. wgpu's implicit
         // barrier between compute passes is what makes the EMA read the weights
         // this step produced rather than the previous step's.
         for layer in &self.layers {
-            layer.encode_ema_pass(encoder);
+            layer.encode_ema_pass(&self.gpu, encoder);
         }
     }
 
@@ -1287,7 +1295,7 @@ impl<State> Model<State> {
             // full batch (this is what `probe_diffusion` does), dispatching the
             // whole grid would compute 15 more samples out of stale memory and
             // throw them away.
-            layer.encode_pass_with_batch(&mut encoder, 1);
+            layer.encode_pass_with_batch(&self.gpu, &mut encoder, 1);
         }
         self.gpu.submit([encoder.finish()]);
 
@@ -1350,7 +1358,8 @@ impl<State> Model<State> {
             panic!("Loss is not a network layer; pass LossMethod to new_training() instead");
         }
         let last_output = self.layers.last().map(|l| l.ty.get_dim_output());
-        let layer = Layer::new(&self.gpu.device, spec, last_output)?;
+        let mut layer = Layer::new(&self.gpu.device, spec, last_output)?;
+        layer.index = self.layers.len();
         self.layers.push(layer);
         Ok(())
     }
@@ -1383,6 +1392,8 @@ impl<State> Model<State> {
             LayerTypes::Concat(ConcatType::new(key, Dim3::default(), skip_dim)),
             last_output,
         )?;
+        let mut layer = layer;
+        layer.index = self.layers.len();
         self.layers.push(layer);
         Ok(())
     }

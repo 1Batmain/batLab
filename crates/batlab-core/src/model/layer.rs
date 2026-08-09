@@ -158,6 +158,10 @@ pub(crate) struct Layer {
     /// for `batch` and encoded for a different one is not an error — see
     /// `encode_pass_with_batch` — but a layer *allocated* for the wrong one is.
     pub(crate) batch: Batch,
+    /// Position in the model's layer list. Used for one thing only: naming this
+    /// layer's passes in a GPU profile, where `L13 Convolution` has to be
+    /// distinguishable from the seven other convolutions of the same stack.
+    pub(crate) index: usize,
 }
 
 impl Layer {
@@ -190,7 +194,16 @@ impl Layer {
             merge_pass: None,
             saved_output_key: None,
             batch: 1,
+            index: 0,
         })
+    }
+
+    /// How this layer's passes are named in a profile: `L03 Convolution`.
+    ///
+    /// Only ever called from behind a profiling check — it allocates, and a
+    /// training step encodes 151 passes.
+    fn profile_prefix(&self) -> String {
+        format!("L{:02} {}", self.index, self.ty.variant_name())
     }
 
     pub(crate) fn clear(&mut self) {
@@ -388,8 +401,8 @@ impl Layer {
         );
     }
 
-    pub(crate) fn encode_pass(&self, encoder: &mut CommandEncoder) {
-        self.encode_pass_with_batch(encoder, self.batch);
+    pub(crate) fn encode_pass(&self, gpu: &GpuContext, encoder: &mut CommandEncoder) {
+        self.encode_pass_with_batch(gpu, encoder, self.batch);
     }
 
     /// Encode the forward pass for the first `batch` samples only.
@@ -400,7 +413,12 @@ impl Layer {
     /// `predict()` uses it to run a single image through a graph whose buffers
     /// are sized for a full training batch — the probe would otherwise pay 16x
     /// the work for one result.
-    pub(crate) fn encode_pass_with_batch(&self, encoder: &mut CommandEncoder, batch: Batch) {
+    pub(crate) fn encode_pass_with_batch(
+        &self,
+        gpu: &GpuContext,
+        encoder: &mut CommandEncoder,
+        batch: Batch,
+    ) {
         assert!(
             !self.pipeline.forward.is_empty(),
             "forward pipeline not initialised"
@@ -427,6 +445,7 @@ impl Layer {
             })
         };
 
+        let entrypoints = self.ty.get_forward_entrypoints();
         for (index, (pipeline, built_wg)) in self.pipeline.forward.iter().enumerate() {
             let workgroups = match &truncated {
                 Some(counts) => counts[index],
@@ -435,11 +454,20 @@ impl Layer {
             // wgpu inserts a pipeline barrier between compute passes of one
             // encoder — that barrier is what makes a multi-pass forward (q/k/v,
             // then scores, then context) see the previous pass's writes.
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bg, &[]);
-            let (x, y) = dispatch_grid(workgroups);
-            pass.dispatch_workgroups(x, y, 1);
+            gpu.compute_pass(
+                encoder,
+                workgroups,
+                || {
+                    let ep = entrypoints.get(index).copied().unwrap_or("forward");
+                    format!("{} · {ep}", self.profile_prefix())
+                },
+                |pass| {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    let (x, y) = dispatch_grid(workgroups);
+                    pass.dispatch_workgroups(x, y, 1);
+                },
+            );
         }
     }
 
@@ -563,17 +591,27 @@ impl Layer {
 
     /// Encode all backward sub-passes (e.g. Conv encodes 3 sequential passes).
     /// wgpu inserts implicit pipeline barriers between compute passes in the same encoder.
-    pub(crate) fn encode_back_pass(&self, encoder: &mut CommandEncoder) {
+    pub(crate) fn encode_back_pass(&self, gpu: &GpuContext, encoder: &mut CommandEncoder) {
         let bg = match self.bind_group.backward.as_ref() {
             Some(bg) => bg,
             None => return,
         };
-        for (pipeline, num_wg) in &self.pipeline.backward {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bg, &[]);
-            let (x, y) = dispatch_grid(*num_wg);
-            pass.dispatch_workgroups(x, y, 1);
+        let entrypoints = self.ty.get_back_entrypoints();
+        for (index, (pipeline, num_wg)) in self.pipeline.backward.iter().enumerate() {
+            gpu.compute_pass(
+                encoder,
+                *num_wg,
+                || {
+                    let ep = entrypoints.get(index).copied().unwrap_or("backward");
+                    format!("{} · {ep}", self.profile_prefix())
+                },
+                |pass| {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    let (x, y) = dispatch_grid(*num_wg);
+                    pass.dispatch_workgroups(x, y, 1);
+                },
+            );
         }
     }
 
@@ -770,13 +808,19 @@ impl Layer {
         self.write_opt_specs(gpu, lr, 1.0, 1);
     }
 
-    pub(crate) fn encode_opt_pass(&self, encoder: &mut CommandEncoder) {
+    pub(crate) fn encode_opt_pass(&self, gpu: &GpuContext, encoder: &mut CommandEncoder) {
         let Some(opt) = &self.opt_pass else { return };
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&opt.pipeline);
-        pass.set_bind_group(0, &opt.bind_group, &[]);
-        let (x, y) = dispatch_grid(opt.num_workgroups);
-        pass.dispatch_workgroups(x, y, 1);
+        gpu.compute_pass(
+            encoder,
+            opt.num_workgroups,
+            || format!("{} · {}", self.profile_prefix(), opt.kind.label()),
+            |pass| {
+                pass.set_pipeline(&opt.pipeline);
+                pass.set_bind_group(0, &opt.bind_group, &[]);
+                let (x, y) = dispatch_grid(opt.num_workgroups);
+                pass.dispatch_workgroups(x, y, 1);
+            },
+        );
     }
 
     /// Refresh the optimiser uniform for the step about to be dispatched.
@@ -978,13 +1022,19 @@ impl Layer {
         gpu.submit([encoder.finish()]);
     }
 
-    pub(crate) fn encode_ema_pass(&self, encoder: &mut CommandEncoder) {
+    pub(crate) fn encode_ema_pass(&self, gpu: &GpuContext, encoder: &mut CommandEncoder) {
         let Some(ema) = &self.ema_pass else { return };
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&ema.pipeline);
-        pass.set_bind_group(0, &ema.bind_group, &[]);
-        let (x, y) = dispatch_grid(ema.num_workgroups);
-        pass.dispatch_workgroups(x, y, 1);
+        gpu.compute_pass(
+            encoder,
+            ema.num_workgroups,
+            || format!("{} · ema", self.profile_prefix()),
+            |pass| {
+                pass.set_pipeline(&ema.pipeline);
+                pass.set_bind_group(0, &ema.bind_group, &[]);
+                let (x, y) = dispatch_grid(ema.num_workgroups);
+                pass.dispatch_workgroups(x, y, 1);
+            },
+        );
     }
 
     /// Refresh the EMA uniform for the step about to be dispatched. `decay` is
@@ -1124,14 +1174,20 @@ impl Layer {
         merged
     }
 
-    pub(crate) fn encode_merge_pass(&self, encoder: &mut CommandEncoder) {
+    pub(crate) fn encode_merge_pass(&self, gpu: &GpuContext, encoder: &mut CommandEncoder) {
         let Some(merge) = &self.merge_pass else {
             return;
         };
-        let mut pass = encoder.begin_compute_pass(&Default::default());
-        pass.set_pipeline(&merge.pipeline);
-        pass.set_bind_group(0, &merge.bind_group, &[]);
-        let (x, y) = dispatch_grid(merge.num_workgroups);
-        pass.dispatch_workgroups(x, y, 1);
+        gpu.compute_pass(
+            encoder,
+            merge.num_workgroups,
+            || format!("{} · grad_merge", self.profile_prefix()),
+            |pass| {
+                pass.set_pipeline(&merge.pipeline);
+                pass.set_bind_group(0, &merge.bind_group, &[]);
+                let (x, y) = dispatch_grid(merge.num_workgroups);
+                pass.dispatch_workgroups(x, y, 1);
+            },
+        );
     }
 }
