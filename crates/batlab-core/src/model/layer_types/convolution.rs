@@ -160,11 +160,26 @@ impl ConvolutionType {
 
     /// Lanes for the `grad_weights` reduction: one sum per weight, and there
     /// are thousands of them, so the rule usually answers "barely split".
+    ///
+    /// Capped at the number of **output rows**, because that is what the lanes
+    /// now split. `conv_back_weights` walks `(sample, oy)` rows and runs `ox`
+    /// densely inside them, so a lane numbered past `OH` would be handed no row
+    /// at all on a batch of one — a thread asked for and then left idle. `OH`
+    /// and not `OH * batch` because the uniform is written once at build time
+    /// and does not know the batch; the cap is therefore conservative in the
+    /// only direction that is safe. No layer of any model here is affected
+    /// (every one has `OH >= 32 >= lanes`); it is a guard for the wide-and-short
+    /// shapes nothing in this repo builds yet.
     pub(crate) fn reduction_lanes_for_weights(&self) -> u32 {
-        Self::reduction_lanes(
+        let lanes = Self::reduction_lanes(
             self.dim_kernel.length() * self.nb_kernel,
             self.output_positions(),
-        )
+        );
+        // The largest power of two no greater than the row count — the lane
+        // count has to stay a power of two for the tree reduction to halve it
+        // down to 1.
+        let rows = self.dim_output.x.max(1);
+        lanes.min(1 << rows.ilog2())
     }
 
     /// Lanes for the `grad_bias` reduction — its **own** count, not the
