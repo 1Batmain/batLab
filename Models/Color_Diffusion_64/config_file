@@ -13,7 +13,7 @@
           64,
           7
         ],
-        "nb_kernel": 32,
+        "nb_kernel": 48,
         "dim_kernel": [
           3,
           3,
@@ -29,7 +29,7 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
         "num_groups": 8,
         "save_key": null
@@ -40,7 +40,7 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
         "method": "Silu",
         "save_key": "skip64"
@@ -51,13 +51,13 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
-        "nb_kernel": 64,
+        "nb_kernel": 96,
         "dim_kernel": [
           3,
           3,
-          32
+          48
         ],
         "stride": 2,
         "padding": "Same",
@@ -69,7 +69,7 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
         "num_groups": 8,
         "save_key": null
@@ -80,7 +80,7 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
         "method": "Silu",
         "save_key": null
@@ -91,13 +91,13 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
-        "nb_kernel": 64,
+        "nb_kernel": 96,
         "dim_kernel": [
           3,
           3,
-          64
+          96
         ],
         "stride": 1,
         "padding": "Same",
@@ -109,7 +109,7 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
         "num_groups": 8,
         "save_key": null
@@ -120,7 +120,7 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
         "method": "Silu",
         "save_key": "skip32"
@@ -131,13 +131,13 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
-        "nb_kernel": 128,
+        "nb_kernel": 192,
         "dim_kernel": [
           3,
           3,
-          64
+          96
         ],
         "stride": 2,
         "padding": "Same",
@@ -149,7 +149,7 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
         "num_groups": 8,
         "save_key": null
@@ -160,7 +160,7 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
         "method": "Silu",
         "save_key": null
@@ -171,13 +171,13 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
-        "nb_kernel": 128,
+        "nb_kernel": 192,
         "dim_kernel": [
           3,
           3,
-          128
+          192
         ],
         "stride": 1,
         "padding": "Same",
@@ -189,7 +189,7 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
         "num_groups": 8,
         "save_key": null
@@ -200,7 +200,7 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
         "method": "Silu",
         "save_key": "skip16"
@@ -211,13 +211,13 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
-        "nb_kernel": 256,
+        "nb_kernel": 384,
         "dim_kernel": [
           3,
           3,
-          128
+          192
         ],
         "stride": 2,
         "padding": "Same",
@@ -229,7 +229,7 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "num_groups": 8,
         "save_key": null
@@ -240,7 +240,7 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "method": "Silu",
         "save_key": null
@@ -251,13 +251,13 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
-        "nb_kernel": 256,
+        "nb_kernel": 384,
         "dim_kernel": [
           3,
           3,
-          256
+          384
         ],
         "stride": 1,
         "padding": "Same",
@@ -269,7 +269,7 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "num_groups": 8,
         "save_key": null
@@ -280,7 +280,7 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "save_key": null
       }
@@ -290,7 +290,7 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "num_groups": 8,
         "save_key": null
@@ -301,7 +301,7 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "method": "Silu",
         "save_key": null
@@ -312,14 +312,14 @@
         "dim_input": [
           8,
           8,
-          256
+          384
         ],
         "scale_factor": 2,
-        "nb_kernel": 128,
+        "nb_kernel": 192,
         "dim_kernel": [
           3,
           3,
-          256
+          384
         ],
         "padding": "Same",
         "save_key": null
@@ -330,12 +330,12 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
         "dim_skip": [
           16,
           16,
-          128
+          192
         ],
         "skip_key": "skip16",
         "save_key": null
@@ -346,7 +346,7 @@
         "dim_input": [
           16,
           16,
-          256
+          384
         ],
         "num_groups": 8,
         "save_key": null
@@ -357,7 +357,7 @@
         "dim_input": [
           16,
           16,
-          256
+          384
         ],
         "method": "Silu",
         "save_key": null
@@ -368,13 +368,13 @@
         "dim_input": [
           16,
           16,
-          256
+          384
         ],
-        "nb_kernel": 128,
+        "nb_kernel": 192,
         "dim_kernel": [
           3,
           3,
-          256
+          384
         ],
         "stride": 1,
         "padding": "Same",
@@ -386,14 +386,14 @@
         "dim_input": [
           16,
           16,
-          128
+          192
         ],
         "scale_factor": 2,
-        "nb_kernel": 64,
+        "nb_kernel": 96,
         "dim_kernel": [
           3,
           3,
-          128
+          192
         ],
         "padding": "Same",
         "save_key": null
@@ -404,12 +404,12 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
         "dim_skip": [
           32,
           32,
-          64
+          96
         ],
         "skip_key": "skip32",
         "save_key": null
@@ -420,7 +420,7 @@
         "dim_input": [
           32,
           32,
-          128
+          192
         ],
         "num_groups": 8,
         "save_key": null
@@ -431,7 +431,7 @@
         "dim_input": [
           32,
           32,
-          128
+          192
         ],
         "method": "Silu",
         "save_key": null
@@ -442,13 +442,13 @@
         "dim_input": [
           32,
           32,
-          128
+          192
         ],
-        "nb_kernel": 64,
+        "nb_kernel": 96,
         "dim_kernel": [
           3,
           3,
-          128
+          192
         ],
         "stride": 1,
         "padding": "Same",
@@ -460,14 +460,14 @@
         "dim_input": [
           32,
           32,
-          64
+          96
         ],
         "scale_factor": 2,
-        "nb_kernel": 32,
+        "nb_kernel": 48,
         "dim_kernel": [
           3,
           3,
-          64
+          96
         ],
         "padding": "Same",
         "save_key": null
@@ -478,12 +478,12 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
         "dim_skip": [
           64,
           64,
-          32
+          48
         ],
         "skip_key": "skip64",
         "save_key": null
@@ -494,7 +494,7 @@
         "dim_input": [
           64,
           64,
-          64
+          96
         ],
         "num_groups": 8,
         "save_key": null
@@ -505,7 +505,7 @@
         "dim_input": [
           64,
           64,
-          64
+          96
         ],
         "method": "Silu",
         "save_key": null
@@ -516,13 +516,13 @@
         "dim_input": [
           64,
           64,
-          64
+          96
         ],
-        "nb_kernel": 32,
+        "nb_kernel": 48,
         "dim_kernel": [
           3,
           3,
-          64
+          96
         ],
         "stride": 1,
         "padding": "Same",
@@ -534,7 +534,7 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
         "num_groups": 8,
         "save_key": null
@@ -545,7 +545,7 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
         "method": "Silu",
         "save_key": null
@@ -556,13 +556,13 @@
         "dim_input": [
           64,
           64,
-          32
+          48
         ],
         "nb_kernel": 3,
         "dim_kernel": [
           3,
           3,
-          32
+          48
         ],
         "stride": 1,
         "padding": "Same",
