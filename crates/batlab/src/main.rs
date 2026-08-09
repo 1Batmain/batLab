@@ -2011,6 +2011,12 @@ fn run_profile_step(args: &[String]) -> Result<(), String> {
                 format!("{} chunks", gpu_dataset.chunk_count())
             }
         );
+        // A profile taken under a swept knob is a profile of a different
+        // machine's settings; say so on the line above the table, or the number
+        // pasted into a report will read as the stock one.
+        for line in batlab_core::tuning::overrides_in_force() {
+            println!("              tuning override · {line}");
+        }
         if !gpu.can_profile() {
             return Err(
                 "this device has no TIMESTAMP_QUERY, so there is no per-pass GPU time to \

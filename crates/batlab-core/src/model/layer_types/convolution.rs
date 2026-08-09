@@ -25,10 +25,21 @@ pub struct ConvolutionUniform {
     pub nb_kernel: u32,
     pub stride: u32,
     pub padding_mode: u32, // 0 = Valid, 1 = Same
-    /// Cooperating threads per `grad_weights` / `grad_bias` sum. Occupies the
-    /// word that used to be explicit padding, so the uniform's size and every
-    /// other field offset are unchanged — the legacy fixtures still bind this
-    /// very same buffer and simply ignore the word.
+    /// Cooperating threads per sum, for the **two** reductions: the
+    /// `grad_weights` split in the low half of the word, the `grad_bias` split
+    /// in the high half (see [`ConvolutionType::pack_lanes`]).
+    ///
+    /// One word and not two because this uniform's layout is pinned: bytes
+    /// 48..64 are a `Dim3` whose trailing word WGSL reads as `vec3` padding, so
+    /// there is no free slot at the end to grow into without moving offsets the
+    /// legacy fixtures bind against. It occupies the word that used to be
+    /// explicit padding, so the uniform's size and every other field offset are
+    /// unchanged.
+    ///
+    /// The two halves differ because the two reductions do: `grad_weights` has
+    /// thousands of independent sums and wants few lanes, `grad_bias` has as
+    /// many sums as there are kernels — 48 on the layer that cost 9,8 ms on a
+    /// single workgroup — and wants as many lanes as it can get.
     pub reduction_lanes: u32,
     pub dim_kernel: Dim3,
     pub dim_input: Dim3,
@@ -94,64 +105,122 @@ impl ConvolutionType {
     /// | conv3 | 9216 |  256 |  8 |  8 (0.0965 ms) |
     /// | conv4 |  288 | 1024 | 32 | 32 (0.0220 ms) |
     ///
-    /// # `TARGET_THREADS` was recalibrated on the real step (`GPU_PROFILE.md`)
+    /// # `TARGET_THREADS` has been recalibrated twice, and the second time says
+    /// why the first expired
     ///
-    /// 65 536 came from `bench_conv_reduction_lanes`, i.e. from one kernel
-    /// dispatched 200 times in a loop, on `Greyscale_Diffusion`, **before the
-    /// batch axis existed**. Two things changed since: each sum now runs over
-    /// `batch × positions`, and there is an instrument (`--profile-step`) that
-    /// times each pass *inside a real training step* instead of in isolation.
+    /// 65 536 came from `bench_conv_reduction_lanes` — one kernel dispatched
+    /// 200 times in a loop, on `Greyscale_Diffusion`, **before the batch axis
+    /// existed**. `GPU_PROFILE.md` §6 re-swept it on the real step and got
+    /// 262 144 (−4,2 % to −5,9 %).
     ///
-    /// Re-swept there, Σ of the timed passes of one step, minimum over 4 armed
-    /// steps:
+    /// That value then expired the moment `conv_back_weights`' inner loop got
+    /// cheap (`KERNEL_HUNT.md` §3): a lane used to pay four integer divisions
+    /// per product and now pays two loads and an FMA, so the barriers of a deep
+    /// split no longer buy back what they cost. Re-swept a third time, Σ of the
+    /// timed passes of one step, minimum over 8 armed steps, two interleaved
+    /// passes over the sweep agreeing to 0,3 %:
     ///
-    /// | TARGET_THREADS | XL b8 | XL b32 | XL b64 | Color_Diffusion_L b32 |
+    /// | TARGET_THREADS | XL b8 | XL b32 | L b8 | L b32 |
     /// |---:|---:|---:|---:|---:|
-    /// |    65 536 (was) |  70.7 | 277.5 | 554.3 | 135.3 |
-    /// |   131 072       |  69.0 | 270.3 | 546.8 | 129.3 |
-    /// | **262 144**     |**67.7**|**264.5**|**524.4**|**127.3**|
-    /// |   524 288       |  67.0 | 265.4 | 545.8 | 136.9 |
-    /// | 1 048 576       |     — | 290.6 |     — |     — |
+    /// |    32 768        | 40.7 | **154.5** | 18.6 | 71.3 |
+    /// | **131 072**      | **40.4** | 155.3 | **18.6** | **71.1** |
+    /// |    262 144 (was) | 41.2 | 159.8 | 20.1 | 79.5 |
+    /// |    524 288       | 45.0 | 179.8 |    — |    — |
+    /// |  1 048 576       | 52.4 | 213.1 |    — |    — |
     ///
-    /// −4.2 % to −5.9 % on the whole step, on two models and three batch sizes,
-    /// with a clear interior optimum: past 262 144 the biggest layer's
-    /// `conv_back_weights` doubles (31.7 → 59.4 ms at 20 736 workgroups), which
-    /// is the tree reduction and its barriers costing more than the sum they
-    /// split.
+    /// 32 768 and 131 072 are a tie; the tie is broken **towards parallelism**
+    /// (at 32 768 the biggest layers fall to a single lane per sum) because a
+    /// device with less throughput per thread loses more to a starved dispatch
+    /// than to a barrier. That is a portability argument, not a measurement.
     ///
     /// This recalibrates the constant; it does **not** fix the structural point
     /// `BATCH_DISPATCH.md` §9 raises — `positions` here is still the count *per
     /// sample*, while the loop covers `batch ×` more. Doing that properly means
     /// getting the batch into the uniform's lane word, and is left open.
+    ///
+    /// # The two numbers are knobs, not constants
+    ///
+    /// Both came out of a sweep on one Mac, and both describe *that machine's*
+    /// balance between parallelism and barrier cost. They are read from
+    /// [`crate::tuning`] (`BATLAB_CONV_TARGET_THREADS`,
+    /// `BATLAB_CONV_MIN_POSITIONS_PER_LANE`) so the same sweep is one shell
+    /// loop on a GPU nobody here owns — see `KERNEL_HUNT.md` §Portabilité. The
+    /// defaults are unchanged.
     pub(crate) fn reduction_lanes(sums: u32, positions: u32) -> u32 {
-        const TARGET_THREADS: u32 = 262_144;
-        const MIN_POSITIONS_PER_LANE: u32 = 16;
+        let target_threads = crate::tuning::conv_target_threads();
+        let min_positions_per_lane = crate::tuning::conv_min_positions_per_lane();
         const MAX_LANES: u32 = WG_SIZE / 2;
 
         let mut lanes = 1u32;
         while lanes < MAX_LANES
-            && sums * lanes < TARGET_THREADS
-            && positions / (lanes * 2) >= MIN_POSITIONS_PER_LANE
+            && sums * lanes < target_threads
+            && positions / (lanes * 2) >= min_positions_per_lane
         {
             lanes *= 2;
         }
         lanes
     }
 
-    /// Independent sums a single workgroup carries (`lanes * slots == 64`).
-    /// The two passes reduce different numbers of sums, so they get different
-    /// splits; the uniform therefore carries the `grad_weights` value and the
-    /// bias pass reuses it (its sum count, `nb_kernel`, is always tiny, so the
-    /// weights-driven choice is never worse for it than not splitting).
-    fn reduction_lanes_for_weights(&self) -> u32 {
-        Self::reduction_lanes(
+    /// Lanes for the `grad_weights` reduction: one sum per weight, and there
+    /// are thousands of them, so the rule usually answers "barely split".
+    ///
+    /// Capped at the number of **output rows**, because that is what the lanes
+    /// now split. `conv_back_weights` walks `(sample, oy)` rows and runs `ox`
+    /// densely inside them, so a lane numbered past `OH` would be handed no row
+    /// at all on a batch of one — a thread asked for and then left idle. `OH`
+    /// and not `OH * batch` because the uniform is written once at build time
+    /// and does not know the batch; the cap is therefore conservative in the
+    /// only direction that is safe. No layer of any model here is affected
+    /// (every one has `OH >= 32 >= lanes`); it is a guard for the wide-and-short
+    /// shapes nothing in this repo builds yet.
+    pub(crate) fn reduction_lanes_for_weights(&self) -> u32 {
+        let lanes = Self::reduction_lanes(
             self.dim_kernel.length() * self.nb_kernel,
             self.output_positions(),
-        )
+        );
+        // The largest power of two no greater than the row count — the lane
+        // count has to stay a power of two for the tree reduction to halve it
+        // down to 1.
+        let rows = self.dim_output.x.max(1);
+        lanes.min(1 << rows.ilog2())
     }
 
+    /// Lanes for the `grad_bias` reduction — its **own** count, not the
+    /// weights' one.
+    ///
+    /// The bias pass has exactly `nb_kernel` sums: 48 on `Color_Diffusion_XL`'s
+    /// L26, against 41 472 for its weights. Feeding the weights' choice to both
+    /// (which is what this did) left the bias with `nb_kernel / slots`
+    /// workgroups — **one** workgroup, 48 threads, on the UpsampleConv of the
+    /// same shape, walking 32 768 positions each. Measured 9,8 ms for a pass
+    /// that reads 6,3 Mio: 0,6 Gio/s, i.e. latency-bound on a thread count that
+    /// cannot cover it. The same rule fed the bias's own sum count answers 32
+    /// lanes and 24 workgroups instead of 1.
+    ///
+    /// What this deliberately does **not** do is split the position axis across
+    /// workgroups, which would need a scratch buffer and a second pass to
+    /// combine them. Costed rather than assumed: 1 → 1536 threads already
+    /// recovers essentially the whole pass, and the remaining ~0,3 ms of the
+    /// step is not worth a buffer and a dispatch per layer.
+    pub(crate) fn reduction_lanes_for_bias(&self) -> u32 {
+        Self::reduction_lanes(self.nb_kernel, self.output_positions())
+    }
+
+    /// The two lane counts as the shader reads them: `grad_weights` in the low
+    /// half of the word, `grad_bias` in the high half. Both are powers of two
+    /// no greater than 32, so neither can ever overflow its half.
+    pub(crate) fn pack_lanes(weight_lanes: u32, bias_lanes: u32) -> u32 {
+        debug_assert!(weight_lanes <= WG_SIZE && bias_lanes <= WG_SIZE);
+        (weight_lanes & 0xffff) | (bias_lanes << 16)
+    }
+
+    /// Independent sums a single workgroup carries (`lanes * slots == 64`).
     fn reduction_slots(&self) -> u32 {
         WG_SIZE / self.reduction_lanes_for_weights()
+    }
+
+    fn bias_slots(&self) -> u32 {
+        WG_SIZE / self.reduction_lanes_for_bias()
     }
 }
 
@@ -264,11 +333,14 @@ impl LayerType for ConvolutionType {
         //     the kernel, as `batch * OH * OW` positions to reduce instead of
         //     `OH * OW`. That is the whole point of the exercise: one `+=` per
         //     weight and per step instead of one per weight and per sample.
-        let slots = self.reduction_slots();
+        //
+        // The bias pass gets its own slot count: it reduces `nb_kernel` sums,
+        // not `dim_kernel.length() * nb_kernel` of them, and inheriting the
+        // weights' split was what left it on a single workgroup.
         vec![
             (self.dim_input.length() * batch).div_ceil(WG_SIZE),
-            (self.dim_kernel.length() * self.nb_kernel).div_ceil(slots),
-            self.nb_kernel.div_ceil(slots),
+            (self.dim_kernel.length() * self.nb_kernel).div_ceil(self.reduction_slots()),
+            self.nb_kernel.div_ceil(self.bias_slots()),
         ]
     }
 
@@ -480,7 +552,10 @@ impl LayerType for ConvolutionType {
                 PaddingMode::Valid => 0,
                 PaddingMode::Same => 1,
             },
-            reduction_lanes: self.reduction_lanes_for_weights(),
+            reduction_lanes: Self::pack_lanes(
+                self.reduction_lanes_for_weights(),
+                self.reduction_lanes_for_bias(),
+            ),
             dim_kernel: self.dim_kernel,
             dim_input: self.dim_input,
             dim_output: self.dim_output,

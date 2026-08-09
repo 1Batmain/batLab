@@ -43,13 +43,26 @@ struct ConvSpec {
     nb_kernel:       u32,
     stride:          u32,
     padding_mode:    u32,
-    // Cooperating threads per grad_weights / grad_bias sum. Sits in the word
-    // that used to be padding, so the uniform's size and layout are unchanged
-    // and the legacy fixtures still bind the very same buffer.
+    // Cooperating threads per sum, for BOTH reductions: grad_weights in the low
+    // half of the word, grad_bias in the high half. Sits in the word that used
+    // to be padding, so the uniform's size and layout are unchanged and the
+    // legacy fixtures still bind the very same buffer.
+    //
+    // Two counts and not one because the two reductions have wildly different
+    // sum counts: `KH*KW*IC*K` weights against `K` biases. Giving the bias the
+    // weights' split left it on ONE workgroup — see `reduction_lanes_for_bias`.
     reduction_lanes: u32,
     dim_kernel:      vec3<u32>,
     dim_input:       vec3<u32>,
     dim_output:      vec3<u32>,
+}
+
+fn weight_lanes() -> u32 {
+    return layer_spec.reduction_lanes & 0xffffu;
+}
+
+fn bias_lanes() -> u32 {
+    return layer_spec.reduction_lanes >> 16u;
 }
 
 // Must mirror convolution.wgsl exactly: the forward maps
@@ -67,6 +80,12 @@ fn pad_x() -> i32 {
         return i32(layer_spec.dim_kernel.y / 2u);
     }
     return 0;
+}
+
+// `sx` at `ox = 0` for a given kernel column: the intercept of the forward's
+// `sx = ox*s + kx - pad_x` line.
+fn pad_x_signed(kx: u32) -> i32 {
+    return i32(kx) - pad_x();
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +200,41 @@ fn reduce_slot(tid: u32, lane: u32, lanes: u32, slots: u32) {
 // One slot per weight element. Consecutive slots are consecutive `kz`, so the
 // threads of a slot-group read consecutive `fwd_input` addresses and share the
 // same `grad_output` value.
+//
+// # Why this loop is a nest and not a flat walk
+//
+// This pass contracts exactly as many products as the forward does — the same
+// triple `(b, oy, ox)` against the same `(ky, kx, kz)` — and took **4,1× longer**
+// (`GPU_PROFILE.md` §3.2), which that report read as a memory-hierarchy
+// handicap. It is not, or not only: the flat walk paid **four integer
+// divisions per product**. `p / positions`, `p % positions`, `pos / OW`,
+// `pos % OW` — all by values only known at runtime, so none of them folds — for
+// one multiply-add. The forward's inner loop, for comparison, is two loads and
+// an FMA.
+//
+// So the position axis is walked as what it is: rows, then columns.
+//
+//   - A **row** is one `(sample, oy)`. The lane split moves there — one
+//     div/mod per row instead of four per position, and a lane still strides
+//     across sample boundaries, which is what turns `batch` sequential
+//     accumulations into one tree reduction.
+//   - Within a row, `ox` runs over a **closed-form interval**. `sx = ox*s + kx
+//     - pad_x` is monotonic in `ox`, so the positions whose tap falls in the
+//     input are contiguous: computing the two ends once replaces a bounds test
+//     taken `OW` times per row. The kernel row test on `sy` stays, once per
+//     row, exactly as `convolution.wgsl` does it.
+//   - Both addresses are then **incremented**, never recomputed: `grad_output`
+//     advances by `K` per `ox` (it is HWK) and `fwd_input` by `s * IC`.
+//
+// The inner loop is left with two loads, an FMA and two adds — the forward's
+// loop. Same taps, same padding rule, same products.
+//
+// The **order** does change: a lane used to visit positions `lane, lane+lanes,
+// …` across the flat axis and now visits whole rows. Float addition is not
+// associative, so this is a reassociation, and the equivalence tests treat it
+// as one (tolerance against the legacy kernel, an f64 oracle to arbitrate, and
+// a "never less accurate than what it replaces" clause) rather than asserting
+// bit-identity, which would be false.
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
 fn conv_back_weights(
@@ -202,9 +256,9 @@ fn conv_back_weights(
     let positions = OH * OW;
     // The batch, straight off the buffer that carries it.
     let batch = arrayLength(&grad_output) / (OH * OW * K);
-    let work = positions * batch;
+    let rows = OH * batch;
 
-    let lanes = layer_spec.reduction_lanes;
+    let lanes = weight_lanes();
     let slots = WG_SIZE / lanes;
     let tid   = lid.x;
     let slot  = tid % slots;
@@ -218,24 +272,39 @@ fn conv_back_weights(
         let ky = (idx / (IC * KW)) % KH;
         let k  = idx / (IC * KW * KH);
 
-        // Same tap geometry and same zero-padding rule as the forward pass.
-        // The position axis now runs over the whole batch: `p / positions` is
-        // the sample, `p % positions` the output position within it. A lane
-        // therefore strides across sample boundaries, which is what turns B
-        // sequential accumulations into one tree reduction.
-        for (var p: u32 = lane; p < work; p += lanes) {
-            let sample = p / positions;
-            let pos    = p % positions;
-            let oy = pos / OW;
-            let ox = pos % OW;
-            let sy = i32(oy * s) + i32(ky) - pad_y();
-            let sx = i32(ox * s) + i32(kx) - pad_x();
-            if sy < 0 || sy >= i32(IH) || sx < 0 || sx >= i32(IW) {
-                continue; // padded position — contributes zero to the gradient
+        let in_len = IH * IW * IC;
+        let row_in = IW * IC;
+        let step_in = s * IC;
+
+        // `sx` at `ox = 0`. Monotonic in `ox` with slope `s > 0`, so
+        // `0 <= sx < IW` is the interval [ox_lo, ox_hi).
+        let sx0 = pad_x_signed(kx);
+        var ox_lo: u32 = 0u;
+        if sx0 < 0 {
+            ox_lo = u32((-sx0 + i32(s) - 1) / i32(s));
+        }
+        var ox_hi: u32 = 0u;
+        let last = i32(IW) - 1 - sx0;
+        if last >= 0 {
+            ox_hi = min(OW, u32(last / i32(s)) + 1u);
+        }
+
+        let sy_at_zero = i32(ky) - pad_y();
+        for (var r: u32 = lane; r < rows; r += lanes) {
+            let sample = r / OH;
+            let oy     = r % OH;
+            let sy = i32(oy * s) + sy_at_zero;
+            if sy < 0 || sy >= i32(IH) {
+                continue; // whole kernel row sits in the zero padding
             }
-            let in_i = sample * IH * IW * IC + u32(sy) * IW * IC + u32(sx) * IC + kz;
-            let go_i = sample * OH * OW * K + oy * OW * K + ox * K + k;
-            g += grad_output[go_i] * fwd_input[in_i];
+            var gi = (sample * positions + oy * OW + ox_lo) * K + k;
+            var ii = sample * in_len + u32(sy) * row_in
+                   + u32(i32(ox_lo * s) + sx0) * IC + kz;
+            for (var ox: u32 = ox_lo; ox < ox_hi; ox++) {
+                g += grad_output[gi] * fwd_input[ii];
+                gi += K;
+                ii += step_in;
+            }
         }
     }
 
@@ -266,21 +335,23 @@ fn conv_back_bias(
     let batch = arrayLength(&grad_output) / (OH * OW * K);
     let work = positions * batch;
 
-    let lanes = layer_spec.reduction_lanes;
+    let lanes = bias_lanes();
     let slots = WG_SIZE / lanes;
     let tid   = lid.x;
     let slot  = tid % slots;
     let lane  = tid / slots;
     let k     = (wid.y * nwg.x + wid.x) * slots + slot;
 
+    // `sample*OH*OW*K + oy*OW*K + ox*K` is `(sample*positions + oy*OW + ox)*K`,
+    // which is `p*K` — the flat position index the loop already carries. The
+    // decomposition into (sample, oy, ox) and its four integer divisions only
+    // existed to be reassembled into the number it started from. Same taps,
+    // same order, bit-identical sum; four divisions and two multiplications per
+    // element less.
     var g: f32 = 0.0;
     if k < K {
         for (var p: u32 = lane; p < work; p += lanes) {
-            let sample = p / positions;
-            let pos    = p % positions;
-            let oy = pos / OW;
-            let ox = pos % OW;
-            g += grad_output[sample * OH * OW * K + oy * OW * K + ox * K + k];
+            g += grad_output[p * K + k];
         }
     }
 

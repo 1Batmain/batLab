@@ -443,61 +443,89 @@ fn worst_relative_to_reference(got: &[f32], reference: &[f64]) -> f64 {
 // The lane rule is duplicated in Rust and WGSL — pin them together
 // ---------------------------------------------------------------------------
 
-/// The lane count the shader reads out of the uniform and the slot count the
+/// The lane counts the shader reads out of the uniform and the slot counts the
 /// Rust side sizes the dispatch with are two views of one decision. If they
 /// drift, the dispatch silently under-covers the weight buffer and some
 /// gradients are never written — a bug no shape-independent assertion would
 /// notice. This checks them against each other on every shape, and pins the
 /// uniform word to the offset the legacy fixtures expect to be padding.
+///
+/// The word carries **two** counts since the bias reduction stopped inheriting
+/// the weights': `grad_weights` in the low half, `grad_bias` in the high half.
+/// Each half is checked against the dispatch it sizes.
 #[test]
 fn conv_reduction_lanes_agrees_with_dispatch() {
     for shape in SHAPES {
         let mut ty = shape.conv_type();
         ty.set_dim_output().unwrap();
 
-        // Word 3 of the uniform is the lane count (bytes 12..16).
+        // Word 3 of the uniform is the packed lane pair (bytes 12..16).
         let bytes = ty.get_spec_uniform_bytes();
-        let lanes = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let packed = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let weight_lanes = packed & 0xffff;
+        let bias_lanes = packed >> 16;
 
-        assert!(
-            lanes.is_power_of_two() && (1..=64).contains(&lanes),
-            "\n{}: lanes = {lanes}, must be a power of two in 1..=64 \
-             (the tree reduction halves it down to 1)\n",
+        // The packing is the shader's decoding, spelled out here so a change to
+        // either half is caught by this test rather than by a silent
+        // mis-dispatch.
+        assert_eq!(
+            packed,
+            ConvolutionType::pack_lanes(weight_lanes, bias_lanes),
+            "\n{}: the packed lane word does not round-trip\n",
             shape.label
         );
 
         let dim_out = shape.dim_output();
         let positions = dim_out.x * dim_out.y;
-        assert!(
-            lanes == 1 || positions / lanes >= 16,
-            "\n{}: {lanes} lanes over {positions} positions leaves \
-             {} per lane — the reduction would cost more than the sum\n",
-            shape.label,
-            positions / lanes
-        );
-
-        // Every weight and every bias must be covered by the dispatch.
-        let slots = 64 / lanes;
-        let counts = ty.get_back_workgroup_counts(1);
         let weight_len = shape.weight_len() as u32;
-        assert_eq!(
-            counts[1],
-            weight_len.div_ceil(slots),
-            "\n{}: grad_weights dispatch is {} workgroups x {slots} slots for \
-             {weight_len} weights\n",
-            shape.label,
-            counts[1]
-        );
+        let counts = ty.get_back_workgroup_counts(1);
+
+        for (name, lanes, sums, dispatched) in [
+            ("grad_weights", weight_lanes, weight_len, counts[1]),
+            ("grad_bias", bias_lanes, shape.nb_kernel, counts[2]),
+        ] {
+            assert!(
+                lanes.is_power_of_two() && (1..=64).contains(&lanes),
+                "\n{} {name}: lanes = {lanes}, must be a power of two in 1..=64 \
+                 (the tree reduction halves it down to 1)\n",
+                shape.label
+            );
+            assert!(
+                lanes == 1 || positions / lanes >= 16,
+                "\n{} {name}: {lanes} lanes over {positions} positions leaves \
+                 {} per lane — the reduction would cost more than the sum\n",
+                shape.label,
+                positions / lanes
+            );
+
+            // Every sum must be covered by the dispatch, and covered once.
+            let slots = 64 / lanes;
+            assert_eq!(
+                dispatched,
+                sums.div_ceil(slots),
+                "\n{} {name}: dispatch is {dispatched} workgroups x {slots} \
+                 slots for {sums} sums\n",
+                shape.label
+            );
+            assert!(
+                dispatched * slots >= sums,
+                "\n{} {name}: dispatch leaves {} sums unwritten\n",
+                shape.label,
+                sums - dispatched * slots
+            );
+        }
+
+        // The point of the split: the bias reduction has orders of magnitude
+        // fewer sums than the weights one, so it must never be left with fewer
+        // lanes. Inheriting the weights' count is what put a 48-bias reduction
+        // on a single workgroup.
         assert!(
-            counts[1] * slots >= weight_len,
-            "\n{}: grad_weights dispatch leaves {} weights unwritten\n",
+            bias_lanes >= weight_lanes,
+            "\n{}: grad_bias got {bias_lanes} lanes for {} sums while \
+             grad_weights got {weight_lanes} for {weight_len} — the pass with \
+             fewer sums must not be the one with fewer threads\n",
             shape.label,
-            weight_len - counts[1] * slots
-        );
-        assert!(
-            counts[2] * slots >= shape.nb_kernel,
-            "\n{}: grad_bias dispatch leaves biases unwritten\n",
-            shape.label
+            shape.nb_kernel
         );
     }
 }
