@@ -123,15 +123,24 @@ impl ConvolutionType {
     /// `BATCH_DISPATCH.md` §9 raises — `positions` here is still the count *per
     /// sample*, while the loop covers `batch ×` more. Doing that properly means
     /// getting the batch into the uniform's lane word, and is left open.
+    ///
+    /// # The two numbers are knobs, not constants
+    ///
+    /// Both came out of a sweep on one Mac, and both describe *that machine's*
+    /// balance between parallelism and barrier cost. They are read from
+    /// [`crate::tuning`] (`BATLAB_CONV_TARGET_THREADS`,
+    /// `BATLAB_CONV_MIN_POSITIONS_PER_LANE`) so the same sweep is one shell
+    /// loop on a GPU nobody here owns — see `KERNEL_HUNT.md` §Portabilité. The
+    /// defaults are unchanged.
     pub(crate) fn reduction_lanes(sums: u32, positions: u32) -> u32 {
-        const TARGET_THREADS: u32 = 262_144;
-        const MIN_POSITIONS_PER_LANE: u32 = 16;
+        let target_threads = crate::tuning::conv_target_threads();
+        let min_positions_per_lane = crate::tuning::conv_min_positions_per_lane();
         const MAX_LANES: u32 = WG_SIZE / 2;
 
         let mut lanes = 1u32;
         while lanes < MAX_LANES
-            && sums * lanes < TARGET_THREADS
-            && positions / (lanes * 2) >= MIN_POSITIONS_PER_LANE
+            && sums * lanes < target_threads
+            && positions / (lanes * 2) >= min_positions_per_lane
         {
             lanes *= 2;
         }

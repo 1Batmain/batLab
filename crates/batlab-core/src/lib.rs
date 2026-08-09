@@ -19,6 +19,7 @@ pub mod model;
 pub mod profile;
 pub mod resources;
 pub mod transfers;
+pub mod tuning;
 
 // The config mirror types `PaddingMode`, `ActivationMethod` and `LossMethod`
 // deliberately stay behind `config::`: the engine exports layer types under those
