@@ -41,8 +41,11 @@ def load_images(pattern):
     return paths, np.stack(arrs)
 
 
-def load_dataset(path, n, size=32):
+def load_dataset(path, n):
     """Lit les n premières images d'un .batraw.
+
+    La géométrie vient de l'en-tête (`width`/`height`/`channels`), jamais d'un
+    argument : ce lecteur marche en 32×32 comme en 64×64 sans rien changer.
 
     Format (main.rs:936-941) : en-tête 24 o puis
     `count*w*h*c` valeurs **f32 LE** — pas des u8. BATRAW1 est en [0,1] et le
