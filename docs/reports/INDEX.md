@@ -167,6 +167,17 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   l'architecture, champ réceptif et verdict compris. Contient le contrat
   observable de la dérive.
 
+### Passage en 64×64
+
+- **[MODEL64.md](MODEL64.md)** — porter le générateur et le pipeline en 64×64, et
+  concevoir un modèle plus grand que XL. Le résultat qui recadre : **la contrainte
+  web ne mord pas** (14–58× de marge sur le binding) ; les vrais arbitrages sont le
+  temps d'entraînement et le poids à télécharger. Tableau de 5 candidats, l'argument
+  **params/pixel** (A/D sont une régression par pixel malgré plus de params bruts),
+  et la recommandation **B (48/96/192/384, parité XL par pixel)** — provisoire, à
+  re-dériver après `archi32`. `gen_unet_config.py` généralisé à N étages,
+  `imagenet_to_raw.py` (renommé) qui détecte 32 ou 64.
+
 ### Restructuration
 
 - **[RESTRUCTURE.md](RESTRUCTURE.md)** — ce qui a bougé, la table ci-dessus, et les pièges
