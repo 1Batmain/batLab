@@ -105,30 +105,33 @@ impl ConvolutionType {
     /// | conv3 | 9216 |  256 |  8 |  8 (0.0965 ms) |
     /// | conv4 |  288 | 1024 | 32 | 32 (0.0220 ms) |
     ///
-    /// # `TARGET_THREADS` was recalibrated on the real step (`GPU_PROFILE.md`)
+    /// # `TARGET_THREADS` has been recalibrated twice, and the second time says
+    /// why the first expired
     ///
-    /// 65 536 came from `bench_conv_reduction_lanes`, i.e. from one kernel
-    /// dispatched 200 times in a loop, on `Greyscale_Diffusion`, **before the
-    /// batch axis existed**. Two things changed since: each sum now runs over
-    /// `batch × positions`, and there is an instrument (`--profile-step`) that
-    /// times each pass *inside a real training step* instead of in isolation.
+    /// 65 536 came from `bench_conv_reduction_lanes` — one kernel dispatched
+    /// 200 times in a loop, on `Greyscale_Diffusion`, **before the batch axis
+    /// existed**. `GPU_PROFILE.md` §6 re-swept it on the real step and got
+    /// 262 144 (−4,2 % to −5,9 %).
     ///
-    /// Re-swept there, Σ of the timed passes of one step, minimum over 4 armed
-    /// steps:
+    /// That value then expired the moment `conv_back_weights`' inner loop got
+    /// cheap (`KERNEL_HUNT.md` §3): a lane used to pay four integer divisions
+    /// per product and now pays two loads and an FMA, so the barriers of a deep
+    /// split no longer buy back what they cost. Re-swept a third time, Σ of the
+    /// timed passes of one step, minimum over 8 armed steps, two interleaved
+    /// passes over the sweep agreeing to 0,3 %:
     ///
-    /// | TARGET_THREADS | XL b8 | XL b32 | XL b64 | Color_Diffusion_L b32 |
+    /// | TARGET_THREADS | XL b8 | XL b32 | L b8 | L b32 |
     /// |---:|---:|---:|---:|---:|
-    /// |    65 536 (was) |  70.7 | 277.5 | 554.3 | 135.3 |
-    /// |   131 072       |  69.0 | 270.3 | 546.8 | 129.3 |
-    /// | **262 144**     |**67.7**|**264.5**|**524.4**|**127.3**|
-    /// |   524 288       |  67.0 | 265.4 | 545.8 | 136.9 |
-    /// | 1 048 576       |     — | 290.6 |     — |     — |
+    /// |    32 768        | 40.7 | **154.5** | 18.6 | 71.3 |
+    /// | **131 072**      | **40.4** | 155.3 | **18.6** | **71.1** |
+    /// |    262 144 (was) | 41.2 | 159.8 | 20.1 | 79.5 |
+    /// |    524 288       | 45.0 | 179.8 |    — |    — |
+    /// |  1 048 576       | 52.4 | 213.1 |    — |    — |
     ///
-    /// −4.2 % to −5.9 % on the whole step, on two models and three batch sizes,
-    /// with a clear interior optimum: past 262 144 the biggest layer's
-    /// `conv_back_weights` doubles (31.7 → 59.4 ms at 20 736 workgroups), which
-    /// is the tree reduction and its barriers costing more than the sum they
-    /// split.
+    /// 32 768 and 131 072 are a tie; the tie is broken **towards parallelism**
+    /// (at 32 768 the biggest layers fall to a single lane per sum) because a
+    /// device with less throughput per thread loses more to a starved dispatch
+    /// than to a barrier. That is a portability argument, not a measurement.
     ///
     /// This recalibrates the constant; it does **not** fix the structural point
     /// `BATCH_DISPATCH.md` §9 raises — `positions` here is still the count *per

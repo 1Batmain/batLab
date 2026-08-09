@@ -24,7 +24,7 @@
 //! # Sweeping on a new machine
 //!
 //! ```text
-//! for t in 65536 131072 262144 524288 1048576; do
+//! for t in 32768 65536 131072 262144 524288 1048576; do
 //!   BATLAB_CONV_TARGET_THREADS=$t \
 //!     batlab --profile-step Color_Diffusion_XL --dataset <path> --batch 32
 //! done
@@ -65,15 +65,30 @@ fn env_knob(name: &'static str, default: u32) -> u32 {
 /// How many threads the `grad_weights` / `grad_bias` reductions aim to keep in
 /// flight when they choose how far to split one sum (`reduction_lanes`).
 ///
-/// Default 262 144, swept on this machine with `--profile-step` on the real
-/// training step — the table is in `ConvolutionType::reduction_lanes` and in
-/// `GPU_PROFILE.md` §6. The optimum is interior: too few lanes starves the GPU,
-/// too many pays more in tree-reduction barriers than the sum it splits. Both
-/// failure modes are architecture-dependent, which is exactly why this is a
-/// knob and not a constant.
+/// Default 131 072, swept on this machine with `--profile-step` on the real
+/// training step — the table is in `KERNEL_HUNT.md` §5. The optimum is
+/// interior: too few lanes starves the GPU, too many pays more in
+/// tree-reduction barriers than the sum it splits. Both failure modes are
+/// architecture-dependent, which is exactly why this is a knob and not a
+/// constant.
+///
+/// It was 262 144 (`GPU_PROFILE.md` §6), and that value expired the moment the
+/// reduction's inner loop got cheap: a lane that used to pay four integer
+/// divisions per product now pays two loads and an FMA, so the barriers of a
+/// deep split no longer buy back what they cost. 262 144 is now the *worst* of
+/// the four values swept (−2,7 % on `Color_Diffusion_XL` at batch 32, −10,4 %
+/// on `Color_Diffusion_L`).
+///
+/// 32 768 and 131 072 measure the same here, to within a spread of 0,3 % that
+/// two interleaved sweeps reproduce. 131 072 is the default because it is the
+/// more *parallel* of the two — at 32 768 the biggest layers fall to a single
+/// lane per sum — and a device with less throughput per thread loses more to a
+/// starved dispatch than to a barrier. That is a portability argument, not a
+/// measurement: on a machine where it is wrong, the sweep in this module's
+/// header finds it in one shell loop.
 pub fn conv_target_threads() -> u32 {
     static V: OnceLock<u32> = OnceLock::new();
-    *V.get_or_init(|| env_knob("BATLAB_CONV_TARGET_THREADS", 262_144))
+    *V.get_or_init(|| env_knob("BATLAB_CONV_TARGET_THREADS", 131_072))
 }
 
 /// Fewest positions a lane may be left to sum. Below this the tree reduction
@@ -89,7 +104,7 @@ pub fn describe() -> Vec<Knob> {
         Knob {
             env: "BATLAB_CONV_TARGET_THREADS",
             value: conv_target_threads(),
-            default: 262_144,
+            default: 131_072,
         },
         Knob {
             env: "BATLAB_CONV_MIN_POSITIONS_PER_LANE",
@@ -140,28 +155,49 @@ mod tests {
     }
 
     /// The defaults listed for the banner must be the defaults the accessors
-    /// actually use — a table that drifts from the code would misreport the
-    /// baseline of every profile pasted into a report.
+    /// actually use. If the table drifts from the code, `overrides_in_force()`
+    /// starts reporting a knob as "overridden" when it is not (or worse, stays
+    /// silent when it is) — and every profile pasted into a report then
+    /// misstates its own baseline.
     #[test]
     fn the_described_defaults_are_the_ones_the_accessors_use() {
-        // The test process may itself be running under an override; what is
-        // pinned here is the *default* column, not the value.
         for knob in describe() {
-            assert!(
-                knob.default > 0,
-                "{} has no compiled-in default",
-                knob.env
-            );
+            assert!(knob.default > 0, "{} has no compiled-in default", knob.env);
             assert!(
                 knob.env.starts_with("BATLAB_"),
                 "{} is not in the BATLAB_ namespace",
                 knob.env
             );
+            // Only checkable for the knobs this process is not overriding —
+            // which, run from `cargo test` with a clean environment, is all of
+            // them.
+            if std::env::var_os(knob.env).is_none() {
+                assert_eq!(
+                    knob.value, knob.default,
+                    "{} reports default {} but resolves to {} with nothing set",
+                    knob.env, knob.default, knob.value
+                );
+            }
         }
         assert_eq!(
             describe().len(),
             2,
             "a knob was added or removed without updating the banner test"
         );
+    }
+
+    /// A run on stock settings must announce nothing; a run under a sweep must
+    /// announce exactly what moved.
+    #[test]
+    fn only_a_moved_knob_is_announced() {
+        for knob in describe() {
+            if std::env::var_os(knob.env).is_none() {
+                assert!(
+                    !overrides_in_force().iter().any(|l| l.starts_with(knob.env)),
+                    "{} is announced as overridden while unset",
+                    knob.env
+                );
+            }
+        }
     }
 }
