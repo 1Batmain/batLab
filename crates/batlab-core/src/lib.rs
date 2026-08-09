@@ -45,9 +45,11 @@ pub use live_frame::{
 pub use model::Model;
 pub use model::training;
 pub use model::training::{
-    BucketStat, CLIMB_TEMPO_RATIO, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame,
-    DenoiseStepStat, DiffusionTask, DriftAction, DriftFrame, DriftPhase, DriftWalk, GpuDataset, GpuDatasetError,
-    LinearNoiseSchedule, LossWeighting, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, MetricsLogger,
+    BaselineBucket, BucketStat, CLIMB_TEMPO_RATIO, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame,
+    DenoiseStepStat, DiffusionTask, DriftAction, DriftFrame, DriftPhase, DriftWalk, EvalConfig,
+    EvalReport, GpuDataset, GpuDatasetError,
+    LinearNoiseSchedule, LossWeighting, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, MetricsLogger, MseBucket,
+    evaluate,
     NoisePredictor, PerpetualDrift, PerpetualOrigin, PerpetualRegime, ProbeConfig,
     RENOISE_DEPTH_STEP, Stats,
     TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups, compose_diffusion_input,
