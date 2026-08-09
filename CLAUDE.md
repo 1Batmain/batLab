@@ -300,6 +300,29 @@ La suite existante : `./blind_tests/run.sh` (`BLIND_BASELINE=1` ajoute la non-r�
   retombe sur le chemin f32 : le rééchantillonnage se fait sur l'hôte de toute
   façon. La définition du format côté Python vit dans `tools/batraw.py`, seule
   et importée par les trois convertisseurs.
+- **Où part le temps d'un pas : `--profile-step <model> --dataset <path>`.**
+  Le temps GPU **réel** de chacune des 151 passes de calcul d'un pas, nommée
+  (couche + entrypoint), triée, avec sous le tableau le budget : Σ des passes,
+  le **span** GPU du pas entier, et l'écart entre les deux — ce que le pas passe
+  ENTRE ses passes. Mesuré par l'horloge du GPU (`TIMESTAMP_QUERY` écrit à
+  l'entrée et à la sortie de chaque passe), pas par une horloge hôte autour d'un
+  submit. Coût nul éteint ; toute `begin_compute_pass` du moteur passe par
+  `GpuContext::compute_pass`, et `nothing_in_the_engine_opens_an_untimed_pass`
+  échoue sur tout contournement — une passe absente du tableau se relirait comme
+  du coût de dispatch.
+  Ce qu'il a trouvé (`docs/reports/GPU_PROFILE.md`) : sur `Color_Diffusion_XL`
+  batch 32, **94,1 % du pas était dans DEUX passes**, parce que
+  `upsample_conv_back_input` balayait la carte de sortie entière pour chaque
+  élément d'entrée — 256 fois trop d'itérations, un rapport qui vaut
+  `OH·OW/scale²` et **empire donc avec la résolution de la couche**. Le pas est
+  passé de **4400 à 265 ms** (16,6×), trajectoire de loss identique à 9,7e-7 sur
+  300 pas appariés. Deux acquis à ne pas réoublier : il n'y a **rien entre les
+  passes** (0,0 ms à batch 16/32/64 — le « per-compute-pass floor » de
+  `PERF_CONVOLUTION.md` §5.4 est tranché, et par la négative), et le coût par
+  échantillon est **plat dès batch 8**, donc augmenter le batch n'achète pas de
+  débit sur cette machine. Ce qui reste est limité par la **hiérarchie mémoire**,
+  pas par le calcul : les trois passes d'une convolution font exactement le même
+  nombre de MAC et `back_weights` met 4,1× plus longtemps que le forward.
 - Tests de non-régression du pipeline : `crates/batlab-core/src/model/audit_tests.rs` (`cargo test`). Ne pas les affaiblir pour les faire passer.
 - **La racine de stockage s'injecte, elle ne se déduit pas.** `batlab_ui::storage::Storage` porte la racine de tous les chemins de données (`Models/`, `datasets/`, `perpetual_samples/`) ; `Storage::at(chemin)` en construit une ailleurs, et `App::with_storage` la fait descendre dans tout le TUI. **Tout test qui touche au stockage passe par `TempRoot`** — c'est ce qui a fait tomber la limite « `cargo test` réécrit `Models/Stable_Diffusion/config_file` » de `docs/reports/PERPETUAL_INFERENCE.md` §5. Critère de recette permanent : `cargo test --workspace` puis `git status` **propre**.
   Le défaut (`Storage::default()`, et les fonctions libres du module que le CLI utilise) reste le workspace, trouvé en remontant jusqu'au `Cargo.toml` portant `[workspace]` : ne pas le réécrire en un nombre fixe de `parent()` — déplacer un crate ferait alors pointer `Models/` ailleurs, **sans erreur**, juste des listes vides. Gardé par `project_root_is_the_workspace_that_holds_models_and_datasets`.

@@ -74,6 +74,19 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
 - **[PERF_GROUP_NORM.md](PERF_GROUP_NORM.md)** — optimisation de `group_norm`.
 - **[PERF_CONVOLUTION.md](PERF_CONVOLUTION.md)** — optimisation de la convolution ; le
   gain local qui ne se transmet pas au pas complet.
+- **[BATCH_DISPATCH_DESIGN.md](BATCH_DISPATCH_DESIGN.md)** — la conception : porter
+  l'axe batch dans les dispatches, et pourquoi le batch y est *implicite*.
+- **[BATCH_DISPATCH.md](BATCH_DISPATCH.md)** — sa réalisation : 18 soumissions par pas
+  deviennent 1, temps CPU ÷13 à ÷43, l'inférence bit à bit inchangée.
+- **[GPU_RESOURCES.md](GPU_RESOURCES.md)** — l'inventaire de ce qu'un modèle alloue sur
+  le GPU, les compteurs de transferts, et ce que les limites du *device* bornent
+  vraiment (le plafond de batch vient d'un binding, pas de la mémoire).
+- **[GPU_PROFILE.md](GPU_PROFILE.md)** — où partent les 4,4 s d'un pas, passe par passe
+  (`--profile-step`, horloge du GPU). **94,1 % du pas dans deux passes sur 151** :
+  `upsample_conv_back_input` balayait la carte de sortie entière. 4400 → 265 ms.
+  Et deux acquis négatifs : il n'y a **rien entre les passes** (le
+  « per-compute-pass floor » de PERF_CONVOLUTION §5.4 est tranché), et le coût par
+  échantillon est plat dès batch 8.
 
 ### Architecture du modèle
 

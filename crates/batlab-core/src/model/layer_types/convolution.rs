@@ -93,8 +93,38 @@ impl ConvolutionType {
     /// | conv2 | 4608 |  256 | 16 |  4 (0.0576 ms; 16 gives 0.0584) |
     /// | conv3 | 9216 |  256 |  8 |  8 (0.0965 ms) |
     /// | conv4 |  288 | 1024 | 32 | 32 (0.0220 ms) |
+    ///
+    /// # `TARGET_THREADS` was recalibrated on the real step (`GPU_PROFILE.md`)
+    ///
+    /// 65 536 came from `bench_conv_reduction_lanes`, i.e. from one kernel
+    /// dispatched 200 times in a loop, on `Greyscale_Diffusion`, **before the
+    /// batch axis existed**. Two things changed since: each sum now runs over
+    /// `batch × positions`, and there is an instrument (`--profile-step`) that
+    /// times each pass *inside a real training step* instead of in isolation.
+    ///
+    /// Re-swept there, Σ of the timed passes of one step, minimum over 4 armed
+    /// steps:
+    ///
+    /// | TARGET_THREADS | XL b8 | XL b32 | XL b64 | Color_Diffusion_L b32 |
+    /// |---:|---:|---:|---:|---:|
+    /// |    65 536 (was) |  70.7 | 277.5 | 554.3 | 135.3 |
+    /// |   131 072       |  69.0 | 270.3 | 546.8 | 129.3 |
+    /// | **262 144**     |**67.7**|**264.5**|**524.4**|**127.3**|
+    /// |   524 288       |  67.0 | 265.4 | 545.8 | 136.9 |
+    /// | 1 048 576       |     — | 290.6 |     — |     — |
+    ///
+    /// −4.2 % to −5.9 % on the whole step, on two models and three batch sizes,
+    /// with a clear interior optimum: past 262 144 the biggest layer's
+    /// `conv_back_weights` doubles (31.7 → 59.4 ms at 20 736 workgroups), which
+    /// is the tree reduction and its barriers costing more than the sum they
+    /// split.
+    ///
+    /// This recalibrates the constant; it does **not** fix the structural point
+    /// `BATCH_DISPATCH.md` §9 raises — `positions` here is still the count *per
+    /// sample*, while the loop covers `batch ×` more. Doing that properly means
+    /// getting the batch into the uniform's lane word, and is left open.
     pub(crate) fn reduction_lanes(sums: u32, positions: u32) -> u32 {
-        const TARGET_THREADS: u32 = 65_536;
+        const TARGET_THREADS: u32 = 262_144;
         const MIN_POSITIONS_PER_LANE: u32 = 16;
         const MAX_LANES: u32 = WG_SIZE / 2;
 
