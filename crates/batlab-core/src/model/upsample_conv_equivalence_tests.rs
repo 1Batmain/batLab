@@ -595,6 +595,36 @@ fn the_inverted_tap_map_computes_the_gradient_the_output_scan_computed() {
                     &new[..new.len().min(8)],
                     &old[..old.len().min(8)],
                 );
+
+                // `grad_weights` claims MORE than agreement within a tolerance.
+                // Its rewrite hoisted loop-invariant work and turned two
+                // divisions per position into two counters; it visits the very
+                // same taps in the very same `(b, oy, ox)` order, skipping the
+                // very same positions. So the sum is the same sum, summed the
+                // same way, and the only honest assertion is bit-identity.
+                //
+                // A tolerance here would pass on a rewrite that quietly
+                // reordered the accumulation — which is precisely the mistake
+                // this claim exists to rule out.
+                if name == "grad_weights" {
+                    let differing = new
+                        .iter()
+                        .zip(old.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(
+                        differing,
+                        0,
+                        "\n{} grad_weights is not bit-identical to the loop it \
+                         replaces ({differing}/{} elements differ).\n\
+                         That rewrite only hoists integer work out of the inner \
+                         loop — every tap, and their order, is unchanged — so \
+                         any float difference means the accumulation moved.\n\
+                         worst relative difference: {cross:e}\n",
+                        shape.label,
+                        new.len(),
+                    );
+                }
                 assert!(
                     new_err < 1e-4,
                     "\n{} backward {name} is off the f64 reference by {new_err:e} \

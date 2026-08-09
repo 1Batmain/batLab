@@ -168,9 +168,33 @@ fn upsample_conv_back_input(
     grad_input[idx] = g;
 }
 
-@compute @workgroup_size(64)
 // One thread per weight, whatever the batch: `grad_weights` is a parameter, so
 // the batch is the outer loop of its reduction, not an axis of its grid.
+//
+// # What the inner loop stopped doing
+//
+// It used to recompute, for every one of the `batch · OH · OW` positions:
+// two `pad_*()` calls (a uniform load and a branch each), the two-sided bounds
+// test on `up_y`/`up_x`, and **two integer divisions by `scale`** — all to
+// produce one multiply-add. Three of those four are loop-invariant in `ox`, and
+// the fourth is a counter.
+//
+//   - `up_y = oy + ky - pad_y` is monotonic in `oy` and `up_x = ox + kx - pad_x`
+//     in `ox`, so "the tap lands in the upsampled map" is a **contiguous
+//     interval** at both levels. Computing the four ends once replaces a
+//     four-way bounds test taken `OH · OW` times.
+//   - `iy = up_y / scale` advances by one every `scale` rows, and
+//     `ix = up_x / scale` every `scale` columns. Two divisions at the top of
+//     the kernel and a counter each replace `2 · batch · OH · OW` of them.
+//   - Both addresses are incremented: `grad_output` by `K` per `ox` (HWK),
+//     `fwd_input` by `IC` when the column counter wraps.
+//
+// Unlike `conv_back_weights`, this one visits **exactly the same taps in
+// exactly the same order** as the loop it replaces — `(b, oy, ox)` ascending,
+// with the same positions skipped. The sum is therefore **bit-identical**, and
+// the test asserts bit-identity rather than a tolerance: anything else would
+// mean the order moved.
+@compute @workgroup_size(64)
 fn upsample_conv_back_weights(
     @builtin(global_invocation_id) gid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
@@ -196,21 +220,58 @@ fn upsample_conv_back_weights(
     let out_len = OH * OW * K;
     let in_len = layer_spec.dim_input.x * IW * IC;
     let batch = arrayLength(&grad_output) / out_len;
+    let row_in = IW * IC;
+
+    // The two intervals, in closed form. `up_y = oy + ky - pad_y` lies in
+    // [0, up_h) exactly for oy in [oy_lo, oy_hi); same for the columns.
+    let dy = i32(ky) - pad_y();
+    let dx = i32(kx) - pad_x();
+    let oy_lo = max(0, -dy);
+    let oy_hi = min(i32(OH), up_h - dy);
+    let ox_lo = max(0, -dx);
+    let ox_hi = min(i32(OW), up_w - dx);
 
     var g: f32 = 0.0;
-    for (var b: u32 = 0u; b < batch; b++) {
-        for (var oy: u32 = 0u; oy < OH; oy++) {
-            for (var ox: u32 = 0u; ox < OW; ox++) {
-                let up_y = i32(oy) + i32(ky) - pad_y();
-                let up_x = i32(ox) + i32(kx) - pad_x();
-                if up_y < 0 || up_y >= up_h || up_x < 0 || up_x >= up_w {
-                    continue;
+    if oy_hi > oy_lo && ox_hi > ox_lo {
+        let oy0 = u32(oy_lo);
+        let oy1 = u32(oy_hi);
+        let ox0 = u32(ox_lo);
+        let ox1 = u32(ox_hi);
+
+        // Where the two counters start: the upsampled coordinate of the first
+        // position of each interval, split into "which input element" and "how
+        // far into its scale-wide window".
+        let uy_lo = u32(oy_lo + dy);
+        let ux_lo = u32(ox_lo + dx);
+        let iy0 = uy_lo / scale;
+        let cy0 = uy_lo % scale;
+        let ix0 = ux_lo / scale;
+        let cx0 = ux_lo % scale;
+
+        for (var b: u32 = 0u; b < batch; b++) {
+            let in_sample = b * in_len;
+            let go_sample = b * out_len;
+            var iy = iy0;
+            var cy = cy0;
+            for (var oy: u32 = oy0; oy < oy1; oy++) {
+                let in_row = in_sample + iy * row_in + kz;
+                var gi = go_sample + (oy * OW + ox0) * K + k;
+                var ii = in_row + ix0 * IC;
+                var cx = cx0;
+                for (var ox: u32 = ox0; ox < ox1; ox++) {
+                    g += grad_output[gi] * fwd_input[ii];
+                    gi += K;
+                    cx += 1u;
+                    if cx == scale {
+                        cx = 0u;
+                        ii += IC;
+                    }
                 }
-                let iy = u32(up_y) / scale;
-                let ix = u32(up_x) / scale;
-                let in_i = b * in_len + iy * IW * IC + ix * IC + kz;
-                let go_i = b * out_len + oy * OW * K + ox * K + k;
-                g += grad_output[go_i] * fwd_input[in_i];
+                cy += 1u;
+                if cy == scale {
+                    cy = 0u;
+                    iy += 1u;
+                }
             }
         }
     }
