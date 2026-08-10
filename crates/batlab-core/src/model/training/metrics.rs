@@ -416,6 +416,45 @@ pub fn reverse_step_from_epsilon(
     }
 }
 
+/// The **async sibling** of [`reverse_step`] — the same composition, the same ε̂
+/// prediction, the same posterior draw, but it *awaits* the ε̂ readback through
+/// [`Model::predict_async`] instead of blocking on it.
+///
+/// This is here so a browser-driven inference descent does not re-derive the
+/// reverse recursion: `batlab_web`'s per-frame step is one call to this, exactly
+/// as its drift frame is one call to [`crate::training::DriftWalk::advance_async`].
+/// A web inference loop that composed `[x_t | timestep]` or seeded the posterior
+/// its own way could drift from the native sampler undetected; going through the
+/// one function it cannot. Its agreement with the synchronous [`reverse_step`]
+/// (and thus with [`sample_diffusion`]) is held by
+/// `the_async_reverse_step_matches_the_sync_one`.
+#[allow(clippy::too_many_arguments)]
+pub async fn reverse_step_async<State>(
+    model: &mut Model<State>,
+    schedule: &LinearNoiseSchedule,
+    input_channels: usize,
+    signal_channels: usize,
+    latent: &[f32],
+    diffusion_step: usize,
+    path_seed: u64,
+    denoise_magnitude: f32,
+    want_x0_hat: bool,
+) -> ReverseStep {
+    let timestep_channels = input_channels.saturating_sub(signal_channels);
+    let features = schedule.timestep_embedding(diffusion_step, timestep_channels);
+    let model_input = compose_diffusion_input(latent, input_channels, signal_channels, &features);
+    let predicted_noise = model.predict_async(&model_input).await;
+    reverse_step_from_epsilon(
+        schedule,
+        latent,
+        predicted_noise,
+        diffusion_step,
+        path_seed,
+        denoise_magnitude,
+        want_x0_hat,
+    )
+}
+
 /// One step down the reverse chain: compose `[x_t | timestep]`, predict ε̂, and
 /// sample the posterior — [`predict_epsilon`] then
 /// [`reverse_step_from_epsilon`], which is the whole of it.

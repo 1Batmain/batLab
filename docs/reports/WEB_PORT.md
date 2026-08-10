@@ -207,6 +207,104 @@ Passent aujourd'hui, en principe (non re-testés en navigateur ici) :
 
 ---
 
+## 7. Le bug de l'inférence — le navigateur mangeait l'erreur
+
+**Symptôme.** La page livrée charge, les deux modes s'animent, le compteur défile
+— mais l'image est du **bruit RGB saturé** (chaque canal indépendant, couleurs
+pures), et l'errance **dégrade** l'image de départ en ce même bruit. Console du
+navigateur : **aucune erreur**.
+
+**La signature.** Un bruit qui *s'installe* dans les deux modes est la récurrence
+inverse qui réinjecte du bruit à chaque pas sans jamais en retirer : c'est ε̂ ≈ 0
+(ou constant). Si ε̂ = 0, alors x̂₀ = x_t/√ᾱ — le latent gaussien brut, saturé à
+*tous* les t — et comme chaque pas inverse ajoute encore σ·bruit, la sortie
+*évolue* vers du bruit tout en restant morte. Le modèle ne calcule rien.
+
+**Ce qui a été écarté, mesuré et non supposé** (le natif est l'oracle) :
+
+- **Le profil de limites WebGPU** (« 8 storage buffers / 65 535 workgroups »).
+  `--headless-sample Elephants_XL --gpu-limits web` rend une image **saine**,
+  au bit près identique à `--gpu-limits native` (min/max/mean/std égaux). Sous
+  wgpu natif, le profil web valide tout (création de pipeline **et** dispatch) et
+  débruite parfaitement. Écarté.
+- **L'arithmétique et la boucle.** La boucle d'inférence du crate web est
+  bit-à-bit la descente de `sample_diffusion` (même seed de base, même path_seed,
+  même ordre t décroissant). Vérifié, puis **verrouillé** par un test (voir plus
+  bas).
+- **La lecture async.** `predict_async` lit les mêmes octets que `predict`
+  (`predict_async_matches_predict_bit_for_bit`).
+- **Le repli EMA.** Le checkpoint ne porte pas d'EMA ; `CheckpointWeights::Ema`
+  retombe alors sur les poids bruts (`use_ema = … && ema.is_some()`), gardé par
+  `asking_for_an_average_a_checkpoint_lacks_falls_back_on_the_weights`. La page
+  charge sans erreur — or le parseur est **strict** (il refuse toute longueur qui
+  ne colle pas et tout octet en trop), donc des poids chargés = des poids de la
+  bonne taille. Écarté.
+
+**Le mécanisme du silence.** Le défaut est donc propre au couple **wasm +
+navigateur** — un pipeline que le compilateur WGSL du navigateur (Tint/WebKit,
+plus strict que `naga → Metal`) rejette, ou une limite tripotée au dispatch,
+**invalide silencieusement** le pipeline : ses dispatches deviennent des no-ops,
+le tampon de sortie garde ses zéros, ε̂ = 0. Et l'erreur était **mangée** :
+
+- le crate web **n'installait aucun sink `log`** — tout ce que wgpu signale par
+  `log::error!` (shader refusé, limite, erreur de device) était écrit *nulle
+  part* sur wasm ;
+- le gestionnaire `on_uncaptured_error` du moteur écrit par `eprintln!`, **perdu**
+  sur wasm (aucun flux std n'est câblé à la console) ;
+- **aucun error scope** n'entourait la construction du modèle ni les frames.
+
+Une page qui peut manger une erreur de validation finit par en manger une. C'est
+la classe de bug que le dépôt documentait déjà (échec silencieux, sorties à zéro
+sur Metal) — ici rendue invisible une seconde fois par l'absence de journal.
+
+**La correction — rendre l'erreur impossible à avaler, et la mesure visible :**
+
+1. **Un sink console** (`console_log`) installé dans `start()` : ce que le moteur
+   essayait déjà de dire arrive enfin dans la console.
+2. **Un error scope de validation** (`GpuContext::guarded`) autour de la
+   construction du modèle **et** de chaque frame. Un shader que le navigateur
+   refuse devient un **message sur la page** (`create()` rejeté en nommant
+   l'erreur du shader) au lieu d'un canvas qui anime un modèle mort ; une erreur
+   au dispatch est attrapée par frame et affichée.
+3. **Statistiques par frame** — ε̂ / x̂₀ (std, mean, min/max, NaN/Inf) — loggées et
+   **affichées sous le canvas**. `ε̂ std ≈ 0` tranche l'hypothèse d'un coup d'œil ;
+   `ε̂ std ≈ 1` l'élimine et déplace le soupçon vers l'affichage.
+4. **Intégrité des poids** : octets reçus + hachage FNV-1a + compte de scalaires
+   attendu (**1 192 563**) loggés, pour confirmer que le téléchargement qui
+   atteint le wasm est le fichier sur disque.
+5. **La boucle d'inférence ne re-dérive plus** la récurrence : elle passe par
+   `reverse_step_async` (moteur), sibling async de `reverse_step`, exactement
+   comme la dérive passe par `advance_async`.
+
+**Le test qui manquait.** La dérive avait `advance_async_matches_advance` ;
+l'inférence — le chemin qui a cassé — n'avait **aucun** équivalent, et re-dérivait
+sa boucle dans le crate web où aucun test ne tourne.
+`the_async_reverse_step_matches_the_sync_one` (GPU, `model/model.rs`) pilote la
+descente async **comme le crate web la pilote** (une `reverse_step_async` par
+frame) et l'égale à `sample_diffusion` au bit près. Une divergence de
+composition/seed/ordre échoue désormais ici, pas dans le navigateur d'un visiteur.
+
+**Observé / non observé (honnêteté du port, tenue).** Prouvé sans navigateur : le
+crate web **compile en wasm** avec l'instrumentation ; `--gpu-limits web` en natif
+débruite au bit près (donc ni les limites, ni la boucle, ni le repli EMA) ; la
+descente async égale la synchrone (nouveau test) ; `cargo test --workspace` vert,
+`git status` propre. **Non observé** : la page dans un vrai navigateur — je n'ai
+pas de pilote WebGPU ici.
+
+→ **Ce que l'utilisateur doit relever, page rechargée (`web/dist/` reconstruit) :**
+la console imprime le profil obtenu, l'intégrité des poids, puis `[batlab] …
+ε̂ std=…`. Deux issues, toutes deux désormais parlantes :
+- un **message d'erreur** (page ou console) nommant un pipeline/shader refusé →
+  la cause est là, dans ce shader, et le correctif sera dans son WGSL ;
+- **pas d'erreur** mais `ε̂ std ≈ 0.000` → le forward est mort sans erreur de
+  validation (un zéro numérique, pas un rejet), et la sonde par frame confirme
+  l'hypothèse tout en excluant un simple bug d'affichage. `ε̂ std ≈ 1` avec une
+  image toujours fausse pointerait, lui, vers l'affichage.
+
+Dans tous les cas la page ne peut **plus** animer un modèle mort en silence.
+
+---
+
 ## Fichiers touchés
 
 - **Moteur (sans dépendance web)** : `crates/batlab-core/src/model/debug.rs`
@@ -219,3 +317,11 @@ Passent aujourd'hui, en principe (non re-testés en navigateur ici) :
   workspace.
 - **Livrable** : `web/index.html`, `web/build.sh`, `web/tools/make_seeds.py`,
   `web/README.md` ; `web/dist/` gitignoré (wasm + poids + seeds).
+- **Le bug de l'inférence (§7)** : `crates/batlab-core/src/gpu_context.rs`
+  (`GpuContext::guarded`, l'error scope de validation),
+  `…/model/training/metrics.rs` (`reverse_step_async`, sibling async de
+  `reverse_step`), `…/model/training/mod.rs` + `…/lib.rs` (export),
+  `…/model/model.rs` (`the_async_reverse_step_matches_the_sync_one`) ;
+  `crates/batlab-web/Cargo.toml` (`log`, `console_log`), `…/src/lib.rs`
+  (sink console, error scopes, sonde ε̂/x̂₀ par frame, intégrité des poids) ;
+  `web/index.html` (ligne de diagnostic sous le canvas).

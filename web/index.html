@@ -44,6 +44,12 @@
     font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
     color: var(--muted); min-height: 1.4em; text-align: center;
   }
+  .diag {
+    font: 11px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--muted); min-height: 1.3em; text-align: center;
+    opacity: .78; max-width: 40ch; word-break: break-word;
+  }
+  .diag.err { color: #e06c50; opacity: 1; }
   .controls { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: center; max-width: 420px; }
   button {
     font: inherit; font-size: 13px; color: var(--fg); background: transparent;
@@ -139,6 +145,7 @@ app.innerHTML = `
   <div class="stage">
     <canvas id="view" width="${W}" height="${H}"></canvas>
     <div class="status" id="status"></div>
+    <div class="diag" id="diag"></div>
     <div class="controls">
       <div class="group">
         <button id="mode-errance" class="on">Errance</button>
@@ -166,6 +173,7 @@ ctx.imageSmoothingEnabled = false;
 const off = new OffscreenCanvas(W, H);
 const offctx = off.getContext('2d');
 const statusEl = document.getElementById('status');
+const diagEl = document.getElementById('diag');
 const regimeGroup = document.getElementById('regime-group');
 const depthGroup = document.getElementById('depth-group');
 
@@ -208,6 +216,9 @@ async function frame(now) {
     offctx.putImageData(img, 0, 0);
     ctx.drawImage(off, 0, 0, W, H, 0, 0, canvas.width, canvas.height);
     statusEl.textContent = inst.status();
+    const diag = inst.diagnostics();
+    diagEl.textContent = diag;
+    diagEl.classList.toggle('err', diag.startsWith('⚠'));
   }
   requestAnimationFrame(frame);
 }

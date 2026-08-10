@@ -286,6 +286,39 @@ impl GpuContext {
         self.limits_profile
     }
 
+    /// Run `op` with a WebGPU **validation error scope** active, returning any
+    /// validation error `op` raised as a string instead of letting it vanish.
+    ///
+    /// This exists for one host and one failure mode: a browser. There, a shader
+    /// the browser's WGSL compiler rejects (it is stricter than the native
+    /// `naga` → Metal path this engine is otherwise validated on) or a limit
+    /// tripped at dispatch does **not** raise — the pipeline is quietly
+    /// invalidated, its dispatches become no-ops, the output buffer keeps the
+    /// zeros it was created with, and nothing is said. Wrapped in a scope, that
+    /// same error is captured and handed back, so a caller (`batlab_web`) can put
+    /// it on the page rather than animate a dead model. See
+    /// `docs/reports/WEB_PORT.md`, "le bug de l'inférence".
+    ///
+    /// Pipeline-creation errors are captured synchronously as `op` runs;
+    /// dispatch/submit errors are flushed with an empty submit before the scope
+    /// is read. On wasm the browser drives the returned future to completion; a
+    /// native caller must be pumping the device (this is only used from wasm).
+    pub async fn guarded<F, T>(&self, op: F) -> Result<T, String>
+    where
+        F: core::future::Future<Output = T>,
+    {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let out = op.await;
+        // Flush any queued work so a dispatch-time validation error lands in the
+        // scope before we pop it. Empty is fine — it is a synchronisation point,
+        // not work.
+        self.queue.submit(core::iter::empty());
+        match scope.pop().await {
+            Some(err) => Err(err.to_string()),
+            None => Ok(out),
+        }
+    }
+
     /// Upload bytes to a GPU buffer, and count them.
     ///
     /// Every host→device write in the engine goes through here rather than

@@ -69,7 +69,7 @@ pub use model::training::{
     RENOISE_DEPTH_STEP, Stats,
     TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups, compose_diffusion_input,
     decode_u8, log_probe, log_train_loss, log_trajectory, predict_epsilon, probe_diffusion, reverse_step,
-    reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
+    reverse_step_async, reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
 };
 pub use model::{
     ActivationMethod, ActivationType, AttentionType, AdamHyperparameters, CheckpointLoad,

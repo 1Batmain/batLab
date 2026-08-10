@@ -31,6 +31,14 @@ wasm-bindgen = "=0.2.121"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+# The `log` facade plus a sink that routes it to the browser console. Without a
+# sink installed, everything wgpu reports through `log` — a rejected shader, a
+# tripped limit, an uncaptured device error — is written to nowhere on wasm, and
+# a silently-invalid pipeline animates a dead model with a clean console. That
+# was the inference bug (see docs/reports/WEB_PORT.md): the page could eat a
+# WebGPU error. It no longer can.
+log = "0.4"
+console_log = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
 version = "0.3"

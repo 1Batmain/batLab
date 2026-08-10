@@ -1940,6 +1940,94 @@ mod tests {
         });
     }
 
+    /// The inference analogue of `advance_async_matches_advance_bit_for_bit`.
+    ///
+    /// The perpetual drift had that guard — its async frame provably equals the
+    /// synchronous walk — but the finite *inference* descent had none, and that
+    /// is the path that broke in the browser: the web crate re-derived the
+    /// T→0 loop inline, so a re-derivation that composed the input or seeded the
+    /// posterior differently from [`sample_diffusion`] would only ever show as a
+    /// wrong image in a visitor's browser, where no test runs. This pins the
+    /// async descent — driven exactly as `batlab_web` drives it, one
+    /// [`reverse_step_async`] per frame — to the synchronous sampler, bit for
+    /// bit. See `docs/reports/WEB_PORT.md`, "le bug de l'inférence".
+    #[test]
+    fn the_async_reverse_step_matches_the_sync_one() {
+        use crate::PaddingMode;
+        use crate::model::layer_types::ConvolutionType;
+        use crate::model::training::{
+            LinearNoiseSchedule, reverse_step_async, sample_diffusion,
+        };
+        use crate::{DIFFUSION_BETA_END, DIFFUSION_BETA_START};
+
+        pollster::block_on(async {
+            let gpu = Arc::new(GpuContext::new_headless().await);
+            let mut model = Model::new(gpu).await;
+            // A diffusion-shaped model: 4 input channels (2 signal + 2 timestep)
+            // down to 2 signal channels, so `compose_diffusion_input` has real
+            // timestep channels to append — the conditioning the reverse chain
+            // relies on. Random init makes ε̂ non-trivial, which is what makes a
+            // divergence between the two drivers visible.
+            let input_channels = 4usize;
+            let signal_channels = 2usize;
+            model
+                .add_layer(LayerTypes::Convolution(ConvolutionType::new(
+                    Dim3::new((4, 4, 4)),
+                    2,
+                    Dim3::new((3, 3, 4)),
+                    1,
+                    PaddingMode::Same,
+                )))
+                .unwrap();
+            model.build_model().unwrap();
+
+            let output_len = 4 * 4 * signal_channels;
+            let schedule = LinearNoiseSchedule::new_linear(8, DIFFUSION_BETA_START, DIFFUSION_BETA_END);
+            let seed = 0xdead_beef_u64;
+
+            // The synchronous sampler, one path — the oracle.
+            let reference = sample_diffusion(
+                &mut model,
+                input_channels,
+                signal_channels,
+                output_len,
+                &schedule,
+                seed,
+                1,
+                1.0,
+                None,
+                None,
+                |_, _| {},
+            );
+
+            // The async descent, reproduced exactly as the web crate opens and
+            // walks it: base latent from `seed ^ BASE_NOISE_FOLD`, path seed the
+            // seed itself, `diffusion_step` counting down T-1 → 0.
+            const BASE_NOISE_FOLD: u64 = 0xa5a5_5a5a_0123_4567;
+            let mut latent = schedule.sample_noise(output_len, seed ^ BASE_NOISE_FOLD);
+            for diffusion_step in (0..schedule.len()).rev() {
+                let stepped = reverse_step_async(
+                    &mut model,
+                    &schedule,
+                    input_channels,
+                    signal_channels,
+                    &latent,
+                    diffusion_step,
+                    seed,
+                    1.0,
+                    false,
+                )
+                .await;
+                latent = stepped.latent;
+            }
+
+            assert_eq!(
+                latent, reference,
+                "the async inference descent diverged from sample_diffusion"
+            );
+        });
+    }
+
     #[test]
     fn training_model_can_build_and_run_group_norm() {
         pollster::block_on(async {

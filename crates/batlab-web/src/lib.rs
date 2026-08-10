@@ -39,8 +39,8 @@ use std::sync::Arc;
 
 use batlab_core::{
     AsyncNoisePredictor, CheckpointWeights, DriftWalk, GpuContext, GpuLimitsProfile,
-    LinearNoiseSchedule, Model, ModelConfig, PerpetualDrift, PerpetualRegime,
-    compose_diffusion_input, compute_inferred_input, decode_u8, reverse_step_from_epsilon,
+    LinearNoiseSchedule, Model, ModelConfig, PerpetualDrift, PerpetualRegime, Stats,
+    compose_diffusion_input, compute_inferred_input, decode_u8, reverse_step_async,
 };
 use wasm_bindgen::prelude::*;
 
@@ -169,6 +169,13 @@ impl AsyncNoisePredictor for ModelPredictor<'_> {
 
 struct Engine {
     model: Model,
+    /// A handle on the device, kept so a frame can run its GPU work inside a
+    /// validation error scope (see [`GpuContext::guarded`]) without borrowing the
+    /// model. This is the browser's only defence against a silently-invalid
+    /// pipeline: without it, a frame whose shaders the browser rejected would
+    /// paint zeroed ε̂ — a model that drifts into saturated noise — and say
+    /// nothing. See `docs/reports/WEB_PORT.md`, "le bug de l'inférence".
+    gpu: Arc<GpuContext>,
     schedule: LinearNoiseSchedule,
     input_channels: usize,
     signal_channels: usize,
@@ -177,6 +184,17 @@ struct Engine {
     output_len: usize,
     seeds: SeedImages,
     seed_counter: u64,
+
+    /// The last frame's tensor statistics, for the on-page diagnostics line and
+    /// the console. An ε̂ whose std collapses to ~0 is the whole tell of the
+    /// inference bug: with ε̂ ≈ 0, x̂₀ = x_t/√ᾱ is the raw latent, saturated at
+    /// every t. A healthy ε̂ has std ≈ 1.
+    last_diag: String,
+    /// A GPU validation error caught this session, surfaced on the page so it can
+    /// never again be swallowed.
+    last_error: Option<String>,
+    /// Frames diagnosed so far, for throttling the console log.
+    diag_frames: u64,
 
     mode: Mode,
 
@@ -221,27 +239,28 @@ impl Engine {
 
     /// One inference frame: predict ε̂, take one reverse step, display x̂₀. When
     /// the chain reaches the image, restart on a new seed so the piece loops.
+    ///
+    /// The reverse step is [`reverse_step_async`] — the engine's own recursion,
+    /// not a copy of it. A loop that composed `[x_t | timestep]` or seeded the
+    /// posterior its own way could diverge from the native sampler unseen; going
+    /// through the one function it cannot (guarded natively by
+    /// `the_async_reverse_step_matches_the_sync_one`).
     async fn inference_frame(&mut self) -> Vec<f32> {
         let diffusion_step = STEPS - 1 - self.inf_step;
-        let timestep_channels = self.input_channels.saturating_sub(self.signal_channels);
-        let features = self.schedule.timestep_embedding(diffusion_step, timestep_channels);
-        let input = compose_diffusion_input(
-            &self.inf_latent,
+        let stepped = reverse_step_async(
+            &mut self.model,
+            &self.schedule,
             self.input_channels,
             self.signal_channels,
-            &features,
-        );
-        let epsilon = self.model.predict_async(&input).await;
-        let stepped = reverse_step_from_epsilon(
-            &self.schedule,
             &self.inf_latent,
-            epsilon,
             diffusion_step,
             self.inf_path_seed,
             DENOISE_MAGNITUDE,
             true,
-        );
+        )
+        .await;
         let x0_hat = stepped.x0_hat.expect("x0_hat was asked for");
+        self.record_diag("inference", diffusion_step, Some(&stepped.predicted_noise), &x0_hat);
         self.inf_latent = stepped.latent;
         self.inf_step += 1;
         if self.inf_step >= STEPS {
@@ -249,6 +268,43 @@ impl Engine {
             self.start_new_inference();
         }
         x0_hat
+    }
+
+    /// Fold this frame's tensor statistics into the diagnostics line and log them
+    /// once a second or so. ε̂ is the one that matters: its std tells a healthy
+    /// forward pass (≈ 1) from a dead one (≈ 0), which is the whole diagnosis of
+    /// the inference bug. `epsilon` is `None` for the drift frame, whose walker
+    /// does not hand ε̂ back; the x̂₀ stats still speak there.
+    fn record_diag(&mut self, mode: &str, t: usize, epsilon: Option<&[f32]>, x0_hat: &[f32]) {
+        let x0 = Stats::of(x0_hat);
+        let eps_part = match epsilon {
+            Some(eps) => {
+                let s = Stats::of(eps);
+                format!(
+                    "ε̂ std={:.3} mean={:.3} [{:.2},{:.2}]{}",
+                    s.std,
+                    s.mean,
+                    s.min,
+                    s.max,
+                    if s.non_finite > 0 {
+                        format!(" ⚠{}×NaN/Inf", s.non_finite)
+                    } else {
+                        String::new()
+                    },
+                )
+            }
+            None => "ε̂ n/a".to_string(),
+        };
+        self.last_diag = format!(
+            "{mode} t={t} · {eps_part} · x̂₀ std={:.3} mean={:.3} [{:.2},{:.2}]",
+            x0.std, x0.mean, x0.min, x0.max,
+        );
+        // First frames log every step (that is where a dead ε̂ is caught on
+        // reload); after that, throttle so the console stays readable.
+        if self.diag_frames < 6 || self.diag_frames % 64 == 0 {
+            log::info!("[batlab] {}", self.last_diag);
+        }
+        self.diag_frames += 1;
     }
 
     /// One drift frame: exactly [`DriftWalk::advance_async`] on the itinerary the
@@ -266,6 +322,8 @@ impl Engine {
             .walk
             .advance_async(action, &self.schedule, &mut predictor)
             .await;
+        let depth = self.depth;
+        self.record_diag("errance", depth, None, &frame.x0_hat);
         frame.x0_hat
     }
 
@@ -328,14 +386,41 @@ impl Engine {
         }
     }
 
-    async fn step(&mut self, pending: &Pending) -> (Vec<u8>, String) {
-        self.apply_pending(pending);
-        let x0_hat = match self.mode {
+    /// The frame's GPU work, dispatched by mode. Split out so [`Engine::step`]
+    /// can run *exactly this* inside a validation error scope.
+    async fn frame_x0(&mut self) -> Vec<f32> {
+        match self.mode {
             Mode::Inference => self.inference_frame().await,
             Mode::Errance => self.errance_frame().await,
+        }
+    }
+
+    async fn step(&mut self, pending: &Pending) -> (Vec<u8>, String, String) {
+        self.apply_pending(pending);
+        // Run the frame under a validation error scope. A shader the browser
+        // rejects, or a limit tripped at dispatch, is captured here and put on
+        // the page instead of silently zeroing ε̂ — the failure mode the whole
+        // instrumentation exists to make impossible to miss.
+        let gpu = Arc::clone(&self.gpu);
+        let x0_hat = match gpu.guarded(self.frame_x0()).await {
+            Ok(x0) => x0,
+            Err(err) => {
+                log::error!("[batlab] WebGPU validation error in a frame: {err}");
+                self.last_error = Some(err);
+                vec![0.0; self.output_len]
+            }
         };
         let rgba = to_rgba(&x0_hat, self.width, self.height, self.signal_channels);
-        (rgba, self.status())
+        (rgba, self.status(), self.diagnostics())
+    }
+
+    /// The diagnostics line for the page: a caught GPU error takes precedence
+    /// over the per-frame statistics — an error means the numbers are moot.
+    fn diagnostics(&self) -> String {
+        match &self.last_error {
+            Some(err) => format!("⚠ WebGPU: {err}"),
+            None => self.last_diag.clone(),
+        }
     }
 }
 
@@ -391,6 +476,7 @@ pub struct BatDiffusion {
     engine: Rc<RefCell<Engine>>,
     pending: Rc<Pending>,
     status: Rc<RefCell<String>>,
+    diag: Rc<RefCell<String>>,
 }
 
 #[wasm_bindgen]
@@ -416,10 +502,12 @@ impl BatDiffusion {
             .await
             .map_err(|err| JsValue::from_str(&err))?;
         let status = engine.status();
+        let diag = engine.diagnostics();
         Ok(BatDiffusion {
             engine: Rc::new(RefCell::new(engine)),
             pending: Rc::new(Pending::default()),
             status: Rc::new(RefCell::new(status)),
+            diag: Rc::new(RefCell::new(diag)),
         })
     }
 
@@ -433,12 +521,14 @@ impl BatDiffusion {
         let engine = self.engine.clone();
         let pending = self.pending.clone();
         let status = self.status.clone();
+        let diag = self.diag.clone();
         wasm_bindgen_futures::future_to_promise(async move {
-            let (rgba, line) = {
+            let (rgba, line, diag_line) = {
                 let mut engine = engine.borrow_mut();
                 engine.step(&pending).await
             };
             *status.borrow_mut() = line;
+            *diag.borrow_mut() = diag_line;
             Ok(js_sys::Uint8Array::from(rgba.as_slice()).into())
         })
     }
@@ -456,6 +546,14 @@ impl BatDiffusion {
     /// The last frame's status line, for an overlay.
     pub fn status(&self) -> String {
         self.status.borrow().clone()
+    }
+
+    /// The last frame's diagnostics line — ε̂ / x̂₀ statistics, or a caught
+    /// WebGPU error. This is what turns "the image is wrong" into "ε̂ std is
+    /// 0.000, the forward pass is dead", the difference between guessing and
+    /// knowing. Shown under the canvas.
+    pub fn diagnostics(&self) -> String {
+        self.diag.borrow().clone()
     }
 
     /// Switch mode: `"inference"` or `"errance"`.
@@ -499,21 +597,64 @@ async fn build_engine(
     let (width, height, out_channels) = (output.0, output.1, output.2);
 
     let gpu = Arc::new(GpuContext::new_headless_with(GpuLimitsProfile::Web).await);
+    log::info!(
+        "[batlab] device opened under the {} limits profile",
+        gpu.limits_profile().label()
+    );
 
     let mut model: Model = Model::new(Arc::clone(&gpu)).await;
-    for draft in &config.layers {
-        model
-            .add_draft(draft)
-            .map_err(|err| format!("could not build a layer: {err}"))?;
+    // Build the model INSIDE a validation error scope. Pipeline creation is
+    // where the browser's WGSL compiler runs; a shader it rejects is captured
+    // here and returned, so an unbuildable model becomes a message on the page
+    // rather than a canvas that animates a dead forward pass in silence. This is
+    // the direct guard for the class of bug that produced saturated noise — see
+    // `docs/reports/WEB_PORT.md`.
+    let build = gpu
+        .guarded(async {
+            for draft in &config.layers {
+                model
+                    .add_draft(draft)
+                    .map_err(|err| format!("could not build a layer: {err}"))?;
+            }
+            model
+                .build_model()
+                .map_err(|err| format!("could not build the model: {err}"))?;
+            Ok::<(), String>(())
+        })
+        .await;
+    match build {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(scope) => {
+            return Err(format!(
+                "the browser rejected a GPU pipeline while building the model — a shader it \
+                 would not compile, or a limit it would not grant: {scope}"
+            ));
+        }
     }
-    model
-        .build_model()
-        .map_err(|err| format!("could not build the model: {err}"))?;
+
+    // Weight integrity, logged so a truncated or altered download is caught by
+    // eye rather than by a wrong image. The checkpoint parser is already strict
+    // (it refuses a length mismatch or trailing bytes), so a clean load means the
+    // scalar count matches the model; these numbers let a visitor confirm the
+    // bytes that reached wasm are the bytes on disk.
+    let expected_params: u64 = config.layers.iter().map(|l| l.parameter_count()).sum();
+    log::info!(
+        "[batlab] weights: {} bytes received, fnv1a={:016x}; model expects {} trainable scalars",
+        weights.len(),
+        fnv1a_64(&weights),
+        expected_params,
+    );
     // The averaged weights when the checkpoint carries them, exactly as
     // production sampling does; falls back to the raw iterate otherwise.
-    model
+    let loaded = model
         .load_checkpoint_bytes_with(&weights, CheckpointWeights::Ema)
         .map_err(|err| format!("could not load the weights: {err}"))?;
+    log::info!(
+        "[batlab] checkpoint loaded: carries_ema={}, using {} weights",
+        loaded.carries_ema,
+        if loaded.used_ema { "averaged" } else { "raw" },
+    );
 
     let schedule = LinearNoiseSchedule::new_linear(STEPS, BETA_START, BETA_END);
     let seeds = SeedImages::parse(&seeds)?;
@@ -529,6 +670,10 @@ async fn build_engine(
 
     let mut engine = Engine {
         model,
+        gpu: Arc::clone(&gpu),
+        last_diag: String::new(),
+        last_error: None,
+        diag_frames: 0,
         schedule,
         input_channels,
         signal_channels,
@@ -554,9 +699,28 @@ async fn build_engine(
     Ok(engine)
 }
 
-/// Installs the panic hook so a Rust panic surfaces as a readable console error
-/// instead of an opaque `unreachable`.
+/// A 64-bit FNV-1a hash of the received weight bytes, logged so a visitor (or a
+/// bug report) can confirm the download that reached wasm is the file on disk.
+/// Cheap, non-cryptographic — its only job is to change when the bytes change.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Installs the panic hook and a console logger.
+///
+/// The logger is not decoration: wgpu reports a rejected shader, a tripped
+/// limit, an uncaptured device error through the `log` facade, and with no sink
+/// installed every one of those was written to nowhere on wasm — the page could
+/// animate a silently-invalid pipeline with a spotless console. That was the
+/// inference bug. With the sink, the browser console carries what the engine was
+/// already trying to say.
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+    let _ = console_log::init_with_level(log::Level::Info);
 }
