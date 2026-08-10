@@ -483,3 +483,70 @@ fn stacked_same_padding_conv_grad_input_is_consistent() {
         );
     });
 }
+
+/// Every float literal in every WGSL shader must be representable as `f32`.
+///
+/// This is not pedantry: `naga → Metal` silently accepted `-3.4028235e38` (what
+/// Rust prints for `f32::MIN`, and which read as an exact decimal sits *above*
+/// `f32::MAX`), while the browser's stricter WGSL front-end refused the whole
+/// module — « value -3.4028235e+38 cannot be represented as 'f32' ». A refused
+/// pipeline fails SILENTLY: its dispatches become no-ops, the output buffer
+/// keeps its zeros, ε̂ comes back all zeros, and the sampler renders pure noise
+/// with no error anywhere. It shipped to a browser before anything caught it.
+///
+/// The engine targets the visitor's browser (see the engine/interface boundary),
+/// so a literal only Metal tolerates is a bug, here, on a native `cargo test`.
+#[test]
+fn every_shader_literal_is_representable_as_f32() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/model/shader");
+    let mut offenders = Vec::new();
+    let mut scanned = 0usize;
+
+    for entry in std::fs::read_dir(&dir).expect("the shader directory is readable") {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wgsl") {
+            continue;
+        }
+        scanned += 1;
+        let source = std::fs::read_to_string(&path).expect("a readable shader");
+        for (line_no, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            // Grow every maximal run of characters a float literal can be made
+            // of, then keep the ones that really parse as a number.
+            let mut token = String::new();
+            for ch in code.chars().chain(std::iter::once(' ')) {
+                if ch.is_ascii_digit() || matches!(ch, '.' | 'e' | 'E' | '+' | '-') {
+                    token.push(ch);
+                    continue;
+                }
+                if !token.is_empty() {
+                    // Only decimals: an integer literal has no f32 range to bust.
+                    if token.contains('.') || token.contains('e') || token.contains('E') {
+                        if let Ok(value) = token.trim_matches(['+', '-']).parse::<f64>() {
+                            if value.is_finite() && value > f32::MAX as f64 {
+                                offenders.push(format!(
+                                    "  {}:{} — `{token}` ({value:e}) exceeds f32::MAX ({:e})",
+                                    path.file_name().unwrap().to_string_lossy(),
+                                    line_no + 1,
+                                    f32::MAX
+                                ));
+                            }
+                        }
+                    }
+                    token.clear();
+                }
+            }
+        }
+    }
+
+    assert!(scanned > 0, "no shader was scanned — the path is wrong");
+    assert!(
+        offenders.is_empty(),
+        "\n{} WGSL literal(s) a strict front-end (the browser's) will refuse,\n\
+         which invalidates the whole pipeline *silently* — zeros out, no error:\n{}\n\n\
+         Use a literal safely under f32::MAX (e.g. -3.4028234e38 as the softmax\n\
+         sentinel), never the canonical print of f32::MIN.\n",
+        offenders.len(),
+        offenders.join("\n")
+    );
+}

@@ -220,7 +220,16 @@ fn attn_scores(
     let p_row = block_base(b, 4u) + n * seq;
 
     // Pass 1 — raw scores, and the row max for the stable softmax.
-    var local_max: f32 = -3.4028235e38;
+    //
+    // The sentinel is deliberately NOT the canonical `-3.4028235e38` that Rust
+    // prints for `f32::MIN`: read as an exact decimal that value sits *above*
+    // f32::MAX (3.40282346...e38), so a strict WGSL front-end refuses it —
+    // « value -3.4028235e+38 cannot be represented as 'f32' ». naga→Metal
+    // accepted it, the browser's compiler did not, and a rejected pipeline
+    // fails SILENTLY: its dispatches become no-ops, ε̂ comes back all zeros and
+    // the sampler renders pure noise. Any literal safely under f32::MAX does
+    // the job of « lower than every score ».
+    var local_max: f32 = -3.4028234e38;
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
         var s: f32 = 0.0;
         for (var i: u32 = 0u; i < c_count; i += 1u) {
