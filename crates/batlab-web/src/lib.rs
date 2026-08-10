@@ -202,6 +202,11 @@ struct Engine {
     inf_latent: Vec<f32>,
     inf_step: usize,
     inf_path_seed: u64,
+    /// The resolved image, held once the chain reaches t=0. Inference is a
+    /// *finite* piece: it ends on its picture and stays there, and only
+    /// « Nouveau bruit » opens the next descent. While it is `Some`, a frame
+    /// costs no GPU work at all — it hands this buffer back.
+    inf_resolved: Option<Vec<f32>>,
 
     // Errance (perpetual drift) state.
     drift: PerpetualDrift,
@@ -227,6 +232,7 @@ impl Engine {
             .sample_noise(self.output_len, seed ^ BASE_NOISE_FOLD);
         self.inf_path_seed = seed;
         self.inf_step = 0;
+        self.inf_resolved = None;
     }
 
     /// (Re)open the drift on seed image `image_index`, under a fresh seed.
@@ -238,7 +244,8 @@ impl Engine {
     }
 
     /// One inference frame: predict ε̂, take one reverse step, display x̂₀. When
-    /// the chain reaches the image, restart on a new seed so the piece loops.
+    /// the chain reaches the image, the run **stops on it** — the picture is the
+    /// end of the piece, and only « Nouveau bruit » opens the next descent.
     ///
     /// The reverse step is [`reverse_step_async`] — the engine's own recursion,
     /// not a copy of it. A loop that composed `[x_t | timestep]` or seeded the
@@ -246,6 +253,11 @@ impl Engine {
     /// through the one function it cannot (guarded natively by
     /// `the_async_reverse_step_matches_the_sync_one`).
     async fn inference_frame(&mut self) -> Vec<f32> {
+        // Chain finished: hold the picture. No dispatch, no readback — the page
+        // idles on the result instead of burning the visitor's GPU on a loop.
+        if let Some(resolved) = self.inf_resolved.as_ref() {
+            return resolved.clone();
+        }
         let diffusion_step = STEPS - 1 - self.inf_step;
         let stepped = reverse_step_async(
             &mut self.model,
@@ -264,8 +276,9 @@ impl Engine {
         self.inf_latent = stepped.latent;
         self.inf_step += 1;
         if self.inf_step >= STEPS {
-            // The image is resolved; the next frame opens a fresh descent.
-            self.start_new_inference();
+            // The image is resolved. Keep it, and stop stepping until the
+            // visitor asks for another one.
+            self.inf_resolved = Some(x0_hat.clone());
         }
         x0_hat
     }
@@ -370,6 +383,11 @@ impl Engine {
     /// A short status line for the overlay.
     fn status(&self) -> String {
         match self.mode {
+            Mode::Inference if self.inf_resolved.is_some() => {
+                // Say it is finished, not merely stalled: a page that stops
+                // moving without a word reads as broken.
+                "Inférence · image terminée · « Nouveau bruit » pour en générer une autre".into()
+            }
             Mode::Inference => {
                 let diffusion_step = STEPS.saturating_sub(1 + self.inf_step);
                 format!("Inférence · débruitage t={diffusion_step} → 0")
@@ -686,6 +704,7 @@ async fn build_engine(
         inf_latent: Vec::new(),
         inf_step: 0,
         inf_path_seed: 0,
+        inf_resolved: None,
         drift: PerpetualDrift::from_image(STEPS, regime, depth, 1),
         walk: DriftWalk::new(vec![0.0; output_len], DENOISE_MAGNITUDE),
         depth,
