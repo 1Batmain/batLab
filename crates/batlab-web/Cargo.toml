@@ -1,0 +1,37 @@
+# File purpose: Cargo manifest for the batlab_web crate — the WebAssembly front
+# end that runs the engine in a visitor's browser on their own GPU (WebGPU).
+#
+# This is the crate the whole engine/interface boundary was drawn for
+# (see the root CLAUDE.md): it depends on `batlab_core` and on the web platform,
+# never the other way round. The dependency arrow is batlab_web -> batlab_core,
+# exactly as batlab -> batlab_ui -> batlab_core, and nothing here reaches back
+# into the engine.
+#
+# It is wasm-only. On a native target the library body is empty (see lib.rs), so
+# `cargo build`/`cargo test --workspace` stay green without ever pulling a web
+# dependency: those live under the `wasm32` target table below.
+
+[package]
+name = "batlab_web"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# cdylib for the wasm module wasm-bindgen post-processes; rlib so the workspace
+# can build it as an ordinary library on native (where it is empty).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+batlab_core = { path = "../batlab-core" }
+
+# The web platform, only for the web target. On native these are absent, so the
+# empty native build has no glue to compile.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = ["console"]

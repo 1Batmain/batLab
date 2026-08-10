@@ -2,4 +2,4 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/batlab-core", "crates/batlab-ui", "crates/batlab"]
+members = ["crates/batlab-core", "crates/batlab-ui", "crates/batlab", "crates/batlab-web"]
