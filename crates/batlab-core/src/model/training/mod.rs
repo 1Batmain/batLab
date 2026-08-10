@@ -16,7 +16,7 @@ use std::fmt;
 pub use dataset::{DatasetPayload, GpuDataset, GpuDatasetError, decode_u8};
 pub use diffusion::DiffusionTask;
 pub use eval::{BaselineBucket, EvalConfig, EvalReport, MseBucket, evaluate};
-pub use drift::{DriftFrame, DriftWalk, NoisePredictor};
+pub use drift::{AsyncNoisePredictor, DriftFrame, DriftWalk, NoisePredictor};
 pub use metrics::{
     BucketStat, DenoiseFrame, DenoiseStepStat, MetricsLogger, ProbeConfig, ReverseStep, Stats,
     compose_diffusion_input, log_probe, log_train_loss, log_trajectory, probe_diffusion,

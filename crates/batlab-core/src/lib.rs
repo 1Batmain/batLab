@@ -12,6 +12,20 @@
 //! a GPU buffer here, whoever displays it (a winit window today, a canvas later)
 //! only reads that buffer.
 
+/// The production diffusion schedule, as one definition.
+///
+/// These were three `const`s in the binary (`crates/batlab/src/main.rs`), which
+/// meant a second consumer of "the schedule the model was trained and sampled
+/// with" — the web build being the first — had to copy them and could drift a
+/// step or a beta out of agreement, silently changing every ᾱ. They live here
+/// now; the binary re-exports these, and the browser reads the same three.
+pub const DIFFUSION_SCHEDULE_STEPS: usize = 256;
+/// Start of the linear beta schedule, calibrated for T = 1000 and rescaled by
+/// [`LinearNoiseSchedule::new_linear`] for the actual step count.
+pub const DIFFUSION_BETA_START: f32 = 1e-4;
+/// End of the linear beta schedule (see [`DIFFUSION_BETA_START`]).
+pub const DIFFUSION_BETA_END: f32 = 2e-2;
+
 pub mod config;
 pub mod gpu_context;
 pub mod live_frame;
@@ -45,6 +59,7 @@ pub use live_frame::{
 pub use model::Model;
 pub use model::training;
 pub use model::training::{
+    AsyncNoisePredictor,
     BaselineBucket, BucketStat, CLIMB_TEMPO_RATIO, DEFAULT_SNR_GAMMA, DatasetPayload, DenoiseFrame,
     DenoiseStepStat, DiffusionTask, DriftAction, DriftFrame, DriftPhase, DriftWalk, EvalConfig,
     EvalReport, GpuDataset, GpuDatasetError,

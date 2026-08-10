@@ -64,6 +64,18 @@ where
     }
 }
 
+/// The same coupling as [`NoisePredictor`], but the model call is a future.
+///
+/// A browser cannot answer "what noise do you see?" synchronously: the GPU
+/// reports back only when the event loop turns, so the answer has to be awaited
+/// (see [`crate::Model::predict_async`]). This is that one method, made async —
+/// nothing else about the drift changes, and [`DriftWalk::advance_async`] walks
+/// the exact same itinerary [`DriftWalk::advance`] does, one `.await` apart.
+#[allow(async_fn_in_trait)]
+pub trait AsyncNoisePredictor {
+    async fn predict_noise(&mut self, latent: &[f32], diffusion_step: usize) -> Vec<f32>;
+}
+
 /// The latent of an endless run, and the climb departure it needs to remember.
 ///
 /// Holds no model and no GPU handle: it is handed a [`NoisePredictor`] per
@@ -181,6 +193,81 @@ impl DriftWalk {
                 // One level down, exactly that one level back on: the noise
                 // budget is stationary by construction rather than by
                 // accounting.
+                self.latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
+                self.frame(stepped.x0_hat.expect("x0_hat was asked for"))
+            }
+        }
+    }
+
+    /// The async twin of [`Self::advance`], for a browser.
+    ///
+    /// Every line that is not the model call is identical to [`Self::advance`] —
+    /// the same schedule functions, in the same order, mutating the latent the
+    /// same way — because it *is* the same walk: only `predict_noise` becomes an
+    /// `.await`. A web run therefore produces the same frames a native one does,
+    /// which is the property `advance_async_matches_advance_bit_for_bit` pins.
+    /// Keeping the two arms side by side (rather than making `advance` call this
+    /// and block) is what keeps the native path free of any executor.
+    pub async fn advance_async<P: AsyncNoisePredictor + ?Sized>(
+        &mut self,
+        action: DriftAction,
+        schedule: &LinearNoiseSchedule,
+        predictor: &mut P,
+    ) -> DriftFrame {
+        match action {
+            DriftAction::Descend {
+                diffusion_step,
+                path_seed,
+            } => {
+                let epsilon = predictor.predict_noise(&self.latent, diffusion_step).await;
+                let stepped = super::metrics::reverse_step_from_epsilon(
+                    schedule,
+                    &self.latent,
+                    epsilon,
+                    diffusion_step,
+                    path_seed,
+                    self.denoise_magnitude,
+                    true,
+                );
+                self.latent = stepped.latent;
+                self.frame(stepped.x0_hat.expect("x0_hat was asked for"))
+            }
+            DriftAction::Climb {
+                forward_step,
+                departure_step,
+                cycle_seed,
+                opens_cycle,
+            } => {
+                if opens_cycle {
+                    self.departure = Some(self.latent.clone());
+                }
+                self.latent = schedule.forward_from(
+                    self.departure
+                        .as_ref()
+                        .expect("a climb always opens with `opens_cycle`"),
+                    departure_step,
+                    forward_step,
+                    cycle_seed,
+                );
+                let epsilon = predictor.predict_noise(&self.latent, forward_step).await;
+                let x0_hat = schedule.x0_estimate(&self.latent, &epsilon, forward_step);
+                self.frame(x0_hat)
+            }
+            DriftAction::Flux {
+                diffusion_step,
+                path_seed,
+                renoise_seed,
+            } => {
+                let epsilon = predictor.predict_noise(&self.latent, diffusion_step).await;
+                let stepped = super::metrics::reverse_step_from_epsilon(
+                    schedule,
+                    &self.latent,
+                    epsilon,
+                    diffusion_step,
+                    path_seed,
+                    self.denoise_magnitude,
+                    true,
+                );
                 self.latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
                 self.frame(stepped.x0_hat.expect("x0_hat was asked for"))
             }
@@ -473,5 +560,63 @@ mod tests {
         walk.restart_from(fresh.clone());
         assert_eq!(walk.latent(), fresh.as_slice());
         assert!(walk.departure.is_none());
+    }
+
+    /// Wraps a synchronous oracle as an [`AsyncNoisePredictor`] whose future is
+    /// already resolved — the cheapest way to drive [`DriftWalk::advance_async`]
+    /// in a test without a GPU or an event loop.
+    struct SyncAsync<F>(F);
+    impl<F> AsyncNoisePredictor for SyncAsync<F>
+    where
+        F: FnMut(&[f32], usize) -> Vec<f32>,
+    {
+        async fn predict_noise(&mut self, latent: &[f32], diffusion_step: usize) -> Vec<f32> {
+            (self.0)(latent, diffusion_step)
+        }
+    }
+
+    /// The web path's whole safety net: [`DriftWalk::advance_async`] must produce
+    /// the identical frame [`DriftWalk::advance`] does, for the identical action
+    /// — otherwise a browser drift would silently diverge from the native one it
+    /// is supposed to be. Run over every regime, for long enough to cover
+    /// descents, climbs (both panes), the cycle turn, and stationary flux, with
+    /// bit-for-bit equality on both the latent and x̂₀ every single frame.
+    #[test]
+    fn advance_async_matches_advance_bit_for_bit() {
+        let schedule = schedule();
+        for regime in [
+            PerpetualRegime::Wander,
+            PerpetualRegime::Breathe,
+            PerpetualRegime::Flux,
+        ] {
+            let depth = 20;
+            let mut drift_sync = PerpetualDrift::new(STEPS, regime, depth, 0x5eed);
+            let mut drift_async = PerpetualDrift::new(STEPS, regime, depth, 0x5eed);
+            let mut walk_sync =
+                DriftWalk::new(schedule.sample_noise(N, drift_sync.initial_noise_seed()), 1.0);
+            let mut walk_async =
+                DriftWalk::new(schedule.sample_noise(N, drift_async.initial_noise_seed()), 1.0);
+            let mut predict_sync = oracle(&schedule, clean());
+            let mut predict_async = SyncAsync(oracle(&schedule, clean()));
+
+            for index in 0..(STEPS + 6 * 2 * (depth + 1)) {
+                let action_sync = drift_sync.step();
+                let action_async = drift_async.step();
+                assert_eq!(
+                    action_sync, action_async,
+                    "{regime:?}: itineraries diverged at frame {index}"
+                );
+                let frame_sync = walk_sync.advance(action_sync, &schedule, &mut predict_sync);
+                let frame_async = pollster::block_on(walk_async.advance_async(
+                    action_async,
+                    &schedule,
+                    &mut predict_async,
+                ));
+                assert_eq!(
+                    frame_sync, frame_async,
+                    "{regime:?}: async frame {index} differs from the sync frame"
+                );
+            }
+        }
     }
 }

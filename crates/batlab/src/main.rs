@@ -37,9 +37,11 @@ const RAW_DATASET_MAGIC_SIGNED: &[u8; 8] = b"BATRAW2\0";
 /// derivable from the first.
 const RAW_DATASET_MAGIC_BYTES: &[u8; 8] = b"BATRAW3\0";
 
-const DIFFUSION_SCHEDULE_STEPS: usize = 256;
-const DIFFUSION_BETA_START: f32 = 1e-4;
-const DIFFUSION_BETA_END: f32 = 2e-2;
+// The schedule constants now live in the engine (one definition, shared with
+// the web build); these aliases keep every call site below unchanged.
+const DIFFUSION_SCHEDULE_STEPS: usize = batlab_core::DIFFUSION_SCHEDULE_STEPS;
+const DIFFUSION_BETA_START: f32 = batlab_core::DIFFUSION_BETA_START;
+const DIFFUSION_BETA_END: f32 = batlab_core::DIFFUSION_BETA_END;
 const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
 const INFERENCE_RUNTIME_LR: f32 = 0.01;
 const INFERENCE_RUNTIME_BATCH_SIZE: u32 = 1;
