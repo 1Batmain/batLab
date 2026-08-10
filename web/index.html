@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>batLab · diffusion sur votre GPU</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0e0f13;
+    --fg: #e9e9ec;
+    --muted: #9aa0aa;
+    --panel: #17181e;
+    --border: #2a2c35;
+    --accent: #d98c5f;
+    --accent-fg: #1a1109;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f6f4; --fg: #191a1d; --muted: #62666e;
+      --panel: #ffffff; --border: #e0e0dc; --accent: #c06a34; --accent-fg: #fff;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 2rem 1rem 3rem;
+  }
+  h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 .2rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 1.6rem; text-align: center; max-width: 44ch; }
+  .stage {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 1rem; box-shadow: 0 10px 40px -20px rgba(0,0,0,.6);
+    display: flex; flex-direction: column; align-items: center; gap: .8rem;
+  }
+  canvas#view {
+    image-rendering: pixelated; width: 384px; height: 384px;
+    border-radius: 8px; background: #808080; display: block;
+  }
+  .status {
+    font: 12px/1.4 ui-monospace, "SF Mono", Menlo, monospace;
+    color: var(--muted); min-height: 1.4em; text-align: center;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: .5rem; justify-content: center; max-width: 420px; }
+  button {
+    font: inherit; font-size: 13px; color: var(--fg); background: transparent;
+    border: 1px solid var(--border); border-radius: 8px; padding: .38rem .7rem;
+    cursor: pointer; transition: background .12s, border-color .12s;
+  }
+  button:hover { border-color: var(--accent); }
+  button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  .group { display: flex; gap: .3rem; align-items: center; }
+  .group .label { color: var(--muted); font-size: 12px; margin-right: .1rem; }
+  .errance-only[hidden] { display: none; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 1.4rem; max-width: 46ch; text-align: center; }
+  .msg {
+    max-width: 46ch; text-align: center; padding: 1.2rem 1.4rem; border-radius: 12px;
+    border: 1px solid var(--border); background: var(--panel);
+  }
+  .msg h2 { font-size: 1rem; margin: 0 0 .5rem; }
+  .msg code { background: rgba(127,127,127,.15); padding: .05rem .35rem; border-radius: 4px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>Un modèle de diffusion, sur <em>votre</em> carte graphique</h1>
+  <p class="sub">
+    Entraîné dans batLab (Rust + wgpu), il tourne ici entièrement dans votre
+    navigateur via WebGPU — aucun serveur ne calcule. À gauche il génère une
+    image depuis du bruit ; en « errance » il dérive sans fin depuis une vraie
+    photo.
+  </p>
+
+  <div id="app"></div>
+
+  <p class="note" id="dl-note"></p>
+
+<script type="module">
+import init, { BatDiffusion } from './batlab_web.js';
+
+const app = document.getElementById('app');
+const dlNote = document.getElementById('dl-note');
+
+function message(title, html) {
+  app.innerHTML = `<div class="msg"><h2>${title}</h2><div>${html}</div></div>`;
+}
+
+// --- WebGPU capability gate -------------------------------------------------
+if (!('gpu' in navigator)) {
+  message(
+    'WebGPU indisponible',
+    `Ce navigateur n'expose pas WebGPU, indispensable ici (aucun repli WebGL
+     ni CPU). Essayez une version récente de <strong>Chrome</strong>,
+     <strong>Edge</strong> (≥ 113) ou <strong>Safari 18+</strong> / Firefox avec
+     WebGPU activé, sur une machine dotée d'un GPU.`
+  );
+  throw new Error('WebGPU unavailable');
+}
+
+// --- Loading UI -------------------------------------------------------------
+message('Chargement…', 'Initialisation du moteur et téléchargement des poids (~14 Mo).');
+
+async function fetchBytes(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${url}: ${resp.status} ${resp.statusText}`);
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+let inst;
+try {
+  await init();
+  const [config, weights, seeds] = await Promise.all([
+    fetchBytes('./model.json'),
+    fetchBytes('./weights.ckpt'),
+    fetchBytes('./seeds.bin'),
+  ]);
+  const mb = (weights.length + seeds.length + config.length) / (1024 * 1024);
+  dlNote.textContent =
+    `Poids téléchargés une fois : ${(weights.length / 1e6).toFixed(1)} Mo ` +
+    `(${weights.length.toLocaleString('fr')} octets). Rendu sur votre GPU sous ` +
+    `le profil de limites WebGPU. Total assets : ${mb.toFixed(1)} Mo.`;
+  inst = await BatDiffusion.create(config, weights, seeds);
+} catch (err) {
+  console.error(err);
+  message(
+    'Échec du démarrage',
+    `Le moteur n'a pas pu s'initialiser sur ce GPU.<br><code>${String(err)}</code>`
+  );
+  throw err;
+}
+
+// --- Build the stage --------------------------------------------------------
+const W = inst.width(), H = inst.height();
+app.innerHTML = `
+  <div class="stage">
+    <canvas id="view" width="${W}" height="${H}"></canvas>
+    <div class="status" id="status"></div>
+    <div class="controls">
+      <div class="group">
+        <button id="mode-errance" class="on">Errance</button>
+        <button id="mode-inference">Inférence</button>
+      </div>
+      <div class="group errance-only" id="regime-group">
+        <span class="label">régime</span>
+        <button data-regime="wander" class="on">errance</button>
+        <button data-regime="breathe">respiration</button>
+        <button data-regime="flux">flux</button>
+      </div>
+      <div class="group errance-only" id="depth-group">
+        <span class="label">t_r</span>
+        <button id="depth-down">−</button>
+        <button id="depth-up">+</button>
+      </div>
+      <button id="reseed">↻ Nouvelle image</button>
+    </div>
+  </div>`;
+
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+// Backing store at model resolution; the CSS upscales it crisply.
+const off = new OffscreenCanvas(W, H);
+const offctx = off.getContext('2d');
+const statusEl = document.getElementById('status');
+const regimeGroup = document.getElementById('regime-group');
+const depthGroup = document.getElementById('depth-group');
+
+function setActive(container, el) {
+  container.querySelectorAll('button').forEach(b => b.classList.remove('on'));
+  el.classList.add('on');
+}
+
+// Mode
+const errBtn = document.getElementById('mode-errance');
+const infBtn = document.getElementById('mode-inference');
+function showErranceControls(on) {
+  regimeGroup.hidden = !on;
+  depthGroup.hidden = !on;
+  document.getElementById('reseed').textContent = on ? '↻ Nouvelle image' : '↻ Nouveau bruit';
+}
+errBtn.onclick = () => { inst.set_mode('errance'); setActive(errBtn.parentElement, errBtn); showErranceControls(true); };
+infBtn.onclick = () => { inst.set_mode('inference'); setActive(infBtn.parentElement, infBtn); showErranceControls(false); };
+
+// Regime
+regimeGroup.querySelectorAll('button[data-regime]').forEach(btn => {
+  btn.onclick = () => { inst.set_regime(btn.dataset.regime); setActive(regimeGroup, btn); };
+});
+
+// Depth
+document.getElementById('depth-up').onclick = () => inst.nudge_depth(1);
+document.getElementById('depth-down').onclick = () => inst.nudge_depth(-1);
+
+// Reseed
+document.getElementById('reseed').onclick = () => inst.reseed();
+
+// --- Render loop (throttled to a contemplative ~30 fps) ---------------------
+const TARGET_MS = 1000 / 30;
+let last = 0;
+async function frame(now) {
+  if (now - last >= TARGET_MS) {
+    last = now;
+    const px = await inst.step();               // Uint8Array, W*H*4
+    const img = new ImageData(new Uint8ClampedArray(px), W, H);
+    offctx.putImageData(img, 0, 0);
+    ctx.drawImage(off, 0, 0, W, H, 0, 0, canvas.width, canvas.height);
+    statusEl.textContent = inst.status();
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
