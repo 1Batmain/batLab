@@ -1,7 +1,9 @@
 //! File purpose: Implements model functionality for model execution, state, or diagnostics.
 
 use crate::gpu_context::GpuContext;
-use crate::model::debug::{LayerDebugView, read_back_f32, read_back_f32_at};
+use crate::model::debug::{
+    LayerDebugView, read_back_f32, read_back_f32_at, read_back_f32_at_async,
+};
 use crate::model::ema::EmaConfig;
 use crate::model::error::ModelError;
 use crate::model::layer::Layer;
@@ -1304,6 +1306,59 @@ impl<State> Model<State> {
         self.read_last_output()
     }
 
+    /// The async sibling of [`Model::predict`] — same submit, same tensor, but
+    /// it *awaits* the ε̂ readback instead of blocking on it.
+    ///
+    /// [`Model::predict`] cannot run in a browser: its readback blocks the
+    /// thread until the GPU is done, and on the web that thread is the one that
+    /// has to turn the event loop for the GPU to report back — a deadlock. This
+    /// path yields there instead, so a wasm caller drives the reverse chain from
+    /// a `requestAnimationFrame` tick without ever blocking. On native it reads
+    /// the very same bytes (`predict_async_matches_predict_bit_for_bit`), so the
+    /// web sampler and the native one cannot diverge.
+    ///
+    /// The forward pass is encoded identically to [`Model::predict`] — one
+    /// sample, `encode_pass_with_batch(.., 1)` — so a model built for a batch
+    /// still predicts a single tensor here.
+    pub async fn predict_async(&mut self, input: &[f32]) -> Vec<f32> {
+        debug_assert!(
+            self.state.is_build,
+            "call build/build_model before predict_async()"
+        );
+
+        self.gpu.write_buffer(
+            self.layers
+                .first()
+                .expect("at least one layer required")
+                .buffers
+                .forward[0]
+                .as_ref(),
+            0,
+            bytemuck::cast_slice(input),
+        );
+
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        for layer in &self.layers {
+            layer.encode_pass_with_batch(&self.gpu, &mut encoder, 1);
+        }
+        self.gpu.submit([encoder.finish()]);
+
+        self.read_last_output_async().await
+    }
+
+    /// The async sibling of [`Model::read_last_output`].
+    pub async fn read_last_output_async(&self) -> Vec<f32> {
+        let last = self.layers.last().expect("at least one layer required");
+        read_back_f32_at_async(
+            self.gpu.as_ref(),
+            last.buffers.forward.last().expect("no output buffer"),
+            0,
+            last.ty.get_dim_output().bytes_size() as u64,
+        )
+        .await
+        .expect("failed to read last output buffer")
+    }
+
     fn build_forwards(&mut self) -> Result<(), ModelError> {
         let mut last_output: Option<Arc<Buffer>> = None;
         let mut saved_output_buffers: HashMap<String, Arc<Buffer>> = HashMap::new();
@@ -1846,6 +1901,41 @@ mod tests {
                 output
                     .iter()
                     .all(|value| (*value - 1.0).abs() < f32::EPSILON)
+            );
+        });
+    }
+
+    /// The web port rests on one claim: [`Model::predict_async`] reads back the
+    /// very bytes [`Model::predict`] does — it only *awaits* the readback where
+    /// the other blocks, because a browser cannot block. Both drive the same GPU
+    /// on native, so this pins them bit-for-bit; a divergence in the async
+    /// readback path (a wrong size, a dropped map, a byte order) shows here
+    /// rather than as a subtly wrong image in someone's browser.
+    #[test]
+    fn predict_async_matches_predict_bit_for_bit() {
+        pollster::block_on(async {
+            let gpu = Arc::new(GpuContext::new_headless().await);
+            let mut model = Model::new(gpu).await;
+            model
+                .add_layer(LayerTypes::Activation(ActivationType::new(
+                    ActivationMethod::Silu,
+                    Dim3::new((2, 2, 4)),
+                )))
+                .unwrap();
+            model
+                .add_layer(LayerTypes::GroupNorm(GroupNormType::new(
+                    Dim3::new((2, 2, 4)),
+                    2,
+                )))
+                .unwrap();
+            model.build_model().unwrap();
+
+            let input: Vec<f32> = (0..16).map(|i| (i as f32 * 0.37).sin()).collect();
+            let sync = model.predict(&input);
+            let asynchronous = model.predict_async(&input).await;
+            assert_eq!(
+                sync, asynchronous,
+                "the async readback diverged from the synchronous one"
             );
         });
     }

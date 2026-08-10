@@ -85,6 +85,82 @@ pub(crate) fn read_back_f32_at(
     Some(values)
 }
 
+/// The async sibling of [`read_back_f32_at`] — the same three steps (copy into a
+/// staging buffer, `map_async`, read the mapped range) but yielding instead of
+/// blocking.
+///
+/// This exists for exactly one host: a browser. On `wasm32` a buffer map only
+/// resolves when control returns to the JavaScript event loop, so
+/// [`read_back_f32_at`]'s `device.poll(wait)` + `pollster::block_on` cannot run
+/// there — blocking the main thread deadlocks the very loop that would fire the
+/// map callback. Awaiting the oneshot instead lets the caller (`spawn_local` on
+/// a `requestAnimationFrame` tick) suspend, the event loop turn, the promise the
+/// WebGPU backend registered resolve, and the callback wake us.
+///
+/// On native the map callback still only fires when the device is polled, so we
+/// poll here — to completion — and the await then resolves at once. The two
+/// paths therefore read back the *same bytes*; the difference is only who turns
+/// the crank. Guarded by `predict_async_matches_predict_bit_for_bit`.
+pub(crate) async fn read_back_f32_at_async(
+    gpu: &GpuContext,
+    buf: &wgpu::Buffer,
+    offset_bytes: u64,
+    size_bytes: u64,
+) -> Option<Vec<f32>> {
+    if size_bytes == 0 {
+        return Some(vec![]);
+    }
+    if !buf.usage().contains(wgpu::BufferUsages::COPY_SRC) {
+        return None;
+    }
+
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("debug_staging_async"),
+        size: size_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(buf, offset_bytes, &staging, 0, size_bytes);
+    gpu.submit([encoder.finish()]);
+    // Counted at the same point the sync path counts it — where the bytes are
+    // committed to travel — so a web run's transfer figures line up with a
+    // native one's.
+    gpu.record_readback(size_bytes);
+
+    let slice = staging.slice(..);
+    let (tx, rx) = futures::channel::oneshot::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+
+    // Native drives the queue itself; the browser drives it for us. On wasm this
+    // poll is unsupported (and unnecessary) — omitting it is the whole reason
+    // this function is not just [`read_back_f32_at`].
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .is_err()
+        {
+            return None;
+        }
+    }
+
+    match rx.await {
+        Ok(Ok(())) => {}
+        _ => return None,
+    }
+
+    let values = {
+        let bytes = slice.get_mapped_range();
+        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+    };
+    staging.unmap();
+    Some(values)
+}
+
 // ---------------------------------------------------------------------------
 // f32 slice summary
 // ---------------------------------------------------------------------------

@@ -24,3 +24,9 @@ Models/*/pretrained_weights/night_run.ckpt
 
 # suite à l'aveugle de l'attention : racine de stockage jetable (BATLAB_ROOT)
 blind_tests_attention/work/
+
+# Le build web déposable : wasm généré, glue wasm-bindgen, poids (14 Mo,
+# gitignorés comme tout checkpoint) et seeds extraits. Reproductible par
+# web/build.sh — les sources (index.html, tools/, build.sh, README) sont, elles,
+# commitées.
+web/dist/
