@@ -684,7 +684,16 @@ async fn build_engine(
     // The portfolio opens on the piece: the endless drift from a real image.
     let regime = PerpetualRegime::Wander;
     let depth = 24;
-    let seed_counter = 0x0bad_cafe_face_5eed;
+    // Seeded from the browser, not from a constant. A fixed counter made the
+    // page *deterministic across loads*: every visitor met the same elephant in
+    // the same order, and a reload could never surprise its author. The engine
+    // stays reproducible — a run is still a pure function of its seed — it is
+    // only the opening seed that now comes from outside.
+    let seed_counter = {
+        let hi = (js_sys::Math::random() * (u32::MAX as f64)) as u64;
+        let lo = (js_sys::Math::random() * (u32::MAX as f64)) as u64;
+        (hi << 32) ^ lo ^ 0x0bad_cafe_face_5eed
+    };
 
     let mut engine = Engine {
         model,
