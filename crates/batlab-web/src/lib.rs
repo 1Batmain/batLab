@@ -202,6 +202,11 @@ struct Engine {
     inf_latent: Vec<f32>,
     inf_step: usize,
     inf_path_seed: u64,
+    /// FNV-1a of the opening latent, and of the finished image. Two numbers on
+    /// screen that answer, from outside, a question reasoning could not: does a
+    /// new seed actually draw a different noise field, and does a different
+    /// noise field actually end on a different picture.
+    inf_noise_print: u32,
     /// The resolved image, held once the chain reaches t=0. Inference is a
     /// *finite* piece: it ends on its picture and stays there, and only
     /// « Nouveau bruit » opens the next descent. While it is `Some`, a frame
@@ -233,6 +238,7 @@ impl Engine {
         self.inf_path_seed = seed;
         self.inf_step = 0;
         self.inf_resolved = None;
+        self.inf_noise_print = fingerprint(&self.inf_latent);
     }
 
     /// (Re)open the drift on seed image `image_index`, under a fresh seed.
@@ -388,16 +394,23 @@ impl Engine {
             // from « the model answers the same thing whatever the noise » —
             // two very different bugs that look identical from the outside.
             Mode::Inference if self.inf_resolved.is_some() => {
+                let image_print = self
+                    .inf_resolved
+                    .as_deref()
+                    .map(fingerprint)
+                    .unwrap_or_default();
                 format!(
-                    "Inférence · image terminée (graine {:08x}) · « Nouveau bruit » pour en générer une autre",
+                    "Inférence terminée · graine {:08x} · bruit {:08x} · image {image_print:08x} · « Nouveau bruit »",
                     self.inf_path_seed as u32,
+                    self.inf_noise_print,
                 )
             }
             Mode::Inference => {
                 let diffusion_step = STEPS.saturating_sub(1 + self.inf_step);
                 format!(
-                    "Inférence · graine {:08x} · débruitage t={diffusion_step} → 0",
+                    "Inférence · graine {:08x} · bruit {:08x} · t={diffusion_step} → 0",
                     self.inf_path_seed as u32,
+                    self.inf_noise_print,
                 )
             }
             Mode::Errance => {
@@ -722,6 +735,7 @@ async fn build_engine(
         inf_step: 0,
         inf_path_seed: 0,
         inf_resolved: None,
+        inf_noise_print: 0,
         drift: PerpetualDrift::from_image(STEPS, regime, depth, 1),
         walk: DriftWalk::new(vec![0.0; output_len], DENOISE_MAGNITUDE),
         depth,
@@ -759,4 +773,21 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 pub fn start() {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Info);
+}
+
+/// FNV-1a over the bits of a tensor — a cheap, stable fingerprint.
+///
+/// Not a hash for security: a number a human can read off a page and compare
+/// between two runs. It exists because « the image looks the same » is not a
+/// measurement, and two identical-looking 32x32 pictures cannot be told from
+/// two genuinely identical ones by eye.
+fn fingerprint(values: &[f32]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for value in values {
+        for byte in value.to_bits().to_le_bytes() {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+    }
+    hash
 }
