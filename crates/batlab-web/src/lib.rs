@@ -383,14 +383,22 @@ impl Engine {
     /// A short status line for the overlay.
     fn status(&self) -> String {
         match self.mode {
+            // The seed is on screen in both states, and that is deliberate: it
+            // is the only way to tell « the page reopens on the same noise »
+            // from « the model answers the same thing whatever the noise » —
+            // two very different bugs that look identical from the outside.
             Mode::Inference if self.inf_resolved.is_some() => {
-                // Say it is finished, not merely stalled: a page that stops
-                // moving without a word reads as broken.
-                "Inférence · image terminée · « Nouveau bruit » pour en générer une autre".into()
+                format!(
+                    "Inférence · image terminée (graine {:08x}) · « Nouveau bruit » pour en générer une autre",
+                    self.inf_path_seed as u32,
+                )
             }
             Mode::Inference => {
                 let diffusion_step = STEPS.saturating_sub(1 + self.inf_step);
-                format!("Inférence · débruitage t={diffusion_step} → 0")
+                format!(
+                    "Inférence · graine {:08x} · débruitage t={diffusion_step} → 0",
+                    self.inf_path_seed as u32,
+                )
             }
             Mode::Errance => {
                 let (counter_name, counter) = self.drift.counter();
