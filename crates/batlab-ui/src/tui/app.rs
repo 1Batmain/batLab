@@ -573,35 +573,23 @@ pub struct MonitorState {
     pub total_steps: usize,
     pub last_sample_path: Option<String>,
     pub error: Option<String>,
-    /// Set to `true` when the user requests a new training run.
     pub restart_training: bool,
-    /// Set after the user successfully saves the model config.
     pub save_status: Option<String>,
-    /// The model config currently being monitored (used when saving).
+    /// The config being monitored, used when saving.
     pub model_config: Option<ModelConfig>,
-    /// Device limit proxy for largest single GPU buffer allocation.
+    /// Device limits, for the resource read-out.
     pub max_buffer_bytes: Option<u64>,
-    /// Device limit proxy for largest storage-binding allocation.
     pub max_storage_binding_bytes: Option<u64>,
-    /// Best-effort estimate of current model+training GPU allocation.
     pub estimated_training_bytes: Option<u64>,
-    /// Inference preview image rendered in the monitor.
     pub inference_image: Option<MonitorImage>,
-    /// Checkpoint used for the latest inference run.
     pub inference_checkpoint_path: Option<String>,
-    /// Seed used for the latest inference sample.
     pub inference_seed: Option<u64>,
-    /// Generic loading/progress state for long-running GPU preparation/sampling.
     pub loading_progress: Option<LoadingProgress>,
-    /// Whether the training worker is currently paused.
     pub is_training_paused: bool,
-    /// Current runtime learning rate (may differ from initial config).
+    /// Runtime lr/batch, which may differ from the initial config.
     pub current_lr: Option<f32>,
-    /// Current runtime batch size (may differ from initial config).
     pub current_batch_size: Option<u32>,
-    /// Commands queued from UI to training worker.
     pub pending_control_commands: Vec<TrainingControlCommand>,
-    /// Live state of a perpetual run, as reported by its worker.
     pub perpetual: Option<PerpetualStatus>,
 }
 
@@ -3035,13 +3023,9 @@ impl App {
         }
     }
 
-    /// Backspace deletes a character of the *typed* fields only.
-    ///
-    /// The guard is not decoration: `fields[TRAINING_DATASET_FIELD]` is the
-    /// dataset path, which the dataset selector owns and this form never shows.
-    /// With the toggle sharing its index, an unguarded `pop()` would have eaten
-    /// that path one character per keystroke, from a screen where nothing
-    /// appears to change.
+    /// Backspace deletes from the TYPED fields only. `fields[TRAINING_DATASET_FIELD]`
+    /// is the dataset path (this form never shows it); with the toggle sharing its
+    /// index, an unguarded `pop()` would eat that path one keystroke at a time.
     pub fn handle_backspace_training(&mut self) {
         let idx = self.training_params.field_idx;
         if idx >= TRAINING_RANDOM_WEIGHTS_FIELD {
