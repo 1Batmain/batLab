@@ -2124,10 +2124,11 @@ mod tests {
             );
 
             // The async descent, reproduced exactly as the web crate opens and
-            // walks it: base latent from `seed ^ BASE_NOISE_FOLD`, path seed the
-            // seed itself, `diffusion_step` counting down T-1 → 0.
-            const BASE_NOISE_FOLD: u64 = 0xa5a5_5a5a_0123_4567;
-            let mut latent = schedule.sample_noise(output_len, seed ^ BASE_NOISE_FOLD);
+            // walks it: base latent from the ONE canonical fold, path seed the
+            // seed itself, `diffusion_step` counting down T-1 → 0. Importing
+            // `base_noise_seed` rather than restating its literal is the whole
+            // point — a divergence in the shared fold has to surface here.
+            let mut latent = schedule.sample_noise(output_len, crate::base_noise_seed(seed));
             for diffusion_step in (0..schedule.len()).rev() {
                 let stepped = reverse_step_async(
                     &mut model,

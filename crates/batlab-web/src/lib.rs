@@ -67,12 +67,11 @@ const DENOISE_MAGNITUDE: f32 = 1.2;
 /// is already too smooth (SAMPLING_SWEEP.md §2).
 const POSTERIOR_VARIANCE: PosteriorVariance = PosteriorVariance::Beta;
 
-/// Same fold as [`batlab_core`]'s reverse-chain seed: distinct runs get distinct
-/// noise fields, avalanched downstream by the engine's `gaussian_at`.
+/// A private multiplier the page spreads its per-run seed counter with — its own
+/// RNG, not a cross-crate invariant. Once a run *has* a seed, the fold that ties
+/// its opening noise to the native sampler is [`batlab_core::base_noise_seed`],
+/// imported (not restated) so the page cannot drift from path 0.
 const SEED_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
-/// The same constant `sample_diffusion` folds into the base latent's seed, so a
-/// web inference run's opening noise matches path 0 of the native sampler.
-const BASE_NOISE_FOLD: u64 = 0xa5a5_5a5a_0123_4567;
 
 /// Which piece the page is showing — the two modes of the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,12 +242,13 @@ impl Engine {
 
     /// Restart the inference run from fresh noise under a new seed — matching
     /// path 0 of [`batlab_core::sample_diffusion`]: the base latent is drawn
-    /// from `seed ^ BASE_NOISE_FOLD`, and the path seed is the seed itself.
+    /// from [`batlab_core::base_noise_seed`], and the path seed is the seed
+    /// itself (`path_seed(seed, 0)`).
     fn start_new_inference(&mut self) {
         let seed = self.next_seed();
         self.inf_latent = self
             .schedule
-            .sample_noise(self.output_len, seed ^ BASE_NOISE_FOLD);
+            .sample_noise(self.output_len, batlab_core::base_noise_seed(seed));
         self.inf_path_seed = seed;
         self.inf_step = 0;
         self.inf_resolved = None;
