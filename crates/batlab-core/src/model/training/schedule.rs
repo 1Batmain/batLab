@@ -1,4 +1,5 @@
-//! File purpose: Implements schedule logic used by the training pipeline.
+//! The linear noise schedule: betas/alphas/alpha_bars and the forward, reverse
+//! and gaussian-field operations built on them.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,26 +10,17 @@ pub struct LinearNoiseSchedule {
     alpha_bars: Vec<f32>,
 }
 
-/// Which of DDPM's two admissible reverse-step variances the posterior draw uses.
+/// Which of DDPM's two admissible reverse-step variances the posterior draw uses
+/// (Ho et al. 2020, §3.2; they coincide only as `T → ∞`):
 ///
-/// A reverse step adds `sigma_t * N(0, 1)` to the posterior mean, and DDPM
-/// (Ho et al. 2020, §3.2) admits two closed forms for `sigma_t^2` that coincide
-/// only in the `T → ∞` limit:
+/// - [`Beta`](PosteriorVariance::Beta) — `sigma_t^2 = beta_t`. The larger, the
+///   default, and BIT-FOR-BIT the historical draw.
+/// - [`Posterior`](PosteriorVariance::Posterior) — the true posterior variance
+///   `beta_t · (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)`. Strictly smaller, and
+///   smallest at `t = 1` (`~0.60·beta` here) where the sharpness-deciding pixels are drawn.
 ///
-/// - [`Beta`](PosteriorVariance::Beta) — `sigma_t^2 = beta_t`. The larger of the
-///   two, and what this sampler has injected since it was written. It is the
-///   default here, and it is **bit-for-bit** the historical draw: [`denoise_step`]
-///   and every config that predates this option resolve to it.
-/// - [`Posterior`](PosteriorVariance::Posterior) — the variance of the true
-///   posterior `q(x_{t-1} | x_t, x_0)`,
-///   `sigma_t^2 = beta_t · (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)`. Strictly
-///   smaller than `beta_t` (the ratio is `< 1`), and smallest at the very bottom
-///   of the chain — `~0.60·beta` at `t = 1` on this schedule — which is exactly
-///   where the last, sharpness-deciding pixels are drawn.
-///
-/// The formula lives in **one place**, [`LinearNoiseSchedule::posterior_sigma`],
-/// so the native sampler, the web crate and every walker read the same number:
-/// a second copy is precisely the divergence this repo has paid for before.
+/// The formula lives in ONE place, [`LinearNoiseSchedule::posterior_sigma`], so
+/// the native sampler, web crate and walkers read the same number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PosteriorVariance {
@@ -68,14 +60,11 @@ const MAX_BETA: f32 = 0.999;
 const TERMINAL_ALPHA_BAR_LIMIT: f32 = 1e-3;
 
 impl LinearNoiseSchedule {
-    /// Builds a linear beta schedule.
-    ///
-    /// `beta_start`/`beta_end` are interpreted as calibrated for
-    /// `BETA_REFERENCE_STEPS` (the DDPM paper's T = 1000) and are rescaled by
-    /// `BETA_REFERENCE_STEPS / num_steps`, so the total injected noise is
-    /// preserved at any T. Without this, reusing the paper's betas at T = 256
-    /// left alpha_bar(T-1) = 0.075 — i.e. 27% of the original signal still
-    /// present in x_T, while sampling starts from pure Gaussian noise.
+    /// Builds a linear beta schedule. `beta_start`/`beta_end` are calibrated for
+    /// `BETA_REFERENCE_STEPS` (DDPM's T = 1000) and rescaled by
+    /// `BETA_REFERENCE_STEPS / num_steps`, preserving total injected noise at any T.
+    /// Without this, the paper's betas at T = 256 left 27% of the signal in x_T
+    /// while sampling starts from pure noise.
     pub fn new_linear(num_steps: usize, beta_start: f32, beta_end: f32) -> Self {
         assert!(num_steps > 0, "noise schedule requires at least one step");
         assert!(
@@ -157,15 +146,9 @@ impl LinearNoiseSchedule {
     }
 
     /// The reverse-step noise scale `sigma_t` for the chosen [`PosteriorVariance`],
-    /// **before** the `denoise_magnitude` multiplier and **before** the `step == 0`
-    /// override that zeroes the final draw.
-    ///
-    /// This is the *sole* definition of the two variances (see
-    /// [`PosteriorVariance`]); [`denoise_step_with_magnitude`] is its only caller.
-    /// [`PosteriorVariance::Beta`] returns `sqrt(beta_t)` — the exact literal the
-    /// step used before this method existed, so the default stays bit-identical.
-    ///
-    /// [`denoise_step_with_magnitude`]: Self::denoise_step_with_magnitude
+    /// BEFORE `denoise_magnitude` and the `step == 0` override. The SOLE definition
+    /// of the two variances; `Beta` returns `sqrt(beta_t)`, the exact literal used
+    /// before this method existed, so the default stays bit-identical.
     pub fn posterior_sigma(&self, step: usize, variance: PosteriorVariance) -> f32 {
         let beta = self.beta(step);
         match variance {
@@ -189,21 +172,14 @@ impl LinearNoiseSchedule {
         }
     }
 
-    /// Smooth multi-resolution timestep embedding.
+    /// Smooth multi-resolution timestep embedding: `tau = step/(T-1)`, each channel
+    /// pair `i` encoding `[sin(pi·2^i·tau), cos(pi·2^i·tau)]`. The lowest pair is a
+    /// monotone `cos(pi·tau)` so even one pair identifies t smoothly, unlike the old
+    /// `sin(step)`/`cos(step)` (period ≈6.28 steps) that aliased adjacent timesteps.
     ///
-    /// The step is first normalised to `tau = step / (T - 1) ∈ [0, 1]`, then each
-    /// channel pair `i` encodes `[sin(pi·2^i·tau), cos(pi·2^i·tau)]`. The lowest
-    /// pair (`i = 0`) gives `cos(pi·tau)`, a strictly monotone signal running
-    /// `1 → -1` across the schedule, so even a single pair uniquely identifies t
-    /// *and* varies smoothly — unlike the previous `sin(step)`/`cos(step)` form
-    /// (period ≈ 6.28 steps), which aliased adjacent timesteps and gave the
-    /// network a near-random code it could not exploit in a short run.
-    ///
-    /// This MUST stay identical to `timestep_value` in
-    /// `shader/diffusion_prepare.wgsl` (checked by
-    /// `timestep_embedding_matches_shader_formula`): training composes the input
-    /// on the GPU with the shader, inference composes it here on the CPU, and the
-    /// network only works if both feed it the same conditioning.
+    /// MUST stay identical to `timestep_value` in `shader/diffusion_prepare.wgsl`
+    /// (guarded by `timestep_embedding_matches_shader_formula`) — training composes
+    /// on the GPU, inference here on the CPU, and both must feed the same conditioning.
     pub fn timestep_embedding(&self, step: usize, channels: usize) -> Vec<f32> {
         if channels == 0 {
             return Vec::new();
@@ -243,28 +219,13 @@ impl LinearNoiseSchedule {
     }
 
     /// One increment of the forward Markov chain:
-    /// `x_t = sqrt(1 - beta_t) * x_{t-1} + sqrt(beta_t) * eps`.
-    ///
-    /// [`Self::add_noise`] jumps straight to `t` from a clean `x0`; this walks
-    /// there. Chaining increments `0..=t` from the same `x0`, each with its own
-    /// noise draw, is the *same distribution* — that is the standard DDPM
-    /// identity, and `climbing_the_forward_chain_matches_add_noise_in_distribution`
-    /// measures it rather than asserting it from the algebra.
-    ///
-    /// The two are therefore interchangeable in maths and not at all in
-    /// experience: the jump replaces an image with noise between two frames,
-    /// while the walk dissolves it over `t` of them. Training keeps the jump,
-    /// which draws an independent `t` per example and has nothing to animate.
-    ///
-    /// **The perpetual climb does not use this** — it uses [`Self::forward_from`],
-    /// for the reason spelled out there: an exact Markov walk draws an
-    /// *independent* field per frame, which at 30 frames a second is television
-    /// static. This stays because it is the correct, tested definition of one
-    /// forward increment, and it is what `forward_from` is measured against.
-    ///
-    /// `seed` must be fresh per increment — reusing one across a walk would add
-    /// the *same* field `t` times, i.e. a single field scaled up, which is not a
-    /// Gaussian walk at all.
+    /// `x_t = sqrt(1 - beta_t) * x_{t-1} + sqrt(beta_t) * eps`. Chaining `0..=t`
+    /// from a clean `x0` is the same distribution as [`Self::add_noise`]'s jump
+    /// (`climbing_the_forward_chain_matches_add_noise_in_distribution` measures it).
+    /// The perpetual climb uses [`Self::forward_from`] instead (an exact Markov walk
+    /// seethes — see module header); this stays as the tested definition it is
+    /// measured against. `seed` must be fresh per increment — reusing one adds the
+    /// same field `t` times, not a Gaussian walk.
     pub fn forward_step(&self, previous: &[f32], step: usize, seed: u64) -> Vec<f32> {
         let step = step.min(self.len().saturating_sub(1));
         let signal_scale = self.alpha(step).sqrt();
@@ -277,39 +238,22 @@ impl LinearNoiseSchedule {
     }
 
     /// The forward process in closed form, from an arbitrary intermediate state.
-    ///
-    /// `departure` is the state a climb sets out from — the one that sits just
-    /// *below* level `departure_step`, i.e. exactly what
-    /// `forward_step(departure, departure_step, _)` consumes. `step` is the
-    /// level to land on. With `r = alpha_bar(step) / alpha_bar_below(departure_step)`:
+    /// `departure` sits just BELOW `departure_step`; `step` is the level to land
+    /// on. With `r = alpha_bar(step) / alpha_bar_below(departure_step)`:
     ///
     /// ```text
     ///   x_t = sqrt(r) * x_dep + sqrt(1 - r) * eps
     /// ```
     ///
-    /// This is `q(x_t | x_s)` for any `s < t`, not just `s = clean`: the ratio of
-    /// `alpha_bar`s *is* the generalisation, which is why the departure is
-    /// allowed to be a noisy latent where [`Self::add_noise`] would need a clean
-    /// `x0`. At `departure_step = 0` the ratio's denominator is `1` and this
-    /// reduces to `add_noise` exactly.
+    /// This is `q(x_t | x_s)` for any `s < t`, not just `s = clean`: the alpha_bar
+    /// ratio IS the generalisation, which is why the departure may be a noisy
+    /// latent where [`Self::add_noise`] needs a clean `x0`. At `departure_step = 0`
+    /// it reduces to `add_noise` exactly.
     ///
-    /// # Why the perpetual climb walks this and not [`Self::forward_step`]
-    ///
-    /// Chaining `forward_step` up the schedule is the *exact* Markov walk, and
-    /// it lands on the same marginal — but every increment draws its **own**
-    /// field. Displayed one increment per frame at 30 Hz, thirty independent
-    /// grains a second is television static: the image dissolved smoothly and
-    /// *seethed* while doing it ("ça frise pendant la phase de remontée"). The
-    /// descent has no such artefact because consecutive latents of the reverse
-    /// chain are strongly correlated.
-    ///
-    /// Here `seed` names **one field for the whole climb**, and every level is
-    /// computed from the departure rather than from the previous frame. Each
-    /// frame keeps the same marginal, the endpoint keeps the same distribution
-    /// — and the grain, being one fixed pattern whose amplitude rises, is
-    /// *revealed* instead of reshuffled. The frames are no longer a Markov
-    /// chain: they are maximally correlated, which is precisely the property the
-    /// eye was asking for.
+    /// The perpetual climb walks THIS, not [`Self::forward_step`]: `seed` names ONE
+    /// field for the whole climb, every level computed from the departure, so the
+    /// grain is revealed (amplitude rising) rather than reshuffled — maximally
+    /// correlated frames, not a Markov chain that seethes. See module header.
     pub fn forward_from(
         &self,
         departure: &[f32],
@@ -354,12 +298,10 @@ impl LinearNoiseSchedule {
     /// The clipped x0 estimate the posterior mean is built from, for the whole
     /// tensor: `clamp(x_t - sqrt(1 - alpha_bar) * eps_hat) / sqrt(alpha_bar)`.
     ///
-    /// This is "what the model believes the clean image is" at `step`, and it is
-    /// the exact same quantity [`Self::denoise_step_with_magnitude`] computes
-    /// internally — both go through [`x0_hat_at`], so the live visualiser cannot
-    /// drift from the sampler. Nothing here is part of the recursion: the value
-    /// is derived from `latent`/`predicted_noise` alone, so computing it is
-    /// side-effect free and optional.
+    /// "What the model believes the clean image is" at `step` — the same quantity
+    /// [`Self::denoise_step_with_magnitude`] computes internally (both through
+    /// [`x0_hat_at`], so the visualiser cannot drift from the sampler). Derived
+    /// from `latent`/`predicted_noise` alone: side-effect free and optional.
     pub fn x0_estimate(&self, latent: &[f32], predicted_noise: &[f32], step: usize) -> Vec<f32> {
         assert_eq!(
             latent.len(),
@@ -396,11 +338,10 @@ impl LinearNoiseSchedule {
         let alpha = self.alpha(step);
         let alpha_bar = self.alpha_bar(step);
         let alpha_bar_prev = self.alpha_bar_below(step);
-        // Posterior mean computed from the clipped x0 estimate. Clamping x0 to
-        // the data range bounds the reverse chain by construction: an imperfect
-        // (or degenerate) noise prediction can no longer be amplified
-        // multiplicatively across the ~1/sqrt(alpha_bar_T) chain gain. For a
-        // well-trained model x0_hat already lies in [-1, 1] and this is a no-op.
+        // Posterior mean from the CLIPPED x0 estimate: clamping x0 to the data
+        // range bounds the chain by construction, so a degenerate ε̂ cannot be
+        // amplified across the ~1/sqrt(alpha_bar_T) chain gain. A no-op for a
+        // well-trained model whose x0_hat already lies in [-1, 1].
         let coeff_x0 = alpha_bar_prev.sqrt() * beta / (1.0 - alpha_bar);
         let coeff_xt = alpha.sqrt() * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar);
         let noise_to_x0 = (1.0 - alpha_bar).sqrt();
@@ -429,12 +370,8 @@ impl LinearNoiseSchedule {
     }
 }
 
-/// The clipped x0 estimate for a single element.
-///
-/// Sole definition of the formula: the reverse step builds its posterior mean
-/// from it, and `x0_estimate` exposes it for display. Keeping one definition is
-/// what makes the visualiser's "what the model believes" pane trustworthy — a
-/// second copy could drift and quietly show something the sampler never used.
+/// The clipped x0 estimate for a single element — the SOLE definition of the
+/// formula, so the reverse step's mean and the visualiser's display cannot drift.
 #[inline]
 fn x0_hat_at(latent: f32, predicted_noise: f32, x0_scale: f32, noise_to_x0: f32) -> f32 {
     (x0_scale * (latent - noise_to_x0 * predicted_noise)).clamp(-1.0, 1.0)
@@ -443,36 +380,16 @@ fn x0_hat_at(latent: f32, predicted_noise: f32, x0_scale: f32, noise_to_x0: f32)
 /// Odd increment of the SplitMix64 stream (the golden-ratio constant).
 const STREAM_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// Draws element `index` of the noise field identified by `seed`.
-///
-/// The index is folded in by **addition through an odd multiplier**, never by
-/// XOR. `gaussian_from_seed(seed ^ index)` reads as harmless — the murmur3
-/// finaliser downstream avalanches fine — but it is catastrophic as soon as the
-/// *caller* also derives its per-draw seed by XOR, which the reverse chain did
-/// (`path_seed ^ diffusion_step`):
-///
-/// ```text
-/// n(step, index) = g(base ^ step ^ index) = n(step', index ^ step ^ step')
-/// ```
-///
-/// i.e. every step of the chain draws the *same* field, merely permuted by
-/// `index -> index ^ step ^ step'`. Accumulated over the 256 reverse steps, the
-/// total injected noise at a pixel then depends on its index only through
-/// `sigma_{u ^ index}` — and `sigma` is smooth in `step`, so flipping a *low*
-/// bit of the index barely changes the sum. On a 32-wide image the low 5 bits
-/// are `x`: the injected noise came out all but constant along a row, and the
-/// sampler painted horizontal bands whatever the model predicted
-/// (`ANISOTROPY_HUNT.md`; guarded by
-/// `injected_noise_over_reverse_chain_is_isotropic`).
-///
-/// The seed is therefore **avalanched first** (`fmix64`), and only then does the
-/// index stream get added. Any relation between two caller seeds — XOR, or the
-/// `+ step * GAMMA` a caller might reasonably use — is destroyed by the mix
-/// before the index is folded in, so no two fields are reindexings of one
-/// another. Doing it the other way round is not enough: `seed + (index+1)*GAMMA`
-/// with a caller seed of `base + (step+1)*GAMMA` collapses to
-/// `base + (step+index+2)*GAMMA`, a field constant along the anti-diagonals —
-/// the same defect wearing a different hat, and the regression test catches it.
+/// Draws element `index` of the noise field identified by `seed`. The seed is
+/// AVALANCHED FIRST (`fmix64`), THEN the index is folded in by ADDITION through an
+/// odd multiplier — never XOR. `seed ^ index` looks harmless but is catastrophic
+/// once the CALLER also XORs its per-draw seed (`path_seed ^ diffusion_step`): the
+/// whole chain then draws one field merely reindexed, which on a 32-wide image
+/// came out near-constant along a row — horizontal bands whatever the model said
+/// (`ANISOTROPY_HUNT.md`). Avalanching first destroys any caller-seed relation
+/// (XOR or `+ step*GAMMA`) before the index is folded in; the order matters (the
+/// reverse collapses to a field constant along the anti-diagonals). Guarded by
+/// `injected_noise_over_reverse_chain_is_isotropic`.
 fn gaussian_at(seed: u64, index: usize) -> f32 {
     let field_key = fmix64(seed);
     gaussian_from_seed(
@@ -600,26 +517,16 @@ mod tests {
         assert_eq!(first.1, second.1);
     }
 
-    /// Walking the forward chain one step at a time must land where the single
-    /// `add_noise` jump lands — same signal coefficient, same noise variance.
-    ///
-    /// This is what licenses the perpetual mode's gradual re-noising: the user
-    /// sees the image dissolve over `t_r` frames instead of being replaced by
-    /// noise between two, and the sampler is handed exactly the `x_t` it would
-    /// have been handed before. Asserted by measurement, not by algebra: the
-    /// claim is about `gaussian_at`'s *actual* draws, and a chain that reused a
-    /// seed (or scaled a field twice) would satisfy the algebra and fail here.
-    ///
-    /// Every intermediate level is checked too — not just the destination —
-    /// because a climb whose middle frames are not legitimate `x_k` would show
-    /// the right start and end with something arbitrary in between, which is
-    /// precisely the part the user looks at.
+    /// Walking the forward chain one step at a time lands where the `add_noise`
+    /// jump does (same signal coefficient, same noise variance) — what licenses the
+    /// gradual re-noising. Asserted by MEASUREMENT of `gaussian_at`'s actual draws,
+    /// not algebra (a reused seed would satisfy the algebra and fail here). Every
+    /// intermediate level is checked too — those are the frames the user watches.
     #[test]
     fn climbing_the_forward_chain_matches_add_noise_in_distribution() {
         const N: usize = 16_384;
         let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
-        // A structured, non-degenerate x0 in the data range: a flat field would
-        // make the signal coefficient unmeasurable.
+        // A structured x0 in range: a flat field makes the signal unmeasurable.
         let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.017).sin() * 0.8).collect();
         let energy: f64 = x0.iter().map(|v| (*v as f64) * (*v as f64)).sum();
 
@@ -700,22 +607,14 @@ mod tests {
         }
     }
 
-    /// `forward_from` must produce a legitimate `x_t` at **every** level it is
-    /// asked for, departing from a clean `x0` *and* from a noisy latent — the
-    /// second is the case breathing lives in, and the one `add_noise` cannot
-    /// serve.
-    ///
-    /// Measured, not deduced: signal coefficient by least squares, mean and
-    /// standard deviation of the residual, against theory *and* against an
-    /// exact Markov walk (`forward_step`) launched from the same departure.
-    /// The last level is the one the next descent is handed, so its agreement
-    /// with the walk is the statement "the wandering has not changed nature".
+    /// `forward_from` must be a legitimate `x_t` at EVERY level, from a clean `x0`
+    /// AND from a noisy latent (breathe's case, which `add_noise` cannot serve).
+    /// Measured against theory AND against an exact Markov walk from the same
+    /// departure — the last level is what the next descent is handed.
     #[test]
     fn the_closed_form_climb_is_a_valid_x_t_at_every_level() {
-        // Large enough that the tolerances below sit well clear of the
-        // estimator's own noise: the least-squares coefficient has a standard
-        // error of sigma/sqrt(sum x_dep^2) ~= 0.003 here, so the 0.02 gate is a
-        // ~6-sigma statement and not a coin flip that happens to be green.
+        // Large enough that the 0.02 gate is a ~6-sigma statement: the LSQ
+        // coefficient's standard error is ~0.003 here.
         const N: usize = 65_536;
         let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
         let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.017).sin() * 0.8).collect();
@@ -853,15 +752,11 @@ mod tests {
         );
     }
 
-    /// The failure mode an *incremental* climb invites: one seed for the whole
-    /// ascent adds the same field over and over, which is a single field scaled
-    /// up — the pixels stay perfectly correlated with it and the image never
-    /// dissolves, it just gains a fixed pattern. The variance check above would
-    /// pass; only comparing two increments catches it.
-    ///
-    /// This is the invariant of [`LinearNoiseSchedule::forward_step`], which the
-    /// perpetual climb no longer uses; it guards the operator, which the closed
-    /// form is measured against in the two tests above.
+    /// The failure mode an incremental climb invites: one seed for the whole
+    /// ascent adds the same field over and over (a single field scaled up, never
+    /// dissolving). The variance check above would pass; only comparing two
+    /// increments catches it. Guards [`LinearNoiseSchedule::forward_step`], the
+    /// operator the closed form is measured against.
     #[test]
     fn a_climb_draws_a_different_field_at_every_increment() {
         let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
@@ -891,10 +786,9 @@ mod tests {
 
     #[test]
     fn reverse_chain_stays_bounded_even_with_degenerate_noise_prediction() {
-        // Worst case for the sampler: the model predicts no noise at all.
-        // Without x0 clamping the chain gain (~1/sqrt(alpha_bar_T)) amplifies
-        // the latent by two orders of magnitude; with it the trajectory must
-        // stay within a few units of the data range.
+        // Worst case: the model predicts no noise. Without x0 clamping the chain
+        // gain (~1/sqrt(alpha_bar_T)) amplifies the latent by two orders of
+        // magnitude; with it, it stays within a few units of the data range.
         let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
         let mut latent = schedule.sample_noise(64, 0xbadc_0ffe);
         let zero_noise = vec![0.0f32; latent.len()];
@@ -908,19 +802,13 @@ mod tests {
         );
     }
 
-    /// Anisotropy hunt — the defect that made every generated image a stack of
-    /// horizontal bands.
-    ///
-    /// A single noise field was always isotropic, so per-field checks passed.
-    /// What collapsed was the field *summed over the reverse chain*: with the
-    /// old `gaussian_from_seed(seed ^ index)` fed a caller seed of
-    /// `base ^ step`, the 256 steps drew one field under XOR permutations of the
-    /// pixel index, and the sum stopped depending on the low bits of the index —
-    /// i.e. on `x`. This walks the real sampler recursion with a null model
-    /// (eps_hat = 0), so it exercises exactly the accumulation the sampler
-    /// performs, and asserts the accumulated field is isotropic on a 32x32 grid.
-    ///
-    /// Measured: 15.6 before the fix, 1.0 after (the assertion trips at 1.5).
+    /// Anisotropy hunt — the defect that made every image horizontal bands. A
+    /// single field was always isotropic (per-field checks passed); the field
+    /// SUMMED over the reverse chain collapsed, because `seed ^ index` with a
+    /// caller seed of `base ^ step` drew one field under XOR permutations of the
+    /// index and the sum stopped depending on its low bits (i.e. on `x`). Walks the
+    /// real recursion with ε̂=0 and asserts isotropy on 32×32. Measured: 15.6
+    /// before the fix, 1.0 after (trips at 1.5).
     #[test]
     fn injected_noise_over_reverse_chain_is_isotropic() {
         const W: usize = 32;
@@ -985,15 +873,11 @@ mod tests {
         }
     }
 
-    /// The visualiser shows `x0_estimate` as "what the model believes the clean
-    /// image is". That claim is only honest if it is the *same* x0 the reverse
-    /// step builds its posterior mean from.
-    ///
-    /// At step 0 the sampler is noiseless (sigma = 0) and alpha_bar_prev = 1, so
-    /// the returned latent is exactly `coeff_x0 * x0_hat + coeff_xt * x_t`.
-    /// Rebuilding that from `x0_estimate` and demanding bit-equality pins the two
-    /// paths to one formula: inline the clamp differently in either one and this
-    /// fails.
+    /// The visualiser's "what the model believes" is only honest if it is the SAME
+    /// x0 the reverse step builds its mean from. At step 0 (sigma=0,
+    /// alpha_bar_prev=1) the latent is exactly `coeff_x0·x0_hat + coeff_xt·x_t`;
+    /// rebuilding that from `x0_estimate` and demanding bit-equality pins both
+    /// paths to one formula.
     #[test]
     fn x0_estimate_is_the_x0_the_reverse_step_uses() {
         let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
