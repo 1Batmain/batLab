@@ -1,17 +1,9 @@
-//! File purpose: The itinerary of an endless denoising run — where on the noise
-//! schedule the sampler is, and when it should stop descending and re-noise.
-//!
-//! A normal sampling run has an end: it walks the reverse chain from `T-1` to
-//! `0` and hands back an image. A perpetual run has none. It descends, reaches
-//! its floor, walks the *forward* chain back up to `t_r`, and descends again —
-//! forever. What changes between the two is *only* the itinerary: every step
-//! down is the same [`crate::reverse_step`], and every step up is one level of
-//! the forward process in closed form,
-//! [`LinearNoiseSchedule::forward_from`](crate::LinearNoiseSchedule::forward_from).
-//!
-//! That itinerary is the whole of this module, and it holds no model, no GPU
-//! handle and no tensor — so the thing that is hardest to eyeball (an infinite
-//! loop) is the thing that is cheapest to unit-test.
+//! The itinerary of an endless denoising run: where on the schedule the sampler
+//! is, and when to stop descending and re-noise. Unlike a normal run, it never
+//! ends — descend to a floor, climb the forward chain back to `t_r`, repeat. Only
+//! the itinerary changes: descents are [`crate::reverse_step`], climbs are one
+//! forward level in closed form ([`LinearNoiseSchedule::forward_from`]). Holds no
+//! model, GPU or tensor, so the infinite loop is cheap to unit-test.
 //!
 //! # The three regimes
 //!
@@ -26,103 +18,37 @@
 //!    at 0, climbs back.       resolves, oscillates.    t*, churns in place.
 //! ```
 //!
-//! `t_r` (the *renoise depth*) is the audacity dial: low `t_r` perturbs an image
-//! that is nearly settled, high `t_r` erases enough of it for a metamorphosis.
-//! Wander and breathe are triangles, not sawtooths: the climb takes exactly as
-//! many frames as the descent it undoes.
+//! `t_r` (the renoise depth) is the audacity dial. Wander/breathe are triangles:
+//! the climb takes as many frames as the descent it undoes. **Flux** removes the
+//! turning points instead of smoothing them — it holds `t*` forever, one reverse
+//! step down and one forward increment back per frame, so the noise level is
+//! stationary and only the content moves. Descent and climb survive only as the
+//! approach to `t*`, both walked at tempo so moving `t*` is a glide.
 //!
-//! # Why a third regime that has no cycle at all
+//! # The climb: walked, in closed form, from the departure latent
 //!
-//! Wander and breathe are *phased*: an image resolves, then dissolves, then
-//! resolves. Even with a perfectly smooth climb (`CLIMB_COHERENCE.md`) the
-//! alternation itself is a pulse — "des frises entre les étapes" — and a viewer
-//! feels the machine turn round twice per cycle.
+//! Walked one level per frame, not jumped ([`add_noise`] straight to `t_r`
+//! watched like a slap). Computed by [`forward_from`] with ONE field per cycle,
+//! not the exact forward chain (a fresh field per increment shimmered — thirty
+//! unrelated grains a second). Started from the latent the descent LEFT, never a
+//! re-read of it as clean: `x_t = sqrt(ᾱ_t/ᾱ_dep)·x_dep + sqrt(1-ᾱ_t/ᾱ_dep)·ε` is
+//! valid from any legitimate `x_dep`, whereas `add_noise` assumes a clean `x₀` and
+//! decays the signal by an extra `sqrt(ᾱ_floor)` every cycle. Rationale and
+//! measurements: `CLIMB_COHERENCE.md`.
 //!
-//! **Flux** removes the turning points instead of smoothing them. It holds one
-//! noise level `t*` forever and, on every frame, takes *one* reverse step down
-//! (`t* → t*-1`) and puts *one* forward increment back (`t*-1 → t*`). The noise
-//! level is stationary; only the content moves, by about `sqrt(beta_t*)` a
-//! frame. There is no phase to announce, no cycle to close and no moment at
-//! which the run changes its mind — which is the whole point.
-//!
-//! Descent and climb still exist in this regime, but only as the *approach* to
-//! `t*`: from above the run descends to it a step at a time, from below it
-//! climbs to it in closed form, and both walk at the current tempo so that
-//! moving `t*` mid-run is a glide rather than a jump.
-//!
-//! # Why the climb is walked and not jumped
-//!
-//! The first version leapt: one [`LinearNoiseSchedule::add_noise`] took the
-//! settled image straight to `t_r` between two frames. Distributionally that is
-//! the same destination, and to watch it was a slap — "an immense quantity of
-//! noise, all at once", which is no way to hold a contemplative image. Walking
-//! the same distance one level at a time, one visualiser frame per level,
-//! dissolves the image over the same number of frames it took to resolve. Same
-//! maths, opposite experience.
-//!
-//! # Why the climb is walked in closed form and not as a Markov chain
-//!
-//! The walked version was first written as the exact forward chain: one
-//! [`LinearNoiseSchedule::forward_step`] per frame. That is the textbook
-//! process and it is correct — and it *shimmered*. Each increment draws its own
-//! independent field, so at thirty frames a second the climb showed thirty
-//! unrelated grains a second: television static laid over a dissolving image.
-//! The descent has no such artefact, because consecutive latents of the reverse
-//! chain are strongly correlated; the climb crackled because its noise was not.
-//!
-//! The climb therefore runs
-//! [`forward_from`](crate::LinearNoiseSchedule::forward_from): every level is
-//! computed from the *departure* state with **one field per cycle**, drawn once
-//! and then revealed as its amplitude rises. Every frame keeps the marginal it
-//! had before and the destination keeps its distribution — only the correlation
-//! *between* frames changes, from zero to one. See `CLIMB_COHERENCE.md`.
-//!
-//! # What the climb starts from
-//!
-//! The latent the descent left, wherever it left it — never a re-interpretation
-//! of it as a clean image. This is what the closed form from an intermediate
-//! state exists for: `x_t = sqrt(ᾱ_t/ᾱ_dep)·x_dep + sqrt(1 - ᾱ_t/ᾱ_dep)·ε` is
-//! valid from *any* legitimate `x_dep`, being `q(x_t | x_dep)` of the forward
-//! process, whereas `add_noise(x, t)` implements
-//! `x_t = sqrt(ᾱ_t)·x₀ + sqrt(1-ᾱ_t)·ε` and is only valid when `x` really is a
-//! clean `x₀` — feed it a latent that already carries noise and the signal
-//! decays by an extra `sqrt(ᾱ_floor)` every cycle. The ratio of `ᾱ`s is exactly
-//! the correction that makes the departure's own noise level accounted for.
-//!
-//! So the climb runs from `floor` to `t_r`, and the two regimes both come out
-//! right for the same reason:
-//!
-//! - **Wander** floors at `t = 0`, where the sampler has `σ = 0` and `ᾱ_prev = 1`
-//!   so its output *is* the clipped x̂₀ (see
-//!   `x0_estimate_is_the_x0_the_reverse_step_uses`). The climb therefore starts
-//!   from a genuine, clipped `x₀` — exactly the image the cycle just showed.
-//! - **Breathe** floors above zero, and the latent there is *not* a clean image
-//!   — which is the point of the regime. Climbing from it keeps the promise
-//!   that the image never fully resolves; starting the climb from x̂₀ instead
-//!   would flash the resolved image on the way up and make breathing a slower
-//!   wander.
-//!
-//! The caller therefore snapshots the latent on the increment that reports
-//! `opens_cycle` and feeds that same snapshot to every level of the climb —
-//! [`DriftAction::Climb`] names the level it departed from so the schedule can
-//! form the right `ᾱ` ratio.
+//! Wander floors at `t=0` (the sampler's output IS the clipped x̂₀, see
+//! `x0_estimate_is_the_x0_the_reverse_step_uses`); breathe floors above zero and
+//! climbs from a still-noisy latent, so the image never fully resolves. The
+//! caller snapshots the latent on the `opens_cycle` increment and feeds it to
+//! every level; [`DriftAction::Climb`] names the departure level for the ᾱ ratio.
 
 use serde::{Deserialize, Serialize};
 
-/// What a run sets out from.
-///
-/// The original perpetual run opened on **pure noise** at the top of the
-/// schedule and denoised its way to a first image — which is a generative run
-/// that then wanders. Asked for in use: *"le mieux, c'est de partir d'une image
-/// déjà réelle, jauger le niveau de bruit qu'on réinjecte, refaire prédire le
-/// modèle, itérer, et laisser le modèle drifter"* — a **drift away from a real
-/// photograph**, which is a different piece.
-///
-/// The itinerary machinery needs no new phase for it. A run that starts on a
-/// real image starts where a wander cycle *ends*: on a clean `x₀` at `t = 0`,
-/// about to climb. So [`PerpetualDrift::from_image`] opens in exactly the state
-/// [`PerpetualDrift::open_climb`] leaves — the same code path a settled cycle
-/// takes, entered from outside.
+/// What a run sets out from. Noise is the original generative-then-wander
+/// opening; Image is a drift away from a real photograph. No new phase is needed
+/// — a run from a real image starts where a wander cycle ENDS (a clean `x₀` at
+/// `t=0`, about to climb), so [`PerpetualDrift::from_image`] opens in exactly the
+/// state [`PerpetualDrift::open_climb`] leaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PerpetualOrigin {
     /// Pure noise at `T-1`. The run denoises down to its first image.
@@ -218,29 +144,17 @@ pub const MIN_FLUX_LEVEL: usize = 1;
 /// How far one press of the depth key moves `t_r`.
 pub const RENOISE_DEPTH_STEP: usize = 8;
 
-/// How fast the climb runs relative to the descent.
-///
-/// `1.0` — the climb takes exactly as long as the descent it undoes, which is
-/// the symmetry the eye reads as breathing. It is affordable because a climb
-/// increment is pure arithmetic: unlike a reverse step it never calls the
-/// model, so the only thing pacing it is the tempo. Raise it to hurry the
-/// dissolve, lower it to draw it out.
+/// How fast the climb runs relative to the descent. `1.0` = the symmetry the eye
+/// reads as breathing. Raise to hurry the dissolve, lower to draw it out.
 pub const CLIMB_TEMPO_RATIO: f32 = 1.0;
 
-/// Odd increments for the independent seed streams a cycle needs. Distinct
-/// constants so a cycle's descent noise and its climb field are unrelated;
-/// both are avalanched by `gaussian_at` before any pixel index is folded in.
+/// Distinct odd increments for the independent seed streams a cycle needs, so its
+/// descent noise and climb field are unrelated (both avalanched by `gaussian_at`).
 const DESCENT_STREAM: u64 = 0x9e37_79b9_7f4a_7c15;
 const RENOISE_STREAM: u64 = 0xbf58_476d_1ce4_e5b9;
-/// The two streams flux draws on, indexed by its **frame** counter rather than
-/// by a cycle — a stationary run has no cycles, and both of its fields have to
-/// be fresh on every frame. They are dedicated (rather than reusing the two
-/// above with a different index) so that no flux frame can ever land on the
-/// seed of a wander cycle, whatever the counters happen to be.
-///
-/// Additive, never XOR: `gaussian_at` avalanches the seed before folding the
-/// pixel index in, and an additive relation between a caller's seed and the
-/// index stream is precisely the defect `ANISOTROPY_HUNT.md` documents.
+/// Flux's two streams, indexed by FRAME (a stationary run has no cycles, and both
+/// fields must be fresh every frame). Dedicated, so no flux frame lands on a
+/// wander cycle's seed. Additive, never XOR — the `ANISOTROPY_HUNT.md` defect.
 const FLUX_PATH_STREAM: u64 = 0xd1b5_4a32_d192_ed03;
 const FLUX_FIELD_STREAM: u64 = 0xa076_1d64_78bd_642f;
 
@@ -256,9 +170,8 @@ pub enum DriftPhase {
 }
 
 impl DriftPhase {
-    /// What the panel says the run is doing. A frame in which the image is
-    /// coming apart is not a malfunction, but it looks like one unless the
-    /// instrument says so.
+    /// What the panel says the run is doing — an image coming apart looks like a
+    /// malfunction unless the instrument says otherwise.
     pub fn label(self) -> &'static str {
         match self {
             DriftPhase::Descent => "descente",
@@ -276,47 +189,29 @@ pub enum DriftAction {
         diffusion_step: usize,
         path_seed: u64,
     },
-    /// Carry the climb's departure state up to level `forward_step`.
-    ///
-    /// The caller applies
+    /// Carry the climb's departure state up to `forward_step`. The caller applies
     /// `schedule.forward_from(departure, departure_step, forward_step, cycle_seed)`,
-    /// where `departure` is the latent it snapshotted on the increment that
-    /// reported `opens_cycle` — never a re-interpretation of it as a clean
-    /// image, see the module header.
+    /// `departure` being the latent snapshotted on the `opens_cycle` increment —
+    /// never re-read as a clean image (see module header).
     Climb {
-        /// The level this frame lands on. Rises by one per action, `departure_step`
-        /// through the ceiling.
+        /// The level this frame lands on (rises by one per action).
         forward_step: usize,
-        /// The level the climb set out from — the departure state sits just
-        /// below it. Constant for the whole climb, and what fixes the `ᾱ` ratio.
+        /// The level the climb set out from — constant, fixes the `ᾱ` ratio.
         departure_step: usize,
-        /// The climb's **single** noise field, drawn once per cycle. Every level
-        /// of one climb reveals more of this same field; the next cycle draws a
-        /// different one.
+        /// The climb's SINGLE noise field, drawn once per cycle.
         cycle_seed: u64,
-        /// Set on the first increment of a climb: the cycle just closed, and
-        /// the latent is the image it settled on. The moment to save a frame —
-        /// and the moment to snapshot the departure.
+        /// First increment of a climb: the cycle just closed. Save a frame and
+        /// snapshot the departure.
         opens_cycle: bool,
     },
-    /// One stationary frame at `diffusion_step`: reverse-step down to
-    /// `diffusion_step - 1`, then put exactly that one level back on with the
-    /// forward increment.
-    ///
-    /// The caller applies
-    /// `schedule.forward_step(reverse_step(x, diffusion_step, path_seed), diffusion_step, renoise_seed)`,
-    /// which is `forward_from` with departure and destination equal — the
-    /// closed form collapses to `sqrt(alpha_t)·x + sqrt(beta_t)·eps` — so the
-    /// latent comes back to the level it started on and the noise budget is
-    /// stationary by construction rather than by accounting.
-    ///
-    /// **Both seeds are fresh on every frame.** The path seed must be, because
-    /// the timestep is constant here: `reverse_step_seed` folds `t` in, so a
-    /// path seed held across frames would inject the *same* posterior field
-    /// over and over — a fixed direction pushed into the image instead of a
-    /// draw.
+    /// One stationary frame at `diffusion_step`: reverse-step down one level, then
+    /// put it back with the forward increment. This is `forward_from` with equal
+    /// departure/destination (collapsing to `sqrt(alpha_t)·x + sqrt(beta_t)·eps`),
+    /// so the noise budget is stationary by construction. BOTH seeds are fresh
+    /// every frame: `t` is constant here, so a held path seed would inject the
+    /// same posterior field repeatedly — a fixed push, not a draw.
     Flux {
-        /// `t*` — the level held. Constant between two changes of the dial.
+        /// `t*` — the level held.
         diffusion_step: usize,
         /// The reverse step's posterior draw for this frame.
         path_seed: u64,
@@ -326,19 +221,12 @@ pub enum DriftAction {
 }
 
 impl DriftAction {
-    /// The phase this action **is** — as opposed to the phase the drift was in
-    /// before it was asked for one.
-    ///
-    /// The two differ by exactly one frame wherever [`PerpetualDrift::settle_phase`]
-    /// has work to do, because it reconciles *inside* [`PerpetualDrift::step`]:
-    /// a caller that reads `phase()` first and steps second labels the frame
-    /// with the phase that was just left. In flux that mislabels the first churn
-    /// frame of every approach as a descent — caught from outside by a black-box
-    /// test that saw a frame tagged `descent` moving with churn amplitude, 40 %
-    /// above the reverse step at the same level.
-    ///
-    /// Anything that names a frame — a dump tag, the TUI's phase read-out —
-    /// takes it from here, so the name and the deed cannot come apart again.
+    /// The phase this action IS, as opposed to the phase the drift was in before
+    /// it was asked for one. The two differ by a frame wherever
+    /// [`PerpetualDrift::settle_phase`] reconciles inside [`PerpetualDrift::step`]:
+    /// reading `phase()` first, stepping second, labels the frame just left (in
+    /// flux, the first churn frame as descent). Anything naming a frame takes it
+    /// from here, so name and deed cannot come apart.
     pub fn phase(&self) -> DriftPhase {
         match self {
             DriftAction::Descend { .. } => DriftPhase::Descent,
@@ -360,32 +248,26 @@ pub struct PerpetualDrift {
     cycle: usize,
     base_seed: u64,
     phase: DriftPhase,
-    /// The level the climb in progress set out from — its departure state sits
-    /// just below this. Fixed for the whole climb, so every level is formed
-    /// from the same departure and the same field.
+    /// The level the current climb set out from — fixed for the whole climb, so
+    /// every level is formed from the same departure and field.
     departure_step: usize,
-    /// The climb in progress' single noise field, fixed when the climb opens.
-    /// Held rather than re-derived per increment so that nothing — not even a
-    /// regime change mid-ascent — can change the grain half-way up.
+    /// The current climb's single noise field, held (not re-derived) so nothing —
+    /// not even a mid-ascent regime change — changes the grain half-way up.
     climb_seed: u64,
     /// Set when a cycle closes, cleared by the climb increment that reports it.
     opens_cycle: bool,
-    /// Stationary frames emitted so far. Flux has no cycles, so this is what
-    /// its seeds are indexed by; it also ticks once per flux approach, which
-    /// keeps an approach's field distinct from the frames either side of it.
+    /// Stationary frames emitted so far. Flux indexes its seeds by this; it also
+    /// ticks once per flux approach, keeping its field distinct from neighbours.
     frame: u64,
-    /// What the run set out from, kept so `[r]` re-seeds the same way the run
-    /// opened: a drift that began on a photograph and re-seeded into pure noise
-    /// would change what the piece *is* on a keystroke.
+    /// What the run set out from, so `[r]` re-seeds the way it opened — re-seeding
+    /// a photograph drift into pure noise would change what the piece IS.
     origin: PerpetualOrigin,
 }
 
 impl PerpetualDrift {
-    /// Opens a run at the top of the schedule.
-    ///
-    /// The first descent always starts from `T-1` whatever `depth` says: the run
-    /// begins on pure noise, and `depth` only governs how far back up each
-    /// *subsequent* cycle throws the image.
+    /// Opens a run at the top of the schedule. The first descent always starts
+    /// from `T-1` whatever `depth` says (the run begins on pure noise); `depth`
+    /// only governs how far each SUBSEQUENT cycle throws the image back up.
     pub fn new(steps: usize, regime: PerpetualRegime, depth: usize, base_seed: u64) -> Self {
         let steps = steps.max(1);
         let mut drift = Self {
@@ -445,15 +327,10 @@ impl PerpetualDrift {
         self.regime
     }
 
-    /// Whether the run is currently resolving the image or dissolving it — the
-    /// phase it *intends* for its next action.
-    ///
-    /// **Not the name of a frame.** [`Self::step`] reconciles the phase against
-    /// the regime and the level on its way in, so this can be overruled by the
-    /// very next call: in flux it reads `Descent` right up to the first frame of
-    /// the churn, and `Descent` again for one frame at the top of an upward
-    /// approach. Whatever files a frame — a dump tag, a status panel — takes its
-    /// name from [`DriftAction::phase`], which is what actually happened.
+    /// The phase the run INTENDS for its next action — NOT the name of a frame.
+    /// [`Self::step`] reconciles it on the way in, so it can be overruled next
+    /// call (in flux it reads `Descent` up to the first churn frame). Frame names
+    /// come from [`DriftAction::phase`], which is what actually happened.
     pub fn phase(&self) -> DriftPhase {
         self.phase
     }
@@ -483,10 +360,8 @@ impl PerpetualDrift {
         self.depth
     }
 
-    /// Lowest timestep a cycle descends to — the regime *is* this number.
-    ///
-    /// Flux has floor and ceiling on the same level: it does not descend
-    /// *towards* `t*`, it lives on it.
+    /// Lowest timestep a cycle descends to — the regime IS this number. Flux has
+    /// floor and ceiling on the same level: it lives on `t*`, not descends toward it.
     pub fn floor(&self) -> usize {
         match self.regime {
             PerpetualRegime::Wander => 0,
@@ -500,18 +375,11 @@ impl PerpetualDrift {
         self.regime.min_depth()
     }
 
-    /// Clamps and applies a new renoise depth.
-    ///
-    /// A deeper `t_r` takes effect at the next climb (the ceiling is only read
-    /// there). A shallower one can leave `t` already at or below the new floor
-    /// — [`Self::step`] compares with `<=`, so that simply ends the descent on
-    /// the next call instead of walking past it; and a climb already above the
-    /// new ceiling ends on its next increment rather than unwinding.
-    ///
-    /// In flux it takes effect on the very next frame, and the run *walks* to
-    /// the new `t*` — down by reverse steps, up by climb increments, one level
-    /// per frame at the current tempo. That is the whole reason moving `t*` is
-    /// not a jump.
+    /// Clamps and applies a new renoise depth. A deeper `t_r` takes effect at the
+    /// next climb; a shallower one that leaves `t` at/below the new floor simply
+    /// ends the descent next call (`step` compares with `<=`). In flux it takes
+    /// effect next frame and the run WALKS to the new `t*` (one level per frame),
+    /// which is why moving `t*` is a glide, not a jump.
     pub fn set_depth(&mut self, depth: usize) {
         self.depth = depth.clamp(self.min_depth(), self.max_depth());
     }
@@ -527,21 +395,16 @@ impl PerpetualDrift {
         self.set_depth(next);
     }
 
-    /// Walks `[m]` round the ring of regimes.
-    ///
-    /// The dial is re-clamped, because the regimes do not share a floor: flux
-    /// may sit at `t* = 1`, which is below what a cycle-based regime accepts.
-    /// Nothing else is reset — the latent stays where it is, and the new regime
-    /// walks to its own level from there.
+    /// Walks `[m]` round the ring of regimes, re-clamping the dial (regimes do not
+    /// share a floor: flux may sit at `t*=1`, below what a cycle regime accepts).
+    /// Nothing else is reset — the new regime walks to its level from where it is.
     pub fn toggle_regime(&mut self) {
         self.regime = self.regime.toggle();
         self.set_depth(self.depth);
     }
 
-    /// Restarts the drift under a new seed, **from whatever it originally set
-    /// out from**. The caller is expected to redraw its latent to match: fresh
-    /// noise for [`PerpetualOrigin::Noise`], another dataset image for
-    /// [`PerpetualOrigin::Image`].
+    /// Restarts the drift under a new seed, from whatever it originally set out
+    /// from. The caller redraws its latent to match (fresh noise, or another image).
     pub fn reseed(&mut self, base_seed: u64) {
         self.base_seed = base_seed;
         self.t = self.steps - 1;
@@ -556,9 +419,9 @@ impl PerpetualDrift {
         }
     }
 
-    /// The seed the run's initial latent should be drawn from — the same fold
-    /// [`crate::base_noise_seed`] gives the native sampler and the web port, so a
-    /// noise-origin drift opens on the very field an inference run would.
+    /// The seed the initial latent is drawn from — the same [`crate::base_noise_seed`]
+    /// fold as the native sampler and web port, so a noise drift opens on the field
+    /// an inference run would.
     pub fn initial_noise_seed(&self) -> u64 {
         crate::base_noise_seed(self.base_seed)
     }
@@ -574,12 +437,10 @@ impl PerpetualDrift {
                     path_seed: self.stream_seed(DESCENT_STREAM),
                 };
                 if diffusion_step <= self.floor() {
-                    // A reverse step at `t` leaves the latent one level below,
-                    // so the forward chain resumes at `t` itself: the climb
-                    // re-walks precisely the ground the descent just covered.
+                    // A reverse step at `t` leaves the latent one level below, so
+                    // the climb resumes at `t` itself and re-walks the ground the
+                    // descent just covered.
                     self.cycle += 1;
-                    // Where the whole climb is formed from: the latent this
-                    // very step is about to produce sits just below here.
                     self.open_climb(diffusion_step, self.stream_seed(RENOISE_STREAM));
                 } else {
                     self.t = diffusion_step - 1;
@@ -595,11 +456,9 @@ impl PerpetualDrift {
                     opens_cycle: std::mem::take(&mut self.opens_cycle),
                 };
                 if forward_step >= self.ceiling() {
-                    // The latent now sits at `forward_step`; that is where the
-                    // reverse chain has to be picked up, ceiling or not — the
-                    // user may have moved `t_r` mid-climb. In flux,
-                    // `settle_phase` turns this straight back into a stationary
-                    // frame on the next call, since the level is now `t*`.
+                    // The reverse chain picks up at `forward_step`, ceiling or not
+                    // (the user may have moved `t_r` mid-climb). In flux,
+                    // `settle_phase` turns this back into a stationary frame.
                     self.phase = DriftPhase::Descent;
                 } else {
                     self.t = forward_step + 1;
@@ -620,20 +479,14 @@ impl PerpetualDrift {
         }
     }
 
-    /// Reconciles the phase with the regime and with the level the latent is
-    /// actually on, before any action is emitted.
-    ///
-    /// Everything that can move under a running drift is handled here and only
-    /// here: `[m]` swapping the regime, and `↑`/`↓` moving `t*` while flux is
-    /// stationary on the old one. Both are answered by *walking* — the descent
-    /// and the climb become the approach to the new level, one level per frame
-    /// at the current tempo — never by teleporting the latent, which is the one
-    /// thing this whole regime exists to avoid.
+    /// Reconciles the phase with the regime and the latent's actual level before
+    /// any action. Everything that can move under a running drift is handled here:
+    /// `[m]` swapping the regime, `↑`/`↓` moving `t*`. Both are answered by WALKING
+    /// (descent/climb become the approach to the new level), never by teleporting.
     fn settle_phase(&mut self) {
         if self.regime != PerpetualRegime::Flux {
             if self.phase == DriftPhase::Flux {
-                // Left flux: the latent sits on `t`, so the triangle picks up
-                // there with a descent, exactly as it would mid-cycle.
+                // Left flux: the latent sits on `t`, so a descent picks up there.
                 self.phase = DriftPhase::Descent;
             }
             return;
@@ -646,11 +499,10 @@ impl PerpetualDrift {
         }
         if self.phase == DriftPhase::Flux {
             match self.t.cmp(&self.ceiling()) {
-                // `t*` was lowered: walk down to it, one reverse step a frame.
+                // `t*` lowered: walk down, one reverse step a frame.
                 std::cmp::Ordering::Greater => self.phase = DriftPhase::Descent,
-                // `t*` was raised: climb the levels in closed form, one field
-                // for the whole approach so the added grain coheres
-                // (`CLIMB_COHERENCE.md`).
+                // `t*` raised: climb in closed form, one field for the whole
+                // approach so the grain coheres (`CLIMB_COHERENCE.md`).
                 std::cmp::Ordering::Less => {
                     self.frame += 1;
                     let seed = self.frame_seed(FLUX_FIELD_STREAM, self.frame);
@@ -700,12 +552,9 @@ impl PerpetualDrift {
         self.frame
     }
 
-    /// The number the panel counts with, and what to call it.
-    ///
-    /// Wander and breathe count cycles. Flux has none — and leaving a cycle
-    /// counter frozen on screen, in the one regime whose whole claim is that it
-    /// never stops, would read as a hung run. It counts its stationary frames
-    /// instead.
+    /// The number the panel counts with, and its label. Wander/breathe count
+    /// cycles; flux has none and counts stationary frames, since a frozen cycle
+    /// counter in the regime that never stops would read as a hung run.
     pub fn counter(&self) -> (&'static str, usize) {
         match self.regime {
             PerpetualRegime::Flux => ("frames", self.frame as usize),
@@ -726,9 +575,8 @@ mod tests {
 
     const STEPS: usize = 256;
 
-    /// Splits the next `count` actions into the levels they work at, so a test
-    /// can read the trajectory as the triangle wave it is: the descents on one
-    /// side, the forward increments of the climbs on the other.
+    /// Splits the next `count` actions into descent levels and climb levels, so a
+    /// test can read the trajectory as the triangle wave it is.
     fn walk(drift: &mut PerpetualDrift, count: usize) -> (Vec<usize>, Vec<usize>) {
         let mut descents = Vec::new();
         let mut climbs = Vec::new();
@@ -736,17 +584,15 @@ mod tests {
             match drift.step() {
                 DriftAction::Descend { diffusion_step, .. } => descents.push(diffusion_step),
                 DriftAction::Climb { forward_step, .. } => climbs.push(forward_step),
-                // `walk` reads a trajectory as the triangle wave it is; flux
-                // has no triangle, and its tests walk it by hand.
+                // Flux has no triangle; its tests walk it by hand.
                 DriftAction::Flux { .. } => panic!("a cycling regime yielded a stationary frame"),
             }
         }
         (descents, climbs)
     }
 
-    /// The run opens on pure noise, so the first descent must start at the top
-    /// of the schedule even when `t_r` is shallow — otherwise the first image is
-    /// a denoised *nothing*, and the whole piece starts from a grey field.
+    /// The run opens on pure noise, so the first descent starts at the top even
+    /// when `t_r` is shallow — else the first image is a denoised grey field.
     #[test]
     fn the_first_descent_starts_at_the_top_of_the_schedule() {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, 16, 7);
@@ -754,10 +600,8 @@ mod tests {
         assert_eq!(descents, vec![STEPS - 1]);
     }
 
-    /// The climb is the correction this module received from real use: the
-    /// re-noising used to be a single jump, which read as an act of violence
-    /// against an image the viewer was contemplating. It is now walked, one
-    /// forward increment per frame, over exactly the ground the descent covered.
+    /// The re-noising is walked, one forward increment per frame, over exactly the
+    /// ground the descent covered — it used to be a single jump (see module header).
     #[test]
     fn wander_descends_to_zero_then_climbs_back_one_increment_at_a_time() {
         let depth = 12;
@@ -781,9 +625,8 @@ mod tests {
         assert_eq!(climbs, (0..=depth).collect::<Vec<_>>());
     }
 
-    /// A cycle that dissolves for as long as it resolved. The symmetry is the
-    /// perceptual point — an image that comes apart faster than it came
-    /// together still reads as a jump, only a shorter one.
+    /// A cycle dissolves for as long as it resolved — the symmetry is the
+    /// perceptual point; a faster dissolve still reads as a (shorter) jump.
     #[test]
     fn the_climb_is_exactly_as_long_as_the_descent_it_undoes() {
         for (regime, depth) in [
@@ -805,18 +648,14 @@ mod tests {
         }
     }
 
-    /// The point of breathing is that the image never settles: a cycle that
-    /// touched `t = 0` would resolve it, which is wander's job.
-    ///
-    /// This holds for the climb too, and that is why the climb starts from the
-    /// latent rather than from x̂₀ — a climb starting at `k = 0` would put the
-    /// fully resolved image on screen on its way up (see the module header).
+    /// Breathing never settles the image (touching `t=0` would resolve it —
+    /// wander's job). This holds for the climb too, which is why it starts from
+    /// the latent, not x̂₀: from `k=0` it would flash the resolved image on the way up.
     #[test]
     fn breathe_never_reaches_a_fully_resolved_image() {
         let depth = 32;
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Breathe, depth, 7);
-        // Skip the opening descent from pure noise, which does pass through 0's
-        // neighbourhood only as far as the floor.
+        // Skip the opening descent from pure noise.
         let (descents, climbs) = walk(&mut drift, STEPS * 2);
         let floor = depth / 2;
         assert!(
@@ -835,10 +674,8 @@ mod tests {
 
     // -- Setting out from a real image --------------------------------------
 
-    /// The mode in one assertion: a run seeded on a photograph does **not**
-    /// spend its first 256 frames denoising a grey field before anything
-    /// happens. It climbs away from the image on frame one, at the dial the
-    /// user set.
+    /// The mode in one assertion: a run seeded on a photograph does NOT spend its
+    /// first 256 frames denoising a grey field — it climbs away on frame one.
     #[test]
     fn a_run_that_sets_out_from_an_image_climbs_away_from_it_immediately() {
         let depth = 24;
@@ -848,8 +685,7 @@ mod tests {
         assert_eq!(drift.current_step(), 0, "the image is a clean x0, at t = 0");
 
         // The first action announces the cycle, so the caller snapshots the
-        // picture as the climb's departure — the same handshake a settled cycle
-        // uses, which is why no new phase was needed.
+        // picture as the climb's departure — the same handshake a settled cycle uses.
         let first = drift.step();
         assert!(
             matches!(
@@ -864,9 +700,8 @@ mod tests {
             "{first:?}"
         );
 
-        // …and then it is an ordinary run: up to t_r, down to the floor, round.
-        // The rest of this climb (depth levels) and the descent it turns into
-        // (depth + 1 levels) — stopping short of the next cycle opening.
+        // …then an ordinary run: the rest of this climb (depth levels) and the
+        // descent it turns into (depth + 1), short of the next cycle opening.
         let (descents, climbs) = walk(&mut drift, depth + depth + 1);
         assert_eq!(
             climbs,
@@ -888,11 +723,9 @@ mod tests {
         assert_eq!(descents, vec![STEPS - 1]);
     }
 
-    /// `[r]` re-seeds the way the run *opened*. A drift that set out from a
-    /// photograph and came back on pure noise would change what the piece is on
-    /// a keystroke — and the caller, which reads `origin` to decide whether to
-    /// draw noise or fetch another image, would be handing the wrong latent to
-    /// a drift already climbing.
+    /// `[r]` re-seeds the way the run OPENED — a photograph drift coming back on
+    /// pure noise would change what the piece is, and hand the wrong latent kind
+    /// to a drift already climbing.
     #[test]
     fn re_seeding_keeps_the_origin_the_run_opened_on() {
         for (origin, opener) in [
@@ -921,9 +754,8 @@ mod tests {
         }
     }
 
-    /// Two runs seeded on images under different seeds must dissolve them under
-    /// *different* fields. Sharing one would make every re-seed walk the same
-    /// path away from whatever picture it was handed.
+    /// Two image runs under different seeds must dissolve under DIFFERENT fields —
+    /// sharing one would walk every re-seed down the same path.
     #[test]
     fn two_image_seeded_runs_climb_under_different_fields() {
         let field = |seed: u64| {
@@ -949,8 +781,8 @@ mod tests {
         assert_ne!(first, second);
     }
 
-    /// The instrument panel reads this, and a viewer watching an image come
-    /// apart needs to be told that is what is happening.
+    /// The instrument panel reads this — a viewer watching an image come apart
+    /// needs to be told that is what is happening.
     #[test]
     fn the_phase_says_which_way_the_run_is_going() {
         let depth = 8;
@@ -967,9 +799,8 @@ mod tests {
         assert_eq!(DriftPhase::Climb.label(), "remontée");
     }
 
-    /// Exactly one action per cycle announces that the cycle closed — the one
-    /// the caller hangs "save this frame" on. Two would double-save; none would
-    /// make the time-lapse stop.
+    /// Exactly one action per cycle announces the close — where the caller hangs
+    /// "save this frame". Two would double-save; none would stop the time-lapse.
     #[test]
     fn one_climb_increment_per_cycle_reports_the_cycle_closing() {
         let depth = 8;
@@ -1015,8 +846,8 @@ mod tests {
         );
     }
 
-    /// Shrinking `t_r` below the current position must end the cycle, not send
-    /// the run descending past a floor it has already crossed.
+    /// Shrinking `t_r` below the current position ends the cycle, not descends
+    /// past a floor already crossed.
     #[test]
     fn shrinking_the_depth_below_the_current_step_ends_the_cycle() {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Breathe, MIN_RENOISE_DEPTH, 7);
@@ -1037,8 +868,8 @@ mod tests {
         assert_eq!(drift.phase(), DriftPhase::Climb);
     }
 
-    /// Raising the floor mid-climb must not leave the run climbing towards a
-    /// ceiling it is already above: it turns round at the next increment.
+    /// Raising the floor mid-climb turns the run round at the next increment, not
+    /// leaves it climbing toward a ceiling it is already above.
     #[test]
     fn shrinking_the_depth_during_a_climb_ends_it_where_the_latent_is() {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, 200, 7);
@@ -1058,21 +889,11 @@ mod tests {
         );
     }
 
-    /// One field per climb, a different one every cycle.
-    ///
-    /// **Reformulated** from `no_two_climb_increments_anywhere_draw_the_same_seed`,
-    /// which demanded the exact opposite *within* a climb — a fresh field per
-    /// increment — because the climb used to be an exact Markov walk, where
-    /// reusing a field would have meant adding the same field `t_r` times
-    /// instead of walking. The climb is now the closed form from the departure,
-    /// where one field per climb is the *design*: it is what makes the grain
-    /// cohere between frames. The property that has **not** moved is uniqueness
-    /// per cycle — that is the anti-frozen-loop guarantee, and it is asserted
-    /// here as strictly as before.
-    ///
-    /// Run in **both** regimes: wander departs from `0`, where a departure
-    /// level that was never updated would still look right, and breathing
-    /// departs from `t_r/2`, where it would not.
+    /// One field per climb (the closed-form design that makes the grain cohere),
+    /// a different one every cycle (the anti-frozen-loop guarantee). Reformulated
+    /// from a test that demanded a fresh field per increment, back when the climb
+    /// was an exact Markov walk. Run in BOTH regimes: wander departs from `0`
+    /// (where a never-updated departure level looks right), breathe from `t_r/2`.
     #[test]
     fn one_field_per_climb_and_a_new_one_every_cycle() {
         let depth = 16;
@@ -1120,9 +941,9 @@ mod tests {
                      would crackle"
                 );
             }
-            // The departure is fixed for a whole climb, and it is the level the
-            // climb opened at — the floor the descent stopped on. Anything else
-            // and the alpha_bar ratio is formed against the wrong noise level.
+            // The departure is fixed for a whole climb, at the floor the descent
+            // stopped on — anything else forms the alpha_bar ratio against the
+            // wrong noise level.
             for (index, levels) in departures.iter().enumerate() {
                 let opening = levels[0].0;
                 assert_eq!(
@@ -1155,11 +976,10 @@ mod tests {
         }
     }
 
-    /// The fear this addresses, stated as the user stated it: a re-noising that
-    /// came back identical would leave the piece turning in circles. Seeds
-    /// differing is not enough — what matters is that the *fields they produce*
-    /// differ, so this runs two consecutive climbs on the same image through the
-    /// real schedule and compares the noise each one actually injected.
+    /// A re-noising that came back identical would leave the piece turning in
+    /// circles. Seeds differing is not enough — what matters is the FIELDS they
+    /// produce, so this runs two climbs through the real schedule and compares the
+    /// noise each injected.
     #[test]
     fn two_consecutive_cycles_dissolve_the_image_into_different_noise() {
         const N: usize = 4096;
@@ -1167,10 +987,8 @@ mod tests {
         let schedule = crate::LinearNoiseSchedule::new_linear(STEPS, 1e-4, 0.02);
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, depth, 0x5eed);
 
-        // The plan of two consecutive climbs, in order. Collected until a
-        // *third* one opens: a climb is only complete once the next has begun,
-        // and comparing a full climb against a truncated one compares lengths
-        // rather than fields.
+        // Two consecutive climbs, collected until a THIRD opens: a climb is only
+        // complete once the next begins, else we compare lengths not fields.
         let mut climbs: Vec<Vec<(usize, usize, u64)>> = Vec::new();
         while climbs.len() < 3 {
             match drift.step() {
@@ -1231,11 +1049,9 @@ mod tests {
              loops instead of drifting"
         );
 
-        // The other half of the same coin, on the same frames: *within* a
-        // cycle the grain must hold from one frame to the next. Uncorrelated
-        // across cycles and correlated along one — the run drifts without
-        // crackling. (The number itself, and the before/after comparison, are
-        // in `consecutive_climb_frames_change_by_the_same_grain`.)
+        // The other half: WITHIN a cycle the grain must hold frame to frame.
+        // Uncorrelated across cycles, correlated along one — drifts without
+        // crackling. (Numbers: `consecutive_climb_frames_change_by_the_same_grain`.)
         let deltas: Vec<Vec<f64>> = first_frames
             .windows(2)
             .map(|w| {
@@ -1272,9 +1088,8 @@ mod tests {
         assert_eq!(descents, vec![STEPS - 1]);
     }
 
-    /// `[m]` walks a ring of three, and each regime's floor is its identity:
-    /// wander bottoms out on the resolved image, breathing half-way, and flux
-    /// does not descend at all — its floor *is* the level it holds.
+    /// `[m]` walks a ring of three; each regime's floor is its identity (wander 0,
+    /// breathe half-way, flux does not descend — its floor IS the level it holds).
     #[test]
     fn toggling_the_regime_walks_the_ring_and_swaps_the_floor() {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, 40, 7);
@@ -1291,10 +1106,8 @@ mod tests {
         assert_eq!(drift.floor(), 0);
     }
 
-    /// The dial does not have the same bottom in every regime, and `[m]` must
-    /// bring the number into the new regime's range on the spot — otherwise a
-    /// flux run at `t* = 1` would hand wander a `t_r` its own machinery
-    /// forbids.
+    /// The dial's bottom differs by regime, so `[m]` must re-clamp on the spot —
+    /// else a flux run at `t*=1` would hand wander a `t_r` its machinery forbids.
     #[test]
     fn leaving_flux_lifts_a_level_the_cycling_regimes_would_not_accept() {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Flux, 1, 7);
@@ -1305,13 +1118,10 @@ mod tests {
     }
 
     // -- Flux ---------------------------------------------------------------
-    //
-    // The regime the user asked for after "ça frise entre les étapes": no
-    // steps at all. What has to be pinned is that it *never turns round* —
-    // neither on its own, nor when the dial moves under it.
+    // What has to be pinned: it NEVER turns round, neither on its own nor when
+    // the dial moves under it.
 
-    /// Collects the next `count` actions as `(phase, level)` pairs, keeping
-    /// flux frames distinguishable from the approach that led to them.
+    /// The next `count` actions as `(phase, level)` pairs.
     fn walk_tagged(drift: &mut PerpetualDrift, count: usize) -> Vec<(DriftPhase, usize)> {
         (0..count)
             .map(|_| {
@@ -1321,17 +1131,16 @@ mod tests {
                     DriftAction::Climb { forward_step, .. } => forward_step,
                     DriftAction::Flux { diffusion_step, .. } => diffusion_step,
                 };
-                // Through the same accessor the dump and the TUI file frames
-                // under, so a mutation of it cannot leave these tests green.
+                // Through the same `phase()` accessor the dump and TUI use, so a
+                // mutation of it cannot leave these tests green.
                 (action.phase(), level)
             })
             .collect()
     }
 
-    /// The regime in one assertion: after the approach, every single frame is a
-    /// stationary one at `t*`. Not a short cycle, not a shallow triangle — no
-    /// descent and no climb ever again, because a turning point is exactly what
-    /// the viewer was feeling.
+    /// The regime in one assertion: after the approach, every frame is stationary
+    /// at `t*` — no descent, no climb ever again (a turning point is what the
+    /// viewer was feeling).
     #[test]
     fn flux_never_turns_round_once_it_has_reached_its_level() {
         let level = 40;
@@ -1362,11 +1171,9 @@ mod tests {
         assert_eq!(drift.cycle(), 0, "a stationary run closes no cycle");
     }
 
-    /// Moving `t*` is the one thing that can make flux move, and it must move
-    /// by *walking*: one level a frame, at the tempo the run is already playing
-    /// at. A `set_depth` that teleported the latent would put back the jump
-    /// this regime exists to remove — and silently, since the level on screen
-    /// would be right either way.
+    /// Moving `t*` must WALK — one level a frame — not teleport the latent, which
+    /// would put back the jump this regime removes, and silently (the level on
+    /// screen would be right either way).
     #[test]
     fn moving_the_level_mid_flux_walks_to_it_one_frame_at_a_time() {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Flux, 32, 7);
@@ -1412,9 +1219,8 @@ mod tests {
         );
     }
 
-    /// `[m]` into flux, from either side of `t*`, and back out. The latent is
-    /// never re-drawn and never re-interpreted: wherever it is, the drift walks
-    /// from there.
+    /// `[m]` into flux from either side of `t*`, and back out. The latent is never
+    /// re-drawn or re-interpreted: wherever it is, the drift walks from there.
     #[test]
     fn entering_and_leaving_flux_walks_from_wherever_the_latent_is() {
         // From above: wander mid-descent, well over t*.
@@ -1466,11 +1272,9 @@ mod tests {
         );
     }
 
-    /// Both of a flux frame's fields have to be fresh, and the path seed is the
-    /// one that is easy to get wrong: the timestep is *constant* here, so a
-    /// path seed held across frames would make `reverse_step_seed` return the
-    /// same value every frame and the sampler would push the identical
-    /// posterior field into the image forever — a fixed direction, not a draw.
+    /// Both of a flux frame's fields must be fresh — the path seed easily wrong:
+    /// `t` is constant here, so a held path seed makes `reverse_step_seed` return
+    /// the same value and push the identical posterior forever (a fixed direction).
     #[test]
     fn every_flux_frame_draws_two_fresh_and_unrelated_fields() {
         use std::collections::HashSet;
@@ -1535,11 +1339,9 @@ mod tests {
                  would vibrate in place instead of drifting"
             );
         }
-        // And *within* a frame: the posterior draw and the re-noising field are
-        // two independent sources, not one counted twice. Comparing the seeds
-        // cannot see this — the sampler transforms its own before drawing, so a
-        // drift that handed out the same number twice would still show two
-        // different seeds here. Only the fields tell.
+        // And WITHIN a frame: posterior draw and re-noising field are independent,
+        // not one counted twice. Comparing seeds cannot see this (the sampler
+        // transforms its own before drawing); only the fields tell.
         for (path, field) in paths.iter().zip(fields.iter()).take(16) {
             let r = correlation(*path, *field);
             assert!(
@@ -1550,19 +1352,11 @@ mod tests {
         }
     }
 
-    /// **The noise level is stationary, measured rather than asserted.**
-    ///
-    /// The claim of the regime is that a reverse step and a forward increment
-    /// cancel *in law*: the latent stays a legitimate `x_{t*}` forever. Getting
-    /// this wrong is not a crash, it is a slow bleed — an image that quietly
-    /// washes out or saturates over minutes, which no snapshot test would see.
-    ///
-    /// Run against an oracle instead of a model: the exact posterior-optimal
-    /// predictor for a data distribution that is a point mass at `x0`, i.e.
-    /// `eps_hat = (x_t - sqrt(alpha_bar)·x0) / sqrt(1 - alpha_bar)`. For that
-    /// distribution the true stationary law is known in closed form —
-    /// `q(x_t | x0)` — so the churn is checked against theory rather than
-    /// against itself.
+    /// The noise level is stationary, MEASURED not asserted: a reverse step and a
+    /// forward increment cancel in law, so the latent stays a legitimate `x_{t*}`.
+    /// Getting it wrong is a slow bleed no snapshot test would catch. Run against
+    /// an oracle (the exact posterior-optimal predictor for a point mass at `x0`),
+    /// whose stationary law `q(x_t | x0)` is known in closed form.
     #[test]
     fn the_flux_churn_holds_the_law_of_its_level() {
         const N: usize = 8192;
@@ -1572,8 +1366,8 @@ mod tests {
         let spread = (1.0 - schedule.alpha_bar(level)).sqrt();
 
         let x0: Vec<f32> = (0..N).map(|i| (i as f32 * 0.017).sin() * 0.8).collect();
-        // Deliberately *not* started on the marginal: a churn that only holds
-        // the level it was handed proves nothing.
+        // Deliberately NOT started on the marginal: a churn that only holds the
+        // level it was handed proves nothing.
         let (mut latent, _) = schedule.add_noise(&x0, level / 2, 0xc0ffee);
 
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Flux, level, 0xf1_0000);
@@ -1584,17 +1378,15 @@ mod tests {
         let mut frames = 0;
         let mut actions = 0;
         while frames < 400 {
-            // A drift that stopped yielding stationary frames — an approach
-            // that overshoots `t*` turns flux into a two-frame cycle — would
-            // spin here forever. A test that hangs reports nothing.
+            // A drift that stopped yielding stationary frames would spin forever;
+            // a hanging test reports nothing.
             actions += 1;
             assert!(
                 actions < STEPS + 4_000,
                 "the drift stopped holding its level: {frames} stationary frames \
                  in {actions} actions"
             );
-            // The approach onto t* is walked by the caller with the same maths;
-            // only the stationary part is measured, so it is skipped here.
+            // Only the stationary part is measured; skip the approach.
             let DriftAction::Flux {
                 diffusion_step,
                 path_seed,
@@ -1636,8 +1428,7 @@ mod tests {
                 .map(|r| (*r as f64) * (*r as f64))
                 .sum::<f64>()
                 / residual.len() as f64;
-            // The first frames are the walk onto the level; the claim is about
-            // the regime it settles into.
+            // Skip the walk onto the level; the claim is about the settled regime.
             if frames > 100 {
                 signals.push(coefficient);
                 spreads.push(variance.sqrt());
@@ -1686,10 +1477,9 @@ mod tests {
              a jump, and there must never be one"
         );
 
-        // It drifts rather than vibrating: consecutive frames are alike, and
-        // frames three hundred apart are not. The residual only — the signal
-        // term is pinned to x0 by the oracle and would flatter any lag; what
-        // has to renew itself is the noise.
+        // It drifts, not vibrates: consecutive frames alike, frames 300 apart not.
+        // The residual only — the oracle pins the signal to x0, so what must renew
+        // itself is the noise.
         let correlation = |a: &[f32], b: &[f32]| {
             let (mean_a, mean_b) = (
                 a.iter().map(|v| *v as f64).sum::<f64>() / a.len() as f64,
@@ -1724,27 +1514,19 @@ mod tests {
         );
     }
 
-    /// A frame is filed under the name of what it did.
-    ///
-    /// Found from outside the code: a black-box run measured a frame tagged
-    /// `descent` that was moving with **churn** amplitude — some 40 % more than
-    /// a reverse step at the same level — at the first frame of every plateau,
-    /// on all eight settings of the dial it tried. The sequencing was right; the
-    /// name was one frame stale, because the caller read `phase()` before
-    /// `step()` and `settle_phase` reconciles inside it.
-    ///
-    /// The whole test battery missed it: every one of these tests already reads
-    /// the phase off the action, which is the *correct* notion, while the dump
-    /// recorded the other one. Nothing that agrees with itself can catch that,
-    /// which is why [`DriftAction::phase`] now exists and everything that names
-    /// a frame goes through it.
+    /// A frame is filed under the name of what it did. Found from outside: a
+    /// black-box run measured a frame tagged `descent` moving with CHURN amplitude
+    /// (~40% more) at the first frame of every plateau, because the caller read
+    /// `phase()` before `step()` and `settle_phase` reconciles inside it. Every
+    /// test here already read the phase off the action, so nothing self-consistent
+    /// caught it — why [`DriftAction::phase`] exists and everything naming a frame uses it.
     #[test]
     fn a_frame_is_named_after_the_action_it_performed_not_the_phase_it_left() {
         let level = 40;
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Flux, level, 7);
 
-        // Read both notions on every frame: the phase standing before the step,
-        // and the phase of what the step turned out to be.
+        // Both notions per frame: the phase standing before the step, and the
+        // phase of what the step turned out to be.
         let mut walked = Vec::new();
         for _ in 0..STEPS - level + 3 {
             let standing = drift.phase();
@@ -1771,19 +1553,16 @@ mod tests {
             "and every frame after it, too"
         );
 
-        // The trap itself, pinned so the next caller cannot walk into it: at
-        // that frame the phase standing beforehand is the one just *left*.
-        // Whoever changes when `settle_phase` runs will see this line and can
-        // delete it knowingly — what must never come back is a frame filed
-        // under a phase it did not perform.
+        // The trap, pinned: at that frame the phase standing beforehand is the one
+        // just LEFT. What must never come back is a frame filed under a phase it
+        // did not perform.
         assert_ne!(
             walked[approach].0, walked[approach].1,
             "if these ever agree, `settle_phase` moved and the comment above is stale"
         );
 
-        // The same seam on the way up: raising `t*` mid-flux walks a climb, and
-        // the frame that resumes the churn is a churn frame. This is where the
-        // TUI used to flash one `descente` at the top of the approach.
+        // The same seam upward: raising `t*` mid-flux walks a climb, and the frame
+        // resuming the churn is a churn frame (the TUI used to flash one `descente`).
         drift.set_depth(level + 4);
         let resumed = walk_tagged(&mut drift, 6);
         assert_eq!(
