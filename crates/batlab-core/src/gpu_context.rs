@@ -1,32 +1,23 @@
-//! File purpose: Creates and configures the shared headless WGPU context used by training and rendering paths.
+//! The shared headless wgpu context (device, queue, pass profiler) used by
+//! training, inference and rendering.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::profile::{PassProfiler, ProfileRun};
 
-/// Which limits this process asks the device for.
-///
-/// `request_device` does not hand out what the adapter can do — it hands out
-/// what you ask for, and asking for nothing means asking for
-/// `wgpu::Limits::default()`, the WebGPU baseline: 256 MiB per buffer, 128 MiB
-/// per storage binding. That was the engine's only mode, and it was the right
-/// one for **inference**, which has to run in a visitor's browser on their card
-/// (see CLAUDE.md). It was never right for **training**, which runs here: the
-/// same Mac's adapter allows 28 GiB, and the baseline was capping the batch at
-/// 341 on `Color_Diffusion_XL` by a *binding* limit rather than by memory, and
-/// forcing the dataset to be streamed in 128 MiB chunks when the whole of
-/// CIFAR-10 RGB in 8-bit is 147 MiB and would sit resident.
-///
-/// So the limits became a choice. The two profiles are not a performance dial:
-/// they are two different questions, and both have to keep working.
+/// Which limits this process asks the device for. `request_device` hands out what
+/// you ASK for, not what the adapter can do; asking for nothing means the WebGPU
+/// baseline (256 MiB/buffer, 128 MiB/binding) — right for inference (the visitor's
+/// browser), wrong for training here, where the adapter allows 28 GiB and the
+/// baseline capped the batch by a BINDING limit. So the limits are a choice: two
+/// questions, both must keep working. Rationale: CLAUDE.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpuLimitsProfile {
-    /// Everything the adapter reports. The default, and what training wants.
+    /// Everything the adapter reports. The default, what training wants.
     #[default]
     Native,
-    /// `wgpu::Limits::default()` — the WebGPU contract, what a browser grants
-    /// without being asked. Running under it is how one checks that a model
-    /// still fits the target the whole engine is shaped around.
+    /// `wgpu::Limits::default()` — the WebGPU contract a browser grants unasked;
+    /// running under it checks a model still fits the target.
     Web,
 }
 
@@ -70,17 +61,11 @@ impl GpuLimitsProfile {
         }
     }
 
-    /// Sets the profile every later [`GpuContext::new_headless`] will use.
-    ///
-    /// A process-wide setting rather than a parameter, deliberately. The limits
-    /// belong to the *device*, this application opens exactly one, and the
-    /// choice is made once from the command line before anything is built.
-    /// Threading it instead would put a `GpuLimitsProfile` through
-    /// `App::with_storage`, the run loop and every screen of the TUI, for a
-    /// value that cannot change while the process lives.
-    ///
-    /// Tests that care about a specific profile do not touch this: they call
-    /// [`GpuContext::new_headless_with`] and say which one they mean.
+    /// Sets the profile every later [`GpuContext::new_headless`] uses. Process-wide,
+    /// not a parameter: the limits belong to the one device this app opens, chosen
+    /// once from the command line — threading it would put it through the whole TUI
+    /// for a value that cannot change. Tests wanting a specific profile call
+    /// [`GpuContext::new_headless_with`] instead.
     pub fn set_process_default(self) {
         PROCESS_DEFAULT.store(self.code(), Ordering::Relaxed);
     }
@@ -93,14 +78,10 @@ impl GpuLimitsProfile {
 
 static PROCESS_DEFAULT: AtomicU8 = AtomicU8::new(0);
 
-/// Whether [`GpuContext::new_headless`] should open a device able to time its
-/// own compute passes.
-///
-/// A process-wide switch for the same reason the limits profile is one: the
-/// `TIMESTAMP_QUERY` feature belongs to the *device*, this application opens
-/// exactly one, and the choice is made from the command line before anything is
-/// built. Off by default, and off means the query set is never created and
-/// [`GpuContext::compute_pass`] is what it always was.
+/// Whether [`GpuContext::new_headless`] opens a device able to time its own compute
+/// passes. Process-wide, like the limits profile (the `TIMESTAMP_QUERY` feature
+/// belongs to the one device). Off by default — off means no query set and
+/// [`GpuContext::compute_pass`] unchanged.
 static PROFILING_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Ask every later [`GpuContext::new_headless`] for pass timing.
@@ -150,19 +131,12 @@ pub struct GpuContext {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) gpu_specs: GpuSpecs,
-    /// The profile this device was actually opened under.
-    ///
-    /// The one that was *granted*, not the one that was asked for: a device
-    /// request can be refused, and the fallback below then leaves the process
-    /// running under limits nobody chose. A run banner that printed the
-    /// intention rather than the outcome would be worse than printing nothing.
+    /// The profile this device was actually GRANTED (not asked for): a request can
+    /// be refused, and the banner must print the outcome, not the intention.
     limits_profile: GpuLimitsProfile,
-    /// What has crossed the host↔GPU boundary through this context.
-    ///
-    /// It lives here because this is the one object every path already shares:
-    /// a counter anywhere else would have to be threaded through the sampler,
-    /// the trainer and the dataset separately, and would miss whichever of them
-    /// was added next.
+    /// What has crossed the host↔GPU boundary. Here because this is the one object
+    /// every path shares — a counter elsewhere would be threaded through the
+    /// sampler, trainer and dataset separately and miss the next one added.
     transfers: crate::transfers::TransferCounters,
     /// Present only when the process asked for profiling *and* the adapter
     /// granted `TIMESTAMP_QUERY`. `None` is the normal, zero-cost state.
@@ -180,11 +154,8 @@ impl GpuContext {
         Self::open(profile, pass_profiling_requested()).await
     }
 
-    /// A context that times its compute passes, whatever the process default.
-    ///
-    /// Tests that need the instrument say so here rather than mutating the
-    /// process-wide switch, which would leak into whatever else the harness runs
-    /// in the same process.
+    /// A context that times its compute passes, whatever the process default —
+    /// for tests that need the instrument without mutating the process-wide switch.
     pub async fn new_headless_profiling() -> Self {
         Self::open(GpuLimitsProfile::process_default(), true).await
     }
@@ -215,11 +186,9 @@ impl GpuContext {
                 (fallback_instance, adapter)
             }
         };
-        // Asked for only when the command line asked for it, and only when the
-        // adapter has it. A missing `TIMESTAMP_QUERY` is not a reason to refuse
-        // to run: it is a reason to say the instrument is unavailable, which the
-        // harness does, rather than to hand back an approximation dressed as a
-        // measurement.
+        // Only when asked AND the adapter has it. A missing `TIMESTAMP_QUERY` is
+        // not a reason to refuse to run — the harness says the instrument is
+        // unavailable rather than hand back an approximation as a measurement.
         let timestamps = want_profiling && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         if want_profiling && !timestamps {
             eprintln!(
@@ -237,13 +206,11 @@ impl GpuContext {
             required_features,
             ..Default::default()
         };
-        // The fallback is not decoration. `adapter.limits()` is what the
-        // adapter *reports*, and a backend is free to refuse a device that asks
-        // for all of it; a panic there would make `--gpu-limits native` a way to
-        // lose the application rather than a way to ask for more. Falling back
-        // to the WebGPU baseline always works — it is the floor every backend
-        // wgpu supports must meet — and the profile recorded below is the one
-        // that was granted, so the banner tells the truth.
+        // A backend may refuse a device that asks for all of `adapter.limits()`; a
+        // panic there would make `--gpu-limits native` a way to lose the app.
+        // Falling back to the WebGPU baseline always works (the floor every backend
+        // meets), and the profile recorded below is the one GRANTED, so the banner
+        // tells the truth.
         let (device, queue, limits_profile) = match adapter.request_device(&descriptor).await {
             Ok((device, queue)) => (device, queue, profile),
             Err(err) if profile != GpuLimitsProfile::Web => {
@@ -286,32 +253,20 @@ impl GpuContext {
         self.limits_profile
     }
 
-    /// Run `op` with a WebGPU **validation error scope** active, returning any
-    /// validation error `op` raised as a string instead of letting it vanish.
-    ///
-    /// This exists for one host and one failure mode: a browser. There, a shader
-    /// the browser's WGSL compiler rejects (it is stricter than the native
-    /// `naga` → Metal path this engine is otherwise validated on) or a limit
-    /// tripped at dispatch does **not** raise — the pipeline is quietly
-    /// invalidated, its dispatches become no-ops, the output buffer keeps the
-    /// zeros it was created with, and nothing is said. Wrapped in a scope, that
-    /// same error is captured and handed back, so a caller (`batlab_web`) can put
-    /// it on the page rather than animate a dead model. See
-    /// `docs/reports/WEB_PORT.md`, "le bug de l'inférence".
-    ///
-    /// Pipeline-creation errors are captured synchronously as `op` runs;
-    /// dispatch/submit errors are flushed with an empty submit before the scope
-    /// is read. On wasm the browser drives the returned future to completion; a
-    /// native caller must be pumping the device (this is only used from wasm).
+    /// Run `op` inside a WebGPU validation error scope, returning any validation
+    /// error as a string instead of letting it vanish. For one host: a browser,
+    /// whose WGSL compiler is stricter than the native naga→Metal path and does
+    /// NOT raise on a rejected shader — it quietly invalidates the pipeline, the
+    /// output keeps its zeros, and nothing is said. The scope hands the error to
+    /// `batlab_web` to show on the page. See `docs/reports/WEB_PORT.md`. wasm-only.
     pub async fn guarded<F, T>(&self, op: F) -> Result<T, String>
     where
         F: core::future::Future<Output = T>,
     {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let out = op.await;
-        // Flush any queued work so a dispatch-time validation error lands in the
-        // scope before we pop it. Empty is fine — it is a synchronisation point,
-        // not work.
+        // Flush queued work so a dispatch-time error lands in the scope before we
+        // pop it. Empty submit = a sync point, not work.
         self.queue.submit(core::iter::empty());
         match scope.pop().await {
             Some(err) => Err(err.to_string()),
@@ -319,13 +274,9 @@ impl GpuContext {
         }
     }
 
-    /// Upload bytes to a GPU buffer, and count them.
-    ///
-    /// Every host→device write in the engine goes through here rather than
-    /// through `queue.write_buffer` directly. That is the whole discipline: the
-    /// counter is only true if there is no second door, and `grep -n
-    /// 'queue.write_buffer' crates/batlab-core/src` outside of tests is the way
-    /// to check there is not.
+    /// Upload bytes to a GPU buffer, and count them. Every host→device write goes
+    /// through here, not `queue.write_buffer` directly — the counter is only true
+    /// if there is no second door (grep to check).
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
         self.transfers.record_write(data.len() as u64);
         self.queue.write_buffer(buffer, offset, data);
@@ -341,12 +292,9 @@ impl GpuContext {
         self.queue.submit(buffers)
     }
 
-    /// Record a device→host readback of `bytes`.
-    ///
-    /// Separate from a helper that performs one, because a readback is three
-    /// steps (copy into a staging buffer, `map_async`, block on a poll) spread
-    /// across `model::debug` and the loss path, and the counter belongs at the
-    /// point where the bytes are known.
+    /// Record a device→host readback of `bytes`. Separate from a helper that
+    /// performs one, because a readback is three steps spread across `model::debug`
+    /// and the loss path; the counter belongs where the bytes are known.
     pub fn record_readback(&self, bytes: u64) {
         self.transfers.record_read(bytes);
     }
@@ -360,22 +308,13 @@ impl GpuContext {
     // Compute passes
     // -----------------------------------------------------------------------
 
-    /// Begin a compute pass, time it when the profiler is armed, and run `body`
-    /// inside it.
-    ///
-    /// Every `begin_compute_pass` in the engine goes through here, for exactly
-    /// the reason every `write_buffer` does: a timing table is only true if
-    /// there is no second door, and `nothing_in_the_engine_opens_an_untimed_pass`
-    /// is the mechanical check that there is not.
-    ///
-    /// `label` is a **closure**: building `L13 Convolution · conv_back_weights`
-    /// allocates a String, and a step encodes 151 passes. With profiling off the
-    /// closure is never called, so an unprofiled run allocates nothing here and
-    /// the descriptor is the same `Default::default()` it always was.
-    ///
-    /// `workgroups` is the logical dispatch count *before* [`crate::model`]'s
-    /// 2-D folding — it is carried so the table can tell a pass that is slow
-    /// because it is big from one that is slow because it is starved.
+    /// Begin a compute pass, time it when the profiler is armed, and run `body`.
+    /// Every `begin_compute_pass` goes through here (like `write_buffer`): a timing
+    /// table is only true with no second door, checked by
+    /// `nothing_in_the_engine_opens_an_untimed_pass`. `label` is a CLOSURE so an
+    /// unprofiled run (151 passes/step) allocates no label String. `workgroups` is
+    /// the logical dispatch count before 2-D folding, carried so the table tells a
+    /// big pass from a starved one.
     pub fn compute_pass<L, F>(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -448,30 +387,24 @@ impl GpuContext {
         Some(profiler.collect(&self.device))
     }
 
-    /// Access to the underlying wgpu device for callers outside the crate.
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
-    /// Access to the underlying wgpu queue for callers outside the crate.
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
 
-    /// Provides access to the adapter used to create the device/queue.
-    ///
-    /// This is mostly useful for surface configuration, where the supported
-    /// formats must be queried.
+    /// The adapter, for surface configuration (querying supported formats).
     pub fn adapter(&self) -> &wgpu::Adapter {
         &self._adapter
     }
 
-    /// Provides access to the wgpu instance for surface creation.
+    /// The wgpu instance, for surface creation.
     pub fn instance(&self) -> &wgpu::Instance {
         &self._instance
     }
 
-    /// Provides access to cached GPU specification details used by the app.
     pub fn specs(&self) -> &GpuSpecs {
         &self.gpu_specs
     }
@@ -491,19 +424,15 @@ mod tests {
             GpuLimitsProfile::parse(" WEB ").unwrap(),
             GpuLimitsProfile::Web
         );
-        // A typo must not silently pick a profile: the two differ by four
-        // orders of magnitude, and a run that quietly took the wrong one would
-        // look like the flag had no effect.
+        // A typo must not silently pick a profile (the two differ by four orders
+        // of magnitude): a wrong one would look like the flag had no effect.
         let err = GpuLimitsProfile::parse("naive").unwrap_err();
         assert!(err.contains("native") && err.contains("web"), "{err}");
     }
 
-    /// Both profiles must open a device, and native must not grant *less*.
-    ///
-    /// The second half is the claim the whole flag rests on. It is written as
-    /// `>=` rather than `>` because an adapter whose own limits are the WebGPU
-    /// baseline is a legitimate machine — the flag then changes nothing, which
-    /// is the correct outcome, not a failure.
+    /// Both profiles open a device and native grants no LESS — the claim the flag
+    /// rests on. `>=`, not `>`: an adapter at the WebGPU baseline is legitimate, and
+    /// the flag then changes nothing (the correct outcome, not a failure).
     #[test]
     fn both_profiles_open_a_device_and_native_never_grants_less() {
         pollster::block_on(async {
@@ -530,14 +459,11 @@ mod tests {
         });
     }
 
-    /// The process default is what `new_headless` picks up, and it starts at
-    /// native — the profile training wants.
+    /// The process default `new_headless` picks up starts native (training's profile).
     #[test]
     fn the_process_default_starts_native() {
-        // Not mutated here: `set_process_default` is global, and a test that
-        // changed it would leak into whatever else the harness runs in this
-        // process. The setter is exercised by the CLI, which is where it is
-        // ever called.
+        // Not mutated here: `set_process_default` is global and would leak into
+        // the rest of the harness. Exercised by the CLI instead.
         assert_eq!(GpuLimitsProfile::default(), GpuLimitsProfile::Native);
     }
 }
