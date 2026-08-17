@@ -5270,6 +5270,7 @@ mod tests {
             seed,
             1,
             1.0,
+            PosteriorVariance::Beta,
             None,
             None,
             |_, _| {},
