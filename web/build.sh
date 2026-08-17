@@ -20,10 +20,11 @@ DIST="$WEB_DIR/dist"
 # checkout rather than in this worktree; hence absolute defaults.
 MODEL_DIR="${MODEL_DIR:-/Users/bat/development/lab/batLab/Models/Elephants_XL}"
 CONFIG="${CONFIG:-$MODEL_DIR/config_file}"
-# The deployed page uses the AVERAGED (EMA) night model, so that is the default
-# source. It is a full training checkpoint (weights + Adam + EMA); the export
-# step below strips it to the weights inference actually generates from.
-WEIGHTS="${WEIGHTS:-/Users/bat/development/lab/batLab/eleph_night/night.ckpt}"
+# The model's own latest weights — not a path into some run directory. A build
+# that pointed at `eleph_night/` broke the moment that campaign folder was tidied
+# away, and it hid which model the page actually served. The checkpoint carries
+# weights + Adam + EMA; the export step below strips it to what inference reads.
+WEIGHTS="${WEIGHTS:-$MODEL_DIR/pretrained_weights/latest.ckpt}"
 SEED_DATASET="${SEED_DATASET:-/Users/bat/development/lab/batLab/datasets/elephants256.batraw}"
 SEED_COUNT="${SEED_COUNT:-32}"
 
