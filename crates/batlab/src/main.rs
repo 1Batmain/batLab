@@ -370,11 +370,6 @@ struct ImageSample {
 fn main() {
     // winit's event loop must own the process main thread (a hard AppKit
     // requirement on macOS), so the TUI and the training/inference loop run on a
-    // worker thread instead. `run_on_main_thread` returns once that worker does.
-    // The headless path also runs inside it: the training path can warm the
-    // visualiser, which needs the event loop to be available.
-    // winit's event loop must own the process main thread (a hard AppKit
-    // requirement on macOS), so the TUI and the training/inference loop run on a
     // worker; `run_on_main_thread` returns once that worker does. The headless
     // path runs inside it too — training can warm the visualiser.
     batlab_ui::visualiser::run_on_main_thread(|| {
@@ -553,14 +548,10 @@ impl SeedImages {
         self.source
     }
 
-    /// The `x₀` a run sets out from: one image of the dataset, drawn from
-    /// `seed`.
-    ///
-    /// The index is **avalanched out of the seed, never taken modulo it**.
-    /// Seeds here come from a clock (`random_seed`) or from a form, so
-    /// `seed % len` would walk consecutive images on consecutive re-seeds and
-    /// correlate the run with whatever order the dataset happens to be in. Same
-    /// discipline as `gaussian_at` — mix first, index second (`ANISOTROPY_HUNT.md`).
+    /// The `x₀` a run sets out from: one dataset image drawn from `seed`. The index
+    /// is AVALANCHED out of the seed, never `seed % len` — seeds come from a clock or
+    /// a form, so modulo would walk consecutive images on consecutive re-seeds. Mix
+    /// first, index second, like `gaussian_at` (`ANISOTROPY_HUNT.md`).
     fn provide_x0(&self, seed: u64) -> Vec<f32> {
         self.samples.sample(self.at_random(seed))
     }
@@ -2632,25 +2623,18 @@ struct RunOptions {
     resume_from: Option<PathBuf>,
     /// `--checkpoint-every N`: how often a partial checkpoint is written.
     checkpoint_every: Option<usize>,
-    /// The checkpoint this run **reads**, when that is not where it writes.
-    ///
-    /// The TUI's weight selector picks a file to continue from; the run then
-    /// writes its own dated one. `None` reads from wherever it writes, which is
-    /// what `--resume`-less headless runs and legacy configs do.
+    /// The checkpoint this run READS, when that is not where it writes: the weight
+    /// selector's pick to continue from. `None` reads from where it writes (a
+    /// `--resume`-less headless run, a legacy config).
     load_from: Option<PathBuf>,
-    /// Where this run **writes**, when that is not where it reads.
-    ///
-    /// A run used to write back over the file it continued from, which is how
-    /// an evening of training erased the morning's. The write target is now a
-    /// dated file of the run's own (`run-<stamp>.ckpt`), while
-    /// `TrainingConfig::checkpoint_path` stays what it always was: the file the
-    /// run *loads*. `None` keeps the old behaviour — that is `--out`, where the
-    /// user named the file and nothing may rename it.
+    /// Where this run WRITES, when that is not where it reads. A run used to write
+    /// back over the file it continued from (an evening erasing the morning); the
+    /// write target is now the run's own dated file, while
+    /// `TrainingConfig::checkpoint_path` stays the file it LOADS. `None` = `--out`,
+    /// the user's named file, unrenamed.
     write_to: Option<PathBuf>,
-    /// Point `latest.ckpt` at every checkpoint this run writes, beside it.
-    ///
-    /// Set exactly when `write_to` is a name batlab chose: `--out` is the
-    /// user's own filing and gets no extra file dropped next to it.
+    /// Point `latest.ckpt` at every checkpoint this run writes — set exactly when
+    /// `write_to` is a name batlab chose (`--out` gets no extra file beside it).
     maintain_latest: bool,
 }
 
@@ -4935,16 +4919,11 @@ mod tests {
         )
     }
 
-    /// The property the whole feature rests on: an export samples **bit for
-    /// bit** the same image, on the same seed, as the checkpoint it came from —
-    /// selecting the same weight set the page selects (the average by default,
-    /// the raw iterate under `--raw-weights`). Proven, not inspected: two full
-    /// reverse chains compared value by value.
-    ///
-    /// The export is also checked to be a smaller, ordinary V2 checkpoint — the
-    /// optimiser moments and the EMA trailer are gone, the weights remain — and
-    /// the EMA and raw references are checked to differ, so "same image" is not
-    /// the vacuous truth of a model whose two weight sets coincide.
+    /// The property the feature rests on: an export samples BIT FOR BIT the same
+    /// image as its source, selecting the same weight set (average by default, raw
+    /// under `--raw-weights`) — two full reverse chains compared value by value.
+    /// Also checks the export is a smaller V2 file (trailers gone, weights remain)
+    /// and that the EMA and raw refs differ, so "same image" is not vacuous.
     #[test]
     fn an_export_samples_the_same_image_as_the_checkpoint_it_came_from() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -5014,14 +4993,9 @@ mod tests {
         }
     }
 
-    /// **The ranking**: `--seed-dataset` beats the model's `seed_dataset`,
-    /// which beats the convention derived from the output channels.
-    ///
-    /// Each source names a *different* file of distinguishable images, so the
-    /// answer says which one won rather than merely that something loaded. The
-    /// middle rung is the one that did not exist: `--headless-perpetual` read
-    /// the flag or nothing at all, so `Models/Elephants_XL` set out from a
-    /// CIFAR truck for an entire campaign.
+    /// The ranking: `--seed-dataset` > the model's `seed_dataset` > the channel
+    /// convention. Each source names a distinguishable file so the answer says which
+    /// won; the middle rung was the missing one (`Elephants_XL` from a CIFAR truck).
     #[test]
     fn the_flag_beats_the_config_which_beats_the_convention() {
         let by_flag = tmp_path("seed_rank_flag.batraw");
