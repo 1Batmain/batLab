@@ -204,3 +204,8 @@ leurs références mutuelles sont restées valides, elles sont désormais voisin
   le web qui recopie la config, l'en-tête `.batraw` triplé), mensonge de config
   (`TrainingConfig.loss`), le tuple de version de checkpoint, et les rangements. Classé
   danger / dette / cosmétique, avec ce qu'il propose de NE PAS faire.
+- **[COMMENT_DIET.md](COMMENT_DIET.md)** — la passe d'allègement des commentaires
+  (9 456 → ~7 000 lignes) : la règle appliquée (test → pointeur d'une ligne ; sinon le
+  commentaire reste ou devient un test), les redites et le commentaire périmé signalés,
+  et surtout la **liste des commentaires gardés délibérément avec leur raison** — la
+  preuve que la passe a discriminé au lieu de raser.

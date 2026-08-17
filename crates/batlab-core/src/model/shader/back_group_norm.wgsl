@@ -1,30 +1,16 @@
-// File purpose: WGSL compute shader implementing back group norm operations for model forward/backward or optimizer passes.
-//
-// The dispatch grid is 2-D when the batch pushes the workgroup count past
-// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
-// linear thread index is recovered from `num_workgroups` rather than read
-// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
-//
-// The backward pass is split into five dispatches (see
-// `GroupNormType::get_back_entrypoints` / `get_back_workgroup_counts`), run in
-// order by `Layer::encode_back_pass`:
-//
-//   1. group_norm_stats      one wg per (sample, group) -> mean, inv_std
-//   2. group_norm_grad_stats one wg per (sample, group) -> sum_dxhat, sum_dxhat_xhat
-//   3. group_norm_back_input one thread per element     -> grad_input (O(1) per element)
-//   4. group_norm_back_gamma one wg per channel         -> grad_gamma
-//   5. group_norm_back_beta  one wg per channel         -> grad_beta
-//
-// Passes 1 and 2 hoist the per-group reductions that the naive version redid
-// inside every invocation. Their results live in the `stats` buffer, laid out
-// as 4 f32 per (sample, group): [mean, inv_std, sum_dxhat, sum_dxhat_xhat].
-//
-// The batch axis splits the five passes exactly as it splits the convolution's
-// three. Passes 1–3 are per activation and grow with the batch — and passes 1
-// and 2 give each sample its OWN statistics, which is what keeps this a group
-// norm rather than something batch-dependent. Passes 4 and 5 reduce onto
-// gamma/beta, which are *parameters*: one workgroup per channel whatever the
-// batch, sweeping `batch * spatial_len` positions instead of `spatial_len`.
+// Group-norm backward. 2-D dispatch grid past WebGPU's 65 535-per-dim limit
+// (`dispatch_grid` in layer.rs). Five passes (`GroupNormType::get_back_entrypoints`),
+// run in order by `Layer::encode_back_pass`:
+//   1. group_norm_stats      per (sample, group) -> mean, inv_std
+//   2. group_norm_grad_stats per (sample, group) -> sum_dxhat, sum_dxhat_xhat
+//   3. group_norm_back_input per element         -> grad_input
+//   4. group_norm_back_gamma per channel         -> grad_gamma
+//   5. group_norm_back_beta  per channel         -> grad_beta
+// Passes 1-2 hoist the per-group reductions the naive version redid per invocation;
+// results live in `stats` as 4 f32 per (sample, group). Each sample gets its OWN
+// statistics (what keeps it a group norm, not batch-dependent). Passes 4-5 reduce
+// onto gamma/beta PARAMETERS: one workgroup per channel whatever the batch,
+// sweeping `batch * spatial_len` positions.
 
 @group(0) @binding(0) var<storage, read>       fwd_input:   array<f32>;
 @group(0) @binding(1) var<storage, read>       gamma:       array<f32>;
