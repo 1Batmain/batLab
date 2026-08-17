@@ -1,4 +1,5 @@
-//! File purpose: Implements layer functionality for model execution, state, or diagnostics.
+//! A `Layer`: its buffers, pipelines, bind groups, and the optimiser/EMA passes
+//! that hang off a trainable one.
 
 use crate::gpu_context::GpuContext;
 use crate::model::error::ModelError;
@@ -27,13 +28,9 @@ pub(crate) struct Buffers {
     pub(crate) backward: Option<Vec<Arc<Buffer>>>,
 }
 
-/// One pipeline per sub-pass, forward and backward alike (e.g. Conv's backward
-/// has 3: grad_input, grad_weights, grad_bias; attention's forward has 4).
-///
-/// The forward was a single `Option<ComputePipeline>` until attention needed a
-/// global barrier mid-forward. Every other layer still declares one entry point
-/// and lands in a one-element list, so the shape of the change is: the common
-/// case is a list of length 1, not a special case.
+/// One pipeline per sub-pass (Conv's backward has 3; attention's forward has 4).
+/// A list, not an `Option`, since attention needed a global barrier mid-forward —
+/// every other layer just lands in a one-element list.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Pipelines {
     pub(crate) forward: Vec<(ComputePipeline, u32)>, // (pipeline, num_workgroups)
@@ -74,12 +71,9 @@ impl OptPass {
     }
 }
 
-/// Per-layer exponential-moving-average pass (only on trainable layers, and
-/// only when the run asked for an EMA).
-///
-/// Separate from [`OptPass`] rather than folded into the update shaders: the
-/// recurrence is the same whichever optimiser produced the weights, and a pass
-/// of its own is one that can be read, tested and switched off on its own.
+/// Per-layer EMA pass (trainable layers, EMA runs only). Separate from [`OptPass`]:
+/// the recurrence is the same whichever optimiser produced the weights, and a pass
+/// of its own can be read, tested and switched off alone.
 #[derive(Debug, Clone)]
 pub(crate) struct EmaPass {
     pub(crate) pipeline: ComputePipeline,
@@ -104,26 +98,14 @@ pub(crate) struct MergePass {
     pub(crate) num_workgroups: u32,
 }
 
-/// Split a 1-D workgroup count into a 2-D grid that respects
-/// `max_compute_workgroups_per_dimension` (65 535 in the WebGPU spec, and on
-/// this adapter).
-///
-/// Nothing in the graph needed this before the batch axis: the largest dispatch
-/// was one workgroup per 64 elements of a single tensor, which for the biggest
-/// layer of `Greyscale_Diffusion_L` is 1024. Multiply that by a batch of 64 and
-/// it is 65 536 — one over the limit.
-///
-/// The failure mode is what makes this worth a named function. wgpu reports the
-/// violation on the queue, the run does NOT stop, and the step simply computes
-/// nothing: the observed symptom was `loss 0.000000` scrolling by. A silent
-/// wrong answer at exactly the batch sizes the batching exists to enable.
-///
-/// The kernels recover their linear index as `gid.y * nwg.x * 64 + gid.x` (or
-/// `wid.y * nwg.x + wid.x` for the workgroup-per-unit passes), reading `nwg`
-/// from `@builtin(num_workgroups)` — so, like the batch itself, the split needs
-/// no uniform and cannot drift from what was dispatched. Trailing workgroups
-/// past the real count are absorbed by the bounds check every kernel already
-/// has.
+/// Split a 1-D workgroup count into a 2-D grid respecting the 65 535-per-dimension
+/// limit — a batch of 64 pushes the biggest `Greyscale_Diffusion_L` layer to
+/// 65 536, one over. The failure mode makes this worth a named function: wgpu
+/// reports the violation on the queue but the run does NOT stop and computes
+/// nothing (`loss 0.000000` scrolling by), a silent wrong answer at exactly the
+/// batch sizes batching exists for. Kernels recover the linear index from
+/// `@builtin(num_workgroups)`, so the split needs no uniform and cannot drift;
+/// trailing workgroups are absorbed by each kernel's bounds check.
 pub(crate) fn dispatch_grid(workgroups: u32) -> (u32, u32) {
     const MAX_PER_DIMENSION: u32 = 65_535;
     if workgroups <= MAX_PER_DIMENSION {
@@ -405,14 +387,10 @@ impl Layer {
         self.encode_pass_with_batch(gpu, encoder, self.batch);
     }
 
-    /// Encode the forward pass for the first `batch` samples only.
-    ///
-    /// Truncating the dispatch is sound because every batched kernel recovers
-    /// its sample as `global_index / per_sample_length`: dispatching a prefix
-    /// of the grid computes a prefix of the samples and touches nothing else.
-    /// `predict()` uses it to run a single image through a graph whose buffers
-    /// are sized for a full training batch — the probe would otherwise pay 16x
-    /// the work for one result.
+    /// Encode the forward pass for the first `batch` samples only. Sound because
+    /// each kernel recovers its sample as `global_index / per_sample_length`, so a
+    /// grid prefix computes a sample prefix and touches nothing else. `predict()`
+    /// uses it to run one image through a batch-sized graph without paying 16× the work.
     pub(crate) fn encode_pass_with_batch(
         &self,
         gpu: &GpuContext,
@@ -872,15 +850,11 @@ impl Layer {
             .unwrap_or(&[])
     }
 
-    /// Build the EMA pass for this layer: two shadow buffers and the kernel that
-    /// pulls them towards the weights after every update.
-    ///
-    /// The shadow is **seeded with the weights as they stand now**, not with
-    /// zeros. `create_opt_pass` runs during `build()`, so "now" is either the
-    /// fresh initialisation or — on a rebuild — the weights that were just
-    /// restored. A zero-seeded shadow would need thousands of steps to shed the
-    /// zeros, and every checkpoint written before then would carry an EMA set
-    /// that generates noise. See `ema.rs` for the pairing with the warmup ramp.
+    /// Build the EMA pass: two shadow buffers and the kernel that pulls them
+    /// towards the weights each update. The shadow is SEEDED with the current
+    /// weights, not zeros (a zero seed would take thousands of steps to shed, and
+    /// every checkpoint until then would carry a noise-generating EMA). Pairs with
+    /// the warmup ramp — see `ema.rs`.
     pub(crate) fn create_ema_pass(&mut self, gpu: &GpuContext, ema: EmaConfig) {
         let Some(layout) = self.ty.get_optimizer_bindings() else {
             return;
