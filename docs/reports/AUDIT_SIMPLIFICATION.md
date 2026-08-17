@@ -285,13 +285,17 @@ Cinq `.ckpt` sont commités sous `Models/` (~2,17 Mo), **aucun n'est fixture de 
 | `Stable_Diffusion/pretrained_weights/latest_backup.ckpt` | 80,1 ko |
 | `Stable_Diffusion/pretrained_weights/one.ckpt` | 80,1 ko |
 
-Les **trois** `.ckpt` de `Stable_Diffusion` font exactement 80 055 octets — très
-probablement le même contenu sous trois noms (`latest`, `latest_backup`, `one`). Le
+Les **trois** `.ckpt` de `Stable_Diffusion` font exactement 80 055 octets. Le
 `.gitignore` n'ignore que `night_run.ckpt`, et le bloc `web/dist/` y **affirme** « tout
-checkpoint est gitignoré » — ce qui est faux pour `Models/`. Proposition : garder au plus
-un `.ckpt` de démonstration par modèle réellement utile, supprimer les doublons
-`Stable_Diffusion`, et clarifier la règle dans `.gitignore`. **À arbitrer** — ce sont tes
-poids.
+checkpoint est gitignoré » — ce qui est faux pour `Models/`.
+
+> **Correction (phase 2, vérification avant action)** : les trois `.ckpt` ne sont **PAS**
+> identiques — trois SHA-256 distincts (même *taille*, contenu différent) : ce sont des
+> poids entraînés **distincts**, pas des copies redondantes comme ce diagnostic le
+> supposait. **Aucun `.ckpt` n'a donc été supprimé** : ce sont des poids entraînés,
+> non régénérables, que l'audit n'a pas créés. Reste, non traité, la seule incohérence
+> réelle : le commentaire `web/dist/` du `.gitignore` qui parle de « tout checkpoint »
+> — laissé à l'arbitrage, il ne casse rien.
 
 ## C3. Modèles de banc sur l'écran d'accueil du TUI
 
@@ -308,6 +312,12 @@ liste d'accueil. **Attention avant de toucher** `Greyscale_Diffusion_broken` (r�
 par des commentaires de `config.rs`) et `Stable_Diffusion` (clé de template) — les sortir
 demande de vérifier ces références. **À arbitrer** : c'est *ta* première vue du TUI, à toi
 de dire lesquels tu veux y voir.
+
+> **Fait (phase 2)** : les quatre `Archi32_*` sont **sortis** du commit — vérifié sans
+> aucun consommateur (aucun banc, blind_test, script ou test ne les lit ; seul
+> `gen_archi32_bench.py` les *écrit*, à l'identique, à la demande). Sa docstring, qui les
+> disait « commitées », est corrigée. `Greyscale_Diffusion_broken` et `Stable_Diffusion`
+> sont **laissés** (références documentées / clé de template), comme signalé.
 
 ---
 
