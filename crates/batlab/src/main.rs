@@ -1,4 +1,4 @@
-//! File purpose: Application entry point that orchestrates training, inference, and TUI workflows.
+//! Application entry point: CLI parsing, headless DEV/CI modes, and TUI orchestration.
 
 use std::collections::HashSet;
 use std::fs;
@@ -24,33 +24,27 @@ use batlab_core::{
 use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, RgbImage};
 
-// Magic headers for the raw binary dataset format produced by the pre-processing
-// scripts. Format: magic(8) | count | width | height | channels | f32 data…
-/// Legacy raw-dataset magic — payload stored in `[0, 1]`. Converted to the
-/// model's `[-1, 1]` convention at load time.
+// `.batraw` magics. Format: magic(8) | count | width | height | channels | data…
+/// Legacy magic — f32 payload in `[0, 1]`, rescaled to `[-1, 1]` at load.
 const RAW_DATASET_MAGIC_UNIT: &[u8; 8] = b"BATRAW1\0";
-/// Legacy raw-dataset magic — f32 payload already stored in `[-1, 1]`.
+/// Legacy magic — f32 payload already in `[-1, 1]`.
 const RAW_DATASET_MAGIC_SIGNED: &[u8; 8] = b"BATRAW2\0";
-/// Current raw-dataset magic — **u8** payload in `[0, 255]`, widened to
-/// `[-1, 1]` on the GPU. A quarter of the file, a quarter of the host RAM and a
-/// quarter of the chunk traffic, for exactly the same values: the sources are
-/// 8-bit, so the f32 encoding stored four bytes of which three were always
-/// derivable from the first.
+/// Current magic — u8 payload widened to `[-1, 1]` on the GPU (a quarter of the
+/// bytes for the same values). See CLAUDE.md and `dataset_decode.wgsl`.
 const RAW_DATASET_MAGIC_BYTES: &[u8; 8] = b"BATRAW3\0";
 
-// The schedule constants now live in the engine (one definition, shared with
-// the web build); these aliases keep every call site below unchanged.
+// Schedule constants live in the engine (one definition, shared with the web
+// build); these aliases keep the call sites below unchanged.
 const DIFFUSION_SCHEDULE_STEPS: usize = batlab_core::DIFFUSION_SCHEDULE_STEPS;
 const DIFFUSION_BETA_START: f32 = batlab_core::DIFFUSION_BETA_START;
 const DIFFUSION_BETA_END: f32 = batlab_core::DIFFUSION_BETA_END;
 const LOSS_REPORT_INTERVAL_STEPS: usize = 25;
 const INFERENCE_RUNTIME_LR: f32 = 0.01;
 const INFERENCE_RUNTIME_BATCH_SIZE: u32 = 1;
-/// What `--help` prints. The headless entry points are the whole scriptable
-/// surface of this binary, so this text *is* their contract: an agent, a CI job
-/// or a black-box tester has nothing else to read, and a flag that is not here
-/// does not exist. The dump layout is spelled out for the same reason — a reader
-/// written from a prose description of "raw f32" reads it shifted by five bytes.
+/// What `--help` prints. The headless entry points are this binary's whole
+/// scriptable surface, so this text IS their contract — a flag not here does not
+/// exist. Keep the dump layout exact: a reader built from a vague description
+/// reads the bytes shifted.
 const HELP: &str = "\
 batlab — deep-learning framework (Rust + wgpu). Run with no arguments for
 the interactive TUI. The flags below are the DEV/CI headless entry points; they
@@ -294,16 +288,10 @@ mid-write still parses up to its last whole frame. Read it with
 `tools/flux_analysis.py`.
 ";
 
-/// Rejects any flag the parser does not know, before anything expensive runs.
-///
-/// A headless run is driven by scripts and agents that cannot see a typo. While
-/// unknown flags were dropped in silence, `--t-star` — a flag named in the
-/// public contract but never parsed — was indistinguishable from a flag that
-/// worked: a whole black-box campaign passed it, got byte-identical dumps, and
-/// only caught it by diffing against a deliberately invented flag.
-///
-/// `valued` flags consume the token after them, so a path or a negative number
-/// can never be mistaken for a flag of its own.
+/// Rejects any unknown flag before anything expensive runs: a silently-ignored
+/// flag (as `--t-star` once was) is indistinguishable from one that works, and
+/// scripts cannot see a typo. `valued` flags consume the next token, so a path
+/// or negative number is never mistaken for a flag.
 fn reject_unknown_flags(args: &[String], valued: &[&str], bare: &[&str]) -> Result<(), String> {
     let mut index = 1;
     while index < args.len() {
@@ -327,11 +315,9 @@ fn reject_unknown_flags(args: &[String], valued: &[&str], bare: &[&str]) -> Resu
     Ok(())
 }
 
-/// Reads `--gpu-limits` and makes it the profile every device request uses.
-///
-/// Applied before any adapter is opened and never consulted again — see
-/// [`GpuLimitsProfile::set_process_default`] for why this is a process setting
-/// rather than a parameter. Absent, the default stands (native).
+/// Reads `--gpu-limits` and makes it the process default for every device
+/// request. Applied before any adapter opens; absent, native stands. Why a
+/// process setting: [`GpuLimitsProfile::set_process_default`].
 fn apply_gpu_limits_flag(args: &[String]) -> Result<(), String> {
     let Some(value) = args
         .iter()
@@ -349,16 +335,9 @@ fn apply_gpu_limits_flag(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// The level dial of a perpetual run, under any of its three spellings.
-///
-/// One field, three names, because the field means two things: `t_r`, the depth
-/// a cycle re-noises back to, and `t*`, the level flux holds. The public
-/// contract named `--t-r` and `--t-star` while only `--depth` was parsed, so
-/// both were accepted by the shell, dropped by the binary, and the run went
-/// ahead at the default level — a blind test campaign passed `--t-star` for a
-/// whole day against dumps that were byte-identical to no flag at all.
-///
-/// `Ok(None)` means no dial was given; the caller supplies the default.
+/// The level dial of a perpetual run, under any of its three spellings: `--t-r`
+/// (a cycle's re-noise depth), `--t-star` (the level flux holds) and `--depth`
+/// all set the one field. `Ok(None)` means no dial given — the caller defaults.
 fn dial_level(args: &[String]) -> Result<Option<usize>, String> {
     let named = |name: &'static str| {
         args.iter()
@@ -394,47 +373,26 @@ fn main() {
     // worker thread instead. `run_on_main_thread` returns once that worker does.
     // The headless path also runs inside it: the training path can warm the
     // visualiser, which needs the event loop to be available.
+    // winit's event loop must own the process main thread (a hard AppKit
+    // requirement on macOS), so the TUI and the training/inference loop run on a
+    // worker; `run_on_main_thread` returns once that worker does. The headless
+    // path runs inside it too — training can warm the visualiser.
     batlab_ui::visualiser::run_on_main_thread(|| {
-        // -----------------------------------------------------------------
-        // DEV/CI ONLY — headless training entry point.
-        //
-        // The normal entry point is the interactive TUI below. This branch
-        // exists so a training run can be driven from a script (validating
-        // pipeline fixes, regression runs) without a terminal. It reuses
-        // `run_training` unchanged, so it exercises exactly the production
-        // path and cannot drift from it.
-        //
-        //   cargo run --release -- --headless-train <model> --steps N \
-        //       --dataset <path> [--lr F] [--batch N] [--out <ckpt path>] \
-        //       [--optimizer sgd|adam] [--weight-init uniform|he] \
-        //       [--loss-weighting uniform|snr] [--snr-gamma F]
-        //
-        // It never writes back to the model's config_file and defaults its
-        // checkpoint to a scratch path, so it cannot clobber saved weights.
-        // -----------------------------------------------------------------
+        // The headless branches below are DEV/CI only (contract in HELP). Each
+        // reuses the production `run_*` path unchanged and never writes back a
+        // model's config_file. `--help` is the sole discovery surface.
         let args: Vec<String> = std::env::args().collect();
-        // Before anything else: the binary has to be able to say what it takes.
-        // Without this the only way to discover a flag was to try it, and an
-        // unknown flag used to be ignored in silence — so trying it proved
-        // nothing either.
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             print!("{HELP}");
             return;
         }
-        // The limits a device is opened with cannot be changed afterwards, and
-        // every path below — headless, TUI, visualiser — opens one. So the
-        // choice is made here, once, before the first adapter request. It is
-        // read again nowhere: `GpuContext::new_headless` picks it up.
+        // A device's limits are fixed at open time and every path below opens
+        // one, so the profile is chosen here, once, before the first adapter
+        // request. `GpuContext::new_headless` picks it up.
         if let Err(err) = apply_gpu_limits_flag(&args) {
             eprintln!("{err}");
             std::process::exit(1);
         }
-        // -----------------------------------------------------------------
-        // DEV/CI ONLY — where a training step's 4.4 seconds go.
-        //
-        //   cargo run --release -p batlab -- --profile-step <model> \
-        //       --dataset <path> [--batch N] [--rounds N] [--top N]
-        // -----------------------------------------------------------------
         if args.iter().any(|arg| arg == "--profile-step") {
             if let Err(err) = run_profile_step(&args) {
                 eprintln!("profile: {err}");
@@ -450,18 +408,6 @@ fn main() {
             return;
         }
 
-        // -----------------------------------------------------------------
-        // DEV/CI ONLY — headless sampling entry point.
-        //
-        // Loads a checkpoint and generates images WITHOUT training, writing a
-        // JSONL log of per-step denoising stats (latent + ε̂ min/max/mean/σ) so
-        // the point where the latent diverges is visible. Never writes back the
-        // model config and never touches saved weights.
-        //
-        //   cargo run --release -- --headless-sample <model> \
-        //       --checkpoint <path> [--seed N] [--paths N] \
-        //       [--magnitude F] [--out <img>] [--log <jsonl>]
-        // -----------------------------------------------------------------
         if args.iter().any(|arg| arg == "--headless-sample") {
             if let Err(err) = run_headless_sample(&args) {
                 eprintln!("headless sampling failed: {err}");
@@ -470,27 +416,6 @@ fn main() {
             return;
         }
 
-        // -----------------------------------------------------------------
-        // DEV/CI ONLY — headless perpetual time-lapse.
-        //
-        // Walks the same drift the TUI's Perpetual mode walks and writes one
-        // PNG per completed cycle, so the wandering can be inspected as a
-        // sequence of stills without a window.
-        //
-        //   cargo run --release -p main -- --headless-perpetual <model> \
-        //       --frames N [--checkpoint <path>] [--depth T] \
-        //       [--regime wander|breathe] [--seed N] [--magnitude F] \
-        //       [--window] [--climb-frames N] [--out <dir>]
-        // -----------------------------------------------------------------
-        // -----------------------------------------------------------------
-        // What this model costs on the GPU, and what crosses the boundary.
-        //
-        // Read-only: it opens an adapter to read its limits, and with
-        // `--measure` it builds the model and runs a handful of steps. It never
-        // writes a config, a checkpoint or an image.
-        //
-        //   cargo run -p batlab -- --resources <model> [--batch N] [--measure]
-        // -----------------------------------------------------------------
         if args.iter().any(|arg| arg == "--resources") {
             if let Err(err) = run_resources(&args) {
                 eprintln!("resources: {err}");
@@ -534,18 +459,11 @@ fn main() {
     });
 }
 
-/// Where a perpetual run's opening picture comes from.
-///
-/// The dataset is loaded once, on the CPU, and kept as plain tensors: a run
-/// asks it for one `x₀` when it starts and one more on every `[r]`. That is
-/// nothing next to a single model call, so there is no GPU dataset here and no
-/// chunk juggling — [`GpuDataset`] exists for training, which streams thousands
-/// of samples a minute.
-///
-/// **One function provides the picture** — [`SeedImages::provide_x0`]. Adding a
-/// chooser later (an index typed into the form, a file dropped on the window)
-/// is a second constructor beside `at_random`, not a new call site: the two
-/// perpetual paths only ever call `provide_x0`.
+/// Where a perpetual run's opening picture comes from. The dataset is loaded
+/// once on the CPU as plain tensors — a run asks for one `x₀` at start and one
+/// per `[r]`, nothing next to a model call, so no [`GpuDataset`] here. One
+/// function provides the picture ([`SeedImages::provide_x0`]); a future chooser
+/// is a second constructor, not a new call site.
 struct SeedImages {
     samples: Dataset,
     path: PathBuf,
@@ -553,27 +471,18 @@ struct SeedImages {
 }
 
 impl SeedImages {
-    /// Loads the dataset a model drifts away from — **the one entry point every
-    /// path that starts a drift goes through**.
+    /// Loads the dataset a model drifts away from — THE one entry point every
+    /// drift goes through. Takes the whole `config`, not a pre-chosen path, so a
+    /// caller cannot forget its `seed_dataset` (the `Elephants_XL`-from-CIFAR
+    /// bug). Ranking lives once in [`storage::Storage::resolve_seed_dataset`].
+    /// Three outcomes by source:
     ///
-    /// It takes the whole `config`, not a pre-chosen path, and that is the
-    /// point: a caller cannot forget to consult the model's own
-    /// `seed_dataset` the way `--headless-perpetual` did for an entire
-    /// campaign, drifting `Elephants_XL` away from CIFAR trucks. The ranking
-    /// itself — flag, then config, then the channel convention — lives once, in
-    /// [`storage::Storage::resolve_seed_dataset`].
-    ///
-    /// Three outcomes, and they differ by source:
-    ///
-    /// - `Ok(Some(_))` — a dataset was found and it fits the model.
-    /// - `Ok(None)` — nothing to load, and nothing was promised: no convention
-    ///   for this geometry, or the derived file is not on this machine. A
-    ///   missing dataset is not a reason to refuse to run, it is a reason to
-    ///   fall back on pure noise and say so.
-    /// - `Err(_)` — something *named* it (flag or config) and it is missing,
-    ///   empty, or has the wrong channels. Falling back to noise there would
-    ///   look exactly like the setting being ignored, which is the bug this
-    ///   whole function exists to close.
+    /// - `Ok(Some(_))` — a dataset was found and fits the model.
+    /// - `Ok(None)` — nothing named, nothing promised: fall back to pure noise
+    ///   and say so (no convention for this geometry, or file absent).
+    /// - `Err(_)` — something NAMED it (flag/config) and it is missing, empty or
+    ///   wrong-channels. Falling back to noise here would look like the setting
+    ///   being ignored — the bug this function exists to close.
     fn resolve(
         flag: Option<&str>,
         config: &ModelConfig,
@@ -690,12 +599,9 @@ impl<State> batlab_core::NoisePredictor for ModelNoise<'_, State> {
     }
 }
 
-/// Which weight set a headless generating run asks for.
-///
-/// The default is the average, because a checkpoint that has one was written by
-/// a run that wanted to be sampled from it. `--raw-weights` is what makes the
-/// comparison possible — and it is a *bare* flag, so it cannot swallow the
-/// argument after it.
+/// Which weight set a headless generating run asks for. Default is the EMA
+/// average (a checkpoint that carries one was meant to be sampled from it);
+/// `--raw-weights` is a bare flag, so it swallows no argument.
 fn weights_source(args: &[String]) -> CheckpointWeights {
     if args.iter().any(|arg| arg == "--raw-weights") {
         CheckpointWeights::Raw
@@ -704,16 +610,11 @@ fn weights_source(args: &[String]) -> CheckpointWeights {
     }
 }
 
-/// Load a checkpoint for **generating**, and say which of its two weight sets
-/// was used.
-///
-/// Every sampling path goes through here — the two headless entry points and
-/// the two TUI ones — so "generation uses the average when the file has one"
-/// is one decision in one place rather than four that can drift.
-///
-/// The line it prints is the contract's observable half: an EMA comparison is
-/// worthless if the two arms might silently have loaded the same weights, and
-/// `carries_ema` vs `used_ema` is exactly what tells them apart.
+/// Load a checkpoint for generating and print which of its two weight sets was
+/// used. Every sampling path funnels here — two headless, two TUI — so "use the
+/// average when the file has one" is one decision, not four. The printed line is
+/// the observable half of the EMA contract: `carries_ema` vs `used_ema` is what
+/// proves the two comparison arms did not silently load the same weights.
 fn load_sampling_checkpoint(
     model: &mut Model<Training>,
     path: &Path,
@@ -734,20 +635,13 @@ fn load_sampling_checkpoint(
     Ok(())
 }
 
-/// The bytes an export carries.
-///
-/// Load `source` with the inference selection rule — the average when the file
-/// carries one, the raw iterate under `--raw-weights` — into a fresh inference
-/// model, then re-serialise only the weights that model would sample from. No
-/// optimiser moments, no EMA trailer: four fifths of a training checkpoint that
-/// inference never reads.
-///
-/// The selection is *not* re-implemented here — it is the one `CheckpointWeights`
-/// enum every sampling path already funnels through. The stripping is not a new
-/// serialiser either: the model is built with SGD (stateless, no optimiser
-/// trailer) and no EMA shadow, so [`Model::checkpoint_bytes`] emits exactly the
-/// weights-only V2 file it has always written for such a model — the layout
-/// `the_parameter_count_matches_the_scalars_a_checkpoint_holds` pins down.
+/// The bytes an export carries: load `source` with the inference selection rule
+/// into a fresh inference model, then re-serialise only the weights it would
+/// sample from — no optimiser moments, no EMA trailer (four fifths of a training
+/// checkpoint inference never reads). Nothing is re-implemented: selection is the
+/// shared `CheckpointWeights` enum, and stripping falls out of building with SGD
+/// (no optimiser trailer) and no EMA shadow, so [`Model::checkpoint_bytes`] emits
+/// the weights-only V2 layout `the_parameter_count_matches_the_scalars_a_checkpoint_holds` pins.
 async fn stripped_checkpoint(
     config: &ModelConfig,
     source: &[u8],
@@ -782,12 +676,9 @@ async fn stripped_checkpoint(
     }
 }
 
-/// See the DEV/CI note in `main`. Not reachable from the TUI.
-///
-/// Writes a checkpoint carrying only the weights inference would generate from —
-/// the file a browser downloads. A training checkpoint is four times heavier: it
-/// also holds Adam's two moments and, for a V3 file, the EMA trailer. This drops
-/// both, keeping (by default) the averaged set the EMA exists to be sampled from.
+/// DEV/CI (see `main`). Writes a checkpoint of only the weights inference reads —
+/// the file a browser downloads — dropping Adam's moments and the EMA trailer
+/// (4× lighter), keeping by default the averaged set the EMA is sampled from.
 fn run_export_weights(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -810,11 +701,9 @@ fn run_export_weights(args: &[String]) -> Result<(), String> {
         return Err(format!("checkpoint does not exist: {ckpt}"));
     }
     let out = flag("--out").ok_or_else(|| "--out <path to .ckpt> is required".to_string())?;
-    // The average when the file has one, the raw iterate under `--raw-weights` —
-    // the same rule sampling applies, so the export carries what the page shows.
+    // Same selection rule as sampling, so the export carries what the page shows.
     let weights = weights_source(args);
-    // 8-bit codes instead of f32: a quarter of the weights-only file again, at
-    // the cost of the quantisation error — a trade the run measures, not assumes.
+    // 8-bit codes instead of f32: a quarter of the file, at the quantisation error.
     let quantize = args.iter().any(|arg| arg == "--quantize");
 
     let config_path = storage::model_config_path(&model_name)
@@ -836,8 +725,8 @@ fn run_export_weights(args: &[String]) -> Result<(), String> {
     }
     fs::write(&out_path, &bytes).map_err(|err| format!("failed to write {out}: {err}"))?;
 
-    // The banner re-emits the parsed configuration so a scripted run can prove
-    // the flag was understood — the same contract every headless mode keeps.
+    // Banner re-emits the parsed config so a scripted run can prove the flags
+    // were understood — the contract every headless mode keeps.
     let which = if matches!(weights, CheckpointWeights::Raw) {
         "raw"
     } else {
@@ -965,9 +854,7 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
     };
     config.run.mode = RunMode::Train(train_cfg.clone());
 
-    // The banner re-emits the parsed configuration: `bench/optimizer/lib.sh`
-    // asserts on it, and it is the only way a scripted run can prove a flag
-    // was understood rather than dropped.
+    // Banner re-emits the parsed config; `bench/optimizer/lib.sh` asserts on it.
     println!(
         "headless training '{model_name}': {steps} steps, lr={lr}, batch={batch_size}, \
          optimizer={}, init={}, loss-weighting={}, ema={}, resume={}, checkpoint-every={}, \
@@ -998,8 +885,8 @@ fn run_headless_train(args: &[String]) -> Result<(), String> {
             let options = RunOptions {
                 resume_from,
                 checkpoint_every,
-                // The path above is already the run's own, and `--resume` is
-                // how a headless run names what it reads: nothing to redirect.
+                // Path above is already the run's own; `--resume` names what it
+                // reads. Nothing to redirect.
                 load_from: None,
                 write_to: None,
                 maintain_latest,
@@ -1078,15 +965,10 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         .unwrap_or(1)
         .max(1);
     let magnitude_flag = flag("--magnitude").and_then(|v| v.parse::<f32>().ok());
-    // Kept at 1.0 by default on purpose: this is the DEV/CI path, and benches
-    // under `bench/` pin that default. Unlike the interactive infer and the web
-    // (which read `config.inference.denoise_magnitude`), this path does not — so
-    // the banner below *names its source*, and flags when the config would have
-    // said something else, rather than being a silent third way of resolving it.
+    // Default 1.0: this DEV/CI path does NOT read `config.inference.denoise_magnitude`
+    // (the interactive infer and web do), and benches under `bench/` pin the
+    // default — so the banner below names its source rather than resolving silently.
     let magnitude = magnitude_flag.unwrap_or(1.0);
-    // Generating uses the average when the checkpoint carries one, because
-    // that is the set the average exists to be sampled from. `--raw-weights`
-    // asks for the last iterate instead — the other arm of the comparison.
     let weights = weights_source(args);
 
     let config_path = storage::model_config_path(&model_name)
@@ -1102,9 +984,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         None => config.inference.posterior_variance,
     };
 
-    // Where the magnitude in force actually came from — named on the banner so
-    // this path is not a silent third resolver (cf. the GPU-profile and seed
-    // lines, which already announce their source).
+    // Where the magnitude in force came from — named on the banner (see above).
     let magnitude_source = if magnitude_flag.is_some() {
         "--magnitude".to_string()
     } else if (config.inference.denoise_magnitude - magnitude).abs() > f32::EPSILON {
@@ -1201,19 +1081,11 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
     })
 }
 
-/// See the DEV/CI note in `main`. Not reachable from the TUI.
-///
-/// The instrument the architecture mission is built on: a way to say *this
-/// checkpoint is better than that one* that is not "look at the picture". It
-/// scores one or more checkpoints on a held-out, deterministic slice — the same
-/// images, the same timesteps, the same noise fields for every checkpoint — so a
-/// difference in the numbers is a difference in the weights and nothing else.
-///
-/// Reports MSE(ε̂, ε) per timestep bucket and the same error in image space
-/// (x₀), against the three trivial baselines of `tools/trivial_baselines.py`.
-/// Every arbitration later in the mission goes through this, exactly because the
-/// EMA one could not — the repo had no ε evaluator, so a 4.9 % weight change
-/// could only be judged by eye (`docs/reports/EMA.md`).
+/// DEV/CI (see `main`). Scores checkpoints on a held-out, deterministic slice —
+/// same images, timesteps and noise fields for each — so a difference in the
+/// numbers is a difference in the weights alone. Reports MSE(ε̂, ε) per timestep
+/// bucket and the same error in x₀ space, against the trivial baselines of
+/// `tools/trivial_baselines.py`. Why it exists: `docs/reports/EMA.md`.
 fn run_eval(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -1374,15 +1246,10 @@ fn run_eval(args: &[String]) -> Result<(), String> {
 }
 
 /// The comparison table `--eval` prints. Presentation only: every number comes
-/// from the engine's [`evaluate`], so the host decides layout, never arithmetic.
-///
-/// Two blocks, both against the same baselines (which are identical across
-/// checkpoints — same draws — so they are read off the first report):
-///   - ε-MSE per bucket, the training objective resolved per timestep range;
-///   - x₀-RMSE per bucket, the error in image units [-1, 1], where the high-t
-///     buckets are where the global content of a sample is actually decided.
-/// The verdict a reader wants is the last line: does the checkpoint beat the
-/// "learned only the mean" baseline in x₀ at high t.
+/// from the engine's [`evaluate`], the host decides layout, never arithmetic.
+/// Two blocks against the same baselines (identical across checkpoints, read off
+/// the first report): ε-MSE per bucket (the objective), and x₀-RMSE per bucket
+/// (error in image units [-1,1]).
 fn print_eval_table(
     model_name: &str,
     dataset_path: &str,
@@ -1411,8 +1278,8 @@ fn print_eval_table(
         .map(|b| format!("t[{}-{})", b.t_lo, b.t_hi))
         .collect();
 
-    // A run label short enough for a table: the file stem, trimmed on the left
-    // (the date/suffix that distinguishes two runs lives at the end).
+    // Table label: file stem, trimmed on the left (the distinguishing date/suffix
+    // is at the end).
     let label_of = |path: &Path| -> String {
         let stem = path
             .file_name()
@@ -1507,14 +1374,11 @@ fn print_eval_table(
     println!("{}", baseline_x0_row("ε̂=0", &|b| b.x0_zero()));
 
     // ---- verdict -------------------------------------------------------
-    // Two honest facts, no single pass/fail. The PRIMARY rank is whole-schedule
-    // ε-MSE, the training objective and what the full multi-step sampler tracks
-    // — that is the number to compare two architectures on. The SECONDARY read
-    // is per-bucket reconstruction against the "learned only the mean" baseline:
-    // a model beats it at the buckets where content is recoverable and cannot at
-    // the very top, where a one-shot x̂₀ is unlearnable for ANY model (which is
-    // why generation takes 256 steps, not one). An overall x₀ average would let
-    // that unlearnable bucket flip the verdict, so it is deliberately not one.
+    // Two facts, no single pass/fail. PRIMARY rank: whole-schedule ε-MSE, the
+    // objective the multi-step sampler tracks. SECONDARY: per-bucket x₀ vs the
+    // "learned only the mean" baseline — deliberately NOT averaged into one
+    // number, since the top bucket (a one-shot x̂₀ unlearnable for any model, why
+    // generation takes 256 steps) would otherwise flip the verdict.
     println!("\nverdict — primary rank: whole-schedule ε-MSE (lower is better):");
     let mut ranked: Vec<(&PathBuf, f64)> = reports
         .iter()
@@ -1550,14 +1414,9 @@ fn print_eval_table(
     }
 }
 
-/// Every frame of a headless drift, both panes, as raw `f32`.
-///
-/// The measurements this exists for are frame-to-frame differences and
-/// correlations, and in flux those live at about **one 8-bit level per frame**.
-/// Reading them off PNGs would be measuring the quantiser: `CLIMB_COHERENCE.md`
-/// §6 records a grain correlation of 1.000 in `f32` that PNGs could not report
-/// above 0.87. So the frames come out unquantised, and every analysis of the
-/// flux regime is done on this file.
+/// Every frame of a headless drift, both panes, as raw `f32` (unquantised):
+/// flux measurements live at ~one 8-bit level per frame, so PNGs would measure
+/// the quantiser, not the signal (`CLIMB_COHERENCE.md` §6).
 ///
 /// Layout — little-endian throughout, `len = w * h * c`:
 ///
@@ -1598,11 +1457,10 @@ impl FrameDump {
         })
     }
 
-    /// Takes the **action** rather than a phase, so the tag can only ever be the
-    /// one of the deed the frame records. Handed a phase, a caller reads it off
-    /// `drift.phase()` before stepping and files the frame under the phase it
-    /// just left — which is exactly how the first churn frame of every approach
-    /// went out labelled `descent` (see [`batlab_core::DriftAction::phase`]).
+    /// Takes the ACTION, not a phase, so the tag is always the deed the frame
+    /// records: a caller handed a phase reads `drift.phase()` before stepping and
+    /// mislabels the frame with the phase it just left (how the first churn frame
+    /// of every approach went out `descent`). See [`batlab_core::DriftAction::phase`].
     fn record(
         &mut self,
         action: batlab_core::DriftAction,
@@ -1638,18 +1496,9 @@ impl FrameDump {
     }
 }
 
-/// The `.batraw` header alone: how many samples, how big each one is, and how
-/// many bytes one value takes.
-///
-/// A dataset's GPU footprint is decided by those numbers, and CIFAR-10 is
-/// 195 MiB on disk — reading it whole to answer "how many chunks?" would make
-/// `--resources` slower than the run it describes. The payload width is part of
-/// the answer since BATRAW3: the same 50 000 images are 586 MiB of f32 or
-/// 147 MiB of u8, and an inventory that assumed f32 would over-report a
-/// BATRAW3 dataset's residency by four.
 /// The dataset a `--resources` question is about: the one named on the command
-/// line, else the one the model's config trains on. `None` when neither exists
-/// on disk — the inventory then simply has no streamed post, and says so.
+/// line, else the one the model's config trains on. `None` when neither exists —
+/// the inventory then has no streamed post.
 fn resources_dataset(
     explicit: Option<String>,
     config: &ModelConfig,
@@ -1659,11 +1508,9 @@ fn resources_dataset(
         _ => None,
     })?;
     let path = PathBuf::from(&named);
-    // One reader for the `.batraw` header, in `storage` — the binary no longer
-    // keeps its own byte-identical copy. (The dataset *loader*,
-    // `try_load_raw_dataset`, is a distinct, richer parser: it works on bytes
-    // already in memory and has to tell BATRAW1 from BATRAW2 to rescale, which
-    // this width-only probe deliberately does not.)
+    // One header reader, in `storage`. (The dataset loader `try_load_raw_dataset`
+    // is a distinct, richer parser — it rescales BATRAW1 vs BATRAW2, which this
+    // width-only probe does not.)
     let (count, width, height, channels, value_bytes) = storage::read_batraw_header(&path)?;
     Some((
         path,
@@ -1674,19 +1521,11 @@ fn resources_dataset(
     ))
 }
 
-/// See the DEV/CI note in `main`. Not reachable from the TUI — except that the
-/// TUI shows the same page, from the same inventory, on the same key.
-///
-/// Prints what the model puts on the GPU and what crosses the host boundary.
-/// Two questions, and the second is the one nobody could answer before: the
-/// model is uploaded once and stays resident, the dataset is streamed one
-/// 64 MiB chunk at a time, and the reverse chain pays a full CPU↔GPU round trip
-/// on every one of its 256 steps because the latent lives on the CPU.
-///
-/// `--measure` is what makes those claims measurements instead of assertions:
-/// it builds the model, runs real training steps and real reverse steps, and
-/// reports the counters' difference. Without it the page is pure prediction and
-/// prints no traffic table at all, rather than a plausible zero.
+/// DEV/CI (see `main`); the TUI shows the same page on `[R]`. Prints what the
+/// model puts on the GPU and what crosses the host boundary. `--measure` makes
+/// the traffic figures real — it builds the model and runs real steps, reporting
+/// the counter deltas; without it the page is prediction and prints no traffic
+/// table (rather than a plausible zero).
 fn run_resources(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -1716,8 +1555,7 @@ fn run_resources(args: &[String]) -> Result<(), String> {
     let config = storage::load_model_config(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
 
-    // The batch the config trains at, unless the caller asks about another —
-    // which is the whole point of the flag: "what would batch 64 cost?".
+    // The config's batch unless the caller asks about another ("what would batch 64 cost?").
     let config_batch = match &config.run.mode {
         RunMode::Train(train) => train.batch_size.max(1),
         _ => 16,
@@ -1772,8 +1610,8 @@ fn run_resources(args: &[String]) -> Result<(), String> {
             RunMode::Train(train) => {
                 batlab_core::Workload::training(train.optimizer, train.ema_decay.is_some())
             }
-            // A model whose config is not a training config still answers the
-            // training question — that is what someone sizing a machine asks.
+            // A non-training config still answers the training question — what
+            // someone sizing a machine asks.
             _ => batlab_core::Workload::training(OptimizerKind::Adam, false),
         }
     };
@@ -1817,9 +1655,8 @@ fn run_resources(args: &[String]) -> Result<(), String> {
         println!("{line}");
     }
 
-    // The two questions the page exists for, answered last because they are
-    // what someone screenshots: where the ceiling is, and what the other
-    // workload costs.
+    // The two questions the page exists for, last because they get screenshotted:
+    // where the batch ceiling is, and what the other workload costs.
     println!();
     match batlab_core::max_batch_that_fits(&request, &device, 4096) {
         Ok(Some(ceiling)) => println!(
@@ -1860,15 +1697,10 @@ fn run_resources(args: &[String]) -> Result<(), String> {
 }
 
 /// Run the real thing and read the counters — the measured half of the page.
-///
-/// Deliberately runs *production* entry points: `DiffusionTask::train_step_
-/// report_batch` for training and `reverse_step` for inference, the same calls
-/// the trainer and the sampler make. A measurement of a special path measures
-/// the special path.
-///
-/// The first step is measured separately and thrown away: it uploads the first
-/// dataset chunk and warms every pipeline, so folding it into the average would
-/// attribute a one-off 64 MiB to every step for ever.
+/// Runs PRODUCTION entry points (`train_step_report_batch`, `reverse_step`), the
+/// same calls the trainer and sampler make. The first step is measured and
+/// thrown away: it uploads the first chunk and warms every pipeline, which folded
+/// into the average would charge a one-off 64 MiB to every step.
 async fn measure_transfers(
     gpu: &Arc<GpuContext>,
     config: &ModelConfig,
@@ -1927,8 +1759,7 @@ async fn measure_transfers(
         None => None,
     };
 
-    // Inference: the reverse chain, one step at a time, on the very function
-    // the sampler uses.
+    // Inference: the reverse chain, one step at a time, on the sampler's function.
     let input_channels = config.input_size.2 as usize;
     let signal_channels = output_size.2 as usize;
     let output_len = (output_size.0 * output_size.1 * output_size.2) as usize;
@@ -1974,17 +1805,9 @@ async fn measure_transfers(
     })
 }
 
-/// See the DEV/CI note in `main`. Not reachable from the TUI.
-///
-/// Walks the same drift the TUI mode walks and writes one PNG per completed
-/// cycle — a time-lapse of the wandering, without a window. It also reports the
-/// mean absolute change between consecutive frames, which is the number that
-/// says whether the run is *drifting* or merely redrawing the same image.
 /// Spacing between the climb frames `--climb-frames n` writes: enough to land
-/// about `n` of them across a climb of `ceiling + 1` increments.
-///
-/// `None` when nothing should be written, so the caller never divides by zero
-/// on a degenerate request.
+/// about `n` across a climb of `ceiling + 1` increments. `None` when nothing
+/// should be written, so the caller never divides by zero.
 fn climb_stride(ceiling: usize, wanted: usize) -> Option<usize> {
     if wanted == 0 {
         return None;
@@ -2045,17 +1868,14 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     let magnitude = flag("--magnitude")
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(1.0);
-    // `--window` also writes the composed x_t | x̂₀ frame the live visualiser
-    // would be showing — the layout, out of the same function the window uses.
+    // `--window` also writes the composed x_t | x̂₀ frame the live visualiser shows.
     let window_frames = args.iter().any(|arg| arg == "--window");
-    // `--climb-frames N` writes roughly N composed frames per climb, so the
-    // gradual dissolve can be read as a contact sheet instead of being taken on
-    // trust. It is the only way to see the climb without a window.
+    // `--climb-frames N` writes ~N composed frames per climb — a contact sheet of
+    // the dissolve, the only way to see the climb without a window.
     let climb_frames = flag("--climb-frames").and_then(|v| v.parse::<usize>().ok());
-    // `--actions N` stops after N drift actions instead of after N closed
-    // cycles. Flux never closes one — that is the point of it — so it is the
-    // only way to bound a flux run, and it is also how the two regimes get
-    // compared over the same number of frames.
+    // `--actions N` stops after N drift actions, not N closed cycles. Flux never
+    // closes a cycle, so this is the only way to bound a flux run (and to compare
+    // the two regimes over the same number of frames).
     let action_budget = flag("--actions").and_then(|v| v.parse::<usize>().ok());
     // Refused rather than defaulted: `--frames` counts *closed cycles*, and flux
     // closes none. The old code would have spun on `written < frames` with
@@ -2071,15 +1891,12 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
     // of the order of one 8-bit level, so a PNG would quantise away the very
     // quantity being measured (`CLIMB_COHERENCE.md` §6).
     let dump_path = flag("--dump").map(PathBuf::from);
-    // The run drifts away from a real image by default, like the TUI mode.
-    // `--seed-noise` asks for the old opening — pure noise at the top of the
-    // schedule — which is the only way to reproduce a pre-img2img campaign;
-    // `--seed-dataset <path>` names the file to draw from instead of deriving
-    // it from the model's output channels.
+    // Drifts from a real image by default. `--seed-noise` restores the old pure-
+    // noise opening (reproduces a pre-img2img campaign); `--seed-dataset <path>`
+    // names the file instead of deriving it from output channels.
     let seed_from_noise = args.iter().any(|arg| arg == "--seed-noise");
-    // `--window` writes the frame the live visualiser would be showing, so it
-    // has to be able to write the layout the visualiser actually defaults to in
-    // this mode: x̂₀ alone, square. `--single-view` asks for that one.
+    // `--single-view` writes x̂₀ alone (square), the visualiser's default layout
+    // in this mode; else the composed x_t | x̂₀.
     let window_view = match args.iter().any(|arg| arg == "--single-view") {
         true => batlab_core::LiveView::X0Only,
         false => batlab_core::LiveView::Both,
@@ -2128,16 +1945,14 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         );
         let seed_images = match seed_from_noise {
             true => None,
-            // The model's `config_file` is consulted here too — it is handed
-            // over whole, so this path cannot quietly skip it.
+            // Config handed over whole, so this path cannot skip `seed_dataset`.
             false => SeedImages::resolve(seed_dataset.as_deref(), &config, output_size)?,
         };
         let mut drift = match seed_images.as_ref() {
             Some(_) => PerpetualDrift::from_image(schedule.len(), regime, depth, seed),
             None => PerpetualDrift::new(schedule.len(), regime, depth, seed),
         };
-        // Same walk the TUI run uses, so a dump records the frames a window
-        // would have shown — including the climb's now-live x̂₀.
+        // Same walk the TUI run uses, so a dump records the window's frames.
         let opening = match seed_images.as_ref() {
             Some(images) => images.provide_x0(seed),
             None => schedule.sample_noise(output_len, drift.initial_noise_seed()),
@@ -2150,11 +1965,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         let mut previous_frame: Option<Vec<f32>> = None;
         let mut mid_captured = false;
 
-        // The banner is the only place a caller can check that what it typed was
-        // heard — which is why it reports the dial under the name the *regime*
-        // gives it, and reads it back off the drift (post-clamp) rather than off
-        // the parse. A banner frozen at `t_r=64` is how `--t-star` went a whole
-        // campaign without being parsed.
+        // Reads the dial back off the drift (post-clamp), not off the parse, so
+        // the banner proves what was heard — a banner frozen at `t_r=64` is how
+        // `--t-star` went a whole campaign without being parsed.
         println!(
             "headless perpetual '{model_name}': regime={} {}={} bound={} \
              magnitude={magnitude} seed={seed}\nweights → {}",
@@ -2167,11 +1980,7 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             },
             checkpoint_path.display(),
         );
-        // Which of the three sources won is part of the answer, not a detail:
-        // "origine → image du dataset X" alone leaves the one question a
-        // surprised reader has — why THAT dataset — unanswered, and that is
-        // precisely how a specialised model drifted away from CIFAR trucks
-        // without anything on screen looking wrong.
+        // Which source won is part of the answer (the CIFAR-trucks bug): name it.
         match seed_images.as_ref() {
             Some(images) => println!(
                 "origine → image du dataset {} ({} images) [{}] — dérive img2img",
@@ -2187,9 +1996,8 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                 }
             ),
         }
-        // Announced only when something will actually land there. A PNG is
-        // written when a cycle closes; flux closes none, so naming a directory
-        // it never even creates reads as a run that failed to write.
+        // A PNG is written when a cycle closes; flux closes none, so naming a
+        // directory it never creates would read as a failed run.
         if drift.regime() == batlab_core::PerpetualRegime::Flux {
             println!("frames  → no PNG in flux (no cycle ever closes) — use --dump");
         } else {
@@ -2210,9 +2018,8 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
             None => written < frames,
         } {
             actions += 1;
-            // Handed whole to `record` below, which names the frame from it —
-            // never from `drift.phase()` read beforehand, which `step`
-            // reconciles on its way in and so names the phase just *left*.
+            // Handed whole to `record` below, which names the frame from the
+            // action, never from a pre-read `drift.phase()` (the phase just left).
             let action = drift.step();
             let level = match action {
                 DriftAction::Descend { diffusion_step, .. } => diffusion_step.saturating_sub(1),
@@ -2220,10 +2027,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                 DriftAction::Flux { diffusion_step, .. } => diffusion_step,
             };
 
-            // A cycle closes on the increment that opens the climb, and what it
-            // settled on is what the run holds *before* that increment moves
-            // anything: the latent at the floor and the estimate beside it. So
-            // the PNGs are written here, ahead of the advance.
+            // A cycle closes on the increment that opens the climb; what it
+            // settled on is what the run holds BEFORE that increment moves, so the
+            // PNGs are written here, ahead of the advance.
             if let DriftAction::Climb {
                 forward_step,
                 opens_cycle: true,
@@ -2235,12 +2041,10 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     output_size,
                     &out_dir.join(format!("{:03}.png", written)),
                 )?;
-                // …and, on request, the frame the live window would be showing
-                // at this instant. In errance the cycle closes at t=0, where the
-                // sampler's output IS its x̂₀ estimate, so the two panes must
-                // land on the same image — the visual half of the check
-                // `identical_sources_produce_two_identical_panes` makes on
-                // synthetic data.
+                // …and, on request, the live window's frame here. The cycle
+                // closes at t=0, where the sampler's output IS its x̂₀, so the two
+                // panes land on the same image — visual half of
+                // `identical_sources_produce_two_identical_panes`.
                 if window_frames {
                     write_tensor_png(
                         &compose_live_frame_view(
@@ -2294,11 +2098,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
 
             match action {
                 DriftAction::Descend { diffusion_step, .. } => {
-                    // One mid-descent frame per cycle: the moment the panes are
-                    // most unlike each other — x_t still visibly noisy, x̂₀
-                    // already an image. That contrast is what a user reads as
-                    // "the two halves are decorrelated", so it is the frame the
-                    // rule has to survive.
+                    // One mid-descent frame per cycle: where the panes are most
+                    // unlike (x_t still noisy, x̂₀ already an image) — the frame
+                    // the "two halves decorrelated" read has to survive.
                     if window_frames && !mid_captured && diffusion_step * 2 <= drift.depth() {
                         write_tensor_png(
                             &compose_live_frame_view(
@@ -2321,11 +2123,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
                     }
                 }
                 DriftAction::Climb { forward_step, .. } => {
-                    // Sampled rather than exhaustive — a t_r = 64 climb is 65
-                    // frames and a contact sheet wants a handful. The opening
-                    // increment is always written, so the sheet starts on the
-                    // first *dissolved* frame rather than on the settled image
-                    // (which `window_NNN.png` already holds).
+                    // Sampled, not exhaustive (a t_r=64 climb is 65 frames). The
+                    // opening increment is always written, so the sheet starts on
+                    // the first dissolved frame, not the settled image.
                     if let Some(count) = climb_frames
                         && (forward_step == drift.departure_step()
                             || climb_stride(drift.ceiling(), count)
@@ -2362,12 +2162,9 @@ fn run_headless_perpetual(args: &[String]) -> Result<(), String> {
         }
 
         let elapsed = started.elapsed().as_secs_f32();
-        // The two counts used to differ, and the difference was the whole cost
-        // model: a climb increment was closed-form arithmetic and called no
-        // model, so a climbing run cost fewer model calls than actions. It is
-        // also exactly what made x̂₀ freeze on the way up. They are now equal by
-        // construction — one call per frame, every frame — and both are printed
-        // so a run where they diverge again is visible at a glance.
+        // Actions and model calls are now equal by construction — one call per
+        // frame. When they differed, the climb called no model (closed-form), the
+        // bug that froze x̂₀ on the way up; both are printed so a re-divergence shows.
         println!(
             "{actions} actions, {steps} model calls, in {elapsed:.2} s \
              ({:.0} calls/s, unthrottled)",
@@ -2389,8 +2186,7 @@ fn run_execution_loop(mut config: ModelConfig) {
 
         let (tx, rx) = std::sync::mpsc::channel::<tui::TrainingEvent>();
         let (control_tx, control_rx) = std::sync::mpsc::channel::<tui::TrainingControlCommand>();
-        // Both training and perpetual runs are steered while they run; a plain
-        // inference has nothing to steer.
+        // Train and perpetual are steerable while running; inference is not.
         let is_steerable = matches!(&config.run.mode, RunMode::Train(_) | RunMode::Perpetual(_));
         let config_clone = config.clone();
 
@@ -2399,14 +2195,9 @@ fn run_execution_loop(mut config: ModelConfig) {
             rt.block_on(async {
                 let run_result = match config_clone.run.mode.clone() {
                     RunMode::Train(train_cfg) => {
-                        // `--resume` and `--checkpoint-every` are DEV/CI flags:
-                        // the TUI walks the weight selector for the first and
-                        // has `[s]` in the monitor for the second.
-                        //
-                        // The config now names where this run *writes* (its own
-                        // dated file); what the selector picked comes in beside
-                        // it as the file to *read*. Training again never writes
-                        // back over the weights it continued from.
+                        // The config names where this run WRITES (its dated file);
+                        // the selector's pick comes in beside it as what to READ,
+                        // so training again never overwrites what it continued from.
                         let options = RunOptions {
                             load_from: prepared.load_from.clone(),
                             maintain_latest: prepared.maintain_latest,
@@ -2439,13 +2230,12 @@ fn run_execution_loop(mut config: ModelConfig) {
 /// What preparing a run resolved that the config itself cannot hold.
 #[derive(Debug, Clone, Default)]
 struct PreparedRun {
-    /// The checkpoint the weight selector pointed at — the file this run
-    /// *reads*. It is not written into the `config_file`: which file tonight's
-    /// run happened to continue from is not a property of the model, and the
-    /// config's own `checkpoint_path` now records where the run *writes*.
+    /// The checkpoint the selector pointed at — what this run READS. Kept out of
+    /// the `config_file` (which run it continued from is not a model property;
+    /// the config's `checkpoint_path` records where it WRITES).
     load_from: Option<PathBuf>,
-    /// Whether `latest.ckpt` should follow what this run writes. True exactly
-    /// when the path below was dated here.
+    /// Whether `latest.ckpt` follows what this run writes — true when the path
+    /// above was dated here.
     maintain_latest: bool,
 }
 
@@ -2460,13 +2250,10 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<Prepar
         }
     };
 
-    // A training run gets its own dated file, resolved once here — including
-    // once per restart from the monitor, so the evening's second run gets a
-    // second file instead of reopening the first one's. The path the selector
-    // left in the config becomes the run's *load* source; the config is then
-    // rewritten naming the file this run will write, so reopening the model
-    // tomorrow lands on the weights this run produced and not on the ones it
-    // started from.
+    // A training run gets its own dated file, resolved once here (and once per
+    // monitor restart, so a second evening run gets a second file). The selector's
+    // path becomes the load source; the config is rewritten naming what this run
+    // writes, so reopening tomorrow lands on this run's weights, not its source.
     let mut prepared = PreparedRun::default();
     if let RunMode::Train(train) = &mut config.run.mode {
         let dated = storage::new_run_checkpoint_path(&model_name, SystemTime::now())
@@ -2481,19 +2268,11 @@ fn normalize_config_for_models_layout(config: &mut ModelConfig) -> Result<Prepar
     Ok(prepared)
 }
 
-// ---------------------------------------------------------------------------
-// DEV/CI ONLY — where a training step's time goes, pass by pass.
-// ---------------------------------------------------------------------------
-
-/// `--profile-step <model>`: one training step, timed by the GPU itself.
-///
-/// Why a subcommand of its own rather than a `--profile` on `--headless-train`:
-/// the training loop reports a loss, runs a per-bucket probe and samples an
-/// image on a schedule, all of which submit their own GPU work. A profile of
-/// "one step" that silently included a 256-step denoising chain every 200 steps
-/// would be a profile of something else. This harness runs the *same*
-/// production call the trainer runs — `DiffusionTask::train_step_batch` — and
-/// nothing else, the way `measure_transfers` does for traffic.
+/// `--profile-step <model>`: one training step, timed by the GPU itself. A
+/// subcommand of its own, not a flag on `--headless-train`, because the training
+/// loop's loss readback, probe and periodic sampling submit their own GPU work —
+/// a profile of "one step" that included a 256-step chain every 200 steps profiles
+/// something else. Runs only the production `DiffusionTask::train_step_batch`.
 fn run_profile_step(args: &[String]) -> Result<(), String> {
     let flag = |name: &str| -> Option<String> {
         args.iter()
@@ -2615,9 +2394,8 @@ fn run_profile_step(args: &[String]) -> Result<(), String> {
                 format!("{} chunks", gpu_dataset.chunk_count())
             }
         );
-        // A profile taken under a swept knob is a profile of a different
-        // machine's settings; say so on the line above the table, or the number
-        // pasted into a report will read as the stock one.
+        // A profile under a swept knob is not the stock one; name the overrides
+        // above the table so a pasted number isn't read as stock.
         for line in batlab_core::tuning::overrides_in_force() {
             println!("              tuning override · {line}");
         }
@@ -2636,9 +2414,8 @@ fn run_profile_step(args: &[String]) -> Result<(), String> {
                 .map_err(|err| format!("training step failed: {err}"))?;
             step += 1;
         }
-        // The warmups are asynchronous — nothing above waited for the GPU. Drain
-        // the queue before the first armed round, or its host wall clock would
-        // include three steps of somebody else's work.
+        // Warmups are async — drain the queue before the first armed round, or
+        // its wall clock would include the warmup steps' GPU work.
         gpu.wait_idle();
 
         let mut runs = Vec::with_capacity(rounds);
@@ -2649,8 +2426,8 @@ fn run_profile_step(args: &[String]) -> Result<(), String> {
             task.train_step_batch(&mut model, &mut gpu_dataset, step, batch as usize, 7)
                 .map_err(|err| format!("training step failed: {err}"))?;
             let encoded = started.elapsed();
-            // `collect_profile` blocks on the submission, so the wall clock
-            // below is host time around a step that has actually finished.
+            // `collect_profile` blocks on the submission, so the wall clock below
+            // is host time around a finished step.
             let run = gpu
                 .collect_profile()
                 .ok_or_else(|| "the profiler recorded nothing".to_string())?;
@@ -2687,8 +2464,8 @@ fn print_pass_profile(
             pass.workgroups,
             pass.invocations,
             pass.label,
-            // Never silently: a pass the backend refused to time reads 0.000 ms,
-            // which is indistinguishable from a fast one unless it says so.
+            // Never silently: an untimed pass reads 0.000 ms, indistinguishable
+            // from a fast one unless it says so.
             match pass.rounds_sampled {
                 0 => "   ⚠ NEVER TIMED by this backend".to_string(),
                 n if (n as usize) < summary.rounds =>
@@ -2710,18 +2487,12 @@ fn print_pass_profile(
         );
     }
 
-    // The budget, and the budget is the point.
-    //
-    // ONE round, not three minima. The estimator everywhere else in this project
-    // is the minimum over rounds, and it is the right one for a *single* number
-    // — but Σ passes, span and wall are three views of the SAME step, and
-    // minimising each independently mixes rounds. It printed "−0.9 ms outside
-    // the GPU span" on the first sweep: a host clock that finished before the
-    // GPU started, which is not a discovery about latency, it is two different
-    // steps subtracted from each other. So the reference round is picked once —
-    // the fastest by wall clock, the closest thing to an uncontended step — and
-    // all three lines come from it. The spread across rounds is printed beside
-    // the span so a reader can see how much that choice was worth.
+    // The budget. ONE round, not three minima: Σ passes, span and wall are three
+    // views of the SAME step, so minimising each independently mixes rounds and
+    // once printed "−0.9 ms outside the GPU span" (a host clock subtracted from a
+    // different step's GPU clock). The reference round is picked once — fastest by
+    // wall clock — and all three lines come from it; the cross-round spread is
+    // printed beside the span.
     let reference = walls
         .iter()
         .enumerate()
@@ -2796,15 +2567,10 @@ async fn build_execution_model(
     ema: Option<EmaConfig>,
 ) -> Result<(Arc<GpuContext>, Model<Training>), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
-    // The loss the run is configured with — cabled through, not hardcoded. A
-    // training run always reaches here with run.mode = Train(the very
-    // TrainingConfig being executed): the headless path sets it just before
-    // run_training, and the TUI path destructures train_cfg out of it. So this
-    // reads exactly train_cfg.loss, alongside the lr/batch/optimizer that
-    // already flow in — and the day LossMethod grows a second variant, a
-    // config_file that names it will no longer be silently ignored. An inference
-    // build (run.mode Infer/Perpetual) computes no loss; MeanSquared is the
-    // dormant default it was always built with.
+    // The configured loss, cabled through rather than hardcoded, so a
+    // `config_file` naming a second `LossMethod` variant is not silently ignored.
+    // An inference build (Infer/Perpetual) computes no loss: MeanSquared is a
+    // dormant default.
     let loss = match &config.run.mode {
         RunMode::Train(train) => train.loss.clone().into(),
         RunMode::Infer | RunMode::Perpetual(_) => PLoss::MeanSquared,
@@ -2818,8 +2584,7 @@ async fn build_execution_model(
     )
     .await;
     model.set_weight_init(weight_init);
-    // Before build(): the shadow buffers are allocated with the optimiser
-    // passes and seeded from the weights that exist then.
+    // Before build(): the shadow buffers are allocated with the optimiser passes.
     model.set_ema(ema);
     for draft in &config.layers {
         append_layer(&mut model, draft).map_err(|err| err.to_string())?;
@@ -2828,24 +2593,18 @@ async fn build_execution_model(
     Ok((gpu, model))
 }
 
-/// Where `--headless-train` writes when `--out` is absent: a per-model scratch
-/// directory under the system temp dir.
-///
-/// Scratch, and it must stay scratch — a CI run that trained into
-/// `Models/<name>/pretrained_weights/` would quietly become the model's weights.
-/// One directory per model so the dated names, which are only unique per
-/// directory, cannot collide between two models trained in the same minute.
+/// Where `--headless-train` writes without `--out`: a per-model scratch dir under
+/// the system temp dir. Must stay scratch — training into a model's
+/// `pretrained_weights/` would quietly become its weights. One dir per model so
+/// the per-dir-unique dated names cannot collide across models.
 fn headless_scratch_dir(model_name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("batlab-{model_name}"))
 }
 
-/// The file a headless run writes, and whether `latest.ckpt` follows it.
-///
-/// `--out` is the user's own filing: written exactly where and exactly as
-/// named, with no dating and no `latest.ckpt` dropped beside it — naming the
-/// file *is* how one opts out of the convention. Without it the run still
-/// writes to scratch, never into a model's saved weights, but under the dated
-/// name every run now carries.
+/// The file a headless run writes, and whether `latest.ckpt` follows it. `--out`
+/// is exact filing — no dating, no `latest.ckpt` beside it — the way one opts out
+/// of the convention. Without it, the run writes to dated scratch, never into a
+/// model's saved weights.
 fn headless_checkpoint_target(
     explicit_out: Option<String>,
     model_name: &str,
@@ -2863,13 +2622,9 @@ fn headless_checkpoint_target(
     }
 }
 
-/// What a run does on top of its `TrainingConfig`, and only ever from the
-/// headless entry point.
-///
-/// A separate struct rather than three more fields on `TrainingConfig`: that
-/// one is serialised into every model's `config_file`, and neither "the file I
-/// happened to resume from tonight" nor "how often to write a partial" is a
-/// property of the model.
+/// What a run does on top of its `TrainingConfig`. A separate struct, not more
+/// fields on `TrainingConfig` (which is serialised into every `config_file`):
+/// neither what a run resumed from nor its partial cadence is a model property.
 #[derive(Debug, Clone, Default)]
 struct RunOptions {
     /// `--resume <ckpt>`: pick the weights, the Adam moments, the step counter
@@ -2930,10 +2685,9 @@ async fn run_training(
             .transpose()
             .map_err(|err| format!("failed to resolve checkpoint path: {err}"))?,
     };
-    // Read here, written there. Everything below that *saves* — the final
-    // checkpoint, the `--checkpoint-every` partials, `[s]` in the monitor — goes
-    // to `write_path`, and the metrics journal follows it, so a run's diagnostics
-    // sit beside the weights that run produced.
+    // Read from `load_path`, save to `write_path` — the final checkpoint, the
+    // `--checkpoint-every` partials, `[s]` — and the metrics journal follows
+    // `write_path`, so diagnostics sit beside the weights the run produced.
     let write_path = options
         .write_to
         .clone()
@@ -2943,17 +2697,14 @@ async fn run_training(
         .clone()
         .or_else(|| checkpoint_path.clone());
 
-    // `--resume` reads from a file of its own and writes to `--out`, so a
-    // resumed run never overwrites the checkpoint it came from unless it is
-    // asked to. It takes precedence over the config's own load mode: it is an
-    // explicit command-line instruction and the config is a default.
+    // `--resume` reads its own file and writes to `--out`, so it never overwrites
+    // its source; an explicit flag, it takes precedence over the config's load mode.
     if let Some(resume) = options.resume_from.as_ref() {
         if !resume.exists() {
             return Err(format!("--resume: no such checkpoint: {}", resume.display()));
         }
-        // Raw, not Ema: training continues from the iterate the optimiser left
-        // — Adam's moments describe that iterate, and the average is not a
-        // point the optimiser ever visited.
+        // Raw, not Ema: training continues from the iterate the optimiser left —
+        // Adam's moments describe it, and the average is not a point it visited.
         let report = model
             .load_checkpoint_with(resume, batlab_core::CheckpointWeights::Raw)
             .map_err(|err| {
@@ -3024,8 +2775,7 @@ async fn run_training(
         .map_err(|err| format!("failed to configure diffusion task: {err}"))?;
     let diffusion = trainer.task().schedule().clone();
     {
-        // Re-emits the weighting the training loop actually built, and the share
-        // of draws it sends to each probe bucket — the number the report reads.
+        // Re-emits the weighting the loop built and its share of draws per probe bucket.
         let mass = trainer.task().timestep_bucket_mass(4);
         let mass = if mass.is_empty() {
             "uniform (0.25 each)".to_string()
@@ -3043,9 +2793,8 @@ async fn run_training(
 
     let dataset = load_dataset(&train_cfg.dataset_path, output_size)?;
     let sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
-    // CPU copies of a handful of clean targets kept for the diagnostic probe
-    // (the GPU dataset is opaque to CPU-side readback). Widened one by one:
-    // an 8-bit dataset is not decoded on the host for anything else.
+    // CPU copies of a few clean targets for the diagnostic probe (the GPU dataset
+    // is opaque to CPU readback), widened one by one.
     let probe_config = ProbeConfig::default();
     let probe_samples: Vec<Vec<f32>> = (0..probe_config.sample_count.min(dataset.len()))
         .map(|index| dataset.sample(index))
@@ -3053,15 +2802,9 @@ async fn run_training(
     let mut gpu_dataset = GpuDataset::from_payload(gpu.as_ref(), dataset.payload, sample_len)
         .map_err(|err| format!("failed to upload dataset to GPU: {err}"))?;
 
-    // The two numbers that decide what a step costs before it has computed
-    // anything, printed together because one explains the other: the limits the
-    // device was GRANTED, and whether the dataset fits inside them.
-    //
-    // A run whose dataset is resident pays its upload once and then nothing;
-    // one whose dataset is streamed pays a chunk on most steps. That difference
-    // is worth more than any optimiser flag on a large corpus, and it used to
-    // be invisible — the engine always asked for the WebGPU baseline, so the
-    // answer was always "streamed" and nobody had a reason to ask.
+    // The device limits GRANTED, and whether the dataset fits inside them: a
+    // resident dataset pays its upload once, a streamed one pays a chunk on most
+    // steps — worth more than any optimiser flag on a large corpus.
     {
         use batlab_core::format_bytes;
         let limits = gpu.device().limits();
@@ -3083,9 +2826,8 @@ async fn run_training(
         );
     }
 
-    // Metrics land next to the checkpoint (`<stem>_metrics.jsonl`), or in a
-    // temp file when no checkpoint path is configured. Truncated per run so the
-    // file always describes the current run only.
+    // Metrics next to the checkpoint (`<stem>_metrics.jsonl`), else a temp file.
+    // Truncated per run so it describes the current run only.
     let mut metrics = {
         let metrics_path = write_path
             .as_ref()
@@ -3355,16 +3097,10 @@ async fn run_training(
     Ok(())
 }
 
-/// Where `--checkpoint-every` writes: `<out stem>.partial.ckpt`, beside the
-/// run's own checkpoint.
-///
-/// **Rotation, not history.** One file, overwritten every time, because the
-/// need this serves is "a run of ten hours that dies at hour nine is not lost",
-/// not "keep every intermediate". Seventeen 40 MB files for one night of
-/// training would be a different feature, and a worse default.
-///
-/// It is a plain `.ckpt` and it is *meant* to show up in the weight selector
-/// and in `--resume`: the point is to be able to pick a dying run back up.
+/// Where `--checkpoint-every` writes: `<out stem>.partial.ckpt`, beside the run's
+/// checkpoint. Rotation, NOT history — one file, overwritten each time, so a
+/// ten-hour run dying at hour nine is not lost (not dozens of 40 MB intermediates).
+/// A plain `.ckpt`, meant to show in the weight selector and `--resume`.
 fn partial_checkpoint_path(checkpoint: &Path) -> PathBuf {
     let stem = checkpoint
         .file_stem()
@@ -3373,18 +3109,10 @@ fn partial_checkpoint_path(checkpoint: &Path) -> PathBuf {
     checkpoint.with_file_name(format!("{stem}.partial.ckpt"))
 }
 
-/// Write the partial checkpoint, **atomically**: a temporary file beside the
-/// target, then a rename.
-///
-/// A checkpoint is tens of megabytes; a kill in the middle of `fs::write`
-/// leaves a truncated file that still ends in `.ckpt`, and the run that
-/// resumes from it fails on a length mismatch — at best. `rename` on the same
-/// filesystem is atomic, so the partial is always either the previous whole
-/// checkpoint or the new whole one.
-///
-/// Never fatal: a run does not die because a disk filled up at step 5 000. It
-/// says so on every failure, which is the loudest thing it can do without
-/// throwing the run away.
+/// Write the partial checkpoint atomically: temp file beside the target, then a
+/// rename. A kill mid-`fs::write` would leave a truncated `.ckpt` that `--resume`
+/// chokes on; an atomic rename leaves either the previous whole checkpoint or the
+/// new one. Never fatal — a full disk at step 5000 is reported, not thrown.
 fn write_partial_checkpoint(
     model: &Model<Training>,
     checkpoint: Option<&Path>,
@@ -3426,21 +3154,17 @@ fn write_partial_checkpoint(
         bytes.len() as f64 / 1.0e6,
         started.elapsed().as_millis()
     );
-    // `latest.ckpt` follows the rotation too: a run killed at hour nine should
-    // leave the *partial* as the model's newest weights, which is the whole
-    // reason partials exist. It also keeps the link from pinning the previous
-    // rotation's bytes on disk — a rename replaces the name, not the inode, so
-    // a stale link would keep a full extra checkpoint alive.
+    // `latest.ckpt` follows the rotation, so a killed run leaves the partial as
+    // the newest weights (and re-linking frees the previous rotation's inode
+    // instead of pinning a full extra checkpoint on disk).
     if maintain_latest {
         point_latest_at_reporting(&target);
     }
 }
 
-/// Point `latest.ckpt` at what was just written, and say so if it fails.
-///
-/// Never fatal: the weights are already on disk under their dated name, which
-/// is the file that must not be lost. A missing link is a listing that opens on
-/// the wrong row, not a lost run.
+/// Point `latest.ckpt` at what was just written; report but never fail. The
+/// weights are already saved under their dated name — a missing link only opens
+/// the listing on the wrong row.
 fn point_latest_at_reporting(written: &Path) {
     if let Err(err) = storage::point_latest_at(written) {
         eprintln!(
@@ -3518,9 +3242,7 @@ fn apply_training_control_command(
             }
             match model.save_checkpoint(path) {
                 Ok(()) => {
-                    // The manual save is a save like any other: `latest.ckpt`
-                    // has to follow it, or the newest weights on disk stop
-                    // being the ones the name promises.
+                    // A save like any other: `latest.ckpt` must follow it.
                     if maintain_latest {
                         point_latest_at_reporting(path);
                     }
@@ -3546,16 +3268,14 @@ fn apply_training_control_command(
             *current_batch_size = batch_size.max(1);
             *total_steps = new_total_steps.max(1);
             model.set_learning_rate(*current_lr);
-            // Rebuilds the graph when the batch actually changes: the batch
-            // axis is baked into every activation buffer. Weights, Adam moments
-            // and the step counter survive the rebuild (see `resize_batch`).
+            // Rebuilds the graph on a batch change (the batch axis is baked into
+            // every activation buffer); weights, moments and step counter survive.
             if let Err(err) = model.resize_batch(*current_batch_size) {
                 eprintln!("[training] could not resize the batch: {err}");
             }
         }
-        // Perpetual-only controls. The monitor gates them on the run mode, so
-        // reaching one here means a stale command from a previous run's
-        // keystroke — ignoring it is the whole handling.
+        // Perpetual-only controls; the monitor gates them by run mode, so one
+        // reaching here is a stale keystroke — ignoring it is the handling.
         tui::TrainingControlCommand::NudgeRenoiseDepth(_)
         | tui::TrainingControlCommand::NudgeTempo(_)
         | tui::TrainingControlCommand::Reseed
@@ -3620,9 +3340,8 @@ async fn run_inference(
         total: total_steps.max(1),
     });
 
-    // The reverse chain keeps its latent on the CPU, so — unlike training, which
-    // hands the visualiser the model's own output buffer — inference needs a GPU
-    // frame to publish into. It shows x_t next to the model's x0 estimate.
+    // The reverse chain keeps its latent on the CPU, so inference needs a GPU
+    // frame to publish into (training hands over the model's own output buffer).
     let mut live = LiveFrame::new(
         model.gpu_context(),
         output_size.0,
@@ -3635,8 +3354,7 @@ async fn run_inference(
         live.frame_width(),
         live.frame_height(),
         live.channels(),
-        // The window title is the only legend a user sees while watching the
-        // frame, so it names the halves rather than merely separating them.
+        // The title is the only legend the user sees, so it names the halves.
         format!(
             "Denoising  —  gauche: x_t (bruité)  |  droite: x̂₀ (estimation)  —  {}×{}×{}",
             output_size.0, output_size.1, output_size.2
@@ -3662,8 +3380,8 @@ async fn run_inference(
         },
     );
 
-    // The latent is gone once sampling returns; leaving the window bound to a
-    // frozen frame would misrepresent it as still live.
+    // The latent is gone once sampling returns; unbind so the window does not
+    // show a frozen frame as if still live.
     tui::clear_visualiser_source();
     let pixels = tensor_to_rgb_pixels(&output, output_size)?;
 
@@ -3685,16 +3403,10 @@ async fn run_inference(
     Ok(())
 }
 
-/// An inference that never returns.
-///
-/// The reverse chain is walked exactly as [`sample_diffusion`] walks it — same
-/// [`reverse_step`], same seed derivation — but instead of stopping at `t = 0`
-/// and handing back an image, the run re-noises what it just made and descends
-/// again. [`PerpetualDrift`] owns the itinerary (which `t`, when to turn round);
-/// this function owns the tensors, the pacing and the controls.
-///
-/// It is the *only* consumer of the run-control channel besides training, and
-/// it never sends `Done`: the run ends when the TUI drops the channel.
+/// An inference that never returns: the same reverse chain as [`sample_diffusion`]
+/// but instead of stopping at `t=0` it re-noises and descends again.
+/// [`PerpetualDrift`] owns the itinerary; this function owns the tensors, pacing
+/// and controls. Never sends `Done` — the run ends when the TUI drops the channel.
 async fn run_perpetual(
     config: ModelConfig,
     cfg: PerpetualConfig,
@@ -3743,28 +3455,23 @@ async fn run_perpetual(
     } else {
         cfg.seed.unwrap_or(0)
     };
-    // The picture the drift sets out from. A dataset that cannot be found is
-    // not fatal: the run falls back on the pure-noise opening perpetual runs
-    // always had, and says which one it is doing on the status line.
-    // No flag on this path — the TUI has no command line — so the model's own
-    // `seed_dataset` is what decides, and the convention behind it.
+    // No flag on this path (the TUI has no command line), so the model's own
+    // `seed_dataset` and the convention decide; an unfindable dataset falls back
+    // to the pure-noise opening, said on the status line.
     let seed_images = SeedImages::resolve(None, &config, output_size)?;
     let mut drift = match seed_images.as_ref() {
         Some(_) => PerpetualDrift::from_image(schedule.len(), cfg.regime, cfg.renoise_depth, seed),
         None => PerpetualDrift::new(schedule.len(), cfg.regime, cfg.renoise_depth, seed),
     };
-    // The latent, and the climb departure it has to remember, both live in the
-    // walk — engine side, so the frame-by-frame behaviour is unit-testable
-    // against an oracle instead of only observable through a window.
+    // The latent and its climb departure live in the walk (engine side), so the
+    // frame-by-frame behaviour is unit-testable against an oracle.
     let opening = match seed_images.as_ref() {
         Some(images) => images.provide_x0(seed),
         None => schedule.sample_noise(output_len, drift.initial_noise_seed()),
     };
-    // The estimate to show before the first frame reports one. Seeded from an
-    // image, that IS the image — which is the honest answer and also what the
-    // viewer expects to see for the frame before the drift moves. Seeded from
-    // noise, a flat mid-grey: never the pure-noise latent, which `add_noise`
-    // would take for a clean image (see the perpetual module's header).
+    // The estimate shown before the first frame reports one. From an image, that
+    // IS the image; from noise, a flat mid-grey — NOT the pure-noise latent,
+    // which `add_noise` would take for a clean image (see perpetual.rs header).
     let mut last_x0 = match seed_images.as_ref() {
         Some(_) => opening.clone(),
         None => vec![0.0f32; output_len],
@@ -3781,10 +3488,8 @@ async fn run_perpetual(
         });
     }
 
-    // A drift is something to look at, so the default is the estimate ALONE,
-    // square, at the image's own aspect ratio — "on n'a même pas besoin de la
-    // fenêtre de gauche". `[x]` brings the latent back when the question is
-    // what the noise is doing.
+    // Default is the estimate ALONE, square — `[x]` brings the latent back when
+    // the question is what the noise is doing.
     let mut view = batlab_core::LiveView::X0Only;
     let mut live = LiveFrame::with_view(
         model.gpu_context(),
@@ -3848,12 +3553,9 @@ async fn run_perpetual(
      -> bool {
         tx.send(tui::TrainingEvent::PerpetualState(tui::PerpetualStatus {
             regime: drift.regime().label().to_string(),
-            // An image coming apart on screen is the nominal behaviour half the
-            // time; unlabelled, it reads as a fault. It names the phase of the
-            // action just taken, not the one the drift intends next: `step`
-            // reconciles the phase on its way in and can overrule that intent,
-            // which used to show as one stray `descente` at the top of every
-            // upward approach in flux.
+            // Names the phase of the action JUST TAKEN, not the drift's next
+            // intent: `step` can overrule that intent, which used to show as a
+            // stray `descente` at the top of every upward approach in flux.
             phase: phase.label().to_string(),
             depth: drift.depth(),
             depth_label: drift.regime().depth_label().to_string(),
@@ -3901,12 +3603,9 @@ async fn run_perpetual(
                             let next_seed = random_seed();
                             drift.reseed(next_seed);
                             // `restart_from` drops the climb departure with the
-                            // latent: a climb reading a snapshot from before the
-                            // re-seed would carry the old image up the schedule.
-                            // Whatever the run opened on, `[r]` opens on again
-                            // — the drift keeps its origin across a re-seed, so
-                            // handing it the other kind of latent would put a
-                            // photograph at the top of the schedule.
+                            // latent. `[r]` reopens on the same origin kind the run
+                            // opened on — handing the other kind would put a
+                            // photograph (or noise) at the wrong end of the schedule.
                             let opening = match seed_images.as_ref() {
                                 Some(images) => images.provide_x0(next_seed),
                                 None => schedule
@@ -3953,10 +3652,8 @@ async fn run_perpetual(
                             }
                         }
                         tui::TrainingControlCommand::ToggleView => {
-                            // The buffer is sized for the layout, so a new view
-                            // means a new frame and a re-registration: the
-                            // window has to be told the new width anyway, and
-                            // it comes back at the new aspect ratio.
+                            // A new view is a new frame size, so re-register at the
+                            // new aspect ratio.
                             view = view.toggle();
                             live = LiveFrame::with_view(
                                 model.gpu_context(),
@@ -3965,14 +3662,13 @@ async fn run_perpetual(
                                 output_size.2,
                                 view,
                             );
-                            // Painted at once from what is already in hand, so
-                            // the new window opens on the picture rather than
-                            // on a frame of mid-grey.
+                            // Painted at once from what is in hand, so the window
+                            // opens on the picture, not on mid-grey.
                             live.publish(walk.latent(), &last_x0);
                             show(&live, model.gpu_context(), view);
                         }
-                        // Training-only commands; a perpetual run has no
-                        // optimiser to retune and no weights of its own to save.
+                        // Training-only commands; a perpetual run has no optimiser
+                        // to retune and no weights of its own to save.
                         tui::TrainingControlCommand::SaveCheckpoint
                         | tui::TrainingControlCommand::UpdateParams { .. } => {}
                     }
@@ -3996,11 +3692,9 @@ async fn run_perpetual(
 
         let action = drift.step();
         phase = action.phase();
-        // A climb increment is closed-form arithmetic and used to be free; it
-        // now costs the one model call that keeps x̂₀ alive while the image
-        // dissolves (`DriftWalk`, and `IMG2IMG_DRIFT.md`). The tempo ratio
-        // below therefore paces two comparable frames, not a cheap one and an
-        // expensive one.
+        // A climb increment now costs the one model call that keeps x̂₀ alive
+        // while the image dissolves (`DriftWalk`, `IMG2IMG_DRIFT.md`), so the
+        // tempo ratio below paces two comparable frames.
         let climbing = matches!(action, DriftAction::Climb { .. });
         let opens_cycle = matches!(action, DriftAction::Climb { opens_cycle: true, .. });
         let frame = walk.advance(
@@ -4017,13 +3711,11 @@ async fn run_perpetual(
         last_x0 = frame.x0_hat;
         steps += frame.model_calls;
         pace.tick();
-        // The turn of the cycle is worth a redraw of the panel; the rest of the
-        // climb rides the usual 100 ms refresh.
+        // The turn of the cycle redraws the panel; the rest rides the 100 ms refresh.
         dirty |= opens_cycle;
 
         let now = std::time::Instant::now();
-        // A climb increment costs no model call, so its pace is free to differ
-        // from the descent's; `CLIMB_TEMPO_RATIO` keeps them equal by default.
+        // Climbing paces at `tempo * CLIMB_TEMPO_RATIO` (1.0 keeps it equal to descent).
         let step_tempo = if climbing {
             tempo * batlab_core::CLIMB_TEMPO_RATIO
         } else {
@@ -4086,13 +3778,9 @@ impl PaceMeter {
     }
 }
 
-/// Renders "which path, which step, which t" from the sampler's flat work
-/// counter.
-///
-/// The sampler reports a single `current`/`total` across all paths, but the two
-/// numbers a user actually watches are the path and the timestep — and t counts
-/// *down* while the step counter counts up, so showing the raw counter as "t"
-/// would state the schedule backwards.
+/// Renders "which path, which step, which t" from the sampler's flat
+/// `current`/`total` counter. t counts DOWN while the counter counts up, so the
+/// raw counter shown as "t" would state the schedule backwards.
 fn denoising_progress_label(
     current: usize,
     schedule: &LinearNoiseSchedule,
@@ -4150,13 +3838,10 @@ fn resolve_sampling_checkpoint_path(
     Ok(checkpoint)
 }
 
-/// A loaded dataset, still in the encoding it will cross to the GPU in.
-///
-/// The point of the type is that it does NOT normalise: a BATRAW3 file arrives
-/// as bytes and leaves as bytes, and only the two callers that genuinely need
-/// host-side pixels (the metrics probe, the perpetual seed image) pay to widen
-/// one sample. Flattening on load would have thrown away three quarters of the
-/// format's benefit before it reached the buffer that matters.
+/// A loaded dataset, still in the encoding it crosses to the GPU in. It does NOT
+/// normalise: a BATRAW3 file stays bytes, and only the callers that need
+/// host-side pixels (metrics probe, perpetual seed image) widen a sample —
+/// flattening on load would throw away most of the format's benefit.
 struct Dataset {
     payload: DatasetPayload,
     sample_len: usize,
@@ -4240,21 +3925,11 @@ fn load_dataset(dataset_path: &str, output_size: (u32, u32, u32)) -> Result<Data
 ///                    encoding the magic names
 /// ```
 ///
-/// Three magics, one header, three payloads:
-///
-/// - `BATRAW3` — **u8**, `[0, 255]`, widened to `[-1, 1]` on the GPU. The
-///   default the converters write, because every image this project has trained
-///   on was 8-bit at the source and storing it as f32 quadrupled the file, the
-///   host RAM and the chunk uploads for nothing. The widening is exact, so a
-///   BATRAW3 file and the BATRAW2 file converted from the same images decode to
-///   the same bits.
-/// - `BATRAW2` — f32 already in `[-1, 1]`, the convention the diffusion pipeline
-///   expects.
-/// - `BATRAW1` — f32 in `[0, 1]`, rescaled on the fly.
-///
-/// A BATRAW3 file whose geometry already matches the model stays 8-bit all the
-/// way to the GPU. Anything else — a mismatched geometry needing a resample —
-/// falls back to the f32 path, because the resample happens on the host anyway.
+/// Three magics: `BATRAW3` (u8, widened to `[-1,1]` on the GPU, the converters'
+/// default), `BATRAW2` (f32 in `[-1,1]`), `BATRAW1` (f32 in `[0,1]`, rescaled).
+/// A BATRAW3 file whose geometry matches the model stays 8-bit to the GPU;
+/// anything needing a resample falls back to the f32 path (the resample is on the
+/// host anyway). Rationale: CLAUDE.md.
 fn try_load_raw_dataset(
     dataset_path: &Path,
     output_size: (u32, u32, u32),
@@ -4301,9 +3976,8 @@ fn try_load_raw_dataset(
     }
 
     let model_sample_len = (output_size.0 * output_size.1 * output_size.2) as usize;
-    // Both accumulate; at most one ends up non-empty. A directory holding an
-    // 8-bit file next to an f32 one is a mixture the GPU cannot stream as one
-    // payload, so it is refused rather than silently widened.
+    // Both accumulate; at most one ends non-empty. A directory mixing an 8-bit
+    // and an f32 file cannot stream as one payload, so it is refused.
     let mut floats: Vec<ImageSample> = Vec::new();
     let mut eight_bit: Vec<u8> = Vec::new();
 
@@ -4333,8 +4007,7 @@ fn try_load_raw_dataset(
         };
 
         let mut offset = RAW_DATASET_MAGIC_SIGNED.len();
-        // count is a u32 value from a validated header produced by our own tooling, so it
-        // safely fits in usize on all supported 32- and 64-bit targets.
+        // count is a u32 from a validated header; fits usize on all supported targets.
         let count = read_u32_le_bytes(&bytes, &mut offset)? as usize;
         let width = read_u32_le_bytes(&bytes, &mut offset)?;
         let height = read_u32_le_bytes(&bytes, &mut offset)?;
@@ -4351,11 +4024,9 @@ fn try_load_raw_dataset(
         }
 
         let geometry_matches = (width, height, channels) == output_size;
-        // The geometry mismatch below is silently repaired by a u8 round-trip
-        // (`raw_floats_to_dynamic_image` + `image_to_tensor`). That is convenient for
-        // rescaling, but it also means feeding a 1-channel dataset to a 3-channel model
-        // "works": every sample is grey replicated over R, G and B, and a whole overnight
-        // run trains on colourless data without a single error. Say it out loud.
+        // A geometry mismatch is repaired by a u8 round-trip, so a 1-channel
+        // dataset fed to a 3-channel model "works" (grey replicated over RGB) —
+        // an overnight run on colourless data with no error. Say it out loud.
         if !geometry_matches {
             eprintln!(
                 "[dataset] WARNING {}: file is {width}x{height}x{channels}, model expects \
@@ -4373,10 +4044,8 @@ fn try_load_raw_dataset(
             );
         }
 
-        // The fast lane, and the only one that keeps the format's benefit: an
-        // 8-bit file the model can eat as it lies. `bytes` is moved wholesale
-        // rather than copied sample by sample — on ImageNet that is 3.9 GB not
-        // walked.
+        // The fast lane that keeps the format's benefit: `bytes` moved wholesale,
+        // not copied sample by sample — 3.9 GB not walked on ImageNet.
         if value_bytes == 1 && geometry_matches {
             if !floats.is_empty() {
                 return Err(format!(
@@ -4675,10 +4344,8 @@ fn image_to_tensor(image: &DynamicImage, dims: (u32, u32, u32)) -> Vec<f32> {
     tensor
 }
 
-/// Thin wrapper over the library's single diffusion sampler. Kept so the call
-/// sites can pass `(u32, u32, u32)` dims; the actual denoising math (and the
-/// `[signal | timestep]` input composition) lives in `batlab_core::metrics` so
-/// training instrumentation and inference cannot drift apart.
+/// Thin wrapper letting call sites pass `(u32,u32,u32)` dims; the denoising math
+/// lives in `batlab_core::metrics`, so instrumentation and inference cannot drift.
 #[allow(clippy::too_many_arguments)]
 fn sample_diffusion_image_with_controls<State, F>(
     model: &mut Model<State>,
@@ -4754,11 +4421,9 @@ fn save_tensor_as_image(
     )
 }
 
-/// Encodes a `[-1, 1]` tensor to a PNG at `path`, creating its directory.
-///
-/// Same encoder as the training previews and the headless sampler — a saved
-/// frame of a perpetual run and a saved sample of a finite one are the same
-/// bytes for the same tensor.
+/// Encodes a `[-1, 1]` tensor to a PNG at `path`, creating its directory. Same
+/// encoder as the training previews and headless sampler, so the same tensor is
+/// the same bytes everywhere.
 fn write_tensor_png(tensor: &[f32], dims: (u32, u32, u32), path: &Path) -> Result<PathBuf, String> {
     let (width, height, channels) = dims;
     let expected_len = (width * height * channels) as usize;
@@ -4795,15 +4460,10 @@ fn write_tensor_png(tensor: &[f32], dims: (u32, u32, u32), path: &Path) -> Resul
     Ok(path)
 }
 
-/// Encode an 8-bit sample into the model's `[-1, 1]` convention.
-///
-/// Diffusion's forward process `x_t = sqrt(a_bar)*x_0 + sqrt(1-a_bar)*eps`
-/// assumes a zero-centered `x_0`; a `[0, 1]` encoding leaves a mean bias of
-/// `0.5*sqrt(a_bar)` at every timestep while the sampler starts from N(0, 1).
-///
-/// Delegates rather than restates: the same widening is applied by the dataset
-/// decode shader, and a second copy of the expression here would be a second
-/// thing to keep in step.
+/// Encode an 8-bit sample into the model's `[-1, 1]` convention. The forward
+/// process assumes a zero-centred `x_0` (a `[0,1]` encoding leaves a mean bias
+/// while the sampler starts from N(0,1)). Delegates to the shared `decode_u8`
+/// rather than restate the expression.
 fn from_u8(value: u8) -> f32 {
     batlab_core::decode_u8(value)
 }
@@ -4836,14 +4496,9 @@ fn tensor_to_rgb_pixels(tensor: &[f32], dims: (u32, u32, u32)) -> Result<Vec<u8>
     Ok(pixels)
 }
 
-/// Append the layer a `config_file` entry describes.
-///
-/// One line, because the translation itself now lives in the engine
-/// ([`Model::add_draft`]). It used to live here, spelled out layer by layer —
-/// and the resource inventory, which has to build the same stack from the same
-/// file without a GPU, could not reach it. Two copies of "what this config
-/// means" is exactly the kind of duplication that ends with a page confidently
-/// reporting a graph the trainer does not build.
+/// Append the layer a `config_file` entry describes. One line: the translation
+/// lives in the engine ([`Model::add_draft`]), so the GPU-less resource inventory
+/// builds the same stack — a second copy would let the page and the trainer diverge.
 fn append_layer<State>(
     model: &mut Model<State>,
     draft: &LayerDraft,
@@ -5036,17 +4691,11 @@ mod tests {
         tags
     }
 
-    /// The frontier a reader of the dump sees between the approach and the churn
-    /// must be the frontier the drift actually walks — the first frame *produced
-    /// by* the churn is a churn frame.
-    ///
-    /// This is the check that was missing when the regime shipped: the drift's
-    /// own tests all read the phase off the action and were green, while the
-    /// dump — the only thing any analysis of flux ever looks at — recorded
-    /// `drift.phase()` sampled *before* the step and so ran one frame late. A
-    /// black-box run caught it from the outside by amplitude (the frame tagged
-    /// `descent` moved like a churn frame, some 40 % above a reverse step at the
-    /// same level); this pins it by name, on the bytes themselves.
+    /// The first frame PRODUCED BY the churn must be tagged a churn frame. This
+    /// check was missing when the regime shipped: the dump recorded `drift.phase()`
+    /// sampled BEFORE the step and so ran one frame late, while the drift's own
+    /// tests read the phase off the action and stayed green. Pins it by name, on
+    /// the bytes.
     #[test]
     fn the_dump_files_the_first_churn_frame_as_flux() {
         let out = tmp_path("flux_phase_frontier.batflux");
@@ -5097,19 +4746,11 @@ mod tests {
         );
     }
 
-    /// The number the model list puts in front of a user, checked against the
-    /// **real** buffers a built model allocates.
-    ///
-    /// `summarize_architecture` counts parameters from the config alone — no
-    /// GPU, no checkpoint — which is what makes it affordable on every
-    /// keystroke and also what makes it easy to get quietly wrong: forget a
-    /// bias vector and every model in the list is understated by a few hundred,
-    /// with nothing on screen to say so. A checkpoint holds exactly the
-    /// trainable scalars and nothing else, so counting them is an independent
-    /// oracle rather than the same arithmetic written twice.
-    ///
-    /// Run on both built-in templates, which between them exercise
-    /// convolution, GroupNorm, upsample+conv, activation and concat.
+    /// The parameter count the model list shows, checked against the real scalars
+    /// a checkpoint holds. `summarize_architecture` counts from the config alone
+    /// (no GPU) — affordable per keystroke but easy to get quietly wrong (a
+    /// forgotten bias understates every row). The checkpoint is an independent
+    /// oracle. Run on both templates (conv, GroupNorm, upsample+conv, activation, concat).
     #[test]
     fn the_parameter_count_matches_the_scalars_a_checkpoint_holds() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -5140,10 +4781,8 @@ mod tests {
                 .await
                 .expect("template must build");
                 // `BBCKPT2` + entry count, then per entry: layer index, weight
-                // count, weights, bias count, biases; then the optimiser
-                // trailer, which SGD writes as a bare 4-byte `none` tag. The
-                // scalars are read from the declared lengths rather than from
-                // the file size, so the trailer cannot be mistaken for weights.
+                // count, weights, bias count, biases; then the SGD trailer (a bare
+                // 4-byte `none`). Scalars read from declared lengths, not file size.
                 let bytes = model.checkpoint_bytes().expect("checkpoint");
                 let u32_at = |at: usize| {
                     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
@@ -5425,17 +5064,10 @@ mod tests {
         let _ = std::fs::remove_file(&by_config);
     }
 
-    /// A seed dataset whose **channels** disagree with the model is refused,
-    /// naming both counts — not resized.
-    ///
-    /// Width and height are resampled on the host, which is a visible thing to
-    /// do to a picture. Channels are not: a greyscale file handed to a colour
-    /// model is replicated across R, G and B and the run *succeeds*, drifting
-    /// away from a grey picture pretending to be colour. That silence has cost
-    /// this repository time before, on the training path.
-    ///
-    /// Checked on both named sources, because both are a human's decision and
-    /// both used to be swallowed.
+    /// A seed dataset whose CHANNELS disagree with the model is refused (naming
+    /// both counts), not resized. Width and height are resampled on the host, but
+    /// a channel mismatch is silent — a greyscale file replicated over RGB drifts
+    /// from grey pretending to be colour. Checked on both named sources.
     #[test]
     fn a_seed_dataset_of_the_wrong_channels_is_refused_not_resized() {
         let grey = tmp_path("seed_wrong_channels.batraw");
@@ -5502,15 +5134,11 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
-    /// The draw has to be a draw. `seed % len` on seeds that come from a clock
-    /// or from a form walks the dataset in order — consecutive `[r]` presses
-    /// would hand out consecutive images, and a run would be correlated with
-    /// whatever order the file happens to be in. The index is therefore
-    /// avalanched first (same discipline as `gaussian_at`,
-    /// `ANISOTROPY_HUNT.md`).
-    ///
-    /// Checked two ways: consecutive seeds must not give consecutive indices,
-    /// and 64 draws over 8 images must reach every one of them.
+    /// The draw has to be a draw: `seed % len` walks the dataset in order, so
+    /// consecutive `[r]` presses would hand out consecutive images. The index is
+    /// avalanched first (same discipline as `gaussian_at`, `ANISOTROPY_HUNT.md`).
+    /// Checked two ways: consecutive seeds ≠ consecutive indices, and 64 draws
+    /// over 8 images reach all of them.
     #[test]
     fn consecutive_seeds_do_not_draw_consecutive_images() {
         let out = tmp_path("seed_images_spread.batraw");
@@ -5558,22 +5186,12 @@ mod tests {
         );
     }
 
-    /// **One resolution, and every drift start goes through it.**
-    ///
-    /// This is the mechanical half of the fix, and the half that keeps it
-    /// fixed. The defect was never that the ranking was wrong — it was that
-    /// `--headless-perpetual` resolved its opening picture *its own way* and so
-    /// never learned about `seed_dataset`, while the TUI path did. Two ways to
-    /// answer one question is how they drifted apart, and a reviewer reading
-    /// either one in isolation sees nothing wrong.
-    ///
-    /// So: any function that opens a drift — one that mentions
-    /// `PerpetualDrift::from_image`, the constructor that means "set out from a
-    /// picture" — must also call [`SeedImages::resolve`]. A third perpetual
-    /// entry point that resolved its own seed would fail here, by name.
-    ///
-    /// Same discipline as `load_sampling_checkpoint` for weights, and as
-    /// `nothing_in_the_engine_opens_an_untimed_pass` for compute passes.
+    /// One resolution, and every drift start goes through it — the half that keeps
+    /// the fix fixed. The defect was that `--headless-perpetual` resolved its
+    /// opening its own way and never learned `seed_dataset`, while the TUI did. So
+    /// any function mentioning `PerpetualDrift::from_image` must also call
+    /// [`SeedImages::resolve`]; a third entry point resolving its own seed fails
+    /// here, by name. Same discipline as `nothing_in_the_engine_opens_an_untimed_pass`.
     #[test]
     fn every_path_that_starts_a_drift_resolves_its_seed_the_same_way() {
         let source = std::fs::read_to_string(
@@ -5674,13 +5292,10 @@ mod tests {
         }
     }
 
-    /// Colour path — a dataset sample must reach the PNG with its channels intact.
-    ///
-    /// The whole pipeline is HWC/z-fastest (`convolution.wgsl`: `iy*W*C + ix*C + iz`),
-    /// which a 1-channel model can never exercise: with C=1 an interleaved and a planar
-    /// layout are the same bytes. This pins the convention on C=3 from the `.batraw`
-    /// header all the way to the encoded pixels, so a planar/interleaved slip shows up
-    /// as a failing test rather than as plausible-looking garbage in a sample.
+    /// Colour path — a sample must reach the PNG with channels intact. The pipeline
+    /// is HWC/z-fastest (`convolution.wgsl`), which C=1 can never exercise (planar
+    /// and interleaved are the same bytes). Pins the convention on C=3 end to end,
+    /// so a planar/interleaved slip fails here instead of shipping garbage.
     #[test]
     fn rgb_dataset_sample_survives_to_png_with_channels_unswapped() {
         let raw = tmp_path("rgb_png_path.batraw");
@@ -5735,19 +5350,10 @@ mod tests {
         }
     }
 
-    /// BATRAW3 is a **lossless** re-encoding, and this is the proof the claim
-    /// rests on.
-    ///
-    /// The two files hold the same images: one as the f32 values the old
-    /// converter wrote, one as the bytes those values came from. Decoded, they
-    /// must be equal **bit for bit** — not close. Anything less and "a quarter
-    /// of the size, at no cost" would be a quarter of the size at a cost nobody
-    /// could see: a systematic shift of the whole corpus, invisible in a loss
-    /// curve and impossible to attribute later.
-    ///
-    /// (The GPU side of the same equality is
-    /// `the_gpu_decode_agrees_with_the_cpu_one` in `training/dataset.rs` — the
-    /// widening happens there for training, and here for the probe.)
+    /// BATRAW3 is a LOSSLESS re-encoding — the proof the claim rests on. Same
+    /// images as f32 and as the bytes they came from must decode BIT FOR BIT
+    /// equal, else "a quarter the size at no cost" hides a systematic corpus shift
+    /// invisible in a loss curve. (GPU side: `the_gpu_decode_agrees_with_the_cpu_one`.)
     #[test]
     fn an_8_bit_file_decodes_to_the_same_bits_as_the_f32_one_it_replaces() {
         // Sixteen bytes spanning the range, including both ends and mid-grey.
@@ -5890,12 +5496,9 @@ mod tests {
             .collect()
     }
 
-    /// The three spellings of the level dial are one flag.
-    ///
-    /// Written against the blind test that caught the defect: the public
-    /// contract offered `--t-star` and `--t-r`, only `--depth` was parsed, and
-    /// nothing anywhere said so — the dumps came out byte-identical to a run
-    /// with no flag at all.
+    /// The three spellings of the level dial are one flag. The defect: the
+    /// contract offered `--t-star`/`--t-r` while only `--depth` was parsed, and the
+    /// dumps came out byte-identical to a run with no flag at all.
     #[test]
     fn every_spelling_of_the_level_dial_is_parsed() {
         for line in [
@@ -5920,12 +5523,9 @@ mod tests {
         );
     }
 
-    /// A flag nobody parses has to be an error, not a shrug.
-    ///
-    /// This is what made the dial defect invisible: passing `--t-star`, passing
-    /// `--t-r`, and passing a flag invented on the spot were three ways of
-    /// getting the same run, so no experiment could tell "ignored" from
-    /// "unimplemented".
+    /// A flag nobody parses has to be an error, not a shrug — else a real flag, a
+    /// stale one and an invented one all yield the same run, so no experiment can
+    /// tell "ignored" from "unimplemented".
     #[test]
     fn an_unknown_flag_is_refused_rather_than_ignored() {
         let valued = ["--headless-perpetual", "--regime", "--t-star"];
