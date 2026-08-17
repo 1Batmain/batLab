@@ -699,14 +699,17 @@ async fn build_engine(
         fnv1a_64(&weights),
         expected_params,
     );
-    // The raw iterate, not the EMA average. On this checkpoint the two are a real
-    // trade-off (SAMPLING_SWEEP.md §2): the EMA is a hair sharper on the laplacian
-    // but noticeably *less saturated*, and the page's images already read as a grey
-    // wash. The raw iterate matches the dataset's saturation (0.053 vs a target
-    // 0.052, against the EMA's 0.037) and is the closest config overall to the real
-    // elephants. `Raw` also falls back correctly on a checkpoint that carries no EMA.
+    // The EMA average — the author's choice, made on the numbers below.
+    //
+    // The two are a genuine trade-off on this checkpoint (SAMPLING_SWEEP.md §2)
+    // and no metric settles it: at magnitude 1.2 the EMA is closer on the
+    // laplacian (0.049 vs 0.045, target 0.054) while the raw iterate is closer
+    // on saturation (0.053 vs 0.037, target 0.052). The sweep's single distance
+    // ranks the raw iterate first, but collapsing sharpness and colour into one
+    // number hides exactly the choice being made — so it was put to the author,
+    // who took the average. Aesthetics is not a tie-break the bench gets to make.
     let loaded = model
-        .load_checkpoint_bytes_with(&weights, CheckpointWeights::Raw)
+        .load_checkpoint_bytes_with(&weights, CheckpointWeights::Ema)
         .map_err(|err| format!("could not load the weights: {err}"))?;
     log::info!(
         "[batlab] checkpoint loaded: carries_ema={}, using {} weights",
