@@ -8,6 +8,7 @@ pub mod layer;
 pub mod layer_types;
 pub mod model;
 pub mod optimizer;
+pub mod quant;
 pub mod training;
 pub mod types;
 pub mod weight_init;

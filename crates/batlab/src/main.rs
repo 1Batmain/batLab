@@ -71,7 +71,7 @@ are not reachable from the TUI and never write back a model's config_file.
   --eval <model> --ckpt <path> [--ckpt <path> ...] --dataset <path>
       [--samples N] [--buckets N] [--t-per-bucket N] [--seed N] [--raw-weights]
 
-  --export-weights <model> --ckpt <path> --out <path> [--raw-weights]
+  --export-weights <model> --ckpt <path> --out <path> [--raw-weights] [--quantize]
 
   --resources <model> [--batch N] [--dataset <path>] [--measure] [--steps N]
       [--inference] [--vram GiB] [--device <name>] [--no-gpu] [--width N]
@@ -216,6 +216,13 @@ Shipping a checkpoint (a lighter file to download):
                     only exists to produce a file, so it never guesses the name.
   --raw-weights     carry the last iterate instead of the average, the same
                     choice sampling's --raw-weights makes.
+  --quantize        code each weight to 8 bits (per-tensor affine: one
+                    (min, scale) pair and one byte per weight, dequantised on
+                    load through a 256-entry table). A quarter of the file again,
+                    at the cost of the quantisation error — measure it with
+                    --eval before shipping it, exactly as the dataset's own 8-bit
+                    move was measured. The file (magic BBCKPTQ) is read by
+                    inference and the web engine; it is NOT resumable.
 
 Where a run's weights land:
   Every run writes its OWN file, `run-<YYYY-MM-DD_HHMM>.ckpt`, and then points
@@ -735,6 +742,7 @@ async fn stripped_checkpoint(
     config: &ModelConfig,
     source: &[u8],
     weights: CheckpointWeights,
+    quantize: bool,
 ) -> Result<Vec<u8>, String> {
     let (_gpu, mut model) = build_execution_model(
         config,
@@ -757,7 +765,11 @@ async fn stripped_checkpoint(
         (false, _) => "raw weights (the file carries no EMA)".to_string(),
     };
     println!("[weights] source → {which}");
-    model.checkpoint_bytes().map_err(|err| err.to_string())
+    if quantize {
+        model.checkpoint_bytes_quantized().map_err(|err| err.to_string())
+    } else {
+        model.checkpoint_bytes().map_err(|err| err.to_string())
+    }
 }
 
 /// See the DEV/CI note in `main`. Not reachable from the TUI.
@@ -777,7 +789,7 @@ fn run_export_weights(args: &[String]) -> Result<(), String> {
     reject_unknown_flags(
         args,
         &["--export-weights", "--ckpt", "--out", "--gpu-limits"],
-        &["--raw-weights"],
+        &["--raw-weights", "--quantize"],
     )?;
 
     let model_name = flag("--export-weights")
@@ -791,6 +803,9 @@ fn run_export_weights(args: &[String]) -> Result<(), String> {
     // The average when the file has one, the raw iterate under `--raw-weights` —
     // the same rule sampling applies, so the export carries what the page shows.
     let weights = weights_source(args);
+    // 8-bit codes instead of f32: a quarter of the weights-only file again, at
+    // the cost of the quantisation error — a trade the run measures, not assumes.
+    let quantize = args.iter().any(|arg| arg == "--quantize");
 
     let config_path = storage::model_config_path(&model_name)
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
@@ -800,7 +815,7 @@ fn run_export_weights(args: &[String]) -> Result<(), String> {
     let source = fs::read(&ckpt_path).map_err(|err| format!("failed to read {ckpt}: {err}"))?;
 
     let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
-    let bytes = rt.block_on(stripped_checkpoint(&config, &source, weights))?;
+    let bytes = rt.block_on(stripped_checkpoint(&config, &source, weights, quantize))?;
 
     let out_path = PathBuf::from(&out);
     if let Some(parent) = out_path.parent() {
@@ -818,9 +833,10 @@ fn run_export_weights(args: &[String]) -> Result<(), String> {
     } else {
         "ema"
     };
+    let encoding = if quantize { "u8" } else { "f32" };
     println!(
-        "export-weights '{model_name}': ckpt={ckpt}, weights={which}, out={out}, \
-         bytes={} (source {} bytes)",
+        "export-weights '{model_name}': ckpt={ckpt}, weights={which}, encoding={encoding}, \
+         out={out}, bytes={} (source {} bytes)",
         bytes.len(),
         source.len()
     );
@@ -5275,7 +5291,7 @@ mod tests {
                 (CheckpointWeights::Ema, &ema_ref),
                 (CheckpointWeights::Raw, &raw_ref),
             ] {
-                let exported = stripped_checkpoint(&config, &source, weights)
+                let exported = stripped_checkpoint(&config, &source, weights, false)
                     .await
                     .expect("export");
                 assert_eq!(

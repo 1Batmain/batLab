@@ -514,3 +514,63 @@ impl Model<Training> {
     }
 }
 
+/// A quantised checkpoint is a faithful 8-bit store: loading it back yields
+/// **exactly** the values the quantiser produced from the weights in the buffer
+/// — bit for bit, not close. Whether those values still make a good image is the
+/// separate, measured question `--eval` answers; this pins that the file format
+/// itself loses nothing beyond the quantisation it declares.
+#[test]
+fn a_quantised_checkpoint_reloads_the_dequantised_weights_exactly() {
+    use crate::model::quant;
+    pollster::block_on(async {
+        let gpu = Arc::new(GpuContext::new_headless().await);
+        let mut model = conv_model(
+            gpu.clone(),
+            1e-2,
+            OptimizerKind::Adam,
+            Some(EmaConfig::new(0.9).unwrap()),
+        )
+        .await;
+        for step in 0..6 {
+            let (input, target) = input_and_target(step);
+            model.train_step(&input, &target);
+        }
+
+        let bytes = model.checkpoint_bytes_quantized().unwrap();
+        assert_eq!(&bytes[..7], b"BBCKPTQ", "the magic marks the quantised format");
+
+        // What the file promises to reconstruct: the forward weights, run
+        // through quantise → dequantise on the host.
+        let expected_w = {
+            let w = weights_of(&model);
+            let q = quant::quantize(&w);
+            quant::dequantize(q.min, q.scale, &q.bytes)
+        };
+        let expected_b = {
+            let b = bias_of(&model);
+            let q = quant::quantize(&b);
+            quant::dequantize(q.min, q.scale, &q.bytes)
+        };
+
+        // A quantised file has no optimiser or EMA trailer, so it loads into a
+        // plain SGD model with no shadow.
+        let gpu2 = Arc::new(GpuContext::new_headless().await);
+        let mut fresh = conv_model(gpu2, 1e-2, OptimizerKind::Sgd, None).await;
+        fresh.load_checkpoint_bytes(&bytes).unwrap();
+
+        assert_eq!(
+            weights_of(&fresh).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "reloaded weights are not the dequantised values, bit for bit"
+        );
+        assert_eq!(
+            bias_of(&fresh).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "reloaded bias is not the dequantised value, bit for bit"
+        );
+        // The size win (one byte per weight against four) is measured on a real
+        // model at export time, where the per-tensor header is negligible; here
+        // the tensors are too small for a byte-count assertion to mean anything.
+    });
+}
+
