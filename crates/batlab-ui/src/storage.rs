@@ -1,21 +1,12 @@
-//! File purpose: The on-disk layout — where `Models/`, `datasets/` and the
-//! checkpoints live, how a `config_file` is read and written, and the
-//! model-manager operations (rename, duplicate, delete).
+//! On-disk layout: where `Models/`, `datasets/` and checkpoints live, how a
+//! `config_file` is read/written, and the manager ops (rename, duplicate,
+//! delete). Deliberately not in `batlab_core` — the engine takes bytes and knows
+//! no paths, so inference can run in a browser (engine/host frontier: CLAUDE.md).
 //!
-//! This is deliberately *not* in `batlab_core`. The engine takes bytes
-//! ([`ModelConfig::from_json_bytes`], [`batlab_core::Model::load_checkpoint_bytes`])
-//! and knows nothing of paths, so that the same inference chain can run in a
-//! browser where there is no filesystem at all. Deciding that a model's config
-//! sits at `Models/<name>/config_file` is a host decision, and it is made here.
-//!
-//! ## The root is injected, not deduced
-//!
-//! Every path below hangs off a [`Storage`] root. The root used to be a global
-//! deduced from the workspace, which meant a test had no way to say "not the
-//! real `Models/`": a plain `cargo test` rewrote `Models/Stable_Diffusion/config_file`
-//! in the repository (`docs/reports/PERPETUAL_INFERENCE.md` §5). Tests now build
-//! a `Storage` on a temporary directory and the workspace root is only ever the
-//! *default*.
+//! The root is injected off a [`Storage`], never a workspace-deduced global:
+//! tests build a `Storage` on a temp dir so `cargo test` cannot rewrite the
+//! repo's `Models/` (guarded by
+//! `project_root_is_the_workspace_that_holds_models_and_datasets`).
 
 use crate::clock;
 use batlab_core::config::ModelConfig;
@@ -32,14 +23,10 @@ pub struct SavedModelEntry {
     pub path: PathBuf,
     pub input_size: (u32, u32, u32),
     pub layer_count: usize,
-    /// Checkpoints found under `pretrained_weights/`, newest first. The model
-    /// list shows them because "which weights does this thing have?" is the
-    /// question that decides whether a model is worth opening at all — and
-    /// "when were they written?" is the one right behind it.
+    /// Checkpoints under `pretrained_weights/`, newest first.
     pub checkpoints: Vec<CheckpointEntry>,
-    /// The stack, its cost and its reach — read off the same `config_file` the
-    /// fields above come from, so the panel beside the list never re-opens a
-    /// file to say what the row already knows.
+    /// Stack, cost and reach — read off the same `config_file` as the fields
+    /// above, so the panel never re-opens a file the row already read.
     pub architecture: batlab_core::ArchitectureSummary,
 }
 
@@ -47,9 +34,8 @@ pub struct SavedModelEntry {
 pub struct CheckpointEntry {
     pub name: String,
     pub path: String,
-    /// When the file was last written, if the filesystem will say. `None` is
-    /// shown as such — an invented date is worse than a missing one, since the
-    /// whole point of showing it is to pick "the one from last night".
+    /// Last-written time, if the filesystem will say. `None` is shown as such —
+    /// an invented date is worse than a missing one.
     pub modified: Option<SystemTime>,
     pub size_bytes: u64,
 }
@@ -82,26 +68,17 @@ impl CheckpointEntry {
 // Checkpoint naming
 // ---------------------------------------------------------------------------
 
-/// The name every run's checkpoint still answers to: the most recent one.
-///
-/// A run no longer *overwrites* it — it writes `run-<stamp>.ckpt` and then
-/// points this name at that file (see [`point_latest_at`]) — but the name
-/// stays, because "open a model and train" means "keep training the model" and
-/// that default is spelled `latest.ckpt` in the weight selector, in every
-/// model's `config_file`, and in three reports.
+/// The name every run's checkpoint still answers to: the most recent one. A run
+/// writes `run-<stamp>.ckpt` then points this name at it ([`point_latest_at`]),
+/// never overwriting. Contract: `docs/reports/DATED_CHECKPOINTS.md`.
 pub const LATEST_CHECKPOINT_NAME: &str = "latest.ckpt";
 
-/// What a run's own checkpoint is called: `run-<YYYY-MM-DD_HHMM>.ckpt`.
+/// A run's own checkpoint: `run-<YYYY-MM-DD_HHMM>.ckpt`. Stamp is local time,
+/// zero-padded, biggest unit first, so sorting the names sorts the runs.
 ///
-/// The stamp is local time, zero-padded, biggest unit first, so **sorting the
-/// names is sorting the runs** — `pretrained_weights/` is listed by name in
-/// more than one place and this is what keeps "last is newest" true there.
-///
-/// Two runs in the same minute (a 20-step smoke test, twice) would collide, so
-/// a taken name gains an `_02`, `_03`… suffix. The separator is an underscore
-/// and not a dash on purpose: `-` sorts *before* `.`, so `run-…_1041-02.ckpt`
-/// would come out ahead of `run-…_1041.ckpt` and break the one property the
-/// stamp exists for. `_` sorts after `.`, so the pair stays in run order.
+/// A same-minute collision gains an `_02`, `_03`… suffix — underscore, NOT dash:
+/// `-` sorts before `.`, so `run-…_1041-02.ckpt` would sort ahead of
+/// `run-…_1041.ckpt` and break that property. `_` sorts after `.`.
 pub fn new_run_checkpoint_path_in(dir: &Path, at: SystemTime) -> PathBuf {
     let stamp = clock::stamp(at);
     let first = dir.join(format!("run-{stamp}.ckpt"));
@@ -119,20 +96,11 @@ pub fn new_run_checkpoint_path_in(dir: &Path, at: SystemTime) -> PathBuf {
 
 /// Point `latest.ckpt` at the checkpoint just written, beside it.
 ///
-/// **A hard link, not a copy.** The alternative — writing the bytes twice —
-/// doubles the cost of every save, and a save is 14 MB for the XL model and
-/// happens on every `--checkpoint-every` rotation; a night of training would
-/// pay for a second copy of every partial for no reason. A link costs a
-/// directory entry, `latest.ckpt` stays a *real file* that `fs::read` opens and
-/// `--resume` loads (unlike a symlink, nothing can dangle), and the two names
-/// simply describe the same bytes.
-///
-/// Written through a hidden scratch name and a rename, so `latest.ckpt` is
-/// never observed missing or half-linked. The scratch name starts with a dot
-/// precisely so a listing racing this call cannot offer it as weights.
-///
-/// Falls back to a copy when the filesystem refuses to link (a `Models/` spread
-/// across devices, an exotic mount): the name matters more than the trick.
+/// A hard link, not a copy: a save is 14 MB (XL) on every `--checkpoint-every`
+/// rotation, and a link keeps `latest.ckpt` a real file `--resume` can open
+/// (unlike a symlink, nothing dangles). Written through a dot-prefixed scratch
+/// name + rename, so a racing listing never sees it missing, half-linked, or
+/// offerable as weights. Falls back to a copy across devices.
 pub fn point_latest_at(written: &Path) -> io::Result<PathBuf> {
     let parent = written.parent().ok_or_else(|| {
         io::Error::other(format!(
@@ -159,11 +127,8 @@ pub fn point_latest_at(written: &Path) -> io::Result<PathBuf> {
     }
 }
 
-/// Newest first, ties broken by name.
-///
-/// The selector opens on the most recent run, which is what "continue training"
-/// means; `latest.ckpt` and the dated file it points at share an mtime, and the
-/// tie-break puts `latest.ckpt` first — the row the default already sits on.
+/// Newest first, ties broken by name. `latest.ckpt` and its dated twin share an
+/// mtime; the tie-break puts `latest.ckpt` first — the row the default sits on.
 fn sort_newest_first(entries: &mut [CheckpointEntry]) {
     entries.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.name.cmp(&b.name)));
 }
@@ -312,56 +277,41 @@ impl From<io::Error> for ManagerError {
 // Duplicating a model
 // ---------------------------------------------------------------------------
 
-/// How much of a model travels with its duplicate.
-///
-/// Weights are the default at the call site that matters: duplicating exists so
-/// a foundation model can be *fine-tuned* under another name, and a fine-tune
-/// with no weights to start from is just a new model.
+/// How much of a model travels with its duplicate. Weights are the default:
+/// duplicating exists to fine-tune a foundation under another name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightsToCopy {
     /// The architecture alone — the copy starts from fresh weights.
     None,
-    /// The weights the model currently answers to, and nothing else.
-    ///
-    /// **Not the history.** A model trained overnight with `--checkpoint-every`
-    /// holds dozens of `run-*.ckpt`, 14 MB each for the XL; copying the lot to
-    /// make one fine-tune would cost half a gigabyte to carry runs the copy has
-    /// no claim to. What travels is the newest run — the one `latest.ckpt`
-    /// designates — under its own dated name, with `latest.ckpt` re-linked onto
-    /// it inside the copy.
+    /// The weights the model currently answers to, and nothing else — NOT the
+    /// history (dozens of 14 MB `run-*.ckpt`). Only the newest run travels,
+    /// under its dated name, with `latest.ckpt` re-linked onto it in the copy.
     Newest,
 }
 
-/// What a duplication actually did, so the UI can *say* it instead of implying
-/// it. `copied_weights` is empty when nothing was carried — including when
-/// weights were asked for and the source model had none yet.
+/// What a duplication actually did, so the UI can say it. `copied_weights` is
+/// empty when nothing was carried (including weights asked for but none existed).
 #[derive(Debug, Clone)]
 pub struct DuplicateOutcome {
     pub path: PathBuf,
-    /// Checkpoint file names written into the copy, in the order they appeared:
-    /// the dated run first, then `latest.ckpt` pointing at it.
+    /// Checkpoint names written into the copy, in order: dated run, then
+    /// `latest.ckpt` pointing at it.
     pub copied_weights: Vec<String>,
 }
 
-/// The `(device, inode)` pair of a file, or `None` if it cannot be read.
-///
-/// Used to answer one question: *which* dated run is `latest.ckpt`? The two are
-/// one set of bytes under two names (`point_latest_at`), and comparing identity
-/// is how that pairing is recovered without reading 14 MB twice.
+/// The `(device, inode)` pair of a file. Answers "which dated run is
+/// `latest.ckpt`?" — the two share bytes ([`point_latest_at`]), so identity
+/// recovers the pairing without reading 14 MB twice.
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).ok()?;
     Some((meta.dev(), meta.ino()))
 }
 
-/// The single checkpoint that carries a model's current weights, or `None` for
-/// a model that has never been trained.
-///
-/// `latest.ckpt` is the answer to "which weights?", but it is a *name*: copying
-/// it alone would drop the date the weights were made on, which is the whole
-/// point of the dated naming. So the dated file it is hard-linked to is
-/// preferred, and `latest.ckpt` is only carried on its own when there is no
-/// such sibling (a checkpoint from before the convention, or a copy of one).
+/// The single checkpoint carrying a model's current weights, or `None` if never
+/// trained. `latest.ckpt` is only a name; the dated file it is hard-linked to is
+/// preferred so the copy keeps the date the weights were made on. `latest.ckpt`
+/// is carried alone only when it has no dated sibling (pre-convention, or a copy).
 fn weights_in_hand(dir: &Path) -> Option<PathBuf> {
     let entries = checkpoint_entries_in(dir);
     let latest = dir.join(LATEST_CHECKPOINT_NAME);
@@ -386,11 +336,8 @@ fn weights_in_hand(dir: &Path) -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// A storage root: the directory holding `Models/`, `datasets/` and the
-/// generated sample folders.
-///
-/// Cheap to clone, holds nothing but the path. Construct one with
-/// [`Storage::at`] to point somewhere else — that is what tests do, and what
-/// `BATLAB_ROOT` does for a throwaway end-to-end session.
+/// generated sample folders. Cheap to clone (just the path). [`Storage::at`]
+/// points elsewhere — what tests and `BATLAB_ROOT` use.
 #[derive(Debug, Clone)]
 pub struct Storage {
     root: PathBuf,
@@ -457,12 +404,9 @@ impl Storage {
             .join(LATEST_CHECKPOINT_NAME))
     }
 
-    /// Where a run starting at `at` writes its own checkpoint:
-    /// `Models/<name>/pretrained_weights/run-<stamp>.ckpt`.
-    ///
-    /// A *new* file every run — that is the whole feature. The previous run's
-    /// weights are still there afterwards, and `latest.ckpt` is pointed at this
-    /// one once it has been written ([`point_latest_at`]).
+    /// Where a run starting at `at` writes its checkpoint:
+    /// `Models/<name>/pretrained_weights/run-<stamp>.ckpt`. A new file every run,
+    /// so the previous run's weights survive; `latest.ckpt` is then pointed here.
     pub fn new_run_checkpoint_path(
         &self,
         model_name: &str,
@@ -562,8 +506,8 @@ impl Storage {
                 input_size: config.input_size,
                 layer_count: config.layers.len(),
                 checkpoints: self.checkpoint_entries(name),
-                // Computed once, here, off the config that was just parsed —
-                // the panel beside the list then costs nothing per keystroke.
+                // Computed once here, off the just-parsed config, so the panel
+                // costs nothing per keystroke.
                 architecture: batlab_core::summarize_architecture(
                     &config.layers,
                     config.input_size,
@@ -574,27 +518,16 @@ impl Storage {
         Ok(models)
     }
 
-    /// **THE** resolution of the dataset a perpetual drift sets out from —
-    /// the one place the three sources are ranked, and the only one allowed to
-    /// know that ranking.
+    /// THE one place the three seed-dataset sources are ranked (contract:
+    /// `docs/reports/SEED_DATASET.md`). `flag` (`--seed-dataset`) beats
+    /// `configured` (`ModelConfig::seed_dataset`) beats the convention on output
+    /// channels. Resolves a name, never contents, and ignores whether the file
+    /// exists — the caller decides (named+missing is an error, derived+missing
+    /// falls back to noise).
     ///
-    /// `flag` (`--seed-dataset`) beats `configured` (`ModelConfig::seed_dataset`)
-    /// beats the convention derived from the model's **output channels**. The
-    /// convention is a last resort, not a default: it is how a model that has
-    /// never been told anything still drifts away from a picture, and it is the
-    /// behaviour that predates the other two.
-    ///
-    /// It resolves a *name*, never a file's contents, and it does not care
-    /// whether the file exists — the caller decides what a missing one means,
-    /// and the answer differs by source: named and missing is an error, derived
-    /// and missing is a fallback onto pure noise.
-    ///
-    /// Relative paths resolve by source, and the two rules are not an
-    /// inconsistency: a **flag** is typed at a shell and keeps the shell's
-    /// meaning (relative to the working directory), while a **config** entry is
-    /// stored and re-read from wherever the binary happens to run, so it is
-    /// taken against the project root — that is what lets a `config_file` say
-    /// `datasets/elephants256.batraw` and still mean it tomorrow.
+    /// Relative paths resolve by source, deliberately: a flag keeps the shell's
+    /// cwd meaning, a config entry is taken against the project root so a stored
+    /// `datasets/elephants256.batraw` still means it tomorrow.
     pub fn resolve_seed_dataset(
         &self,
         flag: Option<&str>,
@@ -647,31 +580,25 @@ impl Storage {
         Ok(datasets)
     }
 
-    /// A dataset's shape, for the resource inventory, from its header alone.
-    ///
-    /// `None` when the file is missing or is not a `.batraw` — the inventory
-    /// then simply has no streamed post, which is the truth rather than a zero.
+    /// A dataset's shape from its header alone, for the resource inventory.
+    /// `None` when the file is missing or not a `.batraw`.
     pub fn dataset_spec(&self, path: &str) -> Option<batlab_core::DatasetSpec> {
         let header = read_batraw_header(Path::new(path))?;
         Some(batlab_core::DatasetSpec {
             sample_count: header.0,
-            // Times the payload's own width, not a hard-coded 4. A BATRAW3
-            // sample is a quarter of the f32 one it replaces, and the residency
-            // budget is decided on this number.
+            // Times the payload's own width, not a hard-coded 4: a BATRAW3 sample
+            // is a quarter of the f32 one, and the residency budget rides on this.
             sample_bytes: header.1 as u64 * header.2 as u64 * header.3 as u64 * header.4,
         })
     }
 
     // --- The manager: rename and delete ---
 
-    /// Resolve `<Models>/<name>` and prove it is a directory that `Models/`
-    /// directly owns, before anything destructive happens to it.
-    ///
-    /// Both sides are canonicalised, so a model directory that is a *symlink*
-    /// to somewhere else fails the check and is refused rather than followed:
-    /// `remove_dir_all` on a resolved symlink target would delete the target's
-    /// contents. Refusing is the right answer — the manager's blast radius is
-    /// one direct child of `Models/`, and nothing else.
+    /// Resolve `<Models>/<name>` and prove it is a direct child of `Models/`
+    /// before anything destructive touches it. Both sides canonicalised, so a
+    /// symlinked model directory is refused, not followed — `remove_dir_all` on a
+    /// resolved symlink would delete the target's contents. Blast radius stays
+    /// one direct child of `Models/`.
     fn model_path_guarded(&self, name: &str) -> Result<PathBuf, ManagerError> {
         validate_model_name(name)?;
         let models_root = self
@@ -691,19 +618,11 @@ impl Storage {
         Ok(resolved)
     }
 
-    /// Rename `Models/<from>/` to `Models/<to>/` **and** rewrite the model's
-    /// `config_file` so the two agree.
-    ///
-    /// The directory name and the config's `model_name` are two copies of one
-    /// fact; a rename that moved only the directory would leave the config
-    /// claiming the old name, and every checkpoint path stored in it pointing at
-    /// a directory that no longer exists. So this also retargets the three
-    /// places a checkpoint path is persisted (`inference.checkpoint`, a training
-    /// run's `checkpoint_path`, a perpetual run's `checkpoint`) when they point
-    /// inside the model's own directory.
-    ///
-    /// If the config rewrite fails the directory rename is undone, so the pair
-    /// is never left half-renamed.
+    /// Rename `Models/<from>/` to `Models/<to>/` and rewrite the `config_file` so
+    /// the two agree: `model_name`, plus every checkpoint path that pointed inside
+    /// the model's own directory (`inference.checkpoint`, a train run's
+    /// `checkpoint_path`, a perpetual run's `checkpoint`). A failed config rewrite
+    /// undoes the directory rename, so the pair is never left half-renamed.
     pub fn rename_model(&self, from: &str, to: &str) -> Result<PathBuf, ManagerError> {
         validate_model_name(to)?;
         let from_path = self.model_path_guarded(from)?;
@@ -728,8 +647,7 @@ impl Storage {
         match self.retarget_config(from, &from_path, to, &to_path) {
             Ok(()) => Ok(to_path),
             Err(err) => {
-                // Undo, so the caller sees "nothing happened" rather than a
-                // directory whose config disagrees with its name.
+                // Undo, so the caller sees "nothing happened".
                 let _ = fs::rename(&to_path, &from_path);
                 Err(err)
             }
@@ -747,8 +665,7 @@ impl Storage {
     ) -> Result<(), ManagerError> {
         let config_path = to_path.join("config_file");
         if !config_path.is_file() {
-            // A directory with no config is not a model the UI can show, but a
-            // rename of it is still a legitimate no-op on the config side.
+            // No config: nothing to retarget, a legitimate no-op.
             return Ok(());
         }
         let mut config = load_model_config(&config_path)?;
@@ -782,13 +699,9 @@ impl Storage {
         Ok(())
     }
 
-    /// A free name for a copy of `from`: `<from>-copy`, then `-copy-2`,
-    /// `-copy-3`… The form opens on it, so the common case — duplicate, press
-    /// Enter — never has to be typed.
-    ///
-    /// Kept inside [`MAX_MODEL_NAME_LEN`] by trimming the *base*, not the
-    /// suffix: a name that says nothing about being a copy would be the one
-    /// thing worth keeping if only one could fit.
+    /// A free name for a copy of `from`: `<from>-copy`, then `-copy-2`… The form
+    /// opens on it. Kept inside [`MAX_MODEL_NAME_LEN`] by trimming the base, not
+    /// the suffix — the `-copy` marker is the part worth keeping.
     pub fn suggest_copy_name(&self, from: &str) -> String {
         let root = self.models_root();
         let with_suffix = |suffix: &str| -> String {
@@ -809,25 +722,13 @@ impl Storage {
         with_suffix("-copy-99")
     }
 
-    /// Copy `Models/<from>/` to `Models/<to>/` — a model of its own, with its
-    /// own `config_file`, that the original knows nothing about.
-    ///
-    /// This is what makes fine-tuning safe. Training a foundation model under a
-    /// second name used to mean training it *in place*: the run would write into
-    /// the same `pretrained_weights/`, and after enough steps on a narrow
-    /// dataset the general model was gone. Duplicate first, fine-tune the copy,
-    /// and the foundation is still there tomorrow — **the original is not opened
-    /// for writing at any point below**.
-    ///
-    /// The copy's config is rewritten by the same code the rename uses
-    /// ([`Storage::retarget_config`]): `model_name` becomes `to`, and every
-    /// checkpoint path that pointed inside the source directory is rebased onto
-    /// the copy. A config that still named the original would send the copy's
-    /// first run back into the directory this whole operation exists to protect.
-    ///
-    /// What `weights` carries is [`WeightsToCopy`]. Anything that fails leaves
-    /// no half-made model: the destination directory is removed and the error
-    /// returned.
+    /// Copy `Models/<from>/` to `Models/<to>/` — a model of its own the original
+    /// knows nothing about. This is what makes fine-tuning safe: the original is
+    /// NOT opened for writing anywhere below, so fine-tuning the copy cannot
+    /// overwrite the foundation. Config rewritten by the rename's own
+    /// [`Storage::retarget_config`] (else the copy's first run writes back into
+    /// the source). `weights` = [`WeightsToCopy`]. A failure leaves no half-made
+    /// model. Contract and e2e: `docs/reports/DUPLICATE_MODEL.md`.
     pub fn duplicate_model(
         &self,
         from: &str,
@@ -880,8 +781,6 @@ impl Storage {
         fs::copy(&config_source, to_path.join("config_file"))?;
         self.retarget_config(from, from_path, to, to_path)?;
 
-        // Created either way: a model directory has a `pretrained_weights/`,
-        // and the copy is a model.
         let target_dir = to_path.join("pretrained_weights");
         fs::create_dir_all(&target_dir)?;
 
@@ -893,12 +792,10 @@ impl Storage {
                 .file_name()
                 .ok_or_else(|| io::Error::other("checkpoint has no file name"))?;
             let written = target_dir.join(name);
-            // A real copy, not a link into the source: the copy has to survive
-            // the original being deleted, and its disk cost has to be visible.
+            // A real copy, not a link into the source: the copy must survive the
+            // original being deleted, and its disk cost has to be visible.
             fs::copy(&source, &written)?;
             copied.push(name.to_string_lossy().to_string());
-            // And `latest.ckpt` inside the copy designates the copy's newest
-            // run, exactly as it does for a model that trained here.
             let latest = point_latest_at(&written)?;
             if latest != written {
                 copied.push(LATEST_CHECKPOINT_NAME.to_string());
@@ -907,12 +804,9 @@ impl Storage {
         Ok(copied)
     }
 
-    /// Delete `Models/<name>/` and everything under it. Irreversible.
-    ///
-    /// The path is resolved and proven to be a direct child of `Models/` first
-    /// (see [`Storage::model_path_guarded`]); anything else is refused with
-    /// nothing touched. Confirming the user meant it is the UI's job — this
-    /// function assumes the question was already asked.
+    /// Delete `Models/<name>/` and everything under it. Irreversible. The path is
+    /// proven a direct child of `Models/` first ([`Storage::model_path_guarded`]);
+    /// anything else is refused, nothing touched. Confirming intent is the UI's job.
     pub fn delete_model(&self, name: &str) -> Result<(), ManagerError> {
         let path = self.model_path_guarded(name)?;
         fs::remove_dir_all(path)?;
@@ -920,16 +814,11 @@ impl Storage {
     }
 }
 
-/// Whether a file in `pretrained_weights/` is weights someone can load.
-///
-/// The extension is the whole test, and it has to be: every training run drops
-/// a `*_metrics.jsonl` next to its checkpoint, so a listing that takes any file
-/// offers that JSONL as loadable weights and counts it in "N checkpoints".
-/// Observed end-to-end — a 40-step run turned one checkpoint into two.
-///
-/// Dot-files stay excluded on top of the extension: macOS writes AppleDouble
-/// siblings (`._latest.ckpt`) whose extension passes the test but whose bytes
-/// are not a checkpoint.
+/// Whether a file in `pretrained_weights/` is loadable weights. The `.ckpt`
+/// extension is the whole test — every run drops a `*_metrics.jsonl` beside its
+/// checkpoint, which "any file" would miscount as weights. Dot-files stay
+/// excluded on top: macOS AppleDouble siblings (`._latest.ckpt`) pass the
+/// extension but are not checkpoints.
 fn is_checkpoint_file(path: &Path) -> bool {
     if !path.is_file() {
         return false;
@@ -950,16 +839,11 @@ fn retarget_under(stored: &str, old_dir: &Path, new_dir: &Path) -> Option<String
 // The default root
 // ---------------------------------------------------------------------------
 
-/// Where [`Storage::default`] points.
-///
-/// `BATLAB_ROOT`, if set, wins: that is how a session can be pointed at a
-/// throwaway directory without touching the repository's own `Models/`.
-/// Otherwise the workspace root, found by walking up until a `Cargo.toml` that
-/// declares `[workspace]` — not by a fixed number of `parent()` hops. This code
-/// moved twice during the restructure — `bat_building/` → `crates/batlab-core/`
-/// → `crates/batlab-ui/` — and each hop would have silently resolved `Models/`
-/// to `crates/Models/` with a hard-coded count: every model and dataset
-/// invisible, no error until first use.
+/// Where [`Storage::default`] points. `BATLAB_ROOT` wins if set (a throwaway
+/// session). Otherwise the workspace root, found by walking up to a `Cargo.toml`
+/// with `[workspace]` — NOT a fixed number of `parent()` hops, which would
+/// silently resolve `Models/` to the wrong place if a crate ever moves. Guarded
+/// by `project_root_is_the_workspace_that_holds_models_and_datasets`.
 pub fn default_root() -> PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -982,12 +866,10 @@ pub fn default_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Free functions over the default root
-//
-// The CLI has exactly one storage root for the life of the process, so it calls
-// these rather than threading a `Storage` through every headless entry point.
-// Anything that needs to be *pointed* somewhere — the TUI, every test — holds a
-// `Storage` instead.
+// Free functions over the default root. The CLI has one root for the whole
+// process, so it calls these instead of threading a `Storage` through every
+// headless entry point. Anything that must be pointed elsewhere — the TUI,
+// every test — holds a `Storage`.
 // ---------------------------------------------------------------------------
 
 pub fn project_root() -> PathBuf {
@@ -1074,12 +956,9 @@ pub fn resolve_seed_dataset(
     Storage::default().resolve_seed_dataset(flag, configured, output_channels)
 }
 
-/// Which of the three sources named the dataset a drift sets out from.
-///
-/// Carried rather than recomputed, so the banner and the monitor panel can say
-/// *why* the run is looking at these pictures. "origine → image du dataset X"
-/// alone left the one question a surprised user actually has — "why THAT
-/// dataset?" — unanswered.
+/// Which of the three sources named the dataset a drift sets out from. Carried,
+/// not recomputed, so the banner and monitor panel can say WHY the run looks at
+/// these pictures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedSource {
     /// `--seed-dataset` on the command line.
@@ -1091,8 +970,7 @@ pub enum SeedSource {
 }
 
 impl SeedSource {
-    /// How the banner names this source. Short, and unambiguous about which of
-    /// the three won — that is the whole reason it is printed.
+    /// How the banner names this source — unambiguous about which of the three won.
     pub const fn label(self) -> &'static str {
         match self {
             SeedSource::Flag => "--seed-dataset",
@@ -1108,15 +986,11 @@ pub struct SeedDatasetChoice {
     pub source: SeedSource,
 }
 
-/// The dataset a model of `channels` output channels drifts away from when
-/// nothing names one.
-///
-/// Derived from the model's **output** geometry rather than guessed: handing a
-/// greyscale drift the RGB file would not error — the loader would flatten it —
-/// and the run would quietly set out from a mangled picture.
-///
-/// `None` for a geometry neither file matches: there is nothing to default to,
-/// and inventing one would drift away from the wrong images.
+/// The dataset a model of `channels` output channels drifts from when nothing
+/// names one. Keyed on OUTPUT geometry, not guessed: a greyscale drift handed the
+/// RGB file would not error (the loader flattens it) and set out from a mangled
+/// picture. `None` when neither file matches — inventing one drifts from the
+/// wrong images.
 pub const fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
     match channels {
         1 => Some("cifar10_grey.batraw"),
@@ -1126,18 +1000,9 @@ pub const fn default_seed_dataset_name(channels: u32) -> Option<&'static str> {
 }
 
 /// `(sample_count, width, height, channels, value_bytes)` from a `.batraw`
-/// header.
-///
-/// The header only: CIFAR-10 is 195 MiB on disk, and reading it whole to answer
-/// "how many chunks does this become on the GPU?" would make the answer cost
-/// more than the run it describes.
-///
-/// All three magics are accepted. `BATRAW1` differs from `BATRAW2` in the
-/// *range* of its payload, not in its shape; `BATRAW3` differs in its **width**
-/// — one byte per value instead of four — which is why the width is part of the
-/// answer rather than assumed. Left out, this function returned `None` for every
-/// file the current converters write, and the Resources page then reported no
-/// streamed dataset at all for them.
+/// header — the header only (reading a 195 MiB CIFAR whole would cost more than
+/// the answer). All three magics accepted; `value_bytes` is part of the answer
+/// because BATRAW3 is one byte per value where BATRAW1/2 are four.
 pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32, u64)> {
     use std::io::Read;
     let mut file = fs::File::open(path).ok()?;
@@ -1163,11 +1028,9 @@ pub fn read_batraw_header(path: &Path) -> Option<(u64, u32, u32, u32, u64)> {
 // Test sandbox
 // ---------------------------------------------------------------------------
 
-/// A storage root under the system temp directory, removed on drop.
-///
-/// Every test that touches storage goes through this. Without it a test either
-/// writes into the repository's own `Models/` or asserts nothing at all — the
-/// first is what actually happened before this type existed.
+/// A storage root under the system temp directory, removed on drop. Every test
+/// that touches storage goes through this, so `cargo test` never writes into the
+/// repo's own `Models/` (what happened before this type existed).
 #[cfg(test)]
 pub(crate) struct TempRoot {
     path: PathBuf,
@@ -1302,13 +1165,8 @@ mod tests {
         assert_eq!(default_seed_dataset_name(0), None);
     }
 
-    /// **The ranking, in the one place that owns it**: flag, then config, then
-    /// the channel convention.
-    ///
-    /// And the relative-path rules that go with it, which are not the same for
-    /// the two named sources on purpose: a flag is typed at a shell and keeps
-    /// the shell's meaning, a config entry is stored and re-read from wherever
-    /// the binary runs, so it is anchored to the project root.
+    /// The ranking (flag > config > channel convention) and its relative-path
+    /// rules: a flag keeps the shell's cwd, a config path anchors to project root.
     #[test]
     fn the_seed_dataset_ranking_is_flag_then_config_then_convention() {
         let temp = TempRoot::new("seed-ranking");
@@ -1377,9 +1235,8 @@ mod tests {
             .collect()
     }
 
-    /// A `SystemTime` for a given wall-clock instant is not something `std`
-    /// offers, so tests that need *distinct, ordered* instants build them by
-    /// offsetting a fixed epoch — which is all the naming rule needs.
+    /// Distinct, ordered `SystemTime`s built by offsetting a fixed epoch — all
+    /// the naming rule needs, and `std` offers no instant-from-wall-clock.
     fn at_minutes(minutes: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(minutes * 60)
     }

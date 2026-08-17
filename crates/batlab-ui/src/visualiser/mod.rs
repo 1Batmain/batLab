@@ -1,30 +1,7 @@
-//! File purpose: Manages the visualiser window lifecycle and GPU-backed frame presentation of model outputs.
-
-//! Live GPU visualiser for model output buffers.
-//!
-//! Opens a native window that renders the model's actual GPU output buffer
-//! directly – no CPU readback, no snapshot, no extra copy.  The visualiser
-//! shares the same wgpu `Device` / `Queue` as the training process so that
-//! the fragment shader reads the live buffer contents on every frame.
-//!
-//! # Usage
-//! ```ignore
-//! use std::sync::Arc;
-//! use batlab_core::GpuContext;
-//! use batlab_core::visualiser::spawn_window;
-//!
-//! // (during training, after model.build())
-//! let gpu: Arc<GpuContext> = model.gpu_context();
-//! let buf: Arc<wgpu::Buffer> = model.last_output_buffer().unwrap();
-//!
-//! let handle = spawn_window(
-//!     gpu, buf,
-//!     32, 32, 3,       // width, height, channels of the output tensor
-//!     "Model Output".to_string(),
-//! );
-//! // Press [v] again to close → drops the handle → window exits.
-//! drop(handle);
-//! ```
+//! Live GPU visualiser: a native window that renders the model's actual GPU output
+//! buffer directly — no CPU readback, no snapshot. Shares the training process's
+//! wgpu `Device`/`Queue`, so the fragment shader reads the live buffer every frame.
+//! Opened with [`spawn_window`]; dropping the handle closes the window.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -48,26 +25,16 @@ use winit::window::{Window, WindowId};
 const FRAME_INTERVAL_MS: u64 = 33;
 /// Poll interval when no visible visualiser is active.
 const IDLE_INTERVAL_MS: u64 = 100;
-/// Longest edge, in logical pixels, the window aims for when it opens.
-///
-/// The size is derived from the frame, never fixed: the window used to open at
-/// a hard-coded 512×512 whatever it was about to show, which stretched every
-/// non-square source. The live perpetual/inference frame is `2W + 3` wide by
-/// `H` high (67×32 on this model), so a square window squashed it by 2.1× —
-/// the pixels were rectangles and the images read as distorted.
+/// Longest edge (logical px) the window aims for. Size is DERIVED from the frame,
+/// not fixed: a hard-coded 512×512 stretched every non-square source (the
+/// perpetual/inference frame is `2W+3`×`H`, squashed 2.1× by a square window).
 const INITIAL_WINDOW_TARGET_EDGE: u32 = 560;
 static VISUALISER_CMD_TX: OnceLock<Sender<ManagerCommand>> = OnceLock::new();
 
-/// Colour of the letterbox bands, as a plain neutral.
-///
-/// Not black: the frame's own darkest pixel is black too, so black bands would
-/// merge with the image and hide where it actually ends. Not mid-grey either,
-/// which competes with the picture. This is the "outside the image" chrome.
-///
-/// **Values are linear, the surface is sRGB.** The clear colour is not passed
-/// through the transfer function, so an innocent-looking `0.08` came out at
-/// `sRGB 80/255` — a mid-grey that framed the image like a mount. Measured on a
-/// screenshot, not assumed: these three land near `sRGB 28/255`.
+/// Colour of the letterbox bands. Not black (the frame's darkest pixel is black,
+/// so black bands would hide where the image ends), not mid-grey. Values are
+/// LINEAR while the surface is sRGB — the clear colour skips the transfer
+/// function, so `0.08` came out `sRGB 80/255`; these land near `sRGB 28/255`.
 const LETTERBOX_COLOUR: wgpu::Color = wgpu::Color {
     r: 0.0115,
     g: 0.0115,
@@ -75,12 +42,9 @@ const LETTERBOX_COLOUR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Size the window opens at: the largest **integer** multiple of the frame that
-/// fits inside [`INITIAL_WINDOW_TARGET_EDGE`] on both axes.
-///
-/// An integer multiple is what makes every source pixel the same square block
-/// of screen pixels — the point of the exercise. A 67×32 frame therefore opens
-/// at ×8 = 536×256, not at a square 512×512.
+/// The largest INTEGER multiple of the frame fitting inside
+/// [`INITIAL_WINDOW_TARGET_EDGE`] on both axes — integer so every source pixel is
+/// the same square block (67×32 opens at ×8 = 536×256, not a square 512×512).
 fn initial_window_size(frame_width: u32, frame_height: u32) -> (u32, u32) {
     let (width, height) = (frame_width.max(1), frame_height.max(1));
     let scale = (INITIAL_WINDOW_TARGET_EDGE / width)
@@ -89,15 +53,10 @@ fn initial_window_size(frame_width: u32, frame_height: u32) -> (u32, u32) {
     (width * scale, height * scale)
 }
 
-/// The `(x, y, width, height)` viewport that fits `frame` inside `surface`
-/// without distorting it — the same scale on both axes, centred, the remainder
-/// left to the clear colour as bands.
-///
-/// Resizing the window used to stretch the quad to whatever shape the surface
-/// had, because the shader draws a full-screen quad and nothing else set a
-/// viewport. Letterboxing here rather than in the shader keeps the shader a
-/// pure row-major indexer: the fragment stage never learns about aspect ratio,
-/// it just gets asked for fewer pixels.
+/// The `(x, y, w, h)` viewport that fits `frame` in `surface` undistorted (same
+/// scale both axes, centred, remainder left to the clear colour). Letterboxing
+/// here, not in the shader, keeps the shader a pure row-major indexer that never
+/// learns about aspect ratio.
 fn letterbox_viewport(surface: (u32, u32), frame: (u32, u32)) -> (f32, f32, f32, f32) {
     let (surface_w, surface_h) = (surface.0.max(1) as f32, surface.1.max(1) as f32);
     let (frame_w, frame_h) = (frame.0.max(1) as f32, frame.1.max(1) as f32);
@@ -120,14 +79,9 @@ fn letterbox_viewport(surface: (u32, u32), frame: (u32, u32)) -> (f32, f32, f32,
 // Public API
 // ---------------------------------------------------------------------------
 
-/// A handle to a running visualiser window.
-///
-/// Dropping the handle sends a close signal to the window thread, which
-/// causes it to exit on the next event-loop iteration.
-///
-/// The handle also tracks whether the window was closed by the user (e.g.
-/// via the window's close button).  Poll [`VisualiserHandle::is_closed`] to
-/// check this and clear the handle on the caller's side.
+/// A handle to a running visualiser window. Dropping it signals the window thread
+/// to exit on its next iteration; poll [`VisualiserHandle::is_closed`] to detect a
+/// user-initiated close and clear the handle.
 pub struct VisualiserHandle {
     /// Caller → window: request the window to close.
     _close_flag: Arc<AtomicBool>,
@@ -251,17 +205,10 @@ fn visualiser_manager_tx() -> Option<&'static Sender<ManagerCommand>> {
     VISUALISER_CMD_TX.get()
 }
 
-/// Run `worker` on a background thread while the visualiser's winit event loop
-/// owns the calling thread.
-///
-/// This **must** be called from the process main thread: on macOS AppKit
-/// requires `NSApplication` (and therefore winit's event loop) to live on the
-/// main thread, and winit panics outright otherwise. Windows and Linux have the
-/// same expectation, merely less strictly enforced.
-///
-/// `worker` receives the whole application (TUI, training, inference); the event
-/// loop exits once it returns, so this function returns when the application is
-/// done.
+/// Run `worker` on a background thread while the winit event loop owns the calling
+/// thread. MUST be called from the process main thread: macOS AppKit requires
+/// `NSApplication` (hence the event loop) on the main thread, and winit panics
+/// otherwise. `worker` gets the whole application; the loop exits when it returns.
 pub fn run_on_main_thread<F>(worker: F)
 where
     F: FnOnce() + Send + 'static,
@@ -882,25 +829,13 @@ fn build_event_loop() -> Option<EventLoop<()>> {
         }
     };
 
-    // The TUI owns the terminal and stays the primary interface, so the
-    // visualiser registers as an accessory: it shows its window without adding
-    // a dock icon.
-    //
-    // The activation policy is only half of it, and the half that does *not*
-    // fix focus. `run_on_main_thread` starts this event loop at process start,
-    // long before any window exists, and winit's AppKit backend ends
+    // `Accessory` keeps batlab out of the Dock — but that is only half of it, and
+    // NOT the half that fixes focus: winit's AppKit backend ends
     // `applicationDidFinishLaunching` with an unconditional
-    // `NSApp.activateIgnoringOtherApps(…)` — the flag defaults to `true`
-    // (winit 0.30.12, `platform_impl/macos/event_loop.rs`, `PlatformSpecific::
-    // default`). `Accessory` keeps batlab out of the Dock and the menu bar; it
-    // does not keep AppKit from making it the frontmost application. That one
-    // call is why launching batlab pulled focus out of the terminal on macOS,
-    // with no visualiser window on screen to explain it.
-    //
-    // Asking for `false` leaves the terminal frontmost. Nothing is lost: the
-    // window still orders front when `[v]` makes it visible, it simply does so
-    // without taking the keyboard away from the TUI — which is what a user
-    // pressing `[v]` and then `[q]` actually wants.
+    // `NSApp.activateIgnoringOtherApps(true)` (winit 0.30.12), which makes batlab
+    // frontmost and stole focus from the terminal at launch. `with_activate_ignoring
+    // _other_apps(false)` leaves the terminal frontmost; the window still orders
+    // front on `[v]` without taking the keyboard. Do NOT remove it.
     #[cfg(target_os = "macos")]
     let event_loop = {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -1021,14 +956,10 @@ mod tests {
         assert!(x > 0.0 && (x + w) <= 1600.0);
     }
 
-    /// The one line that keeps the terminal's focus at launch.
-    ///
-    /// There is no runtime observable to assert here: whether AppKit made
-    /// batlab frontmost is a fact about the window server, not about any value
-    /// this process holds. So the guard is on the source — crude, but it fails
-    /// if the call is dropped, and dropping it silently returns a bug the user
-    /// experiences as "batlab ate my keyboard" with no window to explain it.
-    /// `docs/reports/UX_NAV.md` §1 has the mechanism.
+    /// The one line that keeps the terminal's focus at launch. No runtime
+    /// observable (frontmost-ness is the window server's, not this process's), so
+    /// the guard is on the source: crude, but it fails if the call is dropped —
+    /// the "batlab ate my keyboard" bug. Mechanism: `docs/reports/UX_NAV.md` §1.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_event_loop_never_activates_the_app_over_the_terminal() {
@@ -1041,8 +972,8 @@ mod tests {
         );
     }
 
-    /// wgpu rejects a viewport that leaves the attachment, so the arithmetic
-    /// has to hold for shapes nobody would choose on purpose too.
+    /// wgpu rejects a viewport that leaves the attachment, so the arithmetic must
+    /// hold for degenerate shapes too.
     #[test]
     fn the_viewport_never_leaves_the_surface() {
         let surfaces = [(1u32, 1u32), (0, 0), (3, 1000), (1000, 3), (537, 257)];

@@ -1,30 +1,16 @@
-//! File purpose: What a model costs on the GPU — an itemised inventory of every
-//! buffer the graph allocates, confronted with the limits of a real (or
-//! hypothetical) device.
+//! What a model costs on the GPU: an itemised inventory of every buffer the graph
+//! allocates, judged against a real or hypothetical device's limits.
 //!
-//! # Why this lives in the engine
+//! In the engine, not the UI, because "does my model fit on that machine?" is
+//! asked about the engine — and it is the question a browser must answer before
+//! it starts (WebGPU refuses an allocation past its limits). So the inventory is
+//! computable WITHOUT a GPU, from a [`ModelConfig`], against GIVEN limits.
 //!
-//! The question this answers — "does my model fit on that machine?" — is asked
-//! about the *engine*, not about the terminal that happens to display the
-//! answer. It is also the question a browser has to answer before it starts:
-//! WebGPU hands the page a set of limits (`max_storage_buffer_binding_size` is
-//! 128 MiB by default) and refuses the allocation that exceeds them, so a model
-//! that trains happily on a workstation may be unbuildable on the visitor's
-//! laptop. The inventory therefore has to be computable **without** a GPU, from
-//! a [`ModelConfig`] alone, against limits that are *given* rather than probed.
-//!
-//! # Why it is not a formula
-//!
-//! An inventory that lies is worse than no inventory. So this module does not
-//! re-derive sizes from the geometry: it walks the graph exactly as
-//! `Model::build` does, asking each layer type for the very
-//! [`ForwardBufferBinding`]/[`BackwardBufferBinding`] lists that
-//! `Layer::create_buffers` turns into `wgpu::Buffer`s, and reproducing the
-//! *sharing* rules (a layer's input IS the previous layer's output; a backward
-//! pass re-binds forward buffers) that decide whether two entries are one
-//! allocation or two. What it counts is what gets allocated, and
-//! `the_predicted_inventory_matches_a_real_model` holds it to that against a
-//! model actually built on the device.
+//! Not a formula: an inventory that lies is worse than none. It walks the graph
+//! exactly as `Model::build` does — the same buffer bindings, the same sharing
+//! rules (a layer's input IS the previous output; backward re-binds forward
+//! buffers) — so it counts what is actually allocated, held to that by
+//! `the_predicted_inventory_matches_a_real_model`.
 
 use std::collections::HashMap;
 
@@ -40,22 +26,17 @@ use crate::model::layer_types::{
 use crate::model::optimizer::OptimizerKind;
 use crate::model::types::Dim3;
 
-/// Bytes of the uniform `create_opt_pass` allocates per trainable layer.
-///
-/// Not `size_of::<AdamSpecs>()`: the buffer is allocated at the larger of the
-/// two shapes whatever the optimiser, so that one code path serves both (see
-/// `layer.rs`). Mirroring the allocation is the point of this module.
+/// Bytes of the uniform `create_opt_pass` allocates per trainable layer. Not
+/// `size_of::<AdamSpecs>()`: it is allocated at the larger of the two optimiser
+/// shapes so one code path serves both (`layer.rs`), and this module mirrors that.
 const OPT_SPECS_BYTES: u64 = 32;
 
 // ---------------------------------------------------------------------------
 // Device
 // ---------------------------------------------------------------------------
 
-/// Where the numbers in a [`DeviceProfile`] come from.
-///
-/// Worth carrying next to the limits: "your GPU refuses this" and "a card like
-/// this one would refuse this" are different claims, and a page that shows the
-/// second must not read like the first.
+/// Where a [`DeviceProfile`]'s numbers come from — "your GPU refuses this" and "a
+/// card like this would refuse this" are different claims the page must not blur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProfileSource {
     /// Read off an adapter this process opened.
@@ -74,51 +55,31 @@ pub struct DeviceProfile {
     pub backend: String,
     /// `IntegratedGpu` / `DiscreteGpu` / … as reported by the adapter.
     pub device_type: String,
-    /// Integrated adapters share system RAM: there is no separate VRAM pool to
-    /// exhaust, and a host→device copy is a copy within one memory. This is the
-    /// Mac this project is developed on, and it is exactly why the numbers here
-    /// flatter it relative to a discrete card.
+    /// Integrated adapters share system RAM — no separate VRAM to exhaust — which
+    /// is why the numbers here flatter this Mac relative to a discrete card.
     pub unified_memory: bool,
-    /// What the DEVICE will allocate — the limits the graph actually runs
-    /// against, i.e. the ones `request_device` was asked for. Which profile
-    /// that was is in [`DeviceProfile::limits_profile`]: under `web` they are
-    /// wgpu's defaults (256 MiB per buffer on an adapter that would allow
-    /// 28 GiB — the WebGPU contract the visitor's browser will hand the
-    /// engine), under `native` they are the adapter's own.
+    /// What the DEVICE will allocate — the limits `request_device` asked for (which
+    /// profile: [`DeviceProfile::limits_profile`]). Under `web` these are wgpu's
+    /// defaults (256 MiB/buffer even on an adapter that would allow 28 GiB, the
+    /// contract a browser hands the engine); under `native`, the adapter's own.
     pub max_buffer_size: u64,
     pub max_storage_buffer_binding_size: u64,
-    /// What the ADAPTER says it could allocate in one buffer.
-    ///
-    /// Kept beside the device limits, and never confused with them, because two
-    /// different numbers answer to `max_buffer_size` in this codebase and the
-    /// gap between them is four orders of magnitude. This one is what
-    /// [`GpuSpecs::memory_size`](crate::gpu_context::GpuSpecs::memory_size)
-    /// exposes and what [`crate::training::dataset::select_chunk_bytes`] sizes
-    /// chunks from — so an inventory that used the device figure here predicts
-    /// the wrong chunk size, which is exactly what it did until
-    /// `the_predicted_chunk_plan_is_the_one_the_dataset_allocates` was written.
-    ///
-    /// On Metal it comes out at about the machine's whole unified memory, which
-    /// makes it the closest thing to a capacity metric available — but it is
-    /// still a *maximum allocation size*, not a budget, and it is not reported
-    /// as one.
+    /// What the ADAPTER could allocate in one buffer — kept distinct from the
+    /// device limit above (they differ by four orders of magnitude). This is what
+    /// [`crate::training::dataset::select_chunk_bytes`] sizes chunks from; using the
+    /// device figure predicted the wrong chunk size until
+    /// `the_predicted_chunk_plan_is_the_one_the_dataset_allocates`. On Metal it is
+    /// ~the whole unified memory, but it is a max allocation size, not a budget.
     pub adapter_max_buffer_size: u64,
     pub max_compute_workgroups_per_dimension: u32,
     pub max_storage_buffers_per_shader_stage: u32,
-    /// Total memory the inventory may fill, when it is known.
-    ///
-    /// `None` is the honest answer on every backend this project runs on: wgpu
-    /// exposes no memory budget, and neither does WebGPU — a page cannot ask
-    /// how much VRAM it may have. It is `Some` only when the caller states a
-    /// budget ("would this fit on an 8 GB card?"), which is precisely the
-    /// question this module exists to answer.
+    /// Total memory the inventory may fill. `None` on every backend here (no
+    /// portable API exposes a VRAM budget); `Some` only when the caller states one
+    /// ("would this fit on an 8 GB card?").
     pub memory_budget: Option<u64>,
     pub source: ProfileSource,
-    /// Which profile the device was opened under, when it was opened at all.
-    ///
-    /// `None` for a hypothetical machine: no device was requested, so nothing
-    /// was granted. The distinction matters on the page — "this GPU, asked for
-    /// the web baseline" and "a machine that is not here" are different claims.
+    /// Which profile the device was opened under. `None` for a hypothetical
+    /// machine — no device was requested, so nothing was granted.
     pub limits_profile: Option<GpuLimitsProfile>,
 }
 
@@ -146,13 +107,9 @@ impl DeviceProfile {
         }
     }
 
-    /// A card that is not here: the WebGPU **default** limits — what a browser
-    /// grants without asking for more — plus a memory budget.
-    ///
-    /// These defaults are the right conservative floor for the question "would
-    /// this run in a visitor's browser": `wgpu::Limits::default()` is the
-    /// downlevel-webgl2-free WebGPU baseline, 128 MiB per storage binding and
-    /// 256 MiB per buffer.
+    /// A card that is not here: the WebGPU DEFAULT limits (128 MiB/storage binding,
+    /// 256 MiB/buffer) plus a memory budget — the conservative floor for "would
+    /// this run in a visitor's browser".
     pub fn hypothetical(name: impl Into<String>, memory_budget: Option<u64>) -> Self {
         let limits = wgpu::Limits::default();
         Self {
@@ -377,14 +334,9 @@ pub struct DatasetPlan {
     pub chunk_bytes: u64,
     pub chunk_sample_capacity: u64,
     pub chunk_count: u64,
-    /// Expected chunk uploads a shuffled batch of `batch` costs — the number of
-    /// *distinct* chunks it touches.
-    ///
-    /// Summed per chunk, `Σᵢ (1 − (1 − pᵢ)^batch)` with `pᵢ` the share of the
-    /// dataset chunk `i` holds, rather than the tidy `C·(1 − ((C−1)/C)^batch)`.
-    /// The tidy form assumes equal chunks, and the last chunk never is: on
-    /// CIFAR-10 grey it holds 17 232 samples against 32 768: charging it as a
-    /// full chunk over-predicted the traffic by 31 %.
+    /// Distinct chunks a shuffled batch touches: `Σᵢ (1 − (1 − pᵢ)^batch)` summed
+    /// per chunk, NOT the tidy `C·(1 − ((C−1)/C)^batch)` — the last chunk is short
+    /// (17 232 vs 32 768 on CIFAR grey), and charging it as full over-predicted 31 %.
     pub expected_uploads_per_step: f64,
     /// The same, in bytes, weighting each chunk by its own size.
     pub expected_upload_bytes_per_step: f64,
@@ -396,12 +348,9 @@ impl DatasetPlan {
     }
 }
 
-/// The chunk size `GpuDataset` will pick on a device with these limits.
-///
-/// Shared with [`crate::training::GpuDataset`] rather than reproduced: the
-/// dataset calls this function, so the prediction cannot drift from the
-/// allocation. `MAX_DYNAMIC_CHUNK_BYTES` and the eighth-of-memory target live
-/// with it in `training/dataset.rs`.
+/// The chunk size `GpuDataset` will pick on a device with these limits. Calls the
+/// dataset's own `select_chunk_bytes`, so the prediction cannot drift from the
+/// allocation.
 pub fn plan_dataset(
     device: &DeviceProfile,
     spec: DatasetSpec,
@@ -411,10 +360,8 @@ pub fn plan_dataset(
     let chunk_bytes = crate::model::training::dataset::select_chunk_bytes(
         device.max_storage_buffer_binding_size,
         device.max_buffer_size,
-        // The ADAPTER's figure, because that is the one `GpuDataset` reads
-        // (`GpuSpecs::memory_size`). Passing the device's instead predicted
-        // 64 MiB chunks where the dataset really allocates 128 MiB — half the
-        // right answer, on both the resident footprint and the traffic.
+        // The ADAPTER's figure, the one `GpuDataset` reads: the device's predicted
+        // 64 MiB chunks where the dataset allocates 128 MiB.
         device.adapter_max_buffer_size,
         total,
     );
@@ -874,13 +821,11 @@ impl PlannedGraph {
     }
 }
 
-/// Turn a `config_file`'s layer list into the very layer types the model
-/// builds, dimensions chained exactly as `Layer::new` chains them.
-///
-/// The chaining is not decorative: a draft carries the `dim_input` it was
-/// *written* with, and the model overrides it with the previous layer's real
-/// output. Reading the draft's own field instead would make the inventory agree
-/// with the config file and disagree with the GPU.
+/// Turn a `config_file`'s layer list into the layer types the model builds, with
+/// dimensions chained as `Layer::new` chains them — a draft carries the
+/// `dim_input` it was WRITTEN with, and the model overrides it with the previous
+/// layer's real output, so reading the draft's field would agree with the config
+/// and disagree with the GPU.
 pub fn plan_graph(
     drafts: &[LayerDraft],
     input_size: (u32, u32, u32),
@@ -1252,12 +1197,8 @@ impl Walker {
     }
 }
 
-/// Which post a forward binding belongs to, from the name the layer gave it.
-///
-/// The vocabulary is small and closed (`weights`, `bias`, `gamma`, `beta`,
-/// `specs`, `input`, `output`, `pre_activation`, `stats`, `scratch`,
-/// `skip_input`), and it is the layers' own — classifying by name is reading
-/// what the layer says the buffer is, not guessing from its size.
+/// Which post a forward binding belongs to, from the layer's own name for it —
+/// reading what the layer says the buffer is, not guessing from its size.
 fn forward_kind(name: &str, layer: &LayerTypes) -> Kind {
     match name {
         "specs" => Kind::Uniforms,
@@ -1288,12 +1229,8 @@ fn backward_kind(name: &str, layer: &LayerTypes) -> Kind {
 // Formatting
 // ---------------------------------------------------------------------------
 
-/// Bytes in the binary units GPU limits are expressed in.
-///
-/// Deliberately not the SI formatting the checkpoint selector uses: a
-/// `max_storage_buffer_binding_size` of 134 217 728 is "128 MiB", and rendering
-/// it as "134 MB" next to the limit it is compared against invites a wrong
-/// subtraction.
+/// Bytes in binary units (MiB/GiB), the units GPU limits use — NOT the SI form the
+/// checkpoint selector uses, which next to a limit would invite a wrong subtraction.
 pub fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     let b = bytes as f64;

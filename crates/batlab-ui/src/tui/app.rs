@@ -1,10 +1,7 @@
-//! File purpose: Terminal UI state machine — the screens, the forms, and the
-//! keyboard-driven model builder.
-//!
-//! The serialisable half of what used to live here (the model/run schema) is
-//! `batlab_core::config`: it is engine-side, because a wasm build needs to
-//! describe a model without a terminal anywhere in sight. What is left here is
-//! genuinely terminal state.
+//! Terminal UI state machine: the screens, forms, and keyboard-driven model
+//! builder. The serialisable model/run schema lives engine-side in
+//! `batlab_core::config` (a wasm build describes a model without a terminal);
+//! what is left here is genuinely terminal state.
 
 use crate::storage::{self, SavedModelEntry, Storage, default_seed_dataset_name};
 pub use batlab_core::config::*;
@@ -16,14 +13,11 @@ use std::path::Path;
 // Screens
 // ---------------------------------------------------------------------------
 
-/// The screens of the terminal UI.
-///
-/// The flow is model-first: you open batlab onto [`Screen::ModelList`], you pick
-/// a model, and only then do you pick what to do with it
-/// ([`Screen::ModelActions`]). Every screen below has exactly one parent, and
-/// `Esc` walks back to it — `nav_tests.rs` holds the executable copy of that
-/// claim, because a screen that is drawn and handled but never *assigned* is
-/// this codebase's recurring bug (`docs/reports/PERPETUAL_INFERENCE.md` §1).
+/// The screens of the terminal UI. Model-first flow: open onto
+/// [`Screen::ModelList`], pick a model, then pick an action. Every screen has
+/// one parent that `Esc` walks back to — `nav_tests.rs` is the executable copy,
+/// because a screen drawn and handled but never assigned is this repo's recurring
+/// bug (`docs/reports/PERPETUAL_INFERENCE.md` §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Screen {
     ModelList,
@@ -39,9 +33,8 @@ pub enum Screen {
     PerpetualParams,
     TrainingParams,
     DatasetSelector,
-    /// The dataset a perpetual drift sets out from — a chooser, not a typed
-    /// path, so the geometry of each candidate can be shown next to it and an
-    /// incompatible one refused before the run rather than resized in silence.
+    /// The dataset a perpetual drift sets out from — a chooser, not a typed path,
+    /// so each candidate's geometry shows and an incompatible one is refused.
     SeedDatasetSelector,
     Monitor,
     TrainingControl,
@@ -49,12 +42,9 @@ pub enum Screen {
     Resources,
 }
 
-/// The flow, as the five steps a run actually walks through.
-///
-/// The screens are the implementation; this is the *path*, and it is what the
-/// breadcrumb draws at the bottom of the terminal. Several screens map to one
-/// step — the four parameter forms are all "Parameters", because from the
-/// user's side there is one step there whatever the run mode.
+/// The flow as the five steps a run walks — the *path* the breadcrumb draws.
+/// Several screens map to one step (the four parameter forms are all
+/// "Parameters", one step whatever the run mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PathStep {
     Model,
@@ -94,15 +84,10 @@ impl PathStep {
 }
 
 impl Screen {
-    /// Which step of the path this screen belongs to, or `None` for the screens
-    /// that sit off it.
-    ///
-    /// The match is exhaustive on purpose: a new screen cannot be added without
-    /// someone deciding whether it is a step of the flow or a detour. The
-    /// detours are the manager forms, the architecture editor and its input
-    /// geometry, and the training-control popup — reached *from* a step, but
-    /// not a step, and drawing a breadcrumb on them would claim a position in
-    /// the path that pressing `←` would not honour.
+    /// Which path step this screen belongs to, or `None` for a detour. Exhaustive
+    /// on purpose: a new screen forces a decision, step or detour. Detours (manager
+    /// forms, the architecture editor, the training-control popup) are reached from
+    /// a step but drawing a breadcrumb on them would claim a position `←` won't honour.
     pub const fn path_step(self) -> Option<PathStep> {
         match self {
             Screen::ModelList | Screen::TemplateSelector => Some(PathStep::Model),
@@ -124,14 +109,10 @@ impl Screen {
         }
     }
 
-    /// Whether `←`/`→` walk the path on this screen.
-    ///
-    /// Only the pure selectors qualify. Everywhere else those two keys already
-    /// mean something to a field or a cursor — the layer kind, the tempo of a
-    /// perpetual run, the dataset, a seed toggle — and a breadcrumb that took
-    /// them would break bindings people already use. The parameter forms are
-    /// therefore *shown* on the path but not navigable by arrow: `Esc` remains
-    /// the way back out of a form.
+    /// Whether `←`/`→` walk the path here. Only pure selectors qualify; everywhere
+    /// else those keys already belong to a field or cursor (layer kind, tempo,
+    /// dataset, a seed toggle). The parameter forms are shown on the path but not
+    /// arrow-navigable — `Esc` is the way back out.
     pub const fn walks_the_path_by_arrow(self) -> bool {
         matches!(
             self,
@@ -174,13 +155,11 @@ impl Screen {
 /// flow.
 pub struct ModelListState {
     pub models: Vec<SavedModelEntry>,
-    /// Index into the rows. `models.len()` is the "new model" row — it moves
-    /// with the list rather than sitting at a fixed index, so deleting the last
-    /// model cannot strand the cursor past the end.
+    /// Index into the rows. `models.len()` is the "new model" row; it moves with
+    /// the list, so deleting the last model cannot strand the cursor past the end.
     pub selected: usize,
     pub error: Option<String>,
-    /// What the last manager operation did. Kept on screen so a rename or a
-    /// delete is acknowledged where its effect is visible.
+    /// What the last manager op did, kept on screen where its effect is visible.
     pub status: Option<String>,
 }
 
@@ -214,11 +193,8 @@ pub enum ModelAction {
     Delete,
 }
 
-/// The actions, in the order they are drawn. The key handler bounds its cursor
-/// on this list, so adding an action here is enough to make it selectable.
-///
-/// `Delete` stays last: the cursor arriving there has to be a deliberate walk
-/// past everything else.
+/// The actions, in draw order; the key handler bounds its cursor on this list.
+/// `Delete` stays last — arriving there must be a deliberate walk past the rest.
 pub const MODEL_ACTIONS: [&str; 6] = [
     "Train",
     "Infer",
@@ -271,11 +247,8 @@ pub struct RenameModelState {
     pub error: Option<String>,
 }
 
-/// What a duplicate carries, in the order the two rows are drawn.
-///
-/// Weights first, and selected by default: duplicating exists so a foundation
-/// model can be fine-tuned under another name, and a fine-tune with no weights
-/// to start from is a new model, not a copy.
+/// What a duplicate carries, in draw order. Weights first and selected by
+/// default: duplicating exists to fine-tune a foundation under another name.
 pub const DUPLICATE_CONTENT_CHOICES: [&str; 2] = [
     "config + weights — fine-tune the copy, the original keeps its own",
     "config only     — same architecture, fresh weights",
@@ -296,12 +269,8 @@ impl DuplicateModelState {
     }
 }
 
-/// What the model list says a duplication just did.
-///
-/// It names the files, and it does not round up: asking for weights from a
-/// model that has none copies the config alone, and the line says *that* rather
-/// than leaving the user to discover an empty `pretrained_weights/` two screens
-/// later.
+/// What the model list says a duplication did. Names the files and does not round
+/// up: weights asked of a model that has none copies the config alone, and says so.
 pub fn duplicate_status(from: &str, to: &str, outcome: &storage::DuplicateOutcome) -> String {
     if outcome.copied_weights.is_empty() {
         format!("Duplicated '{from}' → '{to}' — config only, no weights copied")
@@ -313,9 +282,8 @@ pub fn duplicate_status(from: &str, to: &str, outcome: &storage::DuplicateOutcom
     }
 }
 
-/// Deleting is irreversible, so the confirmation is not a keystroke: the model's
-/// name has to be typed back exactly. A `[y]` on a menu is one fat finger away
-/// from a lost training run.
+/// Deleting is irreversible, so confirmation is not a keystroke: the model's name
+/// must be typed back exactly. A `[y]` is one fat finger from a lost training run.
 pub struct DeleteConfirmState {
     pub typed: String,
     pub error: Option<String>,
@@ -333,18 +301,14 @@ pub struct WeightSelectorState {
     pub error: Option<String>,
 }
 
-/// The checkpoint a model is continued from when nothing more specific was
-/// asked for. It is the file every training run writes, so "open a model and
-/// train" means "keep training the model", not "throw the weights away".
+/// The checkpoint continued from by default — the file every run writes, so
+/// "open a model and train" means keep training it, not throw the weights away.
 pub const PREFERRED_CHECKPOINT_NAME: &str = storage::LATEST_CHECKPOINT_NAME;
 
 impl WeightSelectorState {
-    /// The row the cursor should sit on given the checkpoints on disk and the
-    /// path already chosen, if any.
-    ///
-    /// Row 0 is "start from random weights" and it is now the *fallback*, not
-    /// the default: a model with weights opens ready to continue from them.
-    /// Row `i + 1` is `checkpoints[i]`.
+    /// The row the cursor should sit on given the checkpoints and any chosen path.
+    /// Row 0 ("start from random") is the FALLBACK, not the default; row `i+1` is
+    /// `checkpoints[i]`.
     pub fn preferred_row(&self, chosen: Option<&str>) -> usize {
         if let Some(index) = chosen.and_then(|path| {
             self.checkpoints
@@ -400,17 +364,10 @@ pub enum LayerBuilderMode {
     Edit,
 }
 
-/// The Resources page: what this model puts on the GPU, and whether it fits.
-///
-/// The page carries almost no state, and that is deliberate — the inventory is
-/// recomputed from the architecture on every draw (a walk over ~30 layers, well
-/// under a millisecond) rather than cached. A cached inventory is a number that
-/// can go stale behind an architecture edit, which is exactly the class of bug
-/// the weight selector's derived cursor exists to avoid.
-///
-/// What *is* state is the question being asked: at which batch, and about which
-/// workload. `←`/`→` move the batch, which is the whole simulator: the answer to
-/// "what would this cost on a bigger machine" is a number that moves.
+/// The Resources page: what this model puts on the GPU, and whether it fits. It
+/// caches no inventory — recomputed from the architecture each draw (~30 layers,
+/// sub-millisecond), so it cannot go stale behind an architecture edit. The only
+/// state is the question asked: which batch (`←`/`→`) and which workload.
 pub struct ResourcesState {
     /// The batch the page is sizing for. Starts at the model's own.
     pub batch: u32,
@@ -421,12 +378,9 @@ pub struct ResourcesState {
 }
 
 impl ResourcesState {
-    /// Batches the `←`/`→` keys step through.
-    ///
-    /// Powers of two rather than `+1`: nobody trains at batch 37, the
-    /// interesting range spans two orders of magnitude, and one keypress per
-    /// sample would make the top of the range unreachable. Same reasoning as
-    /// the perpetual tempo dial, which is multiplicative for the same reason.
+    /// Batches `←`/`→` step through. Powers of two, not `+1`: the interesting
+    /// range spans two orders of magnitude and `+1` would make the top
+    /// unreachable (same reason the perpetual tempo dial is multiplicative).
     pub const STOPS: [u32; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
 
     /// The next stop above `batch`, or `batch` itself at the top.
@@ -463,12 +417,9 @@ pub struct TrainingParamsState {
     pub selected_dataset: usize,
 }
 
-/// The training form, in the order it is walked.
-///
-/// The last entry is a toggle, not a typed value: it is the explicit opt-out
-/// from the pretrained weights the flow now defaults to. It sits last because
-/// it is the rare choice — the common case is "keep training this model", and
-/// the common case should be the one you can reach by pressing Enter.
+/// The training form, in walk order. The last entry is a toggle — the explicit
+/// opt-out from the pretrained weights the flow defaults to — and sits last
+/// because the common case ("keep training this model") should be Enter-reachable.
 pub const TRAINING_PARAM_FIELD_NAMES: [&str; 5] = [
     "Learning Rate",
     "Batch Size",
@@ -477,9 +428,8 @@ pub const TRAINING_PARAM_FIELD_NAMES: [&str; 5] = [
     "Start from random",
 ];
 
-/// Index of the EMA decay entry, in the form AND in `fields` — the two agree
-/// for every typed row, which is what stops the panel from explaining one
-/// field while the keystrokes edit another.
+/// Index of the EMA decay entry, in the form AND in `fields` — the two agree for
+/// every typed row, so the panel never explains one field while keys edit another.
 pub const TRAINING_EMA_FIELD: usize = 3;
 
 /// Index of the random-weights toggle inside [`TRAINING_PARAM_FIELD_NAMES`].
@@ -491,12 +441,9 @@ pub fn ema_decay_field(decay: Option<f32>) -> String {
     decay.map(|d| d.to_string()).unwrap_or_default()
 }
 
-/// Read the EMA row back: blank (or whitespace) is `None`, anything else has to
-/// be a decay strictly inside `(0, 1)`.
-///
-/// `1.0` freezes the average on the initial weights for ever and `0.0` makes it
-/// a copy of the weights — both are silently useless rather than loudly wrong,
-/// which is exactly the setting that costs a night of GPU before anyone looks.
+/// Read the EMA row back: blank is `None`, else a decay strictly inside `(0, 1)`.
+/// `1.0` freezes the average and `0.0` makes it a copy — both silently useless,
+/// the setting that costs a night of GPU before anyone looks.
 pub fn parse_ema_decay_field(raw: &str) -> Result<Option<f32>, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -511,12 +458,9 @@ pub fn parse_ema_decay_field(raw: &str) -> Result<Option<f32>, String> {
     Ok(Some(decay))
 }
 
-/// Where the dataset path is parked inside `TrainingParamsState::fields`.
-///
-/// It is NOT a form row: it shares its number with the toggle by accident of
-/// arithmetic, not by design. Named because it used to be a bare `[3]` in
-/// fifteen places, and inserting a row in front of it silently repointed every
-/// one of them at the EMA field.
+/// Where the dataset path is parked in `TrainingParamsState::fields`. NOT a form
+/// row. Named because it was a bare `[3]` in fifteen places, and inserting a row
+/// ahead of it silently repointed every one at the EMA field.
 pub const TRAINING_DATASET_FIELD: usize = 4;
 
 pub struct InferenceParamsState {
@@ -550,20 +494,16 @@ pub const PERPETUAL_PARAM_FIELD_NAMES: [&str; 7] = [
     "Regime",
 ];
 
-/// The row that opens [`Screen::SeedDatasetSelector`]. Not typed: a path is
-/// long, and the chooser can show each candidate's geometry — which is the
-/// whole point, since a mismatched one is refused rather than resized.
+/// The row that opens [`Screen::SeedDatasetSelector`].
 pub const PERPETUAL_SEED_DATASET_FIELD: usize = 5;
 
-/// The chooser behind the "Seed Dataset" row.
-///
-/// Row 0 is always "(défaut — selon les canaux de sortie)", which stores `None`
-/// and hands the choice back to the convention. The rest are the files
-/// `datasets/` holds, each with the geometry read from its header.
+/// The chooser behind the "Seed Dataset" row. Row 0 is always
+/// "(défaut — selon les canaux de sortie)" (stores `None`, hands back to the
+/// convention); the rest are `datasets/` files, geometry read from each header.
 #[derive(Default)]
 pub struct SeedDatasetSelectorState {
-    /// `(path, geometry)` — geometry `None` when the header could not be read
-    /// (a directory of images, say), which is not a reason to hide the entry.
+    /// `(path, geometry)` — geometry `None` when the header could not be read (a
+    /// directory of images), which is not a reason to hide the entry.
     pub datasets: Vec<(String, Option<(u32, u32, u32)>)>,
     /// 0 = the default row; `index - 1` indexes `datasets`.
     pub selected: usize,
@@ -587,40 +527,32 @@ pub struct MonitorImage {
 }
 
 /// Live read-out of a perpetual run, republished by the worker on every change.
-///
-/// The worker owns the drift — the TUI only ever *asks* for a change and is
-/// told the result. Mirroring `t_r` in the UI and hoping the two agree is how a
-/// footer starts lying about what the sampler is doing.
+/// The worker owns the drift; the TUI only asks and is told the result. Mirroring
+/// `t_r` in the UI and hoping it agrees is how a footer starts lying.
 #[derive(Debug, Clone)]
 pub struct PerpetualStatus {
     pub regime: String,
-    /// Which way the run is going — "descente" or "remontée". Half of a cycle
-    /// is spent dissolving the image on purpose, and the panel has to say so.
+    /// "descente" or "remontée" — half a cycle dissolves the image on purpose.
     pub phase: String,
     pub depth: usize,
-    /// What the depth dial is called in this regime — `t_r` where it is a
-    /// renoise depth, `t*` in flux where it is the level the run lives on.
-    /// Published by the worker rather than derived in the UI, so the name and
-    /// the number on screen cannot disagree about which regime is running.
+    /// The depth dial's name in this regime (`t_r` renoise depth, `t*` in flux).
+    /// Published by the worker, so name and number cannot disagree about regime.
     pub depth_label: String,
     pub min_depth: usize,
     pub max_depth: usize,
     pub cycle: usize,
-    /// What `cycle` counts in this regime — cycles, or stationary frames in
-    /// flux, which has none.
+    /// What `cycle` counts here — cycles, or stationary frames in flux (none).
     pub cycle_label: String,
     pub diffusion_step: usize,
     /// Reverse steps walked since the run started.
     pub steps: usize,
     /// Measured pace, as opposed to the requested `tempo`.
     pub steps_per_sec: f32,
-    /// What the `[v]` window is showing — x̂₀ alone, or both panes. Published by
-    /// the worker, which owns the `LiveFrame`, so the legend and the window
-    /// cannot disagree about which layout is up.
+    /// What `[v]` shows — x̂₀ alone or both panes. Published by the worker (which
+    /// owns the `LiveFrame`), so legend and window cannot disagree.
     pub view: String,
-    /// What the run set out from: a dataset image, or pure noise when none
-    /// could be found. Worth saying, because a run that silently fell back on
-    /// noise looks exactly like one that was asked to.
+    /// What the run set out from — a dataset image or pure noise. A silent noise
+    /// fallback looks exactly like one that was asked for, so say it.
     pub origin: String,
     pub tempo: f32,
     pub paused: bool,
@@ -641,50 +573,32 @@ pub struct MonitorState {
     pub total_steps: usize,
     pub last_sample_path: Option<String>,
     pub error: Option<String>,
-    /// Set to `true` when the user requests a new training run.
     pub restart_training: bool,
-    /// Set after the user successfully saves the model config.
     pub save_status: Option<String>,
-    /// The model config currently being monitored (used when saving).
+    /// The config being monitored, used when saving.
     pub model_config: Option<ModelConfig>,
-    /// Device limit proxy for largest single GPU buffer allocation.
+    /// Device limits, for the resource read-out.
     pub max_buffer_bytes: Option<u64>,
-    /// Device limit proxy for largest storage-binding allocation.
     pub max_storage_binding_bytes: Option<u64>,
-    /// Best-effort estimate of current model+training GPU allocation.
     pub estimated_training_bytes: Option<u64>,
-    /// Inference preview image rendered in the monitor.
     pub inference_image: Option<MonitorImage>,
-    /// Checkpoint used for the latest inference run.
     pub inference_checkpoint_path: Option<String>,
-    /// Seed used for the latest inference sample.
     pub inference_seed: Option<u64>,
-    /// Generic loading/progress state for long-running GPU preparation/sampling.
     pub loading_progress: Option<LoadingProgress>,
-    /// Whether the training worker is currently paused.
     pub is_training_paused: bool,
-    /// Current runtime learning rate (may differ from initial config).
+    /// Runtime lr/batch, which may differ from the initial config.
     pub current_lr: Option<f32>,
-    /// Current runtime batch size (may differ from initial config).
     pub current_batch_size: Option<u32>,
-    /// Commands queued from UI to training worker.
     pub pending_control_commands: Vec<TrainingControlCommand>,
-    /// Live state of a perpetual run, as reported by its worker.
     pub perpetual: Option<PerpetualStatus>,
 }
 
 // App
 // ---------------------------------------------------------------------------
 
-/// Open an adapter just to read its limits, and let it go.
-///
-/// The Resources page is about *this* machine, so the limits have to come off
-/// the machine. Nothing else here needs the device — the context is dropped as
-/// soon as its numbers are read, and a run creates its own later.
-///
-/// A machine with no adapter is not an error: the page falls back on the WebGPU
-/// default limits and says the profile is hypothetical. Someone reading a config
-/// on a headless box still deserves an answer.
+/// Open an adapter just to read its limits, then drop it (a run makes its own).
+/// The Resources page is about THIS machine. No adapter is not an error: the page
+/// falls back on the WebGPU default limits and says the profile is hypothetical.
 fn probe_device_profile() -> batlab_core::DeviceProfile {
     let context = std::panic::catch_unwind(|| {
         pollster::block_on(batlab_core::GpuContext::new_headless())
@@ -700,9 +614,8 @@ fn probe_device_profile() -> batlab_core::DeviceProfile {
 
 pub struct App {
     pub screen: Screen,
-    /// Where `Models/` and `datasets/` live for this session. Injected rather
-    /// than deduced, so a test — or a throwaway `BATLAB_ROOT` session — can
-    /// rename and delete models without any of it landing in the repository.
+    /// Where `Models/` and `datasets/` live this session. Injected, not deduced,
+    /// so a test (or `BATLAB_ROOT` session) can rename/delete without touching the repo.
     pub storage: Storage,
     pub model_list: ModelListState,
     pub template_selector: TemplateSelectorState,
@@ -720,38 +633,31 @@ pub struct App {
     pub training_control: TrainingControlState,
     pub monitor: MonitorState,
     pub resources: ResourcesState,
-    /// The device the Resources page judges this model against.
-    ///
-    /// Injected for the same reason [`Storage`] is: the default probes a real
-    /// adapter, and a test that walked the flow would then need a GPU to press
-    /// a key. `App::with_device_profile` hands it a stated one instead.
+    /// The device the Resources page judges this model against. Injected like
+    /// [`Storage`], so a test walking the flow needs no GPU to press a key
+    /// (`App::with_device_profile` hands it a stated one).
     pub device_profile: batlab_core::DeviceProfile,
-    /// The dataset the page accounts for — resolved from the model's training
-    /// config when one is loaded, `None` otherwise.
+    /// The dataset the page accounts for — from the model's training config, else `None`.
     pub resources_dataset: Option<batlab_core::DatasetSpec>,
-    /// The optimiser and the weight average the model's config asks for. They
-    /// triple the parameter posts between them, so the page reads them from the
-    /// file rather than assuming.
+    /// The optimiser and weight average the config asks for; they triple the
+    /// parameter posts, so the page reads them from the file rather than assuming.
     pub resources_optimizer: batlab_core::OptimizerKind,
-    /// The three training knobs the model's `config_file` carries and no form
-    /// field shows. Held so that launching a run **preserves** them: they are
-    /// read back into the `TrainingConfig` the run is given, rather than reset
-    /// to their defaults on the way past.
+    /// The three training knobs the `config_file` carries but no form shows. Held
+    /// so launching a run PRESERVES them (read back into the `TrainingConfig`
+    /// rather than reset to defaults).
     pub training_optimizer: batlab_core::OptimizerKind,
     pub training_weight_init: batlab_core::WeightInit,
     pub training_loss_weighting: LossWeighting,
     pub resources_ema: bool,
     pub run_config: Option<RunConfig>,
-    /// The model's own seed dataset, as its `config_file` holds it — a property
-    /// of the model, not of one run, which is why it lives here beside
-    /// `active_model_name` and not in `perpetual_params`. Written back into
-    /// every `ModelConfig` this TUI builds, so a training run does not erase
-    /// what a perpetual run set. `None` = fall back on the channel convention.
+    /// The model's own seed dataset (a model property, not a run's), so it lives
+    /// here beside `active_model_name`, not in `perpetual_params`. Written into
+    /// every `ModelConfig` this TUI builds, so a training run does not erase what a
+    /// perpetual run set. `None` = fall back on the channel convention.
     pub seed_dataset: Option<String>,
     pub active_model_name: Option<String>,
-    /// The model this process currently has a run on, if any. The manager
-    /// refuses to rename or delete it — see [`App::model_run_in_progress`] for
-    /// what that does and does not cover.
+    /// The model this process has a run on, if any. The manager refuses to
+    /// rename/delete it — see [`App::model_run_in_progress`] for its limits.
     pub running_model: Option<String>,
     pub selected_checkpoint_path: Option<String>,
     pub load_checkpoint_on_start: bool,
@@ -892,19 +798,15 @@ impl App {
     /// An app on the default storage root (the workspace, or `BATLAB_ROOT`).
     pub fn new() -> Self {
         let mut app = Self::with_storage(Storage::default());
-        // Probed once, at startup, and only on the real entry point: the limits
-        // do not change while the process runs, and `with_storage` — the
-        // constructor the tests use — must not need an adapter to press a key.
+        // Probed only on the real entry point: `with_storage` (the test
+        // constructor) must not need an adapter to press a key.
         app.device_profile = probe_device_profile();
         app
     }
 
-    /// An app that judges the Resources page against `profile` instead of
-    /// probing an adapter.
-    ///
-    /// Two uses, and the second is why it exists: answering "would this fit on
-    /// an 8 GiB card?" about a machine that is not here, and letting the
-    /// navigation tests press every key without a GPU.
+    /// An app judging the Resources page against `profile` instead of probing.
+    /// Two uses: "would this fit on an 8 GiB card?" about an absent machine, and
+    /// letting the nav tests press every key without a GPU.
     pub fn with_device_profile(
         storage: Storage,
         profile: batlab_core::DeviceProfile,
@@ -914,9 +816,8 @@ impl App {
         app
     }
 
-    /// An app on an explicit storage root. This is the constructor tests use:
-    /// the flow writes, renames and deletes model directories, and none of that
-    /// belongs in the repository's own `Models/`.
+    /// An app on an explicit storage root — the constructor tests use, so the
+    /// flow's writes/renames/deletes never touch the repo's own `Models/`.
     pub fn with_storage(storage: Storage) -> Self {
         let models = storage.list_models().unwrap_or_default();
         let templates = built_in_templates();
@@ -933,11 +834,8 @@ impl App {
         let datasets = storage.list_datasets().unwrap_or_default();
         let dataset_path = datasets.first().cloned().unwrap_or_default();
         let mut app = Self {
-            // The model list is the front door: open batlab, choose a model,
-            // then choose what to do with it. Opening on the template selector
-            // (as this once did) made every saved model unreachable, and
-            // opening on a fork between "load" and "new" made the common case
-            // — I have models, show me them — cost a keystroke and a decision.
+            // The model list is the front door. Opening on the template selector
+            // (as this once did) made every saved model unreachable.
             screen: Screen::ModelList,
             storage,
             model_list: ModelListState {
@@ -1012,8 +910,7 @@ impl App {
                     default_lr.to_string(),
                     default_batch.to_string(),
                     default_steps.to_string(),
-                    // Empty means no averaging — the default, and the run this
-                    // binary did before averaging existed.
+                    // Empty = no averaging (the default).
                     String::new(),
                     dataset_path,
                 ],
@@ -1055,16 +952,9 @@ impl App {
                 inference: false,
                 scroll: 0,
             },
-            // Probed once, here, rather than on every draw: opening an adapter
-            // costs tens of milliseconds and its limits do not change while the
-            // process runs. A machine with no adapter at all falls back on the
-            // WebGPU defaults, which is the honest answer — those are the limits
-            // a browser would grant — and the page says the profile is
-            // hypothetical.
-            // Until `App::new` probes a real one. On a machine with no adapter
-            // this stays, and it is the honest answer rather than a blank: the
-            // WebGPU defaults are the limits a browser grants the visitor's GPU,
-            // and the page says the profile is hypothetical.
+            // Placeholder until `App::new` probes a real adapter. On a machine
+            // with no adapter this stays — the WebGPU defaults are the limits a
+            // browser would grant, and the page says the profile is hypothetical.
             device_profile: batlab_core::DeviceProfile::hypothetical(
                 "no adapter probed — WebGPU default limits",
                 None,
@@ -1123,14 +1013,10 @@ impl App {
         self.template_selector.error = None;
     }
 
-    /// Re-reads the model's checkpoints and puts the cursor back where the
-    /// current choice says it belongs.
-    ///
-    /// The cursor is *derived*, never remembered: `load_checkpoint_on_start`
-    /// plus `selected_checkpoint_path` are the single source of truth, and every
-    /// path that invalidates the weights (editing a layer, changing the input
-    /// geometry) clears them. Deriving is what keeps a stale row from
-    /// re-selecting a checkpoint that no longer matches the architecture.
+    /// Re-reads the model's checkpoints and re-derives the cursor. The cursor is
+    /// DERIVED from `load_checkpoint_on_start` + `selected_checkpoint_path`, never
+    /// remembered — every path that invalidates the weights clears them, so a
+    /// stale row cannot re-select a checkpoint the architecture no longer matches.
     fn refresh_weight_selector(&mut self) {
         let Some(model_name) = self.active_model_name.clone() else {
             self.weight_selector.checkpoints.clear();
@@ -1158,25 +1044,17 @@ impl App {
         }
     }
 
-    /// Whether the open model has any weights to continue from.
-    ///
-    /// The two screens that offer the choice both need it: the weight selector
-    /// says so where the list would otherwise just be empty, and the training
-    /// form uses it to pin its toggle on — "start from random" is not a choice
-    /// when it is the only option, and a form that pretends otherwise is
-    /// lying.
+    /// Whether the open model has weights to continue from. The training form pins
+    /// its toggle on this — "start from random" is not a choice when it is the only
+    /// option, and a form that pretends otherwise lies.
     pub fn has_pretrained_weights(&self) -> bool {
         !self.weight_selector.checkpoints.is_empty()
     }
 
-    /// Points the flow at the model's pretrained weights, which is what opening
-    /// a model now means.
-    ///
-    /// `keep` is the path the model's own `config_file` recorded, honoured when
-    /// it still exists on disk; otherwise the preferred checkpoint
-    /// ([`PREFERRED_CHECKPOINT_NAME`], else the first) is taken. With no
-    /// checkpoints at all this falls back to random weights — the only case
-    /// where it does.
+    /// Points the flow at the model's pretrained weights (what opening a model
+    /// means). `keep` is the config's recorded path, honoured if still on disk;
+    /// else the preferred checkpoint ([`PREFERRED_CHECKPOINT_NAME`], else first);
+    /// with no checkpoints at all, random — the only fallback case.
     fn preselect_pretrained_weights(&mut self, keep: Option<String>) {
         self.load_checkpoint_on_start = false;
         self.selected_checkpoint_path = keep.clone();
@@ -1190,16 +1068,15 @@ impl App {
                 self.load_checkpoint_on_start = true;
             }
             None => {
-                // No weights yet: the run starts from random, and the
-                // checkpoint path is where this run will *write*.
+                // No weights yet: start from random; the path is where this run WRITES.
                 self.selected_checkpoint_path = self.default_checkpoint_for_active_model();
                 self.load_checkpoint_on_start = false;
             }
         }
     }
 
-    /// The training form's toggle. Turning it off is only possible when there
-    /// are weights to turn it off *to*.
+    /// The training form's toggle. Only turnable off when there are weights to
+    /// turn it off TO.
     pub fn toggle_start_from_random(&mut self) {
         if !self.has_pretrained_weights() {
             return;
@@ -1219,8 +1096,7 @@ impl App {
         self.training_params.error = None;
     }
 
-    /// What the training form shows for its toggle: `true` means this run
-    /// throws the weights away and starts over.
+    /// The training toggle: `true` = this run throws the weights away.
     pub fn start_from_random_weights(&self) -> bool {
         !self.load_checkpoint_on_start
     }
@@ -1250,9 +1126,9 @@ impl App {
         }
     }
 
-    /// The checkpoint a run defaults to for the model currently open —
-    /// `Models/<name>/pretrained_weights/latest.ckpt`. `None` only when no model
-    /// is open, or when the folder cannot be prepared.
+    /// The open model's default checkpoint —
+    /// `Models/<name>/pretrained_weights/latest.ckpt`. `None` if no model is open
+    /// or the folder cannot be prepared.
     fn default_checkpoint_for_active_model(&self) -> Option<String> {
         let model_name = self.active_model_name.as_deref()?;
         self.storage
@@ -1304,8 +1180,7 @@ impl App {
             input_size: template.input_size,
             layers: template.layers.clone(),
             inference: InferenceConfig::default(),
-            // A template names no dataset of its own: a fresh model falls back
-            // on the channel convention until someone chooses otherwise.
+            // A template names no dataset: a fresh model uses the channel convention.
             seed_dataset: None,
             run: RunConfig {
                 mode: RunMode::Infer,
@@ -1317,8 +1192,7 @@ impl App {
             .map_err(|err| format!("Failed to write template config_file: {err}"))?;
         self.refresh_weight_selector();
         self.weight_selector.selected = 0;
-        // The template *created* a model; the flow rejoins the common path —
-        // model in hand, now pick what to do with it.
+        // The template created a model; rejoin the common path (pick an action).
         self.refresh_model_list();
         self.select_model_in_list(&template.key);
         self.screen = Screen::ModelActions;
@@ -1327,11 +1201,9 @@ impl App {
 
     fn apply_loaded_model(&mut self, config: ModelConfig) {
         self.active_model_name = config.model_name.clone();
-        // Reset before the match below fills them in, so a model whose config
-        // is not a training config cannot inherit the previous model's
-        // optimiser. Adam is the default for such a model rather than SGD:
-        // `OPTIMIZER_ADAM.md` makes it the project's standard, and sizing an
-        // Adam run as an SGD one under-reports the parameter posts by 3×.
+        // Reset before the match fills them in, so a non-training config cannot
+        // inherit the previous model's optimiser. Adam, not SGD, is the default:
+        // sizing an Adam run as SGD under-reports the parameter posts by 3×.
         self.resources_optimizer = batlab_core::OptimizerKind::Adam;
         self.training_optimizer = batlab_core::OptimizerKind::default();
         self.training_weight_init = batlab_core::WeightInit::default();
@@ -1349,17 +1221,14 @@ impl App {
         self.input_size.error = None;
         self.refresh_datasets();
         self.sync_inference_params_from_config(&config.inference);
-        // Unconditional, and it has to be: the seed dataset is a property of
-        // the model, so it is read whatever `run.mode` the file last recorded.
-        // Read only under `RunMode::Perpetual` it would have done two wrong
-        // things at once — lost the setting the moment a training run rewrote
-        // the mode, and left the *previous* model's dataset in place when the
-        // one being opened has none.
+        // Unconditional: the seed dataset is a model property, read whatever
+        // `run.mode` the file recorded. Read only under Perpetual, it would be
+        // lost the moment a training run rewrote the mode, and leave the previous
+        // model's dataset in place when the one opened has none.
         self.seed_dataset = config.seed_dataset.clone();
 
-        // Whichever path the model's own `config_file` last recorded. It is a
-        // preference, not a verdict: `preselect_pretrained_weights` honours it
-        // only if that file is still on disk.
+        // Whichever path the config last recorded — a preference, not a verdict:
+        // `preselect_pretrained_weights` honours it only if the file still exists.
         let recorded = match config.run.mode {
             RunMode::Infer => {
                 self.model_actions.selected = ModelAction::Infer.index();
@@ -1367,10 +1236,8 @@ impl App {
             }
             RunMode::Train(train) => {
                 self.model_actions.selected = ModelAction::Train.index();
-                // What the Resources page needs from a training config, and
-                // could not honestly guess: Adam doubles the parameter posts,
-                // an EMA adds another copy, and the dataset is the one post
-                // that is streamed rather than resident.
+                // What the Resources page cannot guess: Adam doubles the parameter
+                // posts, an EMA adds a copy, and the dataset is the streamed post.
                 self.resources_optimizer = train.optimizer;
                 self.training_optimizer = train.optimizer;
                 self.training_weight_init = train.weight_init;
@@ -1592,9 +1459,8 @@ impl App {
                 let idx = names.iter().position(|&n| n == "Skip Key")?;
                 let skip_key = normalize_key(lb.fields.get(idx)?)?;
                 let dim_skip = self.saved_output_dims().get(&skip_key).copied()?;
-                // Add is shape-preserving, but ONLY when both sides match on
-                // every axis. A mismatch previews nothing rather than a wrong
-                // shape — the builder refuses it at add time with a message.
+                // Add is shape-preserving only when both sides match on every
+                // axis; a mismatch previews nothing (refused at add time).
                 if dim_skip != inferred {
                     return None;
                 }
@@ -1798,9 +1664,8 @@ impl App {
                     .get(&skip_key)
                     .copied()
                     .ok_or_else(|| format!("Unknown skip key '{skip_key}'"))?;
-                // The whole point of Add over Concat: it needs the same shape on
-                // both sides. Refused here, naming both widths, rather than
-                // corrupting a buffer at build (the UpsampleConv trap).
+                // Add needs the same shape both sides; refused here naming both
+                // widths, not corrupting a buffer at build (the UpsampleConv trap).
                 if dim_skip != inferred {
                     return Err(format!(
                         "Add requires identical dims, got input {}x{}x{} and skip {}x{}x{} \
@@ -2277,9 +2142,8 @@ impl App {
         let (name, path) = (model.name.clone(), model.path.clone());
         match storage::load_model_config(&path) {
             Ok(mut config) => {
-                // The directory is the name. Rename keeps the two in step, and
-                // if a hand-edited `config_file` disagrees the directory wins —
-                // it is what the manager and every checkpoint path key off.
+                // The directory is the name; if a hand-edited `config_file`
+                // disagrees, the directory wins (what the manager keys off).
                 config.model_name = Some(name);
                 self.model_list.error = None;
                 self.apply_loaded_model(config);
@@ -2306,17 +2170,12 @@ impl App {
         }
     }
 
-    /// Opens the action menu on the model already in hand, re-reading its
-    /// checkpoints from disk first.
-    ///
-    /// The host calls this on the restart path. Without the re-read the menu
-    /// showed "no checkpoints" for a model that plainly had some, because
-    /// `run_monitor` builds a fresh `App` and never fills the checkpoint list —
-    /// found by driving the real TUI, where a run had just been saved.
+    /// Opens the action menu on the model in hand, re-reading its checkpoints
+    /// first — the restart path builds a fresh `App` that never filled the list,
+    /// so without the re-read the menu showed "no checkpoints" for a model with some.
     pub fn enter_model_actions(&mut self) {
-        // The run that just ended most likely wrote a checkpoint, and "run
-        // again" almost always means "carry on from it" — so the re-read also
-        // re-points the flow at the weights it just found.
+        // The run that just ended likely wrote a checkpoint and "run again" means
+        // "carry on from it", so re-point the flow at the weights just found.
         let recorded = self.selected_checkpoint_path.clone();
         self.preselect_pretrained_weights(recorded);
         self.model_actions.error = None;
@@ -2330,15 +2189,10 @@ impl App {
 
     // --- Walking the path: `←` and `→`, and the `Esc` they share a spine with ---
 
-    /// One step back up the path.
-    ///
-    /// `Esc` and `←` both go through here on the selector screens, which is the
-    /// point: two keys that mean "back" and are implemented twice drift, and the
-    /// drift is invisible until someone uses the one that was not maintained.
-    ///
-    /// Returns `false` when there is nothing above — only on the model list,
-    /// the front door. `Esc` turns that into a quit; `←` turns it into nothing,
-    /// because an arrow key must never be the thing that ends the session.
+    /// One step back up the path. `Esc` and `←` both go through here, so two
+    /// "back" keys cannot drift apart. Returns `false` when there is nothing above
+    /// (the model list): `Esc` turns that into a quit, `←` into nothing — an arrow
+    /// must never end the session.
     pub fn path_back(&mut self) -> bool {
         match self.screen {
             Screen::ModelList => false,
@@ -2361,15 +2215,10 @@ impl App {
         }
     }
 
-    /// One step forward along the path, for the user who went back with `←` and
-    /// wants to return without re-deciding anything.
-    ///
-    /// It only ever moves where moving is *navigation*. The template selector is
-    /// the deliberate hole in the sequence: going forward from it writes a new
-    /// model's `config_file` to disk, and an arrow key is not an instruction to
-    /// create something. `Enter` remains the way to do that. The same reasoning
-    /// keeps `Rename` and `Delete` inert here — they are not steps of the path,
-    /// they are what the action menu also happens to offer.
+    /// One step forward along the path, for the user who went back with `←`. Only
+    /// moves where moving is navigation: the template selector is inert here (going
+    /// forward would write a `config_file`, which is `Enter`'s job, not an arrow's),
+    /// and so are `Rename`/`Delete` (not path steps).
     pub fn path_forward(&mut self) {
         match self.screen {
             Screen::ModelList => {
@@ -2380,10 +2229,9 @@ impl App {
                         .map(|model| model.name.as_str())
                         == self.active_model_name.as_deref();
                 if returning_to_the_same_model {
-                    // Re-opening would re-read the `config_file` and reset the
-                    // action and weight choices from it. The whole promise of
-                    // `→` is that going back and forward costs nothing, so the
-                    // model already in hand is simply picked back up.
+                    // Re-opening would re-read the config and reset the choices;
+                    // `→` promises going back and forth costs nothing, so pick the
+                    // model in hand back up.
                     self.model_actions.error = None;
                     self.screen = Screen::ModelActions;
                 } else {
@@ -2400,15 +2248,10 @@ impl App {
         }
     }
 
-    /// Whether this process is running the named model right now.
-    ///
-    /// The state consulted is the TUI's own: `running_model` is set when a run
-    /// starts and stays set until the run reports itself done. **It does not
-    /// cross the process boundary** — a second batlab, or a `--headless-train`
-    /// in another shell, is invisible here, and renaming a model out from under
-    /// one of those will send its next checkpoint write to a directory that no
-    /// longer exists. A lockfile under the model directory is the fix, and is
-    /// deliberately not in this mission.
+    /// Whether THIS process is running the named model. `running_model` is TUI
+    /// state and does NOT cross the process boundary — a second batlab or a
+    /// `--headless-train` in another shell is invisible here. A lockfile is the
+    /// fix, deliberately out of scope.
     pub fn model_run_in_progress(&self, model_name: &str) -> bool {
         self.running_model.as_deref() == Some(model_name) && !self.monitor.done
     }
@@ -2422,9 +2265,8 @@ impl App {
         Ok(())
     }
 
-    /// Enter on the action menu. The three run modes go on to pick weights; the
-    /// two manager operations open their own screen, and refuse outright while
-    /// the model is running.
+    /// Enter on the action menu. Run modes go on to pick weights; manager
+    /// operations open their own screen and refuse while the model is running.
     pub fn finish_model_actions(&mut self) {
         let Some(action) = self.selected_action() else {
             return;
@@ -2453,10 +2295,8 @@ impl App {
             }
             ModelAction::Duplicate => {
                 self.duplicate_model.input = self.storage.suggest_copy_name(&model_name);
-                // Weights, every time the form opens. The choice is not
-                // remembered between visits: "duplicate to fine-tune" is what
-                // the feature is for, and a leftover "config only" from a
-                // previous visit would silently make a copy with no weights.
+                // Weights every time the form opens, not remembered between
+                // visits: a leftover "config only" would silently copy no weights.
                 self.duplicate_model.selected = 0;
                 self.duplicate_model.error = None;
                 self.screen = Screen::DuplicateModel;
@@ -2469,9 +2309,8 @@ impl App {
         }
     }
 
-    /// Renames the open model on disk, then returns to the list with the
-    /// renamed entry selected — the list is where the new name is visible, so
-    /// it is where the operation reports back.
+    /// Renames the open model on disk, then returns to the list with the renamed
+    /// entry selected — where the new name is visible.
     pub fn finish_rename(&mut self) {
         let Some(current) = self.active_model_name.clone() else {
             self.rename_model.error = Some("No model selected.".to_string());
@@ -2485,8 +2324,8 @@ impl App {
         match self.storage.rename_model(&current, &target) {
             Ok(_) => {
                 self.active_model_name = Some(target.clone());
-                // The weights moved with the directory; whatever the forms were
-                // pointing at is stale until the model is opened again.
+                // The weights moved with the directory; the forms' paths are
+                // stale until the model is opened again.
                 self.selected_checkpoint_path = None;
                 self.load_checkpoint_on_start = false;
                 self.weight_selector.checkpoints.clear();
@@ -2503,11 +2342,8 @@ impl App {
     }
 
     /// Copies the open model under a new name, then returns to the list with the
-    /// **copy** selected — the copy is the model the user now wants to work on,
-    /// which is the whole reason for having duplicated.
-    ///
-    /// The original is left open in `active_model_name`: nothing about it
-    /// changed, so nothing about the session's grip on it needs to.
+    /// COPY selected (the model to work on now). The original stays open in
+    /// `active_model_name` — nothing about it changed.
     pub fn finish_duplicate(&mut self) {
         let Some(current) = self.active_model_name.clone() else {
             self.duplicate_model.error = Some("No model selected.".to_string());
@@ -2536,8 +2372,7 @@ impl App {
         }
     }
 
-    /// Deletes the open model, but only once its name has been typed back
-    /// exactly. Anything else leaves the directory alone and says so.
+    /// Deletes the open model, only once its name is typed back exactly.
     pub fn finish_delete(&mut self) {
         let Some(current) = self.active_model_name.clone() else {
             self.delete_confirm.error = Some("No model selected.".to_string());
@@ -2628,9 +2463,8 @@ impl App {
         }
     }
 
-    /// Opens the input-size form from the layer builder. Confirming it clears
-    /// the layer list — the geometry is the chain's first link, and the layers
-    /// after it were sized against the old one.
+    /// Opens the input-size form. Confirming clears the layer list — the geometry
+    /// is the chain's first link and the layers after it were sized against the old.
     pub fn open_input_size(&mut self) {
         self.input_size.fields = vec![
             self.layer_builder.model_input.0.to_string(),
@@ -2706,8 +2540,7 @@ impl App {
             seed,
             denoising_paths,
             denoise_magnitude,
-            // No form dial for the variance: the model's config_file is
-            // authoritative, so a model set to `posterior` keeps it here.
+            // No form dial for variance: keep the config_file's choice.
             posterior_variance: self
                 .monitor
                 .model_config
@@ -2809,14 +2642,10 @@ impl App {
         Ok(())
     }
 
-    /// The `ModelConfig` a run is launched with — and, since
-    /// `normalize_config_for_models_layout` writes it back, the one that lands
-    /// in `Models/<name>/config_file`.
-    ///
-    /// On [`App`] rather than inline in the event loop so that what a run is
-    /// given, and what the file keeps, can be asserted without a terminal.
-    /// That matters here: `seed_dataset` is carried through **whatever the run
-    /// mode is**, which is a claim worth a test rather than a comment.
+    /// The `ModelConfig` a run launches with — and, since
+    /// `normalize_config_for_models_layout` writes it back, the one that lands in
+    /// `config_file`. A method on [`App`], not inline in the event loop, so what a
+    /// run gets and what the file keeps can be asserted without a terminal.
     pub fn compose_run_config(&self, run: RunConfig) -> ModelConfig {
         let denoising_paths = self
             .inference_params
@@ -2844,9 +2673,8 @@ impl App {
             },
             denoising_paths,
             denoise_magnitude,
-            // Preserve the model's stored variance across a rewrite: the form has
-            // no dial for it, so wiping it to the default would silently downgrade
-            // a `posterior` model back to `beta`.
+            // Preserve the stored variance: no form dial, so defaulting it would
+            // silently downgrade a `posterior` model to `beta`.
             posterior_variance: self
                 .monitor
                 .model_config
@@ -2860,10 +2688,8 @@ impl App {
             input_size: self.layer_builder.model_input,
             layers: self.layer_builder.layers.clone(),
             inference,
-            // Whatever the mode. It belongs to the model, so a training run has
-            // to carry it through rather than drop it: this is the line that
-            // keeps a specialised model's seed from being erased by the next
-            // night of training.
+            // Whatever the mode: it belongs to the model, so a training run must
+            // carry it — the line that keeps a specialised seed from being erased.
             seed_dataset: self.seed_dataset.clone(),
             run,
         }
@@ -2876,20 +2702,14 @@ impl App {
         self.inferred_input()
     }
 
-    /// Whether `path` can seed a drift of this model, and why not when it
-    /// cannot.
-    ///
-    /// **Channels only.** Width and height are resampled on the host on the way
-    /// in, which is a deliberate and visible thing to do to a picture — a 64×64
-    /// photograph scaled down to 32×32 is still that photograph. Channels are
-    /// not: a greyscale file handed to a colour model is replicated across R, G
-    /// and B, and a colour one handed to a greyscale model is flattened. Both
-    /// *succeed*, which is exactly what makes them worth refusing — the repo
-    /// already lost time to that silence once.
+    /// Whether `path` can seed a drift of this model, and why not. CHANNELS ONLY:
+    /// width/height are resampled on the host (a scaled photo is still that photo),
+    /// but a channel mismatch silently replicates or flattens and SUCCEEDS — which
+    /// is what makes it worth refusing.
     pub fn seed_dataset_verdict(&self, path: &str) -> Result<(), String> {
         let Some((_, _, _, channels, _)) = storage::read_batraw_header(Path::new(path)) else {
-            // Not a `.batraw`: a directory of images has no header to check,
-            // and its channels are decided by the loader on purpose.
+            // Not a `.batraw`: a directory of images has no header; its channels
+            // are the loader's call.
             return Ok(());
         };
         let wanted = self.seed_dataset_target().2;
@@ -2906,10 +2726,8 @@ impl App {
         ))
     }
 
-    /// What the channel convention would pick if nothing else named a dataset —
-    /// spelled out rather than left as "default", because "default" is exactly
-    /// the word that let a colour model drift away from CIFAR trucks without
-    /// anyone noticing.
+    /// What the channel convention would pick if nothing named a dataset — spelled
+    /// out, not left as "default" (the word that let a colour model drift from CIFAR trucks).
     pub fn seed_dataset_default_label(&self) -> String {
         match default_seed_dataset_name(self.seed_dataset_target().2) {
             Some(name) => name.to_string(),
@@ -2969,9 +2787,8 @@ impl App {
         self.seed_dataset_selector.error = None;
     }
 
-    /// Takes the row under the cursor. An incompatible dataset is **refused
-    /// here**, on the screen that chose it — not swallowed and turned into a
-    /// mangled opening picture three screens later.
+    /// Takes the row under the cursor. An incompatible dataset is refused HERE,
+    /// on the screen that chose it, not three screens later as a mangled picture.
     pub fn finish_seed_dataset_selector(&mut self) -> Result<(), String> {
         let selected = self.seed_dataset_selector.selected;
         let chosen = match selected {
@@ -2987,8 +2804,7 @@ impl App {
         self.seed_dataset = chosen;
         self.seed_dataset_selector.error = None;
         self.screen = Screen::PerpetualParams;
-        // Onto the next row, so walking the form with Enter walks *through*
-        // this one instead of reopening the chooser it just closed.
+        // Onto the next row, so Enter walks through instead of reopening the chooser.
         self.perpetual_params.field_idx = PERPETUAL_SEED_DATASET_FIELD + 1;
         Ok(())
     }
@@ -3014,8 +2830,7 @@ impl App {
     }
 
     /// Whether the monitor is watching a perpetual run — the gate on every
-    /// perpetual key, so they cannot fire during a training or inference run
-    /// where they would mean something else (or nothing).
+    /// perpetual key, so they cannot fire during training or inference.
     pub fn is_perpetual_run(&self) -> bool {
         self.monitor
             .model_config
@@ -3023,9 +2838,8 @@ impl App {
             .is_some_and(|config| matches!(config.run.mode, RunMode::Perpetual(_)))
     }
 
-    /// Queues a perpetual control command. The worker owns the drift, so
-    /// nothing here anticipates the result: the footer updates when the run
-    /// says so.
+    /// Queues a perpetual control command. The worker owns the drift, so nothing
+    /// here anticipates the result — the footer updates when the run says so.
     pub fn send_perpetual_command(&mut self, command: TrainingControlCommand) {
         self.monitor.pending_control_commands.push(command);
     }
@@ -3049,15 +2863,11 @@ impl App {
         self.screen = Screen::LayerBuilder;
     }
 
-    /// Open the Resources page on the model in hand.
-    ///
-    /// The batch it opens at is the one the model's own training form carries,
-    /// not a constant: the first number someone wants is what their *current*
-    /// run costs, and only then what a different batch would.
+    /// Open the Resources page on the model in hand, at the batch the training
+    /// form carries — the first number someone wants is what their current run costs.
     pub fn enter_resources(&mut self) {
         self.resources.scroll = 0;
-        // Slot 1 of the training form is the batch size — see the field's own
-        // comment on `TrainingParamsState::fields`.
+        // Slot 1 of the training form is the batch size.
         if let Some(batch) = self
             .training_params
             .fields
@@ -3069,12 +2879,9 @@ impl App {
         self.screen = Screen::Resources;
     }
 
-    /// The inventory the Resources page draws, for the batch and workload it is
-    /// currently asking about.
-    ///
-    /// Recomputed rather than stored — see [`ResourcesState`]. It reads the
-    /// architecture from the layer builder's own list, which is the *edited*
-    /// stack: add a layer and the page's numbers move with it, without a save.
+    /// The inventory the Resources page draws for its current batch and workload.
+    /// Recomputed, not stored (see [`ResourcesState`]), off the layer builder's
+    /// EDITED stack — add a layer and the numbers move without a save.
     pub fn resources_inventory(
         &self,
         batch: u32,
@@ -3093,8 +2900,7 @@ impl App {
             input_size: self.layer_builder.model_input,
             batch: batch.max(1),
             workload,
-            // Inference streams nothing: the sampler holds one latent, and the
-            // dataset is not in the graph at all.
+            // Inference streams nothing: one latent, no dataset in the graph.
             dataset: if self.resources.inference {
                 None
             } else {
@@ -3147,13 +2953,10 @@ impl App {
                 loss: LossMethod::MeanSquared,
                 checkpoint_path: self.selected_checkpoint_path.clone(),
                 load_checkpoint: self.load_checkpoint_on_start,
-                // Carried from the model's own config, not reset to the
-                // defaults. These three have no form field, so `::default()`
-                // here meant that starting a run from the TUI silently
-                // downgraded `--optimizer adam` to SGD — and then wrote that
-                // back to `config_file`, making the loss permanent. Worse, the
-                // Resources page one screen earlier reads the *file's* value,
-                // so it sized an Adam run while launching an SGD one.
+                // Carried from the config, not reset: these three have no form
+                // field, and `::default()` here silently downgraded Adam to SGD
+                // then wrote it back to `config_file` (while the Resources page
+                // still sized an Adam run).
                 optimizer: self.training_optimizer,
                 weight_init: self.training_weight_init,
                 loss_weighting: self.training_loss_weighting,
@@ -3220,13 +3023,9 @@ impl App {
         }
     }
 
-    /// Backspace deletes a character of the *typed* fields only.
-    ///
-    /// The guard is not decoration: `fields[TRAINING_DATASET_FIELD]` is the
-    /// dataset path, which the dataset selector owns and this form never shows.
-    /// With the toggle sharing its index, an unguarded `pop()` would have eaten
-    /// that path one character per keystroke, from a screen where nothing
-    /// appears to change.
+    /// Backspace deletes from the TYPED fields only. `fields[TRAINING_DATASET_FIELD]`
+    /// is the dataset path (this form never shows it); with the toggle sharing its
+    /// index, an unguarded `pop()` would eat that path one keystroke at a time.
     pub fn handle_backspace_training(&mut self) {
         let idx = self.training_params.field_idx;
         if idx >= TRAINING_RANDOM_WEIGHTS_FIELD {
@@ -3274,9 +3073,9 @@ impl App {
         self.training_control.fields[idx].pop();
     }
 
-    /// Both manager forms take a model name, so every printable key is text —
-    /// including `q`, which quits on most other screens. `Esc` is the only way
-    /// out, or a model called `q-experiment` could not be typed at all.
+    /// Manager forms take a model name, so every printable key is text —
+    /// including `q` (which quits elsewhere). `Esc` is the only way out, or a
+    /// model called `q-experiment` could not be typed.
     pub fn handle_char_rename(&mut self, c: char) {
         if !c.is_control() {
             self.rename_model.input.push(c);
@@ -3323,18 +3122,16 @@ mod tests {
         RunMode, Screen, TRAINING_DATASET_FIELD, TRAINING_EMA_FIELD, TrainingConfig,
         TrainingControlCommand, parse_ema_decay_field, storage,
     };
-    // Straight from the engine, as the production code above refers to them —
-    // they are no longer re-exported into `app`'s own scope.
+    // From the engine directly — no longer re-exported into `app`'s scope.
     use batlab_core::{OptimizerKind, WeightInit};
     use crate::storage::TempRoot;
     use crate::tui::events::handle_key;
     use crossterm::event::KeyCode;
     use batlab_core::config::{built_in_templates, compute_inferred_input};
 
-    /// Every app under test lives on its own throwaway storage root. The
-    /// template route writes a `config_file`, and rename/delete move and remove
-    /// directories: on the deduced root all of that landed in the repository's
-    /// own `Models/` (`docs/reports/PERPETUAL_INFERENCE.md` §5).
+    /// Every app under test lives on its own throwaway root: the template route
+    /// writes a `config_file` and rename/delete move directories, all of which
+    /// landed in the repo's `Models/` on the deduced root (PERPETUAL_INFERENCE.md §5).
     fn test_app(tag: &str) -> (TempRoot, App) {
         let temp = TempRoot::new(tag);
         let app = App::with_storage(temp.storage());
@@ -3355,11 +3152,8 @@ mod tests {
         assert_eq!(app.layer_builder.current_kind, LayerKind::Add);
     }
 
-    /// The front door is the model list. `Screen::LoadPath` — its ancestor —
-    /// existed, was drawn, and handled its keys while nothing ever assigned it,
-    /// so a trained model under `Models/` could not be reached at all. Opening
-    /// straight onto the list is what makes "I have models, show me them" cost
-    /// nothing.
+    /// The front door is the model list. `Screen::LoadPath` was drawn and handled
+    /// keys while nothing ever assigned it, so a trained model could not be reached.
     #[test]
     fn app_opens_on_the_model_list() {
         let (_temp, app) = test_app("opens-on-list");
@@ -3367,9 +3161,8 @@ mod tests {
         assert_eq!(app.model_list.selected, 0);
     }
 
-    /// The last row of the list is the template flow, and its index moves with
-    /// the list — on an empty root it is row 0, which is why a fresh install is
-    /// not a dead end.
+    /// The last row is the template flow; its index moves with the list, so on an
+    /// empty root it is row 0 — a fresh install is not a dead end.
     #[test]
     fn the_last_row_of_an_empty_list_opens_the_template_flow() {
         let (_temp, mut app) = test_app("empty-list");
@@ -3398,10 +3191,9 @@ mod tests {
         assert_eq!(app.active_model_name.as_deref(), Some(created.as_str()));
     }
 
-    /// Opening a saved model must not touch what it says. The template route
-    /// calls `write_model_config` with `InferenceConfig::default()`, which is
-    /// how the previous mission silently reset two `config_file`s; the load
-    /// route has to carry the stored inference block into the form instead.
+    /// Opening a saved model must not touch what it says: the load route carries
+    /// the stored inference block into the form rather than resetting it to default
+    /// (how a previous mission silently reset two `config_file`s).
     #[test]
     fn loading_a_model_preserves_its_inference_block() {
         let (_temp, mut app) = test_app("preserve-inference");
@@ -3436,15 +3228,9 @@ mod tests {
         assert_eq!(app.screen, Screen::ModelActions);
     }
 
-    /// Starting a training run from the TUI must **preserve** the three knobs
-    /// the config file carries and no form shows.
-    ///
-    /// Same defect class as the seed dataset, one step over: the field is read
-    /// at run time, but the only interactive way to launch destroyed it first.
-    /// `--optimizer adam` converges ~20× faster per step
-    /// (`OPTIMIZER_ADAM.md`), and a run started from the TUI silently became
-    /// SGD — then wrote that back to `config_file`, so the loss was permanent
-    /// and invisible.
+    /// Starting a training run from the TUI must PRESERVE the three knobs the
+    /// config carries and no form shows. The launch used to destroy them, silently
+    /// turning Adam into SGD and writing that back to `config_file` (OPTIMIZER_ADAM.md).
     #[test]
     fn starting_a_run_from_the_form_keeps_the_optimizer_the_config_asked_for() {
         let (_temp, mut app) = test_app("keep-training-knobs");
@@ -3577,13 +3363,9 @@ mod tests {
         );
     }
 
-    /// It is a property of the **model**, so a training run must carry it
-    /// through rather than drop it.
-    ///
-    /// Parked inside `RunMode::Perpetual` — where it was declared — a single
-    /// night of training rewrote `run.mode` and the setting was gone, with
-    /// nothing on screen to say so. That is why it sits at the top level of
-    /// `ModelConfig`, beside `inference`.
+    /// A property of the MODEL, so a training run must carry it through. Parked
+    /// inside `RunMode::Perpetual`, a night of training rewrote `run.mode` and lost
+    /// it — why it sits at `ModelConfig` top level, beside `inference`.
     #[test]
     fn a_training_run_does_not_erase_the_models_seed_dataset() {
         let (_temp, mut app) = test_app("seed-survives-training");
@@ -3618,8 +3400,7 @@ mod tests {
              the form has to find it"
         );
 
-        // And launching a *training* run writes it straight back, which is the
-        // half that was lost when it lived inside `RunMode::Perpetual`.
+        // And a training run writes it straight back — the half lost inside `RunMode::Perpetual`.
         for mode in [
             RunMode::Infer,
             RunMode::Train(TrainingConfig {
@@ -3645,9 +3426,8 @@ mod tests {
         }
     }
 
-    /// Opening a model that names **no** dataset must not leave the previous
-    /// model's in place. The state is per-model, so it is read outside the
-    /// `run.mode` match — read inside it, a stale value would survive.
+    /// Opening a model that names NO dataset must not leave the previous model's
+    /// in place. Read outside the `run.mode` match — inside it, a stale value survives.
     #[test]
     fn opening_a_model_without_a_seed_dataset_clears_the_previous_ones() {
         let (_temp, mut app) = test_app("seed-not-sticky");
@@ -3674,12 +3454,9 @@ mod tests {
         );
     }
 
-    /// A dataset whose **channels** disagree with the model is refused by the
-    /// chooser, with the reason on screen, and the setting is left alone.
-    ///
-    /// Refusing here rather than at run time is the point: the loader would
-    /// have replicated a greyscale file across R, G and B and succeeded, and
-    /// the only symptom would have been a drift away from a grey picture.
+    /// A dataset whose CHANNELS disagree is refused by the chooser, reason on
+    /// screen, setting untouched. Refusing here, not at run time, because the
+    /// loader would replicate a greyscale file across RGB and succeed.
     #[test]
     fn the_chooser_refuses_a_dataset_of_the_wrong_channels() {
         let (_temp, mut app, _name) = app_on_a_model("seed-wrong-channels");
@@ -3710,9 +3487,8 @@ mod tests {
         );
     }
 
-    /// The first row hands the choice back to the convention, and says which
-    /// file that is. "Default" without naming the file is how a colour model
-    /// drifted away from CIFAR trucks with nothing on screen looking wrong.
+    /// The first row hands the choice back to the convention and names the file —
+    /// "default" without the name is how a colour model drifted from CIFAR trucks.
     #[test]
     fn the_default_row_clears_the_choice_and_names_what_takes_over() {
         let (_temp, mut app, _name) = app_on_a_model("seed-default-row");
@@ -3749,15 +3525,10 @@ mod tests {
         assert_eq!(app.layer_builder.model_input, (32, 32, 7));
     }
 
-    /// Every model the "New model (from template)" flow writes to disk must be
-    /// conditionable on the timestep — `input_size.z > output.z`.
-    ///
-    /// The invariant is checked on the **config_file as written**, not on the
-    /// template in memory, because that file is what training and inference
-    /// will read back. Both templates shipped a model that failed this (1→1 and
-    /// 3→3, the geometry of `Models/Greyscale_Diffusion_broken`); a blind test
-    /// caught it by reading the file, which is why the assertion lives here too
-    /// and not only in `batlab_core`.
+    /// Every model the template flow writes must be conditionable on t
+    /// (`input_size.z > output.z`). Checked on the config_file AS WRITTEN (what
+    /// training reads back), not the in-memory template: both templates once
+    /// shipped 1→1 and 3→3, caught by a blind test reading the file.
     #[test]
     fn every_model_created_from_a_template_is_conditionable_on_the_timestep() {
         for (index, template) in built_in_templates().into_iter().enumerate() {
@@ -3871,9 +3642,8 @@ mod tests {
         );
     }
 
-    /// A model with nothing to load falls back to random — and the fallback is
-    /// coherent: the flag is off, and the path points at where this run will
-    /// *write*, not at a file that does not exist.
+    /// A model with nothing to load falls back to random, coherently: flag off,
+    /// path pointing where this run WRITES, not at a nonexistent file.
     #[test]
     fn a_model_with_no_weights_falls_back_to_random() {
         let (_temp, mut app, _name) = app_on_a_model("default-no-weights");
@@ -3915,9 +3685,8 @@ mod tests {
         assert_eq!(app.selected_checkpoint_path, chosen);
     }
 
-    /// With no weights on disk the toggle is pinned on: there is nothing to
-    /// turn it off *to*, and a checkbox that silently refuses is worse than one
-    /// that is honestly stuck.
+    /// With no weights the toggle is pinned on — nothing to turn it off TO, and a
+    /// checkbox that silently refuses is worse than one honestly stuck.
     #[test]
     fn the_random_toggle_is_pinned_when_there_is_nothing_to_load() {
         let (_temp, mut app, _name) = app_on_a_model("random-pinned");
@@ -3929,9 +3698,8 @@ mod tests {
         assert!(!app.load_checkpoint_on_start);
     }
 
-    /// Editing the architecture invalidates the weights, and the default must
-    /// not quietly bring them back: a checkpoint from another geometry would be
-    /// refused by the engine mid-run, after the GPU work of building the model.
+    /// Editing the architecture invalidates the weights, and the default must not
+    /// bring them back — a checkpoint of another geometry is refused mid-run.
     #[test]
     fn editing_a_layer_drops_the_weights_and_the_default_does_not_restore_them() {
         let (_temp, mut app, name) = app_on_a_model("edit-drops-weights");
@@ -3985,9 +3753,8 @@ mod tests {
         }
     }
 
-    /// The dataset path lives at `fields[3]`, which is also the toggle's index.
-    /// Backspace on the toggle used to eat that path one character at a time,
-    /// from a screen that shows neither.
+    /// The dataset path shares `fields[3]` with the toggle's index; backspace on
+    /// the toggle used to eat that path one character at a time.
     #[test]
     fn backspace_on_the_toggle_does_not_eat_the_dataset_path() {
         let (_temp, mut app, _name) = app_on_a_model("backspace-toggle");
@@ -4056,9 +3823,8 @@ mod tests {
         }
     }
 
-    /// `t_r` below the drift's own minimum would make a cycle a single step and
-    /// freeze the piece; the form must refuse it rather than let the drift
-    /// silently clamp something the user cannot see.
+    /// `t_r` below the drift minimum makes a cycle one step and freezes the piece;
+    /// the form must refuse it, not let the drift silently clamp.
     #[test]
     fn perpetual_params_reject_a_depth_below_the_drift_minimum() {
         let (_temp, mut app) = test_app("perpetual-min-depth");
@@ -4067,8 +3833,7 @@ mod tests {
     }
 
 
-    /// The EMA row is empty by default, and empty means no average — the run
-    /// the framework did before averaging existed.
+    /// The EMA row is empty by default, and empty means no average.
     #[test]
     fn the_ema_row_starts_empty_and_an_empty_row_means_no_average() {
         let (_temp, mut app) = test_app("ema-default-off");
@@ -4117,8 +3882,7 @@ mod tests {
         }
     }
 
-    /// The form refuses the two decays that are silently useless rather than
-    /// loudly wrong — and it refuses them on the form, not six hours later.
+    /// The form refuses the silently-useless decays on the form, not six hours later.
     #[test]
     fn the_form_refuses_a_decay_outside_the_open_unit_interval() {
         assert_eq!(parse_ema_decay_field(""), Ok(None));
@@ -4143,13 +3907,8 @@ mod tests {
         assert!(app.finish_training_params().is_err());
     }
 
-    /// Typing on the EMA row must not eat the dataset path.
-    ///
-    /// This is the exact bug the old `fields[3]`-is-both-things layout produced
-    /// once already: the toggle shared its index with the dataset, and
-    /// backspace on it deleted the path one character per keystroke from a
-    /// screen where nothing appeared to change. Inserting a row in front of the
-    /// dataset is precisely the edit that re-creates it.
+    /// Typing on the EMA row must not eat the dataset path — the exact bug the old
+    /// `fields[3]`-is-both-things layout produced, which inserting a row re-creates.
     #[test]
     fn typing_on_the_ema_row_leaves_the_dataset_path_alone() {
         let (_temp, mut app) = test_app("ema-no-clobber");
@@ -4170,8 +3929,7 @@ mod tests {
             "the dataset path is not what this row edits"
         );
 
-        // …and the toggle row, which is past every typed field, must not edit
-        // anything at all.
+        // …and the toggle row, past every typed field, must edit nothing.
         app.training_params.field_idx = super::TRAINING_RANDOM_WEIGHTS_FIELD;
         for _ in 0..10 {
             app.handle_backspace_training();
@@ -4596,10 +4354,9 @@ mod tests {
         assert_eq!(app.screen, Screen::DeleteConfirm);
     }
 
-    /// Re-entering the action menu re-reads the model's checkpoints. On the
-    /// restart path the app is rebuilt from scratch, so a menu that trusted its
-    /// own state announced "no checkpoints" for a model that had just written
-    /// one.
+    /// Re-entering the action menu re-reads the checkpoints — the restart path
+    /// rebuilds the app, so trusting its own state announced "no checkpoints" for
+    /// a model that had just written one.
     #[test]
     fn re_entering_the_action_menu_re_reads_the_checkpoints() {
         let (_temp, mut app, name) = app_on_a_model("reenter-actions");

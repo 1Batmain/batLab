@@ -1,30 +1,17 @@
-//! File purpose: Bridges a CPU-side tensor produced step by step (the diffusion
-//! sampler's latent) to a GPU buffer the visualiser can bind and render live.
-//!
-//! Training needs no such bridge: the model's output buffer already lives on the
-//! GPU, so the visualiser binds it and reads whatever the last pass wrote. The
-//! reverse diffusion chain is the opposite shape — [`crate::sample_diffusion`]
-//! keeps its latent as a `Vec<f32>` on the CPU and never uploads it, since the
-//! model is only ever asked to predict from it. This type gives that latent a
-//! GPU home so the same visualiser can display it, at the cost of one small
-//! upload per denoising step.
+//! Bridges the sampler's CPU-side latent to a GPU buffer the visualiser can render
+//! live. Training needs no bridge (its output already lives on the GPU), but the
+//! reverse chain keeps its latent as a `Vec<f32>` on the CPU; this gives it a GPU
+//! home at the cost of one small upload per denoising step.
 
 use std::sync::Arc;
 
 use crate::GpuContext;
 use wgpu::util::DeviceExt as _;
 
-/// The rule drawn between the two panes, one entry per column, as raw tensor
-/// values — the shader maps `-1 → black` and `+1 → white`.
-///
-/// Without it the window shows one image with a seam down the middle and
-/// nothing saying there is a seam. A user watching a live run read it as a
-/// single picture that had come apart — "cut in two, the left decorrelated
-/// from the right" — which is a fair description of a frame whose halves are
-/// *supposed* to differ, and an alarming one if you think you are looking at
-/// one image. A light/dark/light rule is the cheapest thing that cannot be
-/// mistaken for content: no sample from this model contains a one-pixel
-/// saturated-black column flanked by two saturated-white ones.
+/// The rule between the two panes, one entry per column (`-1 → black`, `+1 → white`).
+/// Without it the two panes read as one image that has come apart. A light/dark/light
+/// column cannot be mistaken for content — no sample holds a one-pixel black column
+/// flanked by two white ones.
 pub const SEPARATOR_COLUMNS: [f32; 3] = [1.0, -1.0, 1.0];
 
 /// How many panes the frame carries.
@@ -38,16 +25,10 @@ pub const SEPARATOR_COLUMNS: [f32; 3] = [1.0, -1.0, 1.0];
 ///   └───────────────┴─┴───────────────┘  └───────────────┘
 /// ```
 ///
-/// [`LiveView::X0Only`] is the perpetual default, and the reason is not screen
-/// real estate: *"on n'a même pas besoin de la fenêtre de gauche"*. A drift is
-/// something to look at, and the double view puts the picture in half a window
-/// at the wrong aspect ratio, beside a field of noise that competes with it for
-/// attention. The noise is diagnostic, so it stays one key away — `[x]` — for
-/// when the question is what the latent is doing rather than what the image is.
-///
-/// A single pane is also the only view whose frame is **square**, which is the
-/// real geometry of a CIFAR sample; the visualiser letterboxes to whatever
-/// ratio it is handed, so the window simply opens right.
+/// [`LiveView::X0Only`] is the perpetual default: a drift is something to look at,
+/// and the double view halves the picture at the wrong aspect ratio beside a field
+/// of noise. The noise is diagnostic, one key away (`[x]`). The single pane is also
+/// the only SQUARE frame — a CIFAR sample's real geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveView {
     /// x̂₀ alone, at the image's own aspect ratio.
@@ -68,9 +49,8 @@ impl LiveView {
     pub fn frame_width(self, pane_width: u32) -> u32 {
         match self {
             LiveView::X0Only => pane_width.max(1),
-            // The `+ 3` is the rule: the visualiser is told this number, so the
-            // gutter is real pixels in the buffer rather than something the
-            // shader would have to know about.
+            // `+ 3` is the rule: real pixels in the buffer, so the shader need not
+            // know about the gutter.
             LiveView::Both => pane_width.max(1) * 2 + SEPARATOR_COLUMNS.len() as u32,
         }
     }
@@ -92,13 +72,10 @@ impl LiveView {
     }
 }
 
-/// A GPU-resident frame the visualiser renders while the sampler fills it.
-///
-/// The buffer is laid out as a **single wide image** — see [`LiveView`] for the
-/// two layouts. The visualiser's shader is a plain row-major indexer
-/// (`buf[(y * width + x) * channels + c]`), so a wide image is rendered side by
-/// side with no shader change and no second window — the panes are just spans
-/// of one tensor.
+/// A GPU-resident frame the visualiser renders while the sampler fills it. Laid
+/// out as a SINGLE wide image (see [`LiveView`]): the shader is a plain row-major
+/// indexer, so the panes are just spans of one tensor — no shader change, no
+/// second window.
 pub struct LiveFrame {
     gpu: Arc<GpuContext>,
     buffer: Arc<wgpu::Buffer>,
@@ -119,12 +96,9 @@ impl LiveFrame {
         Self::with_view(gpu, width, height, channels, LiveView::Both)
     }
 
-    /// The same, in the layout of `view`.
-    ///
-    /// The buffer is sized for the view, so switching views means a new
-    /// `LiveFrame` and a re-registration with the visualiser — the window has
-    /// to be told the new width anyway, and a buffer that could hold either
-    /// would leave half of itself rendered as content in the narrow one.
+    /// The same, in the layout of `view`. The buffer is sized for the view, so
+    /// switching views is a new `LiveFrame` + re-registration (the window needs the
+    /// new width anyway, and a shared buffer would render its unused half as content).
     pub fn with_view(
         gpu: Arc<GpuContext>,
         width: u32,
@@ -208,13 +182,9 @@ impl LiveFrame {
     }
 }
 
-/// Composes the frame the visualiser would display, as a plain CPU tensor of
-/// `live_frame_width(width) × height × channels` — no GPU, no window.
-///
-/// The window is what users report on ("the image is cut in two"), so the
-/// headless path can write out exactly what it would have shown, through the
-/// same composition the live path uses. A screenshot proves what one screen
-/// did; this proves what the buffer holds.
+/// Composes the frame the visualiser would display, as a plain CPU tensor (no GPU,
+/// no window), through the same composition the live path uses — so the headless
+/// path can write out exactly what it would have shown. Proves what the buffer holds.
 pub fn compose_live_frame(
     latent: &[f32],
     x0_hat: &[f32],
@@ -246,16 +216,10 @@ pub fn live_frame_width(pane_width: u32) -> u32 {
 }
 
 /// Lays the two panes and the rule into `staging`, row-major with interleaved
-/// channels — the exact indexing the shader performs.
-///
-/// Split out of [`LiveFrame::publish`] so it can be tested at all: the rest of
-/// `LiveFrame` needs a GPU, this does not, and the layout is the part that can
-/// be silently wrong. The previous mission's validation counted published
-/// frames and sampled `latent[0]` / `x0[0]`; neither would have noticed a
-/// stride that interleaved the panes instead of stacking them side by side.
-///
-/// Total in its inputs: writes every element of `staging` it owns, including
-/// the rule, on every call.
+/// channels — the exact indexing the shader performs. Split out of
+/// [`LiveFrame::publish`] so it can be tested without a GPU: the layout is the part
+/// that can be silently wrong (a stride that interleaved the panes instead of
+/// stacking them). Writes every element of `staging` on every call.
 fn compose_frame(
     staging: &mut [f32],
     latent: &[f32],
@@ -354,11 +318,9 @@ mod tests {
         );
     }
 
-    /// The same claim read the way the eye reads it: a checkerboard on the
-    /// left, a horizontal ramp on the right. If the buffer were interleaved or
-    /// transposed, the checkerboard would smear and the ramp would run down
-    /// instead of across — the two patterns fail in visibly different ways, so
-    /// this is the test that says what the window should *look* like.
+    /// The same claim the way the eye reads it: a checkerboard left, a horizontal
+    /// ramp right. Interleaved or transposed, the checkerboard smears and the ramp
+    /// runs down — two patterns that fail visibly differently.
     #[test]
     fn a_checkerboard_and_a_ramp_survive_the_composition_side_by_side() {
         let (w, h) = (6u32, 4u32);

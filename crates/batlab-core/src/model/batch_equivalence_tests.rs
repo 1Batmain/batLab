@@ -1,20 +1,10 @@
-//! Equivalence of the batched graph with the sequential one it replaced.
-//!
-//! The batch axis now lives in the buffer sizes and the dispatch grids
-//! (`docs/reports/BATCH_DISPATCH_DESIGN.md`). Two failure modes dominate that
-//! kind of refactor, and both are silent:
-//!
-//! 1. **a missing slice offset** — a kernel reads or writes sample 0's data
-//!    while computing sample 3's. Nothing crashes: the shapes are right, the
-//!    values are plausible, the loss still goes down.
-//! 2. **a truncated reduction** — a gradient sums over `positions` instead of
-//!    `batch * positions`. Again nothing crashes; the model just trains on a
-//!    fraction of its batch.
-//!
-//! The tests below are built to catch exactly those. The reference is not a
-//! frozen fixture but `DiffusionTask::train_step_batch_sequential` and the
-//! batch-1 graph — i.e. the pre-batching code, still executable — plus an f64
-//! oracle that knows neither implementation.
+//! Equivalence of the batched graph with the sequential one it replaced. Two
+//! SILENT failure modes dominate this refactor: (1) a missing slice offset — a
+//! kernel reads sample 0 while computing sample 3, shapes right, loss still down;
+//! (2) a truncated reduction — a gradient sums over `positions` not
+//! `batch * positions`, training on a fraction of the batch. The reference is not
+//! a fixture but `DiffusionTask::train_step_batch_sequential` (the pre-batching
+//! code, still executable) plus an f64 oracle knowing neither implementation.
 
 use crate::gpu_context::GpuContext;
 use crate::model::debug::read_back_f32;
@@ -95,14 +85,10 @@ async fn single_conv_model(gpu: Arc<GpuContext>, batch: u32) -> Model<Training> 
     model
 }
 
-/// conv(s2) -> up-conv(x2) -> concat(skip) -> conv.
-///
-/// The U-net shape, and the one where the batch axis is easiest to get wrong:
-/// Concat is the only layer whose three tensors have DIFFERENT per-sample
-/// lengths (out = input + skip channels), so a single shared `sample * len`
-/// offset is wrong for it — and UpsampleConv reduces onto its weights over a
-/// tap map that is not the convolution's. Both are in every real model of the
-/// repository and in neither of the fixtures above.
+/// conv(s2) -> up-conv(x2) -> concat(skip) -> conv — the U-net shape, where the
+/// batch axis is easiest to get wrong: Concat's three tensors have DIFFERENT
+/// per-sample lengths, so a shared `sample * len` offset is wrong for it, and
+/// UpsampleConv reduces over a different tap map. Both are in every real model.
 async fn skip_model(gpu: Arc<GpuContext>, batch: u32) -> Model<Training> {
     let mut model = Model::new_training_with_optimizer(
         gpu,
@@ -267,24 +253,13 @@ fn sequential_gradients(
     read_parameter_gradients(model)
 }
 
-/// Largest disagreement between two gradient vectors, **relative to the scale
-/// of the vector** (`max |a-b| / max(||a||inf, ||b||inf)`).
-///
-/// Not the per-element relative error, and the difference is not cosmetic. A
-/// gradient buffer spans orders of magnitude, and its small entries are small
-/// because they are nearly-cancelled sums of large terms. On the U-net fixture
-/// below, entry 100 of the first convolution's `grad_weights` is 7.12e-4 in a
-/// buffer whose largest entry is 4.61: the two paths differ there by 2.98e-7,
-/// which is the f32 rounding floor for terms of that size — and which the
-/// per-element metric reports as a 4.2e-4 "relative error". That number does
-/// not measure agreement on the gradient; it measures how close to zero its
-/// smallest entry happens to fall.
-///
-/// The vector-relative error is the standard answer for a quantity like this,
-/// and it stays strict where it matters: a truncated batch reduction or a
-/// missed slice offset moves the LARGE entries, which are exactly the ones
-/// `||.||inf` is made of. That claim is checked by mutation (§4.6 of the
-/// report), not asserted.
+/// Largest disagreement between two gradient vectors, relative to the vector's
+/// SCALE (`max |a-b| / max(||a||inf, ||b||inf)`) — not the per-element error. A
+/// gradient's small entries are nearly-cancelled sums of large terms, differing at
+/// the f32 rounding floor; the per-element metric reads that as huge "relative
+/// error" while measuring only how close to zero an entry falls. The vector-relative
+/// error stays strict where it matters (a truncated reduction moves the LARGE
+/// entries `||.||inf` is made of), checked by mutation (report §4.6).
 fn worst_relative_diff(a: &[f32], b: &[f32]) -> f64 {
     assert_eq!(a.len(), b.len(), "length mismatch");
     let scale = a
@@ -320,15 +295,10 @@ fn worst_relative_to_f64(a: &[f32], oracle: &[f64]) -> f64 {
 // 1. Forward — bit for bit, sample by sample
 // ---------------------------------------------------------------------------
 
-/// The forward pass contains no reduction over the batch axis: sample `i` of a
-/// batch of `B` reads only its own slice, in the same order, from the same
-/// weights. Its output must therefore be **bit-identical** to running that
-/// sample alone.
-///
-/// Asserting on `to_bits()` rather than a tolerance is deliberate, and it is
-/// what gives this test its power: a wrong slice offset that happens to land on
-/// a neighbouring sample produces numbers of the right magnitude, which a 1e-5
-/// threshold would only catch by luck.
+/// The forward has no batch-axis reduction: sample `i` reads only its own slice,
+/// so its output must be BIT-IDENTICAL to running it alone. Asserted on `to_bits()`,
+/// not a tolerance — a wrong slice offset landing on a neighbour produces numbers of
+/// the right magnitude that a 1e-5 threshold would catch only by luck.
 #[test]
 fn forward_is_bit_identical_sample_by_sample() {
     pollster::block_on(async {
@@ -534,29 +504,14 @@ fn conv_oracle(
     }
 }
 
-/// Who is right when the two f32 results differ?
-///
-/// The hard requirement is the first assertion: within 1e-4 of the f64 truth.
-///
-/// The second one needs more care than the earlier reduction missions did, and
-/// the difference is worth stating rather than hiding. `PERF_GROUP_NORM.md`
-/// §3.2 and `PERF_CONVOLUTION.md` §4.2 could demand `new <= 1.5 * old` outright,
-/// because there the change was purely *how* a fixed set of terms was
-/// associated — a tree instead of a chain, over the same `positions` terms.
-/// Here the term count itself changes: a lane that used to walk `positions`
-/// values and hand its partial to a `+=` between samples now walks
-/// `batch * positions` of them in one f32 accumulator. Longer chain, more
-/// rounding — measured on `grad_bias` at batch 5: 2.1e-6 against the oracle
-/// where the sequential path gets 5.3e-7. That is not a bug and not a
-/// regression to fix; it is the arithmetic of the operation being asked for.
-///
-/// So the clause becomes: either the batched result beats the old 1.5x bar, or
-/// it sits within a small multiple of the **rounding floor of the sum it now
-/// performs** — `sqrt(n) * f32::EPSILON` for `n` accumulated terms, the
-/// standard random-walk estimate. The floor is *derived from the shape*, not
-/// fitted to the measurement, and a reduction that is genuinely broken (a
-/// truncated batch, a missed slice) is off by O(1) relative, some four orders
-/// of magnitude above it. The test still bites.
+/// Who is right when the two f32 results differ? Hard bar: within 1e-4 of the f64
+/// truth. The second clause needs care — unlike the earlier reduction missions
+/// (same terms, tree vs chain), the batched path sums `batch * positions` in one
+/// f32 accumulator, a longer chain with more rounding (grad_bias at batch 5: 2.1e-6
+/// vs the sequential 5.3e-7). Not a bug — the arithmetic asked for. So: either it
+/// beats the old 1.5× bar, or it sits within a multiple of the sum's rounding floor
+/// `sqrt(n) * f32::EPSILON` (DERIVED from the shape, not fitted). A genuinely broken
+/// reduction is O(1) off, four orders above — the test still bites.
 #[test]
 fn batch_reduction_is_arbitrated_by_an_f64_oracle() {
     pollster::block_on(async {
@@ -851,20 +806,11 @@ fn concat_and_upsample_conv_carry_the_batch_correctly() {
 // 8. The 65 535-workgroup ceiling
 // ---------------------------------------------------------------------------
 
-/// WebGPU caps a dispatch at 65 535 workgroups **per dimension**. Nothing in
-/// this repository came close before: the largest single-tensor dispatch is one
-/// workgroup per 64 elements, i.e. 1024 for the biggest layer of
-/// `Greyscale_Diffusion_L`. Multiply by a batch of 64 and it is 65 536 — one
-/// over.
-///
-/// The failure mode is why this test exists rather than a comment. wgpu reports
-/// the violation on the queue and the run CONTINUES: the observed symptom was
-/// `loss 0.000000` scrolling past at batch 64, a step that computed nothing at
-/// all. A silent wrong answer, at exactly the batch sizes the batching exists
-/// to make possible.
-///
-/// The shape here is chosen to cross the ceiling cheaply: 64 elements per
-/// sample is one workgroup per sample, so `batch` IS the workgroup count.
+/// WebGPU caps a dispatch at 65 535 workgroups per dimension; a batch of 64 pushes
+/// the biggest `Greyscale_Diffusion_L` layer to 65 536, one over. This is a test
+/// not a comment because the failure mode is silent: wgpu reports the violation on
+/// the queue but the run CONTINUES (`loss 0.000000` at batch 64, a step computing
+/// nothing). Shape chosen to cross the ceiling cheaply: `batch` IS the workgroup count.
 #[test]
 fn a_dispatch_past_the_65535_workgroup_ceiling_is_still_correct() {
     pollster::block_on(async {

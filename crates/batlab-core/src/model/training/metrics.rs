@@ -1,10 +1,7 @@
-//! File purpose: Diffusion training/sampling instrumentation — per-timestep-bucket
-//! loss, predicted-noise (ε̂) vs target-noise (ε) statistics, and per-step latent
-//! trajectory stats, all written to a JSONL file next to the checkpoint.
-//!
-//! Everything here drives the model through its *public* API (`predict`) and the
-//! shared [`LinearNoiseSchedule`], so the diagnostics never depend on GPU
-//! internals and behave identically for a healthy and a degenerate model.
+//! Diffusion training/sampling instrumentation — per-bucket loss, ε̂-vs-ε stats,
+//! per-step trajectory — written to a JSONL beside the checkpoint. Drives the
+//! model through its PUBLIC API (`predict`) and the shared schedule, so the
+//! diagnostics never depend on GPU internals.
 
 use crate::model::Model;
 use crate::model::training::{LinearNoiseSchedule, PosteriorVariance};
@@ -12,13 +9,10 @@ use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-/// Packs a `[signal | timestep-embedding]` model input, matching byte-for-byte
-/// the layout the GPU `diffusion_prepare` shader produces during training.
-///
-/// This is the single source of truth for input composition: training's GPU
-/// prepare pass, the diagnostic probe, and inference sampling all agree on it,
-/// so the timestep conditioning the network is *trained* on is exactly the one
-/// it is *sampled* with.
+/// Packs a `[signal | timestep-embedding]` model input, byte-for-byte the layout
+/// the GPU `diffusion_prepare` shader produces during training — the single source
+/// of truth for input composition, so the conditioning the network is TRAINED on
+/// is exactly the one it is SAMPLED with.
 pub fn compose_diffusion_input(
     signal: &[f32],
     input_channels: usize,
@@ -335,30 +329,19 @@ pub struct DenoiseFrame<'a> {
 /// Odd increment used to fold the timestep into a path's seed.
 const STEP_SEED_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 
-/// The seed one reverse step draws its injected noise from.
-///
-/// The timestep is mixed in by **multiply-add, not XOR**: `path_seed ^
-/// diffusion_step` collided with the XOR the noise field itself once used to
-/// fold in the pixel index, so every step of the chain re-drew one single field
-/// under an `index ^ step` permutation and the sampler painted horizontal bands
-/// whatever the model predicted. See `gaussian_at` in `schedule.rs` and
-/// `ANISOTROPY_HUNT.md`. The schedule-side fix already breaks the collision;
-/// this keeps callers from relying on it — and being one function, no caller
-/// can derive its step seed a *different*, broken way.
+/// The seed one reverse step draws its noise from. The timestep is mixed in by
+/// MULTIPLY-ADD, not XOR: `path_seed ^ step` collided with the field's own XOR of
+/// the pixel index and painted horizontal bands (`ANISOTROPY_HUNT.md`). One
+/// function, so no caller can derive its step seed a different, broken way.
 pub fn reverse_step_seed(path_seed: u64, diffusion_step: usize) -> u64 {
     path_seed.wrapping_add((diffusion_step as u64 + 1).wrapping_mul(STEP_SEED_GAMMA))
 }
 
-/// The fold that turns a **run seed** into the seed of its *opening latent*.
-///
-/// One value, one place. The native sampler ([`sample_diffusion`]), the drift's
-/// noise fallback ([`crate::PerpetualDrift::initial_noise_seed`]) and the web
-/// port all pass their run seed through [`base_noise_seed`] so a browser run's
-/// first noise field is the very one native path 0 sets out from. A second copy
-/// of this literal — a private `const` in the web crate, say — is exactly the
-/// silent divergence `WEB_PORT.md` was written about: it would compile, animate,
-/// and never trip a test. Kept public so the guard test and the web crate
-/// *import* it rather than restate it.
+/// The fold from a run seed to its opening latent's seed — one value, one place.
+/// The native sampler, the drift's noise fallback and the web port all pass their
+/// run seed through [`base_noise_seed`], so a browser run opens on the field native
+/// path 0 does. A second copy (a private `const` in the web crate) is exactly the
+/// silent divergence `WEB_PORT.md` warns of; public so callers import, not restate.
 pub const BASE_NOISE_FOLD: u64 = 0xa5a5_5a5a_0123_4567;
 
 /// The opening latent's noise seed for a run seed — see [`BASE_NOISE_FOLD`].
@@ -366,12 +349,9 @@ pub fn base_noise_seed(seed: u64) -> u64 {
     seed ^ BASE_NOISE_FOLD
 }
 
-/// The seed of denoising **path** `path_idx` under run seed `seed`.
-///
-/// Path 0 is the run seed itself, so a single-path run (inference, the web) and
-/// path 0 of a multi-path sample draw the same chain. Same odd increment as
-/// [`reverse_step_seed`]'s timestep fold, and — like it — one function so no
-/// caller can spread the seed a different way.
+/// The seed of denoising path `path_idx`. Path 0 is the run seed itself, so a
+/// single-path run (inference, web) and path 0 of a multi-path sample draw the same
+/// chain. One function, so no caller spreads the seed a different way.
 pub fn path_seed(seed: u64, path_idx: usize) -> u64 {
     seed ^ (path_idx as u64).wrapping_mul(STEP_SEED_GAMMA)
 }
@@ -387,14 +367,10 @@ pub struct ReverseStep {
     pub x0_hat: Option<Vec<f32>>,
 }
 
-/// Asks the model what noise it sees in `latent` at `diffusion_step` — the one
-/// model call of a reverse step, and the only thing about the model any walker
-/// needs.
-///
-/// Split out of [`reverse_step`] so that the recursion below can be written
-/// once against a *prediction* rather than against a `Model`: the perpetual
-/// walk ([`crate::training::DriftWalk`]) then runs against an oracle predictor
-/// in tests, on a machine with no GPU, without a second copy of the maths.
+/// Asks the model what noise it sees in `latent` at `diffusion_step` — a reverse
+/// step's one model call. Split out so the recursion is written against a
+/// PREDICTION, not a `Model`, letting the perpetual walk run against an oracle in
+/// tests without a GPU or a second copy of the maths.
 pub fn predict_epsilon<State>(
     model: &mut Model<State>,
     schedule: &LinearNoiseSchedule,
@@ -409,13 +385,10 @@ pub fn predict_epsilon<State>(
     model.predict(&model_input)
 }
 
-/// The reverse recursion proper, from an ε̂ somebody has already predicted.
-///
-/// **This is the only place the reverse recursion is written.** Every walker
-/// goes through it — [`sample_diffusion`], which descends T→0 once per path,
-/// and the perpetual drift, which descends arbitrary spans and re-noises
-/// between them. The step-seed derivation and the posterior draw therefore
-/// cannot diverge between a finite sample and an endless one.
+/// The reverse recursion proper, from an already-predicted ε̂ — the ONLY place it
+/// is written. Every walker goes through it ([`sample_diffusion`] and the
+/// perpetual drift), so the step-seed derivation and posterior draw cannot diverge
+/// between a finite sample and an endless one.
 #[allow(clippy::too_many_arguments)]
 pub fn reverse_step_from_epsilon(
     schedule: &LinearNoiseSchedule,
@@ -446,18 +419,11 @@ pub fn reverse_step_from_epsilon(
     }
 }
 
-/// The **async sibling** of [`reverse_step`] — the same composition, the same ε̂
-/// prediction, the same posterior draw, but it *awaits* the ε̂ readback through
-/// [`Model::predict_async`] instead of blocking on it.
-///
-/// This is here so a browser-driven inference descent does not re-derive the
-/// reverse recursion: `batlab_web`'s per-frame step is one call to this, exactly
-/// as its drift frame is one call to [`crate::training::DriftWalk::advance_async`].
-/// A web inference loop that composed `[x_t | timestep]` or seeded the posterior
-/// its own way could drift from the native sampler undetected; going through the
-/// one function it cannot. Its agreement with the synchronous [`reverse_step`]
-/// (and thus with [`sample_diffusion`]) is held by
-/// `the_async_reverse_step_matches_the_sync_one`.
+/// The async sibling of [`reverse_step`] — same composition, ε̂ and posterior draw,
+/// but it AWAITS the readback ([`Model::predict_async`]). So a browser inference
+/// descent does not re-derive the recursion (which could compose `[x_t|timestep]`
+/// or seed the posterior differently and drift undetected); held to the sync path
+/// by `the_async_reverse_step_matches_the_sync_one`.
 #[allow(clippy::too_many_arguments)]
 pub async fn reverse_step_async<State>(
     model: &mut Model<State>,
@@ -523,18 +489,12 @@ pub fn reverse_step<State>(
     )
 }
 
-/// Core diffusion sampler with optional per-step trajectory capture.
-///
-/// This is the *single* sampler used by inference and by the diagnostics, so the
-/// denoising math the metrics observe is exactly the one production runs use.
-/// When `trajectory` is `Some`, the first path's per-step latent/ε̂ stats are
-/// recorded — enough to see *where* along the 256-step chain the latent diverges.
-///
-/// `observer`, when `Some`, is called once per reverse step with the freshly
-/// computed latent and x0 estimate; this is what the live inference visualiser
-/// hangs off, so it watches the real chain instead of a re-implementation of it.
-/// The x0 estimate is only computed when an observer is attached, so the
-/// non-observed path allocates exactly as before.
+/// The SINGLE diffusion sampler, used by inference and diagnostics alike, so the
+/// math the metrics observe is production's. `trajectory: Some` records the first
+/// path's per-step stats (where along the chain the latent diverges). `observer:
+/// Some` is called per step with the latent and x0 estimate — what the live
+/// visualiser hangs off, so it watches the real chain, not a re-implementation
+/// (x0 is computed only when observed).
 #[allow(clippy::too_many_arguments)]
 pub fn sample_diffusion<State, F>(
     model: &mut Model<State>,

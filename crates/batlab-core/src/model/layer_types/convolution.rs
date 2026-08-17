@@ -1,4 +1,5 @@
-//! File purpose: Defines the convolution layer type, shapes, and GPU bindings used by the model graph.
+//! The convolution layer type: shapes, GPU bindings, and the backward-pass
+//! reduction-lane heuristic.
 
 use crate::model::error::ModelError;
 use crate::model::layer_types::{
@@ -25,21 +26,13 @@ pub struct ConvolutionUniform {
     pub nb_kernel: u32,
     pub stride: u32,
     pub padding_mode: u32, // 0 = Valid, 1 = Same
-    /// Cooperating threads per sum, for the **two** reductions: the
-    /// `grad_weights` split in the low half of the word, the `grad_bias` split
-    /// in the high half (see [`ConvolutionType::pack_lanes`]).
-    ///
-    /// One word and not two because this uniform's layout is pinned: bytes
-    /// 48..64 are a `Dim3` whose trailing word WGSL reads as `vec3` padding, so
-    /// there is no free slot at the end to grow into without moving offsets the
-    /// legacy fixtures bind against. It occupies the word that used to be
-    /// explicit padding, so the uniform's size and every other field offset are
-    /// unchanged.
-    ///
-    /// The two halves differ because the two reductions do: `grad_weights` has
-    /// thousands of independent sums and wants few lanes, `grad_bias` has as
-    /// many sums as there are kernels — 48 on the layer that cost 9,8 ms on a
-    /// single workgroup — and wants as many lanes as it can get.
+    /// Cooperating threads per sum for the TWO reductions: `grad_weights` in the
+    /// low half of the word, `grad_bias` in the high half (see
+    /// [`ConvolutionType::pack_lanes`]). Packed into one word — the word that was
+    /// explicit padding — so the uniform's size and every field offset stay pinned
+    /// against the legacy fixtures. The two halves differ because the reductions do:
+    /// `grad_weights` has thousands of sums and wants few lanes, `grad_bias` has one
+    /// per kernel and wants as many as it can get.
     pub reduction_lanes: u32,
     pub dim_kernel: Dim3,
     pub dim_input: Dim3,
@@ -75,77 +68,20 @@ impl ConvolutionType {
     }
 
     /// How many threads cooperate on one `grad_weights` / `grad_bias` sum.
+    /// Splitting a sum across lanes buys parallelism but costs a barrier'd tree
+    /// reduction, so it only pays when there are too few sums to keep the GPU busy.
+    /// Rule: fewest lanes that put ~`TARGET_THREADS` threads in flight, never below
+    /// `MIN_POSITIONS_PER_LANE` positions per lane, never past `MAX_LANES`.
     ///
-    /// Splitting a sum across lanes buys parallelism but costs a tree reduction
-    /// with its barriers, so it only pays when there are too few sums to keep
-    /// the GPU busy on their own. `conv3` has 9216 weights — already plenty —
-    /// and measurably *lost* time when every sum was split 16 ways; `conv1` has
-    /// 432 weights and 1024 positions, and gains ~9x from splitting maximally.
+    /// `MAX_LANES` is 32, NOT 64: at 64 a workgroup holds a single slot, so
+    /// consecutive threads no longer walk consecutive `kz` and the slot layout's
+    /// coalescing is lost (measured +35% on conv4).
     ///
-    /// The rule is therefore: use the fewest lanes that still put roughly
-    /// `TARGET_THREADS` threads in flight, never splitting so far that a lane
-    /// has fewer than `MIN_POSITIONS_PER_LANE` positions left to sum (below
-    /// that the reduction costs more than the sum it replaces), and never past
-    /// `MAX_LANES`.
-    ///
-    /// `MAX_LANES` is 32, not 64, on purpose: at 64 lanes a workgroup holds a
-    /// single slot, so consecutive threads no longer walk consecutive `kz` and
-    /// the coalescing the slot layout exists for is lost. Measured on conv4
-    /// that costs 35% (0.0220 ms at 32 lanes vs 0.0297 at 64), and on conv1 it
-    /// buys nothing (0.0291 vs 0.0290).
-    ///
-    /// Calibrated against `bench_conv_reduction_lanes`, which sweeps every
-    /// legal lane count per layer. The resulting choices land within 1.4% of
-    /// the per-layer optimum on all four convolutions of Greyscale_Diffusion:
-    ///
-    /// | layer | sums | positions | picked | best measured |
-    /// |---|---:|---:|---:|---:|
-    /// | conv1 |  432 | 1024 | 32 | 32 (0.0291 ms) |
-    /// | conv2 | 4608 |  256 | 16 |  4 (0.0576 ms; 16 gives 0.0584) |
-    /// | conv3 | 9216 |  256 |  8 |  8 (0.0965 ms) |
-    /// | conv4 |  288 | 1024 | 32 | 32 (0.0220 ms) |
-    ///
-    /// # `TARGET_THREADS` has been recalibrated twice, and the second time says
-    /// why the first expired
-    ///
-    /// 65 536 came from `bench_conv_reduction_lanes` — one kernel dispatched
-    /// 200 times in a loop, on `Greyscale_Diffusion`, **before the batch axis
-    /// existed**. `GPU_PROFILE.md` §6 re-swept it on the real step and got
-    /// 262 144 (−4,2 % to −5,9 %).
-    ///
-    /// That value then expired the moment `conv_back_weights`' inner loop got
-    /// cheap (`KERNEL_HUNT.md` §3): a lane used to pay four integer divisions
-    /// per product and now pays two loads and an FMA, so the barriers of a deep
-    /// split no longer buy back what they cost. Re-swept a third time, Σ of the
-    /// timed passes of one step, minimum over 8 armed steps, two interleaved
-    /// passes over the sweep agreeing to 0,3 %:
-    ///
-    /// | TARGET_THREADS | XL b8 | XL b32 | L b8 | L b32 |
-    /// |---:|---:|---:|---:|---:|
-    /// |    32 768        | 40.7 | **154.5** | 18.6 | 71.3 |
-    /// | **131 072**      | **40.4** | 155.3 | **18.6** | **71.1** |
-    /// |    262 144 (was) | 41.2 | 159.8 | 20.1 | 79.5 |
-    /// |    524 288       | 45.0 | 179.8 |    — |    — |
-    /// |  1 048 576       | 52.4 | 213.1 |    — |    — |
-    ///
-    /// 32 768 and 131 072 are a tie; the tie is broken **towards parallelism**
-    /// (at 32 768 the biggest layers fall to a single lane per sum) because a
-    /// device with less throughput per thread loses more to a starved dispatch
-    /// than to a barrier. That is a portability argument, not a measurement.
-    ///
-    /// This recalibrates the constant; it does **not** fix the structural point
-    /// `BATCH_DISPATCH.md` §9 raises — `positions` here is still the count *per
-    /// sample*, while the loop covers `batch ×` more. Doing that properly means
-    /// getting the batch into the uniform's lane word, and is left open.
-    ///
-    /// # The two numbers are knobs, not constants
-    ///
-    /// Both came out of a sweep on one Mac, and both describe *that machine's*
-    /// balance between parallelism and barrier cost. They are read from
-    /// [`crate::tuning`] (`BATLAB_CONV_TARGET_THREADS`,
-    /// `BATLAB_CONV_MIN_POSITIONS_PER_LANE`) so the same sweep is one shell
-    /// loop on a GPU nobody here owns — see `KERNEL_HUNT.md` §Portabilité. The
-    /// defaults are unchanged.
+    /// `TARGET_THREADS`/`MIN_POSITIONS_PER_LANE` are per-machine knobs read from
+    /// [`crate::tuning`] (env-overridable), calibrated by `bench_conv_reduction_lanes`.
+    /// The sweep tables and recalibration history: `KERNEL_HUNT.md`, `GPU_PROFILE.md`
+    /// §6. Structural caveat still open (`positions` is per-sample, the loop covers
+    /// `batch ×` more): `BATCH_DISPATCH.md` §9.
     pub(crate) fn reduction_lanes(sums: u32, positions: u32) -> u32 {
         let target_threads = crate::tuning::conv_target_threads();
         let min_positions_per_lane = crate::tuning::conv_min_positions_per_lane();
@@ -161,47 +97,26 @@ impl ConvolutionType {
         lanes
     }
 
-    /// Lanes for the `grad_weights` reduction: one sum per weight, and there
-    /// are thousands of them, so the rule usually answers "barely split".
-    ///
-    /// Capped at the number of **output rows**, because that is what the lanes
-    /// now split. `conv_back_weights` walks `(sample, oy)` rows and runs `ox`
-    /// densely inside them, so a lane numbered past `OH` would be handed no row
-    /// at all on a batch of one — a thread asked for and then left idle. `OH`
-    /// and not `OH * batch` because the uniform is written once at build time
-    /// and does not know the batch; the cap is therefore conservative in the
-    /// only direction that is safe. No layer of any model here is affected
-    /// (every one has `OH >= 32 >= lanes`); it is a guard for the wide-and-short
-    /// shapes nothing in this repo builds yet.
+    /// Lanes for the `grad_weights` reduction. Capped at the number of output ROWS:
+    /// `conv_back_weights` walks `(sample, oy)` rows, so a lane past `OH` gets no
+    /// row and idles. `OH` not `OH * batch` because the uniform is written once at
+    /// build time without the batch — conservative in the only safe direction. No
+    /// model here hits it (`OH >= 32 >= lanes`); a guard for wide-and-short shapes.
     pub(crate) fn reduction_lanes_for_weights(&self) -> u32 {
         let lanes = Self::reduction_lanes(
             self.dim_kernel.length() * self.nb_kernel,
             self.output_positions(),
         );
-        // The largest power of two no greater than the row count — the lane
-        // count has to stay a power of two for the tree reduction to halve it
-        // down to 1.
+        // Largest power of two ≤ the row count (the tree reduction halves to 1).
         let rows = self.dim_output.x.max(1);
         lanes.min(1 << rows.ilog2())
     }
 
-    /// Lanes for the `grad_bias` reduction — its **own** count, not the
-    /// weights' one.
-    ///
-    /// The bias pass has exactly `nb_kernel` sums: 48 on `Color_Diffusion_XL`'s
-    /// L26, against 41 472 for its weights. Feeding the weights' choice to both
-    /// (which is what this did) left the bias with `nb_kernel / slots`
-    /// workgroups — **one** workgroup, 48 threads, on the UpsampleConv of the
-    /// same shape, walking 32 768 positions each. Measured 9,8 ms for a pass
-    /// that reads 6,3 Mio: 0,6 Gio/s, i.e. latency-bound on a thread count that
-    /// cannot cover it. The same rule fed the bias's own sum count answers 32
-    /// lanes and 24 workgroups instead of 1.
-    ///
-    /// What this deliberately does **not** do is split the position axis across
-    /// workgroups, which would need a scratch buffer and a second pass to
-    /// combine them. Costed rather than assumed: 1 → 1536 threads already
-    /// recovers essentially the whole pass, and the remaining ~0,3 ms of the
-    /// step is not worth a buffer and a dispatch per layer.
+    /// Lanes for the `grad_bias` reduction — its OWN sum count (`nb_kernel`), not
+    /// the weights' one: feeding the weights' choice to both left the bias one
+    /// workgroup of 48 threads walking 32 768 positions (9.8 ms, latency-bound).
+    /// Deliberately does NOT split the position axis across workgroups (a scratch
+    /// buffer + second pass), which the sweep showed recovers ~nothing more.
     pub(crate) fn reduction_lanes_for_bias(&self) -> u32 {
         Self::reduction_lanes(self.nb_kernel, self.output_positions())
     }
@@ -320,23 +235,13 @@ impl LayerType for ConvolutionType {
     }
 
     fn get_back_workgroup_counts(&self, batch: Batch) -> Vec<u32> {
-        // grad_weights / grad_bias no longer run one thread per output element:
-        // a workgroup carries `reduction_slots()` independent sums, each split
-        // across `64 / slots` cooperating lanes.
-        //
-        // The batch axis splits the three sub-passes in two:
-        //   - `grad_input` writes one activation per thread, so it scales with
-        //     the batch like any elementwise pass;
-        //   - `grad_weights` / `grad_bias` write *parameters*. There are
-        //     exactly as many sums as there are weights whatever the batch, so
-        //     their workgroup count is unchanged and the batch enters inside
-        //     the kernel, as `batch * OH * OW` positions to reduce instead of
-        //     `OH * OW`. That is the whole point of the exercise: one `+=` per
-        //     weight and per step instead of one per weight and per sample.
-        //
-        // The bias pass gets its own slot count: it reduces `nb_kernel` sums,
-        // not `dim_kernel.length() * nb_kernel` of them, and inheriting the
-        // weights' split was what left it on a single workgroup.
+        // A workgroup carries `reduction_slots()` independent sums, each split
+        // across `64 / slots` lanes. The batch splits the three sub-passes in two:
+        // `grad_input` writes one activation per thread (scales with batch);
+        // `grad_weights`/`grad_bias` write PARAMETERS — as many sums as weights
+        // whatever the batch, so the batch enters inside the kernel as
+        // `batch * OH * OW` positions (one `+=` per weight per STEP, not per sample).
+        // The bias pass gets its own slot count (`nb_kernel` sums, not the weights').
         vec![
             (self.dim_input.length() * batch).div_ceil(WG_SIZE),
             (self.dim_kernel.length() * self.nb_kernel).div_ceil(self.reduction_slots()),
@@ -474,14 +379,9 @@ impl LayerType for ConvolutionType {
     }
 
     fn get_back_buffers_specs(&self, batch: Batch) -> Vec<(String, BufferSpec)> {
-        // Backward bind group layout (all three sub-passes share this layout):
-        //   [0] fwd_input    — shared from forward[0]
-        //   [1] weights      — shared from forward[1]
-        //   [2] specs        — shared from forward[3]
-        //   [3] grad_output  — incoming gradient (from next layer or loss)
-        //   [4] grad_input   — outgoing gradient to previous layer  (NEW)
-        //   [5] grad_weights — accumulated weight gradients         (NEW)
-        //   [6] grad_bias    — accumulated bias gradients           (NEW)
+        // Backward bind group (shared by all three sub-passes): [0] fwd_input,
+        // [1] weights, [2] specs (shared from forward), [3] grad_output (incoming),
+        // [4] grad_input (outgoing), [5] grad_weights, [6] grad_bias.
         let read_storage = |size: u32| BufferSpec {
             size: size.max(4),
             usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,

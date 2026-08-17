@@ -1,29 +1,15 @@
-// File purpose: WGSL compute shader implementing the backward pass of spatial self-attention.
+// Spatial self-attention, backward. 2-D dispatch grid past WebGPU's 65 535-per-dim
+// limit (`dispatch_grid` in layer.rs). Forward recap (attention.wgsl):
+//   q,k,v = W·x + b ; s = qᵀk·scale ; p = softmax(s) ; ctx = p·v ; out = x + W_o·ctx + b_o
 //
-// The dispatch grid is 2-D when the batch pushes the workgroup count past
-// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
-// linear thread index is recovered from `num_workgroups` rather than read
-// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
-//
-// Forward recap (attention.wgsl):
-//   q,k,v = W·x + b ;  s = qᵀk·scale ;  p = softmax(s)
-//   ctx   = p·v     ;  out = x + W_o·ctx + b_o
-//
-// TWO SCRATCH BUFFERS, SAME LAYOUT. The forward saved q, k, v, ctx and probs in
-// one buffer because WebGPU guarantees only eight storage buffers per stage
-// (see the header of attention.wgsl — bound separately this pass needed twelve,
-// and the rejection is silent: the whole command buffer dies and the loss reads
-// zero). `grad_scratch` mirrors `fwd_scratch` block for block, so a block's
-// gradient always sits at the block's own offset:
-//
+// TWO scratch buffers, SAME layout (the 8-storage-buffer limit forces sharing —
+// see attention.wgsl header): `grad_scratch` mirrors `fwd_scratch` block for block.
 //   fwd_scratch  [ q | k | v | ctx | probs ]
 //   grad_scratch [ gq| gk| gv| gctx| gscores ]     stride 4·N·C + N²
 //                  0  NC  2NC  3NC   4NC
 //
-// Backward, in the order the passes are dispatched. Each pass reads only what
-// an earlier pass has already written — that ordering IS the dependency graph,
-// since wgpu barriers between compute passes of one encoder:
-//
+// Passes, in dispatch order (each reads only what an earlier one wrote — the order
+// IS the dependency graph, via wgpu's inter-pass barrier):
 //   1. attn_back_ctx     grad_ctx[n,i] = Σ_c go[n,c]·W_o[c,i]
 //   2. attn_back_v       grad_v[m,i]   = Σ_n p[n,m]·grad_ctx[n,i]
 //   3. attn_back_scores  grad_p[n,m]   = Σ_i grad_ctx[n,i]·v[m,i]
@@ -34,14 +20,12 @@
 //   6. attn_back_weights one thread per weight, summing over batch AND positions
 //   7. attn_back_bias    one thread per bias,   summing over batch AND positions
 //
-// Pass 5's leading `go[n,c]` is the residual: the identity branch carries the
-// incoming gradient through untouched, which is what makes a zero-initialised
-// W_o a harmless no-op rather than a dead end for the gradient.
+// Pass 5's leading `go[n,c]` is the residual — the identity branch carries the
+// gradient through, so a zero-init W_o is a harmless no-op, not a dead end.
 //
-// Bindings match AttentionType::get_back_buffers_specs():
-//   [0] fwd_input   [1] weights      [2] specs        [3] grad_output
-//   [4] grad_input  [5] grad_weights [6] grad_bias
-//   [7] fwd_scratch (saved forward)  [8] grad_scratch (backward's own)
+// Bindings (AttentionType::get_back_buffers_specs()): [0] fwd_input [1] weights
+// [2] specs [3] grad_output [4] grad_input [5] grad_weights [6] grad_bias
+// [7] fwd_scratch [8] grad_scratch.
 
 @group(0) @binding(0) var<storage, read>       fwd_input:    array<f32>;
 @group(0) @binding(1) var<storage, read>       weights:      array<f32>;
@@ -167,14 +151,10 @@ fn attn_back_v(
 // 3. grad_probs then the softmax Jacobian
 // ---------------------------------------------------------------------------
 //
-// ONE WORKGROUP PER (SAMPLE, ROW), because the softmax backward is a reduction
-// over the row: dL/ds_i = p_i·(dL/dp_i − Σ_j p_j·dL/dp_j). The subtracted term
-// is the same for the whole row — it is what makes the gradient of a
-// probability distribution sum to zero.
-//
-// grad_p is staged in the probs block of `grad_scratch` and then overwritten in
-// place: each thread re-reads only the slots it wrote itself, so no cross-thread
-// ordering is involved beyond the reduction's own barriers.
+// ONE WORKGROUP PER (SAMPLE, ROW): the softmax backward reduces over the row,
+// dL/ds_i = p_i·(dL/dp_i − Σ_j p_j·dL/dp_j), the subtracted term making a
+// distribution's gradient sum to zero. grad_p is staged in the probs block and
+// overwritten in place; each thread re-reads only its own slots.
 
 @compute @workgroup_size(64)
 fn attn_back_scores(
@@ -184,11 +164,9 @@ fn attn_back_scores(
 ) {
     let seq = layer_spec.seq_len;
     let c_count = layer_spec.channels;
-    // Trailing workgroups of the 2-D grid RETURN rather than fold onto the last
-    // row: this pass stages grad_p in the row and then overwrites it in place,
-    // so two workgroups sharing a row would read each other's half-finished
-    // work. The condition is workgroup-uniform (`wid`, `nwg`), so the barriers
-    // below stay in uniform control flow. See attn_scores in attention.wgsl.
+    // Trailing workgroups RETURN, not fold onto the last row: this overwrites
+    // grad_p in place, so a shared row would corrupt. Workgroup-uniform condition
+    // keeps the barriers in uniform control flow (cf. attn_scores).
     let rows = batch_count() * seq;
     let unit = wid.y * nwg.x + wid.x;
     if unit >= rows { return; }
@@ -223,11 +201,9 @@ fn attn_back_scores(
 // 4. grad_q and grad_k
 // ---------------------------------------------------------------------------
 //
-// Same index space (both are N×C per sample), so one thread produces both.
-// Note the transposed read for k: q[n] is the ROW of the score matrix and k[n]
-// its COLUMN, so grad_k sums down `grad_s[·, n]` while grad_q sums along
-// `grad_s[n, ·]`. Swapping the two is a silent, plausible-looking bug — it
-// produces finite gradients that are simply wrong.
+// Same index space, so one thread produces both. Note the TRANSPOSED read for k:
+// grad_k sums down `grad_s[·, n]` while grad_q sums along `grad_s[n, ·]` — swapping
+// them is a silent, plausible-looking bug (finite but wrong gradients).
 
 @compute @workgroup_size(64)
 fn attn_back_qk(
@@ -297,10 +273,8 @@ fn attn_back_input(
 // 6. grad_weights — one thread per weight, the batch folded into its loop
 // ---------------------------------------------------------------------------
 //
-// A weight is a PARAMETER: there are exactly as many sums as there are weights
-// whatever the batch, so this pass does not scale with it — the batch enters
-// inside the kernel as more positions to reduce. One `=` per weight per step,
-// not one per sample.
+// A weight is a PARAMETER: the same sum count whatever the batch, so this pass does
+// not scale with it — the batch enters inside the kernel as more positions.
 
 @compute @workgroup_size(64)
 fn attn_back_weights(

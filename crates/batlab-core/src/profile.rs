@@ -1,45 +1,21 @@
-//! File purpose: real GPU time, compute pass by compute pass.
+//! Real GPU time, compute pass by compute pass. `TIMESTAMP_QUERY` lets a pass
+//! write the GPU's own clock at its begin and end; this allocates one query set,
+//! hands a slot pair per pass, and reads them back after the submit — GPU time,
+//! measured by the GPU, not host time around a submit.
 //!
-//! # Why this exists
+//! Three quantities out of one armed step, all different:
+//! - **`nanos` per pass** — `end − begin`, the pass's own cost.
+//! - **`span`** — last `end` minus first `begin`: the whole step's GPU duration,
+//!   INCLUDING what sits between passes (wgpu's implicit inter-pass barrier).
+//! - **`span − Σ nanos`** — what the step spends BETWEEN passes, the "per-pass
+//!   floor" `PERF_CONVOLUTION.md` §5.4 could not measure.
 //!
-//! Every performance report of this repo so far has measured *wall clock around
-//! a whole step* (`PERF_GROUP_NORM.md`, `BATCH_DISPATCH.md`) or *one kernel
-//! dispatched 200 times in a loop* (`PERF_CONVOLUTION.md` §5.1). Neither answers
-//! the question a 4.4 s step raises: which of the 151 compute passes of that
-//! step is the 4.4 s in, and how much of it is not in any of them.
+//! It does NOT measure anything outside the profiled encoder (dataset copies,
+//! uniform uploads, loss readback); those are host wall clock minus `span`.
 //!
-//! # What it measures, and what it does not
-//!
-//! `wgpu::Features::TIMESTAMP_QUERY` lets a compute pass write the GPU's own
-//! clock at its beginning and at its end. This module allocates one query set,
-//! hands out a pair of slots per pass, and reads the pairs back after the
-//! submission has completed. The numbers are therefore **GPU time, measured by
-//! the GPU**, not host time around a submit.
-//!
-//! Three quantities come out of one armed step, and they are different things:
-//!
-//! - **`nanos` per pass** — `end − begin` of that pass. The pass's own cost.
-//! - **`span`** — last `end` minus first `begin`, on the same clock. The GPU-side
-//!   duration of the whole encoded step, *including* whatever sits between the
-//!   passes (the implicit barrier wgpu inserts between compute passes of one
-//!   encoder, and the command-buffer overhead of starting the next one).
-//! - **`span − Σ nanos`** — what the step spends *between* its passes. This is
-//!   the number `PERF_CONVOLUTION.md` §5.4 called "the per-compute-pass floor"
-//!   and could not measure; it is why kernels 3.7× faster in isolation moved the
-//!   step by −1 %.
-//!
-//! What it does **not** measure: anything outside the profiled encoder — the
-//! dataset copy submissions, the uniform uploads, the loss readback. Those show
-//! up as host wall clock minus `span`, and the harness that drives this module
-//! reports that gap separately rather than folding it in.
-//!
-//! # Cost when off
-//!
-//! Nothing is allocated and no feature is requested unless the process asked for
-//! profiling before opening the device ([`crate::GpuContext`] holds an
-//! `Option<PassProfiler>`). With it off, [`crate::GpuContext::compute_pass`] is
-//! `begin_compute_pass(&Default::default())` plus one `Option::is_some`, and the
-//! label closure is never called, so no label string is ever built.
+//! Off, it costs nothing: [`crate::GpuContext`] holds an `Option<PassProfiler>`,
+//! so `compute_pass` is a plain `begin_compute_pass` plus one `is_some`, and the
+//! label closure is never called.
 
 use std::sync::Mutex;
 
@@ -51,21 +27,14 @@ pub struct PassTiming {
     pub label: String,
     /// `end − begin`, in nanoseconds of GPU clock.
     pub nanos: u64,
-    /// The logical workgroup count the dispatch asked for (before
-    /// `dispatch_grid` folds it into 2-D). Kept because a pass that is slow
-    /// because it is *big* and a pass that is slow because it is *starved* look
-    /// identical in the time column alone.
+    /// The logical workgroup count (before `dispatch_grid`'s 2-D fold), kept so a
+    /// big pass and a starved one are not confused in the time column alone.
     pub workgroups: u32,
-    /// Whether the GPU actually wrote this pass's two timestamps.
-    ///
-    /// It does not always. Metal drops counter samples for some compute
-    /// encoders — observed here on three of the twenty Adam passes, roughly one
-    /// armed step in four, always on tiny dispatches — and returns a pair of
-    /// zeros instead. Zero is not a plausible reading of a clock that is
-    /// currently at 3.76e15, so an unsampled pass is *named* as unsampled
-    /// rather than silently counted as free. Counting it as free is exactly the
-    /// mistake this module exists to prevent: it would show up as time between
-    /// the passes, which is the one quantity the whole diagnosis turns on.
+    /// Whether the GPU actually wrote this pass's two timestamps. Metal drops
+    /// counter samples for some tiny dispatches and returns zeros instead; zero is
+    /// no plausible reading of a clock at 3.76e15, so an unsampled pass is NAMED as
+    /// such — counting it free would show up as time between passes, the quantity
+    /// the diagnosis turns on.
     pub sampled: bool,
 }
 
@@ -257,13 +226,9 @@ impl PassProfiler {
             .map(|(i, (label, workgroups))| {
                 let begin = ticks[i * 2];
                 let end = ticks[i * 2 + 1];
-                // A clock currently reading 3.7e15 does not return 0, and
-                // Metal's own sentinel for a failed sample is `u64::MAX`. Either
-                // value means "not sampled", and an unsampled pass is excluded
-                // from the span rather than dragging its start down to zero —
-                // which is exactly what produced a span of 3 761 240 032 ms on
-                // the first sweep of this instrument. `end < begin` is rejected
-                // on the same grounds.
+                // 0 and `u64::MAX` (Metal's failed-sample sentinel) both mean "not
+                // sampled": excluded from the span rather than dragging its start to
+                // zero (which once produced a 3 761 240 032 ms span). `end < begin` too.
                 let sampled = begin != 0
                     && end != 0
                     && begin != u64::MAX
@@ -345,15 +310,11 @@ impl ProfileSummary {
         use std::collections::HashMap;
         let mut order: Vec<String> = Vec::new();
         let mut acc: HashMap<String, PassSummary> = HashMap::new();
-        // Per round, the same label can appear more than once; sum those
-        // occurrences *within* a round, then take the min of the per-round sums
-        // across rounds. Otherwise a label that appears twice would report the
-        // cost of one of its two dispatches.
-        //
-        // A round in which any occurrence went unsampled contributes NOTHING to
-        // that label: its sum would be short by a whole dispatch, and being
-        // short is exactly what the minimum estimator would prefer. That is how
-        // a dropped counter sample turns into a fast kernel.
+        // Sum a label's occurrences WITHIN a round, then take the min of the
+        // per-round sums (else a twice-dispatched label reports one dispatch). A
+        // round with any unsampled occurrence contributes NOTHING to that label —
+        // its short sum is exactly what the min estimator would prefer, i.e. how a
+        // dropped counter sample becomes a fast kernel.
         for run in runs {
             let mut per_round: HashMap<&str, (u64, u32, u32, bool)> = HashMap::new();
             for pass in &run.passes {
@@ -472,14 +433,9 @@ mod tests {
         assert_eq!(s.passes[0].label, "a");
     }
 
-    /// A pass the backend declined to time must not be reported as a fast one.
-    ///
-    /// Metal drops counter samples on some compute encoders (observed on the
-    /// small Adam dispatches, roughly one armed step in four). Those arrive as a
-    /// pair of zeros. Two things must NOT happen: the pass must not enter the
-    /// minimum with a time of 0, and — worse — the missing time must not
-    /// reappear as "between the passes", which is the one quantity this whole
-    /// instrument exists to measure.
+    /// A pass Metal declined to time (a pair of zeros) must not become a fast one:
+    /// it must not enter the minimum at 0, and — worse — its missing time must not
+    /// reappear as "between the passes", the quantity this instrument exists for.
     #[test]
     fn a_pass_the_backend_did_not_time_is_not_a_free_pass() {
         let mut good = run(&[("a", 100, 4), ("b", 50, 2)], 160);
@@ -503,15 +459,10 @@ mod tests {
         assert_eq!(b.rounds_sampled, 2);
     }
 
-    /// There must be no second door — the same rule as
-    /// `nothing_in_the_engine_bypasses_the_counted_queue`, for the same reason.
-    ///
-    /// A timing table that omits a pass does not fail, does not warn, and does
-    /// not show up in any number: it just reports a smaller total and a larger
-    /// "unattributed", which would be read as *evidence about dispatch
-    /// overhead* when it is in fact a hole in the instrument. That is the one
-    /// failure mode a per-pass profile must not have, so the rule is checked
-    /// mechanically rather than remembered.
+    /// No second door (like `nothing_in_the_engine_bypasses_the_counted_queue`): a
+    /// timing table that omits a pass reports a smaller total and a larger
+    /// "unattributed", read as dispatch overhead when it is a hole in the instrument.
+    /// Checked mechanically rather than remembered.
     #[test]
     fn nothing_in_the_engine_opens_an_untimed_pass() {
         fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
