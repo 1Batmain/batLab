@@ -119,6 +119,15 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
   aveugle (spec du régime flux, sans une ligne d'implémentation).
 - **[BLIND_TEST_FLUX.md](BLIND_TEST_FLUX.md)** — son verdict : 9/9 PASS après trois
   passes, dont un correctif prouvé label-only.
+- **[MISSION_BLIND_TEST_MANAGER.md](MISSION_BLIND_TEST_MANAGER.md)** / **[BLIND_TEST_MANAGER.md](BLIND_TEST_MANAGER.md)**
+  — l'aveugle du gestionnaire de modèles : son ordre de mission, puis son verdict.
+- **[MISSION_BLIND_ATTENTION.md](MISSION_BLIND_ATTENTION.md)** / **[BLIND_TEST_ATTENTION.md](BLIND_TEST_ATTENTION.md)**
+  — l'aveugle de l'attention, mêmes deux pièces.
+- **[GO_NOGO.md](GO_NOGO.md)** — le contrat d'acceptation de l'attention, que
+  l'aveugle cite comme spec.
+
+Ces cinq-là vivaient à la racine du dépôt jusqu'au rangement du 17 août 2026 ;
+leurs références mutuelles sont restées valides, elles sont désormais voisines.
 
 ### Visualiseur
 

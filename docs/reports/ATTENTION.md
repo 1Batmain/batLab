@@ -234,7 +234,7 @@ pression mémoire franchi entre 32 et 64. Premières cibles à profiler :
 `attn_back_weights` (147 456 threads sommant chacun sur `batch·N`) et
 `attn_back_bias` (768 threads — 12 workgroups, occupation très faible).
 
-Verdict et commande de run : `GO_NOGO.md` à la racine du worktree.
+Verdict et commande de run : `GO_NOGO.md` (déplacé ici depuis la racine).
 
 ## 8. Ce qui n'a pas été fait
 
