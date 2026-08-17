@@ -1,32 +1,24 @@
-//! File purpose: Implements dataset logic used by the training pipeline.
+//! GpuDataset: chunking, residency and the 8-bit → f32 decode path.
 
 use crate::gpu_context::GpuContext;
 use std::error::Error;
 use std::fmt;
 
 const DEFAULT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
-/// Share of the GPU's capacity a **streamed** chunk may take.
-///
-/// A streamed chunk is re-uploaded on every miss, so its size is a recurring
-/// cost and the fraction is deliberately small.
+/// Share of GPU capacity a STREAMED chunk may take — small, because a streamed
+/// chunk is re-uploaded on every miss (a recurring cost).
 const GPU_MEMORY_CHUNK_FRACTION: u64 = 8;
-/// Share of the GPU's capacity a **resident** dataset may take.
-///
-/// Twice as generous as the streaming fraction, and for the opposite reason: a
-/// dataset that fits entirely is uploaded once and never again, so its size is
-/// paid a single time in exchange for removing the traffic altogether. On the
-/// machine this is developed on the two work out at 3.5 GiB and 7 GiB, and
-/// ImageNet 32×32 in 8-bit — 3.94 GB — lands between them: it is streamed under
-/// the streaming rule and resident under this one, which is the whole point.
+/// Share of GPU capacity a RESIDENT dataset may take — twice the streaming
+/// fraction, for the opposite reason: a dataset that fits is uploaded once and
+/// removes the traffic. On this machine the two are 3.5 and 7 GiB; ImageNet 32×32
+/// in 8-bit (3.94 GB) lands between them — streamed under one rule, resident under
+/// this one, which is the point.
 const GPU_MEMORY_RESIDENT_FRACTION: u64 = 4;
 
-/// What the dataset holds on the host, and therefore what crosses to the GPU.
-///
-/// The two variants are the two `.batraw` payload encodings, kept apart all the
-/// way to the device instead of being normalised to f32 on load. That is the
-/// whole of BATRAW3: a corpus whose source is 8-bit stays 8-bit until a shader
-/// widens it, so the file, the host RAM and — the expensive one — the chunk
-/// upload are all a quarter of what they were.
+/// What the dataset holds on the host, and therefore what crosses to the GPU. The
+/// two variants are the two `.batraw` encodings, kept apart to the device instead
+/// of normalised to f32 on load — the whole of BATRAW3: an 8-bit corpus stays
+/// 8-bit until a shader widens it, so file, host RAM and chunk upload are a quarter.
 #[derive(Debug, Clone)]
 pub enum DatasetPayload {
     /// One `Vec<f32>` per sample. Every dataset that predates BATRAW3, plus any
@@ -37,12 +29,9 @@ pub enum DatasetPayload {
     Bytes(Vec<u8>),
 }
 
-/// The `[0, 255] -> [-1, 1]` widening, in the one place both sides read.
-///
-/// Exact: 256 inputs, 256 f32 outputs, no rounding — which is why BATRAW3 is a
-/// lossless re-encoding of a BATRAW2 file that came from 8-bit sources, and why
-/// `to_u8` in the binary is its exact inverse. The GPU copy of this expression
-/// lives in `dataset_decode.wgsl` and is pinned to it by test.
+/// The `[0,255] → [-1,1]` widening — exact (256 inputs, no rounding), which is why
+/// BATRAW3 is lossless and `to_u8` is its inverse. The GPU builds a 256-entry table
+/// from THIS and is pinned to it by `the_gpu_decode_agrees_with_the_cpu_one`.
 pub fn decode_u8(value: u8) -> f32 {
     value as f32 / 127.5 - 1.0
 }
@@ -109,12 +98,10 @@ pub struct GpuDataset {
     sample_len: usize,
     /// How many times a chunk has been uploaded to the GPU.
     ///
-    /// Each load is a `queue.write_buffer` of the WHOLE chunk (64 MiB on this
-    /// machine), so this counter is the single most expensive thing the dataset
-    /// does. It exists because the cost is invisible otherwise: nothing in the
-    /// training loop mentions it, and a shuffled sampler makes it depend on the
-    /// batch size and on the dataset/chunk ratio rather than on anything the
-    /// caller wrote.
+    /// Each load is a `write_buffer` of the WHOLE chunk (64 MiB), the dataset's
+    /// single most expensive act — counted because it is otherwise invisible (a
+    /// shuffled sampler makes it depend on batch and dataset/chunk ratio, nothing
+    /// the caller wrote).
     chunk_loads: u64,
 }
 
@@ -176,30 +163,19 @@ impl fmt::Display for GpuDatasetError {
 
 impl Error for GpuDatasetError {}
 
-/// Bytes of one dataset chunk on a device with these caps.
+/// Bytes of one dataset chunk on a device with these caps. Pure and public: the
+/// inventory calls the SAME function ([`crate::resources::plan_dataset`]) so the
+/// prediction cannot drift from the allocation. Two cases:
 ///
-/// Pure, and public, because the resource inventory has to answer "how much of
-/// the dataset sits on the GPU at once?" for a machine that is not here — see
-/// [`crate::resources::plan_dataset`]. Sharing the function is what stops the
-/// prediction from drifting away from the allocation: there is one rule, and
-/// both callers read it.
+/// - RESIDENT — the whole dataset fits one allocatable buffer within the residency
+///   budget: take all of it, one upload for the run's life (reachable for CIFAR
+///   and ImageNet 32×32 under native limits, not the WebGPU baseline).
+/// - STREAMED — it does not fit: size to the streaming budget, a shuffled batch
+///   pays for the chunks it lands in (what the browser still gets).
 ///
-/// # Two cases, and the second is the one worth having
-///
-/// **Resident** — the whole dataset fits in one buffer this device will
-/// allocate, and within the residency budget. Then take all of it: one upload
-/// for the life of the run, and every step after the first costs *nothing*.
-/// This is unreachable under the WebGPU baseline for anything real (128 MiB per
-/// storage binding), and reachable for CIFAR-10 and for ImageNet 32×32 alike
-/// under an adapter's own limits — see [`crate::GpuLimitsProfile`].
-///
-/// **Streamed** — it does not fit, so the chunk is sized to the streaming
-/// budget and a shuffled batch pays for the chunks it lands in. Unchanged from
-/// what it always was, because that is what the browser target still gets.
-///
-/// The `.min(binding_cap)` matters as much as the buffer cap: the chunk is
-/// bound as a storage buffer by the decode shader, so a limit on bindings is a
-/// limit on residency. It is the one that binds on the web profile.
+/// `.min(binding_cap)` matters as much as the buffer cap — the chunk is a storage
+/// binding for the decode shader, so a binding limit is a residency limit (the one
+/// that binds on web).
 pub fn select_chunk_bytes(
     binding_cap: u64,
     buffer_cap: u64,
@@ -361,26 +337,13 @@ impl GpuDataset {
         self.chunk_count() == 1
     }
 
-    /// Copy a whole batch into `destination`, sample `i` of the list landing at
-    /// slot `i` (offset `i * sample_len` floats).
-    ///
-    /// This is NOT one copy per sample into one encoder, and the difference is a
-    /// correctness one. `ensure_chunk_loaded` uploads through
-    /// `queue.write_buffer`, and wgpu applies every pending queue write BEFORE
-    /// the command buffers submitted after it. Two samples from two different
-    /// chunks encoded into a single encoder would therefore both read the chunk
-    /// loaded last: the first copy would silently pick up the wrong image, with
-    /// no validation error and no crash — just a batch quietly trained on
-    /// duplicated data.
-    ///
-    /// So the batch is grouped by chunk and each resident chunk gets its own
-    /// submission. A dataset that fits in one chunk — the common case — is one
-    /// group and one submission, which is also the point of the exercise.
-    ///
-    /// What the group does depends on the payload: an f32 chunk is copied
-    /// buffer-to-buffer, an 8-bit one is widened by a compute pass. The grouping
-    /// itself is shared, because the reason for it is the chunk upload and that
-    /// is the same on both sides.
+    /// Copy a whole batch into `destination`, sample `i` at slot `i`. NOT one copy
+    /// per sample into one encoder — a correctness point: `write_buffer` uploads
+    /// apply BEFORE the command buffers after them, so two samples from two chunks
+    /// in one encoder would both read the chunk loaded last (a silent wrong image).
+    /// So the batch is grouped by chunk, one submission each; a single-chunk
+    /// dataset (the common case) is one group. An f32 chunk is copied
+    /// buffer-to-buffer, an 8-bit one widened by a compute pass; the grouping is shared.
     pub fn copy_samples_to(
         &mut self,
         gpu: &GpuContext,
@@ -898,9 +861,8 @@ mod tests {
                 "{count} samples: an 8-bit chunk holds {bytes}, four f32 chunks hold {}",
                 floats * 4
             );
-            // Rounded up, because the last chunk is short on both sides: four
-            // f32 chunks' worth of images fit in one 8-bit chunk, so the count
-            // falls to a quarter of itself, ceiling included.
+            // Rounded up (last chunk short both sides): four f32 chunks of images
+            // fit one 8-bit chunk, so the count falls to a quarter.
             assert!(
                 count.div_ceil(bytes) <= count.div_ceil(floats).div_ceil(4),
                 "{count} samples: {} 8-bit chunks against {} f32 ones",
@@ -909,9 +871,8 @@ mod tests {
             );
         }
 
-        // The headline of the report, spelled out. ImageNet 32×32 RGB is
-        // 1 281 167 images of 3072 bytes: 15.7 GB as f32, 3.9 GB as u8 — and it
-        // is the f32 figure that makes the corpus impractical, not the corpus.
+        // ImageNet 32×32 RGB (1 281 167 × 3072 bytes): 15.7 GB f32 vs 3.9 GB u8 —
+        // the f32 figure is what makes the corpus impractical, not the corpus.
         let imagenet = 1_281_167u64 * sample_len;
         assert_eq!(imagenet * 4 / 1_000_000_000, 15);
         assert_eq!(imagenet / 1_000_000_000, 3);
