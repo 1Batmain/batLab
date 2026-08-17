@@ -1,4 +1,5 @@
-//! File purpose: Implements diffusion logic used by the training pipeline.
+//! The DDPM training task: the GPU prepass that composes `x_t` and the target
+//! noise, the batched training step, and the per-epoch sample shuffle.
 
 use super::weighting::{LossWeighting, TimestepSampler};
 use super::{
@@ -22,12 +23,9 @@ pub struct DiffusionTask {
     sampler: TimestepSampler,
 }
 
-/// Per-epoch permutation of the dataset.
-///
-/// The sample index used to be `(step*batch_size + batch_offset) % sample_count`,
-/// i.e. strictly sequential: the presentation order was identical at every
-/// epoch. The permutation is regenerated whenever the epoch changes and is
-/// derived from the epoch number alone, so runs stay reproducible.
+/// Per-epoch permutation of the dataset (the index used to be strictly
+/// sequential). Regenerated on each epoch change from the epoch number alone, so
+/// runs stay reproducible.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SampleShuffle {
     order: Vec<usize>,
@@ -391,15 +389,11 @@ impl DiffusionTask {
         Ok(loss)
     }
 
-    /// The pre-batching training step, kept verbatim as a **test reference**.
-    ///
-    /// One `CommandEncoder` and one `submit` per sample, gradients accumulated
-    /// with `+=` between samples, optimiser applied once at the end. This is
-    /// the code the batched path has to agree with, and keeping it executable
-    /// — rather than freezing a fixture — means the equivalence tests compare
-    /// two things that both still run.
-    ///
-    /// Requires a model built at `batch = 1`.
+    /// The pre-batching training step, kept verbatim as a test REFERENCE: one
+    /// encoder and submit per sample, gradients `+=` between them, optimiser once
+    /// at the end. The batched path must agree with it, and keeping it executable
+    /// (not a frozen fixture) means the equivalence tests compare two live things.
+    /// Requires a `batch = 1` model.
     #[cfg(test)]
     pub(crate) fn train_step_batch_sequential(
         &mut self,
@@ -720,14 +714,10 @@ fn fold_seed(seed: u64) -> u32 {
         .wrapping_add(1013904223)
 }
 
-/// Draws t ~ U{0, schedule_len-1}, independently of which sample is paired with
-/// it.
-///
-/// The timestep used to be `counter % schedule_len` while the sample index was
-/// `counter % sample_count` — both derived from the same linear counter, so the
-/// timestep was a deterministic function of the image. A given sample only ever
-/// saw `gcd(sample_count, schedule_len)` distinct timesteps (16 of 256 for
-/// CIFAR-10), whereas DDPM requires t drawn independently of x_0.
+/// Draws t ~ U{0, schedule_len-1}, INDEPENDENTLY of the paired sample. Both used to
+/// be `counter % _`, so t was a deterministic function of the image and a sample saw
+/// only `gcd(sample_count, schedule_len)` timesteps (16 of 256 on CIFAR) — DDPM
+/// requires t drawn independently of x_0.
 pub(crate) fn diffusion_step_for(counter: usize, schedule_len: usize, seed: u64) -> usize {
     if schedule_len == 0 {
         return 0;
@@ -815,22 +805,12 @@ mod tests {
         });
     }
 
-    /// The batched prepass must give every sample bit-for-bit the noise and the
-    /// timestep embedding the sequential prepass gave it.
-    ///
-    /// This is the invariant the whole validation plan rests on: if sample i of
-    /// a batch draws different noise than it used to, an old-path/new-path
-    /// training comparison measures nothing, because the two runs are no longer
-    /// solving the same problem.
-    ///
-    /// The comparison is between two *code paths*, with no duplicated formula:
-    /// the batched step is run once, then `train_step_batch_sequential` — the
-    /// pre-batching loop, kept executable — is run with batch sizes 1, 2, ... B,
-    /// each leaving slot 0 holding the prepass output of its last sample. At
-    /// `step = 0` the counter is `0 * batch_size + offset == offset`, so slot j
-    /// of the batch of B and the last slot of the batch of j+1 are the same
-    /// (sample, timestep, batch_offset) triple — and must therefore produce the
-    /// same bits.
+    /// The batched prepass must give every sample bit-for-bit the noise and
+    /// timestep the sequential prepass did — the invariant the validation rests on:
+    /// if sample i draws different noise, an old-vs-new training comparison measures
+    /// nothing. Compares two CODE PATHS, no duplicated formula: the batched step
+    /// once, then `train_step_batch_sequential` at sizes 1..B, matching the same
+    /// (sample, timestep, offset) triple in slot j vs the last slot of batch j+1.
     #[test]
     fn batched_prepass_gives_each_sample_the_noise_it_had_alone() {
         pollster::block_on(async {
@@ -1036,24 +1016,12 @@ mod tests {
         }
     }
 
-    /// Training on an 8-bit dataset must be the SAME run as training on the f32
-    /// dataset converted from it — same losses, step for step, bit for bit.
-    ///
-    /// This is the claim BATRAW3 lives or dies on. A quarter of the traffic is
-    /// worth nothing if it also changes the numbers, and "changes the numbers"
-    /// is not something a loss curve reveals: a systematically shifted corpus
-    /// still trains, still converges, and still looks entirely normal. So the
-    /// two paths are run side by side against each other rather than each
-    /// against a plausibility check.
-    ///
-    /// It closes the loop the unit tests leave open. `dataset.rs` proves the GPU
-    /// widening equals `decode_u8`; this proves that equality survives the
-    /// prepass, the forward, the loss and the optimiser — that nothing else in
-    /// the step reads the payload's encoding.
-    ///
-    /// (Verified at scale outside the suite as well: 40 steps of
-    /// `Color_Diffusion_XL` on `cifar10_rgb.batraw` in both encodings print the
-    /// same three losses to six decimals — `docs/reports/CUSTOM_DATASET.md` §3.)
+    /// Training on an 8-bit dataset must be the SAME run as on the f32 dataset
+    /// converted from it — same losses, step for step, bit for bit. The claim
+    /// BATRAW3 lives or dies on: a quarter of the traffic is worth nothing if it
+    /// changes the numbers, and a shifted corpus still trains and looks normal.
+    /// Closes the loop `dataset.rs` leaves open (GPU widening == `decode_u8`):
+    /// proves that equality survives the prepass, forward, loss and optimiser.
     #[test]
     fn an_8_bit_dataset_trains_exactly_like_the_f32_one_it_replaces() {
         pollster::block_on(async {
