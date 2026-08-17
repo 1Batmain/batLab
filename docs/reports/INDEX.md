@@ -100,6 +100,11 @@ CLI (`--headless-train`, `--headless-sample`, `--headless-perpetual`, `--regime`
 - **[ANISOTROPY_HUNT.md](ANISOTROPY_HUNT.md)** — pourquoi les images générées étaient des
   bandes horizontales : deux XOR isotropes qui se composent. Cause racine, correctif,
   guérison prouvée.
+- **[SAMPLING_SWEEP.md](SAMPLING_SWEEP.md)** — les réglages d'échantillonnage les plus nets,
+  ancrés sur les stats du dataset réel : la variance postérieure en option (défaut
+  bit-à-bit inchangé), le balayage magnitude × variance × poids × trajectoires, et la
+  recommandation (magnitude 1,2, beta, 1 trajectoire, itéré brut — 2,6× plus proche du
+  dataset). Le plafond qui reste est le modèle et la résolution 32×32, pas le sampler.
 
 ### Le mode Perpetual
 

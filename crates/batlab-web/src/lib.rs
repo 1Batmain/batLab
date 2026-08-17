@@ -50,13 +50,21 @@ const STEPS: usize = batlab_core::DIFFUSION_SCHEDULE_STEPS;
 const BETA_START: f32 = batlab_core::DIFFUSION_BETA_START;
 const BETA_END: f32 = batlab_core::DIFFUSION_BETA_END;
 
-/// The denoise magnitude for both modes — the config's inference default.
-const DENOISE_MAGNITUDE: f32 = 1.0;
+/// The denoise magnitude for both modes.
+///
+/// `1.2`, not `1.0`: the `docs/reports/SAMPLING_SWEEP.md` campaign measured the
+/// page's generation as *under* the dataset on every statistic (a deficit of
+/// detail, not an excess of noise), and raising the magnitude fills it. `1.2`
+/// lands `grad_energy` on the dataset target without tipping into noise (`1.5`
+/// overshoots); it is the closest config to the real elephants (distance 0.098
+/// vs 0.253 for the old `1.0`, on the full stats vector).
+const DENOISE_MAGNITUDE: f32 = 1.2;
 
-/// The reverse-step variance the browser sampler injects. Kept in step with the
-/// model's `config_file` inference block; the single formula behind both spellings
-/// lives in [`batlab_core::PosteriorVariance`], so the page cannot drift from the
-/// native sampler. `Beta` is DDPM's larger variance and the historical default.
+/// The reverse-step variance the browser sampler injects. The single formula
+/// behind both spellings lives in [`batlab_core::PosteriorVariance`], so the page
+/// cannot drift from the native sampler. `Beta` — DDPM's larger variance — wins:
+/// `Posterior` is smaller and only smooths further, the wrong way for a model that
+/// is already too smooth (SAMPLING_SWEEP.md §2).
 const POSTERIOR_VARIANCE: PosteriorVariance = PosteriorVariance::Beta;
 
 /// Same fold as [`batlab_core`]'s reverse-chain seed: distinct runs get distinct
@@ -691,10 +699,14 @@ async fn build_engine(
         fnv1a_64(&weights),
         expected_params,
     );
-    // The averaged weights when the checkpoint carries them, exactly as
-    // production sampling does; falls back to the raw iterate otherwise.
+    // The raw iterate, not the EMA average. On this checkpoint the two are a real
+    // trade-off (SAMPLING_SWEEP.md §2): the EMA is a hair sharper on the laplacian
+    // but noticeably *less saturated*, and the page's images already read as a grey
+    // wash. The raw iterate matches the dataset's saturation (0.053 vs a target
+    // 0.052, against the EMA's 0.037) and is the closest config overall to the real
+    // elephants. `Raw` also falls back correctly on a checkpoint that carries no EMA.
     let loaded = model
-        .load_checkpoint_bytes_with(&weights, CheckpointWeights::Ema)
+        .load_checkpoint_bytes_with(&weights, CheckpointWeights::Raw)
         .map_err(|err| format!("could not load the weights: {err}"))?;
     log::info!(
         "[batlab] checkpoint loaded: carries_ema={}, using {} weights",
