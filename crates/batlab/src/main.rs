@@ -1620,32 +1620,6 @@ impl FrameDump {
 /// the answer since BATRAW3: the same 50 000 images are 586 MiB of f32 or
 /// 147 MiB of u8, and an inventory that assumed f32 would over-report a
 /// BATRAW3 dataset's residency by four.
-fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32, u64), String> {
-    use std::io::Read;
-    let mut file =
-        fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let mut header = [0u8; 24];
-    file.read_exact(&mut header)
-        .map_err(|err| format!("failed to read the header of {}: {err}", path.display()))?;
-    let magic = &header[..8];
-    let value_bytes: u64 = if magic == RAW_DATASET_MAGIC_BYTES {
-        1
-    } else if magic == RAW_DATASET_MAGIC_SIGNED || magic == RAW_DATASET_MAGIC_UNIT {
-        4
-    } else {
-        return Err(format!("invalid magic in {}", path.display()));
-    };
-    let word = |i: usize| {
-        u32::from_le_bytes([
-            header[8 + i * 4],
-            header[9 + i * 4],
-            header[10 + i * 4],
-            header[11 + i * 4],
-        ])
-    };
-    Ok((word(0) as u64, word(1), word(2), word(3), value_bytes))
-}
-
 /// The dataset a `--resources` question is about: the one named on the command
 /// line, else the one the model's config trains on. `None` when neither exists
 /// on disk — the inventory then simply has no streamed post, and says so.
@@ -1658,7 +1632,12 @@ fn resources_dataset(
         _ => None,
     })?;
     let path = PathBuf::from(&named);
-    let (count, width, height, channels, value_bytes) = read_batraw_header(&path).ok()?;
+    // One reader for the `.batraw` header, in `storage` — the binary no longer
+    // keeps its own byte-identical copy. (The dataset *loader*,
+    // `try_load_raw_dataset`, is a distinct, richer parser: it works on bytes
+    // already in memory and has to tell BATRAW1 from BATRAW2 to rescale, which
+    // this width-only probe deliberately does not.)
+    let (count, width, height, channels, value_bytes) = storage::read_batraw_header(&path)?;
     Some((
         path,
         batlab_core::DatasetSpec {
@@ -5806,8 +5785,8 @@ mod tests {
         write_batraw(&f32_file, 1, 2, 2, 3, &[vec![0.0; 12]]);
         write_batraw3(&u8_file, 1, 2, 2, 3, &[vec![0u8; 12]]);
 
-        assert_eq!(read_batraw_header(&f32_file).unwrap(), (1, 2, 2, 3, 4));
-        assert_eq!(read_batraw_header(&u8_file).unwrap(), (1, 2, 2, 3, 1));
+        assert_eq!(storage::read_batraw_header(&f32_file).unwrap(), (1, 2, 2, 3, 4));
+        assert_eq!(storage::read_batraw_header(&u8_file).unwrap(), (1, 2, 2, 3, 1));
         let _ = std::fs::remove_file(&f32_file);
         let _ = std::fs::remove_file(&u8_file);
     }
