@@ -1,35 +1,15 @@
-// File purpose: WGSL compute shader implementing back convolution operations for model forward/backward or optimizer passes.
+// Convolution backward. 2-D dispatch grid past WebGPU's 65 535-per-dim limit, so
+// the thread index comes from `num_workgroups` (`dispatch_grid` in layer.rs).
 //
-// The dispatch grid is 2-D when the batch pushes the workgroup count past
-// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
-// linear thread index is recovered from `num_workgroups` rather than read
-// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
-
-// Bindings match ConvolutionType::get_back_buffers_specs():
-//   [0] fwd_input    — input used in the forward pass  (HWC: iy*W*C + ix*C + iz)
-//   [1] weights      — forward weights                 (KHKWKC: k*KH*KW*KC + ky*KW*KC + kx*KC + kz)
-//   [2] specs        — ConvSpec uniform (shared from forward)
-//   [3] grad_output  — incoming gradient from next layer/loss (HWK: oy*OW*K + ox*K + k)
-//   [4] grad_input   — outgoing gradient to previous layer    (HWC)
-//   [5] grad_weights — weight gradient accumulator            (KHKWKC)
-//   [6] grad_bias    — bias gradient accumulator              (K)
+// Bindings match ConvolutionType::get_back_buffers_specs(): [0] fwd_input (HWC:
+// iy*W*C + ix*C + iz), [1] weights (KHKWKC), [2] specs, [3] grad_output (HWK), and
+// the three accumulators [4] grad_input, [5] grad_weights, [6] grad_bias.
 //
-// Three separate compute passes prevent write races:
-//   conv_back_input   dispatched over input  elements  x batch
-//   conv_back_weights dispatched over weight elements   (NOT x batch)
-//   conv_back_bias    dispatched over kernel count      (NOT x batch)
-//
-// The batch axis splits these three in two, and the split IS the design (see
-// docs/reports/BATCH_DISPATCH_DESIGN.md §3.1). `conv_back_input` writes one
-// activation per thread, so it grows with the batch like any elementwise pass.
-// The other two write *parameters*: there are exactly as many sums as there are
-// weights whatever the batch, so their grid is unchanged and the batch enters
-// INSIDE the kernel, as `batch * OH * OW` positions to reduce instead of
-// `OH * OW`. One `+=` per weight and per step, instead of one per weight and
-// per sample.
-//
-// Neither kernel is told the batch: it is `arrayLength(&grad_output) / (OH*OW*K)`,
-// read off the buffer that carries it.
+// Three passes avoid write races: `conv_back_input` over input elements × batch;
+// `conv_back_weights`/`conv_back_bias` over parameters, NOT × batch — the same
+// sum count whatever the batch, so the batch enters INSIDE the kernel as
+// `batch * OH * OW` positions (one `+=` per weight per STEP). The batch is read
+// as `arrayLength(&grad_output) / (OH*OW*K)`. Design: BATCH_DISPATCH_DESIGN.md §3.1.
 
 @group(0) @binding(0) var<storage, read>       fwd_input:    array<f32>;
 @group(0) @binding(1) var<storage, read>       weights:      array<f32>;
@@ -43,14 +23,10 @@ struct ConvSpec {
     nb_kernel:       u32,
     stride:          u32,
     padding_mode:    u32,
-    // Cooperating threads per sum, for BOTH reductions: grad_weights in the low
-    // half of the word, grad_bias in the high half. Sits in the word that used
-    // to be padding, so the uniform's size and layout are unchanged and the
-    // legacy fixtures still bind the very same buffer.
-    //
-    // Two counts and not one because the two reductions have wildly different
-    // sum counts: `KH*KW*IC*K` weights against `K` biases. Giving the bias the
-    // weights' split left it on ONE workgroup — see `reduction_lanes_for_bias`.
+    // Cooperating threads per sum for BOTH reductions: grad_weights in the low half
+    // of the word, grad_bias in the high half (in the old padding word, so layout is
+    // pinned). Two counts because the sum counts differ wildly (`KH*KW*IC*K` vs `K`):
+    // the bias needs its own or it lands on ONE workgroup. See `reduction_lanes_for_bias`.
     reduction_lanes: u32,
     dim_kernel:      vec3<u32>,
     dim_input:       vec3<u32>,
@@ -158,22 +134,12 @@ fn conv_back_input(
     grad_input[idx] = g;
 }
 
-// ---------------------------------------------------------------------------
-// Cooperative reduction layout, shared by passes 2 and 3.
-//
-// Both are sums over the OH*OW output positions, one sum per output element
-// (a weight, resp. a kernel's bias). The naive version gave each sum a single
-// thread, which left conv1's bias pass running 16 threads over 1024 positions.
-//
-// Instead a workgroup of 64 threads is split into `slots` independent sums of
-// `lanes` threads each (lanes * slots == 64). Each lane walks the position
-// axis in strides of `lanes`, then the lanes of a slot are tree-reduced.
-//
-// `lanes` comes from the uniform (`ConvolutionType::reduction_lanes` picks it,
-// calibrated by `bench_conv_reduction_lanes`), so the dispatch on the Rust side
-// and the split in here cannot drift apart. `lanes == 1` degenerates to exactly
-// one thread per sum — the naive scheme — which is the right choice for the
-// layers that already have thousands of independent sums.
+// Cooperative reduction shared by passes 2 and 3: sums over OH*OW positions, one
+// sum per output element. A 64-thread workgroup is split into `slots` sums of
+// `lanes` threads each (lanes*slots == 64); each lane strides the position axis by
+// `lanes`, then a slot's lanes are tree-reduced. `lanes` comes from the uniform
+// (`ConvolutionType::reduction_lanes`), so the Rust dispatch and this split cannot
+// drift. `lanes == 1` degenerates to one thread per sum.
 const WG_SIZE: u32 = 64u;
 var<workgroup> partial: array<f32, WG_SIZE>;
 
@@ -197,44 +163,14 @@ fn reduce_slot(tid: u32, lane: u32, lanes: u32, slots: u32) {
 // Pass 2 — grad_weights
 //   grad_weights[k][ky][kx][kz] += Σ_{oy,ox} grad_output[oy][ox][k] * fwd_input[oy*s+ky][ox*s+kx][kz]
 //
-// One slot per weight element. Consecutive slots are consecutive `kz`, so the
-// threads of a slot-group read consecutive `fwd_input` addresses and share the
-// same `grad_output` value.
-//
-// # Why this loop is a nest and not a flat walk
-//
-// This pass contracts exactly as many products as the forward does — the same
-// triple `(b, oy, ox)` against the same `(ky, kx, kz)` — and took **4,1× longer**
-// (`GPU_PROFILE.md` §3.2), which that report read as a memory-hierarchy
-// handicap. It is not, or not only: the flat walk paid **four integer
-// divisions per product**. `p / positions`, `p % positions`, `pos / OW`,
-// `pos % OW` — all by values only known at runtime, so none of them folds — for
-// one multiply-add. The forward's inner loop, for comparison, is two loads and
-// an FMA.
-//
-// So the position axis is walked as what it is: rows, then columns.
-//
-//   - A **row** is one `(sample, oy)`. The lane split moves there — one
-//     div/mod per row instead of four per position, and a lane still strides
-//     across sample boundaries, which is what turns `batch` sequential
-//     accumulations into one tree reduction.
-//   - Within a row, `ox` runs over a **closed-form interval**. `sx = ox*s + kx
-//     - pad_x` is monotonic in `ox`, so the positions whose tap falls in the
-//     input are contiguous: computing the two ends once replaces a bounds test
-//     taken `OW` times per row. The kernel row test on `sy` stays, once per
-//     row, exactly as `convolution.wgsl` does it.
-//   - Both addresses are then **incremented**, never recomputed: `grad_output`
-//     advances by `K` per `ox` (it is HWK) and `fwd_input` by `s * IC`.
-//
-// The inner loop is left with two loads, an FMA and two adds — the forward's
-// loop. Same taps, same padding rule, same products.
-//
-// The **order** does change: a lane used to visit positions `lane, lane+lanes,
-// …` across the flat axis and now visits whole rows. Float addition is not
-// associative, so this is a reassociation, and the equivalence tests treat it
-// as one (tolerance against the legacy kernel, an f64 oracle to arbitrate, and
-// a "never less accurate than what it replaces" clause) rather than asserting
-// bit-identity, which would be false.
+// One slot per weight; consecutive slots are consecutive `kz` (coalesced reads).
+// Walked as ROWS, not a flat position axis: a flat walk paid four runtime integer
+// divisions per product (none foldable) for one FMA, which read as a 4.1× memory
+// handicap (`GPU_PROFILE.md` §3.2) but was largely that. Per row `(sample, oy)`,
+// `ox` runs a closed-form interval (`sx` monotonic in `ox`), and both addresses are
+// incremented, never recomputed — leaving the forward's own two-loads-plus-FMA loop.
+// This reassociates the sum (float add is not associative), so the equivalence tests
+// use a tolerance + f64 oracle, not bit-identity.
 // ---------------------------------------------------------------------------
 @compute @workgroup_size(64)
 fn conv_back_weights(
