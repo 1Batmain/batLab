@@ -196,3 +196,11 @@ leurs références mutuelles sont restées valides, elles sont désormais voisin
 
 - **[RESTRUCTURE.md](RESTRUCTURE.md)** — ce qui a bougé, la table ci-dessus, et les pièges
   rencontrés en la faisant.
+
+### Audit transversal
+
+- **[AUDIT_SIMPLIFICATION.md](AUDIT_SIMPLIFICATION.md)** — le tour d'ensemble après la
+  campagne des deux jours : doublons de logique (le fold de bruit de base non canonisé,
+  le web qui recopie la config, l'en-tête `.batraw` triplé), mensonge de config
+  (`TrainingConfig.loss`), le tuple de version de checkpoint, et les rangements. Classé
+  danger / dette / cosmétique, avec ce qu'il propose de NE PAS faire.

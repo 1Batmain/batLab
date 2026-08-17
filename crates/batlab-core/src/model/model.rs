@@ -38,6 +38,55 @@ const CHECKPOINT_MAGIC_V3: &[u8; 7] = b"BBCKPT3";
 const CHECKPOINT_MAGIC_Q8: &[u8; 7] = b"BBCKPTQ";
 const CHECKPOINT_MAGIC_LEN: usize = 7;
 
+/// Which checkpoint layout a file declares, read off its magic.
+///
+/// This replaces a `(has_optimizer_trailer, has_ema_trailer, quantized)` triple
+/// whose eight combinations only ever described **four** real formats — a
+/// quantised file that also carried an EMA trailer, for one, was a state no
+/// writer could produce. The four variants are the four magics; what each
+/// carries is a *method*, so an impossible mix is unrepresentable rather than
+/// merely unproduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointVersion {
+    /// `BBCKPT1`: weights only, no trailer.
+    V1,
+    /// `BBCKPT2`: weights plus the optimiser-state trailer.
+    V2,
+    /// `BBCKPT3`: V2 plus the EMA weight-average trailer.
+    V3,
+    /// `BBCKPTQ`: 8-bit quantised weights, no trailer (an inference artefact).
+    Q8,
+}
+
+impl CheckpointVersion {
+    /// The version a file's leading magic declares, or `None` when the magic is
+    /// missing or unknown.
+    fn from_magic(bytes: &[u8]) -> Option<Self> {
+        match bytes.get(..CHECKPOINT_MAGIC_LEN)? {
+            m if m == CHECKPOINT_MAGIC_V3 => Some(Self::V3),
+            m if m == CHECKPOINT_MAGIC_V2 => Some(Self::V2),
+            m if m == CHECKPOINT_MAGIC_V1 => Some(Self::V1),
+            m if m == CHECKPOINT_MAGIC_Q8 => Some(Self::Q8),
+            _ => None,
+        }
+    }
+
+    /// Only V2 and V3 carry the optimiser moments.
+    fn has_optimizer_trailer(self) -> bool {
+        matches!(self, Self::V2 | Self::V3)
+    }
+
+    /// Only V3 carries the weight average.
+    fn has_ema_trailer(self) -> bool {
+        matches!(self, Self::V3)
+    }
+
+    /// Only the Q8 artefact stores its entries as 8-bit codes.
+    fn quantized(self) -> bool {
+        matches!(self, Self::Q8)
+    }
+}
+
 /// Trailer tags for the optimiser-state section of a V2 checkpoint.
 const OPT_STATE_NONE: u32 = 0;
 const OPT_STATE_ADAM: u32 = 1;
@@ -1172,18 +1221,10 @@ impl<State> Model<State> {
         // Version, read off the magic. V1 has no trailer at all, V2 an
         // optimiser trailer, V3 that plus the weight average; the quantised
         // artefact has no trailer and reads its entries as 8-bit codes.
-        let (has_optimizer_trailer, has_ema_trailer, quantized) =
-            match bytes.get(..CHECKPOINT_MAGIC_LEN) {
-                Some(magic) if magic == CHECKPOINT_MAGIC_V3 => (true, true, false),
-                Some(magic) if magic == CHECKPOINT_MAGIC_V2 => (true, false, false),
-                Some(magic) if magic == CHECKPOINT_MAGIC_V1 => (false, false, false),
-                Some(magic) if magic == CHECKPOINT_MAGIC_Q8 => (false, false, true),
-                _ => {
-                    return Err(ModelError::InvalidCheckpointFormat {
-                        message: "missing or invalid checkpoint magic".to_string(),
-                    });
-                }
-            };
+        let version =
+            CheckpointVersion::from_magic(bytes).ok_or_else(|| ModelError::InvalidCheckpointFormat {
+                message: "missing or invalid checkpoint magic".to_string(),
+            })?;
 
         struct LoadedEntry {
             layer_index: usize,
@@ -1199,7 +1240,7 @@ impl<State> Model<State> {
             // A quantised entry dequantises to the very same f32 vector a float
             // entry reads directly, so everything below is oblivious to which
             // encoding produced it.
-            let (weights, bias) = if quantized {
+            let (weights, bias) = if version.quantized() {
                 let weights = read_quantized_tensor(bytes, &mut offset)?;
                 let bias = read_quantized_tensor(bytes, &mut offset)?;
                 (weights, bias)
@@ -1220,10 +1261,10 @@ impl<State> Model<State> {
         // The optimiser trailer is applied where it is parsed — nothing
         // downstream depends on it. The EMA trailer is not, hence the split.
         let optimizer_trailer_at = offset;
-        if has_optimizer_trailer {
+        if version.has_optimizer_trailer() {
             skip_optimizer_state(bytes, &mut offset)?;
         }
-        let ema = if has_ema_trailer {
+        let ema = if version.has_ema_trailer() {
             Self::parse_ema_state(bytes, &mut offset)?
         } else {
             None
@@ -1336,7 +1377,7 @@ impl<State> Model<State> {
             }
         }
 
-        if has_optimizer_trailer {
+        if version.has_optimizer_trailer() {
             let mut opt_offset = optimizer_trailer_at;
             self.restore_optimizer_state(bytes, &mut opt_offset)?;
         }
@@ -2124,10 +2165,11 @@ mod tests {
             );
 
             // The async descent, reproduced exactly as the web crate opens and
-            // walks it: base latent from `seed ^ BASE_NOISE_FOLD`, path seed the
-            // seed itself, `diffusion_step` counting down T-1 → 0.
-            const BASE_NOISE_FOLD: u64 = 0xa5a5_5a5a_0123_4567;
-            let mut latent = schedule.sample_noise(output_len, seed ^ BASE_NOISE_FOLD);
+            // walks it: base latent from the ONE canonical fold, path seed the
+            // seed itself, `diffusion_step` counting down T-1 → 0. Importing
+            // `base_noise_seed` rather than restating its literal is the whole
+            // point — a divergence in the shared fold has to surface here.
+            let mut latent = schedule.sample_noise(output_len, crate::base_noise_seed(seed));
             for diffusion_step in (0..schedule.len()).rev() {
                 let stepped = reverse_step_async(
                     &mut model,

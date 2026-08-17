@@ -107,6 +107,21 @@ pub enum LossMethod {
     MeanSquared,
 }
 
+/// The engine's loss type is a separate enum — the config layer must not depend
+/// on `model` internals — so this is the one conversion between them, in the
+/// crate that owns both, the missing twin of the `PaddingMode`/`ActivationMethod`
+/// conversions above. Its exhaustiveness is the guard: add a variant to both and
+/// the compiler forces the mapping here, so a configured loss can never again be
+/// silently dropped on the way to the trainer (it used to be — the field was
+/// serialised, round-tripped, and never read).
+impl From<LossMethod> for crate::model::layer_types::LossMethod {
+    fn from(method: LossMethod) -> Self {
+        match method {
+            LossMethod::MeanSquared => crate::model::layer_types::LossMethod::MeanSquared,
+        }
+    }
+}
+
 impl fmt::Display for LossMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "MeanSquared")

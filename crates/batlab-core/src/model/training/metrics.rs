@@ -349,6 +349,33 @@ pub fn reverse_step_seed(path_seed: u64, diffusion_step: usize) -> u64 {
     path_seed.wrapping_add((diffusion_step as u64 + 1).wrapping_mul(STEP_SEED_GAMMA))
 }
 
+/// The fold that turns a **run seed** into the seed of its *opening latent*.
+///
+/// One value, one place. The native sampler ([`sample_diffusion`]), the drift's
+/// noise fallback ([`crate::PerpetualDrift::initial_noise_seed`]) and the web
+/// port all pass their run seed through [`base_noise_seed`] so a browser run's
+/// first noise field is the very one native path 0 sets out from. A second copy
+/// of this literal — a private `const` in the web crate, say — is exactly the
+/// silent divergence `WEB_PORT.md` was written about: it would compile, animate,
+/// and never trip a test. Kept public so the guard test and the web crate
+/// *import* it rather than restate it.
+pub const BASE_NOISE_FOLD: u64 = 0xa5a5_5a5a_0123_4567;
+
+/// The opening latent's noise seed for a run seed — see [`BASE_NOISE_FOLD`].
+pub fn base_noise_seed(seed: u64) -> u64 {
+    seed ^ BASE_NOISE_FOLD
+}
+
+/// The seed of denoising **path** `path_idx` under run seed `seed`.
+///
+/// Path 0 is the run seed itself, so a single-path run (inference, the web) and
+/// path 0 of a multi-path sample draw the same chain. Same odd increment as
+/// [`reverse_step_seed`]'s timestep fold, and — like it — one function so no
+/// caller can spread the seed a different way.
+pub fn path_seed(seed: u64, path_idx: usize) -> u64 {
+    seed ^ (path_idx as u64).wrapping_mul(STEP_SEED_GAMMA)
+}
+
 /// What one reverse step produced.
 pub struct ReverseStep {
     /// x_{t-1}, the latent after the step.
@@ -530,11 +557,10 @@ where
     let steps = schedule.len().max(1);
     let total_work = path_count.saturating_mul(steps);
     let mut accumulated = vec![0.0f32; output_len];
-    let base_noise_seed = seed ^ 0xa5a5_5a5a_0123_4567;
-    let base_latent = schedule.sample_noise(output_len, base_noise_seed);
+    let base_latent = schedule.sample_noise(output_len, base_noise_seed(seed));
 
     for path_idx in 0..path_count {
-        let path_seed = seed ^ ((path_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let path_seed = path_seed(seed, path_idx);
         let mut latent = base_latent.clone();
 
         for (step_idx, diffusion_step) in (0..schedule.len()).rev().enumerate() {
@@ -667,6 +693,95 @@ mod tests {
             .map(|step| reverse_step_seed(path_seed, step))
             .collect();
         assert_eq!(distinct.len(), 256, "two timesteps share a seed");
+    }
+
+    /// The canonical folds must still compute the exact values the four scattered
+    /// literals used to — pinning them so this centralisation is provably a
+    /// no-op, and so a fat-fingered edit to `BASE_NOISE_FOLD` cannot pass.
+    #[test]
+    fn the_canonical_seed_folds_match_the_old_literals() {
+        // The two folds exactly as they read at metrics.rs:560, perpetual.rs:561,
+        // model.rs:2129 and web/lib.rs before centralisation — rebuilt from
+        // halves so this test is not itself flagged as a second copy.
+        let old_base_fold: u64 = (0xa5a5_5a5a_u64 << 32) | 0x0123_4567;
+        let old_gamma: u64 = (0x9e37_79b9_u64 << 32) | 0x7f4a_7c15;
+        for seed in [0u64, 1, 42, 7, 0xdead_beef, u64::MAX] {
+            assert_eq!(base_noise_seed(seed), seed ^ old_base_fold);
+            for path_idx in 0..8usize {
+                assert_eq!(
+                    path_seed(seed, path_idx),
+                    seed ^ (path_idx as u64).wrapping_mul(old_gamma),
+                );
+            }
+        }
+        // Path 0 is the run seed itself — the identity the web's single-path
+        // inference and native path 0 both lean on.
+        assert_eq!(path_seed(12345, 0), 12345);
+    }
+
+    /// The base-noise fold has exactly one home. Any *other* line in any crate
+    /// that spells the literal out is a second source of truth — the very
+    /// divergence a web port re-deriving its opening noise would introduce, and
+    /// which no run would ever flag. Checked mechanically over every crate's
+    /// sources, not just this one, because the copy that mattered lived in
+    /// `batlab-web`.
+    #[test]
+    fn the_base_noise_fold_is_written_in_exactly_one_place() {
+        // Assembled from halves so this detector is not itself an offender.
+        let literal = concat!("0xa5a5_5a5a", "_0123_4567");
+        // crates/batlab-core/src → up to the workspace, then every crate's src.
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/<name> sits two levels below the workspace root")
+            .to_path_buf();
+
+        fn walk(dir: &std::path::Path, literal: &str, offenders: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries {
+                let path = entry.expect("bad directory entry").path();
+                if path.is_dir() {
+                    walk(&path, literal, offenders);
+                    continue;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if !name.ends_with(".rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("failed to read a source file");
+                for (number, line) in source.lines().enumerate() {
+                    if !line.contains(literal) {
+                        continue;
+                    }
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    // The one allowed line: the canonical `pub const` definition.
+                    if code.contains("const BASE_NOISE_FOLD") {
+                        continue;
+                    }
+                    offenders.push(format!("{}:{}: {}", path.display(), number + 1, code));
+                }
+            }
+        }
+
+        let mut offenders = Vec::new();
+        for crate_dir in std::fs::read_dir(workspace.join("crates"))
+            .expect("failed to read crates/")
+            .flatten()
+        {
+            walk(&crate_dir.path().join("src"), literal, &mut offenders);
+        }
+        assert!(
+            offenders.is_empty(),
+            "the base-noise fold must come from batlab_core::BASE_NOISE_FOLD, not a restated \
+             literal — a second copy is how a run opens on a different noise field than the \
+             native sampler, silently:\n{}",
+            offenders.join("\n")
+        );
     }
 
     #[test]

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Génère le banc d'architectures de la mission archi32 (item 4), écrit sous
-Models/ comme configs COMMITTÉES et reproductibles.
+Models/ comme configs reproductibles, régénérées À LA DEMANDE (elles ne sont
+plus commitées : quatre entrées de banc encombraient l'écran d'accueil du TUI
+pour rien — ce script les recrée à l'identique quand le banc est relancé).
 
 Quatre candidats 32×32 RGB (entrée [32,32,7] = 3 canaux signal + 4 canaux
 d'embedding temporel, sortie 3), à entraîner from scratch sur elephants_all,

@@ -67,7 +67,7 @@ are not reachable from the TUI and never write back a model's config_file.
   --headless-perpetual <model> [--checkpoint <path>] [--regime wander|breathe|flux]
       [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
       [--frames N] [--actions N] [--window] [--climb-frames N] [--out <dir>]
-      [--raw-weights]
+      [--raw-weights] [--seed-dataset <path>] [--seed-noise] [--single-view]
 
   --eval <model> --ckpt <path> [--ckpt <path> ...] --dataset <path>
       [--samples N] [--buckets N] [--t-per-bucket N] [--seed N] [--raw-weights]
@@ -268,6 +268,15 @@ Perpetual notes:
   --actions N       stops after N drift actions (frames). The only bound flux
                     accepts, and how two regimes are compared over equal frames.
                     Overrides --frames when both are given.
+  --seed-dataset    the dataset the drift's seed image is drawn from. Overrides
+      <path>        the config's seed_dataset and the channel default; its
+                    channel count must match the model's. Default: the model's
+                    configured seed dataset, else the by-channel default.
+  --seed-noise      open on pure noise instead of a real dataset image — the
+                    old img2img-less opening. Default: drift from a seed image.
+  --single-view     render x0_hat alone rather than the x_t | x0_hat pair.
+                    Default HERE: the pair (unlike the interactive window, which
+                    opens on x0_hat alone).
 
 --dump <path> writes every frame of the run, little-endian throughout:
 
@@ -1068,9 +1077,13 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1)
         .max(1);
-    let magnitude = flag("--magnitude")
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(1.0);
+    let magnitude_flag = flag("--magnitude").and_then(|v| v.parse::<f32>().ok());
+    // Kept at 1.0 by default on purpose: this is the DEV/CI path, and benches
+    // under `bench/` pin that default. Unlike the interactive infer and the web
+    // (which read `config.inference.denoise_magnitude`), this path does not — so
+    // the banner below *names its source*, and flags when the config would have
+    // said something else, rather than being a silent third way of resolving it.
+    let magnitude = magnitude_flag.unwrap_or(1.0);
     // Generating uses the average when the checkpoint carries one, because
     // that is the set the average exists to be sampled from. `--raw-weights`
     // asks for the last iterate instead — the other arm of the comparison.
@@ -1087,6 +1100,20 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         Some(spec) => PosteriorVariance::from_cli(&spec)
             .ok_or_else(|| format!("--variance must be 'beta' or 'posterior', got '{spec}'"))?,
         None => config.inference.posterior_variance,
+    };
+
+    // Where the magnitude in force actually came from — named on the banner so
+    // this path is not a silent third resolver (cf. the GPU-profile and seed
+    // lines, which already announce their source).
+    let magnitude_source = if magnitude_flag.is_some() {
+        "--magnitude".to_string()
+    } else if (config.inference.denoise_magnitude - magnitude).abs() > f32::EPSILON {
+        format!(
+            "défaut DEV/CI (config.inference.denoise_magnitude={} n'est PAS lu sur ce chemin)",
+            config.inference.denoise_magnitude
+        )
+    } else {
+        "défaut DEV/CI".to_string()
     };
 
     let out_path = flag("--out").unwrap_or_else(|| {
@@ -1164,8 +1191,8 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
 
         let img_stats = Stats::of(&image);
         println!(
-            "headless sample '{model_name}': seed={seed} paths={paths} magnitude={magnitude} \
-             variance={}\n\
+            "headless sample '{model_name}': seed={seed} paths={paths} \
+             magnitude={magnitude} (source: {magnitude_source}) variance={}\n\
              image → {out_path}\nmetrics → {log_path}\n\
              final image stats: min={:.4} max={:.4} mean={:.4} std={:.4}",
             variance.as_str(), img_stats.min, img_stats.max, img_stats.mean, img_stats.std
@@ -1620,32 +1647,6 @@ impl FrameDump {
 /// the answer since BATRAW3: the same 50 000 images are 586 MiB of f32 or
 /// 147 MiB of u8, and an inventory that assumed f32 would over-report a
 /// BATRAW3 dataset's residency by four.
-fn read_batraw_header(path: &Path) -> Result<(u64, u32, u32, u32, u64), String> {
-    use std::io::Read;
-    let mut file =
-        fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let mut header = [0u8; 24];
-    file.read_exact(&mut header)
-        .map_err(|err| format!("failed to read the header of {}: {err}", path.display()))?;
-    let magic = &header[..8];
-    let value_bytes: u64 = if magic == RAW_DATASET_MAGIC_BYTES {
-        1
-    } else if magic == RAW_DATASET_MAGIC_SIGNED || magic == RAW_DATASET_MAGIC_UNIT {
-        4
-    } else {
-        return Err(format!("invalid magic in {}", path.display()));
-    };
-    let word = |i: usize| {
-        u32::from_le_bytes([
-            header[8 + i * 4],
-            header[9 + i * 4],
-            header[10 + i * 4],
-            header[11 + i * 4],
-        ])
-    };
-    Ok((word(0) as u64, word(1), word(2), word(3), value_bytes))
-}
-
 /// The dataset a `--resources` question is about: the one named on the command
 /// line, else the one the model's config trains on. `None` when neither exists
 /// on disk — the inventory then simply has no streamed post, and says so.
@@ -1658,7 +1659,12 @@ fn resources_dataset(
         _ => None,
     })?;
     let path = PathBuf::from(&named);
-    let (count, width, height, channels, value_bytes) = read_batraw_header(&path).ok()?;
+    // One reader for the `.batraw` header, in `storage` — the binary no longer
+    // keeps its own byte-identical copy. (The dataset *loader*,
+    // `try_load_raw_dataset`, is a distinct, richer parser: it works on bytes
+    // already in memory and has to tell BATRAW1 from BATRAW2 to rescale, which
+    // this width-only probe deliberately does not.)
+    let (count, width, height, channels, value_bytes) = storage::read_batraw_header(&path)?;
     Some((
         path,
         batlab_core::DatasetSpec {
@@ -2790,11 +2796,24 @@ async fn build_execution_model(
     ema: Option<EmaConfig>,
 ) -> Result<(Arc<GpuContext>, Model<Training>), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
+    // The loss the run is configured with — cabled through, not hardcoded. A
+    // training run always reaches here with run.mode = Train(the very
+    // TrainingConfig being executed): the headless path sets it just before
+    // run_training, and the TUI path destructures train_cfg out of it. So this
+    // reads exactly train_cfg.loss, alongside the lr/batch/optimizer that
+    // already flow in — and the day LossMethod grows a second variant, a
+    // config_file that names it will no longer be silently ignored. An inference
+    // build (run.mode Infer/Perpetual) computes no loss; MeanSquared is the
+    // dormant default it was always built with.
+    let loss = match &config.run.mode {
+        RunMode::Train(train) => train.loss.clone().into(),
+        RunMode::Infer | RunMode::Perpetual(_) => PLoss::MeanSquared,
+    };
     let mut model = Model::new_training_with_optimizer(
         gpu.clone(),
         lr,
         batch_size,
-        PLoss::MeanSquared,
+        loss,
         optimizer,
     )
     .await;
@@ -5270,6 +5289,7 @@ mod tests {
             seed,
             1,
             1.0,
+            PosteriorVariance::Beta,
             None,
             None,
             |_, _| {},
@@ -5805,8 +5825,8 @@ mod tests {
         write_batraw(&f32_file, 1, 2, 2, 3, &[vec![0.0; 12]]);
         write_batraw3(&u8_file, 1, 2, 2, 3, &[vec![0u8; 12]]);
 
-        assert_eq!(read_batraw_header(&f32_file).unwrap(), (1, 2, 2, 3, 4));
-        assert_eq!(read_batraw_header(&u8_file).unwrap(), (1, 2, 2, 3, 1));
+        assert_eq!(storage::read_batraw_header(&f32_file).unwrap(), (1, 2, 2, 3, 4));
+        assert_eq!(storage::read_batraw_header(&u8_file).unwrap(), (1, 2, 2, 3, 1));
         let _ = std::fs::remove_file(&f32_file);
         let _ = std::fs::remove_file(&u8_file);
     }

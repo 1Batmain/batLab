@@ -556,9 +556,11 @@ impl PerpetualDrift {
         }
     }
 
-    /// The seed the run's initial latent should be drawn from.
+    /// The seed the run's initial latent should be drawn from — the same fold
+    /// [`crate::base_noise_seed`] gives the native sampler and the web port, so a
+    /// noise-origin drift opens on the very field an inference run would.
     pub fn initial_noise_seed(&self) -> u64 {
-        self.base_seed ^ 0xa5a5_5a5a_0123_4567
+        crate::base_noise_seed(self.base_seed)
     }
 
     /// Yields the next action and advances.

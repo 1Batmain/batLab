@@ -9,7 +9,6 @@
 use crate::storage::{self, SavedModelEntry, Storage, default_seed_dataset_name};
 pub use batlab_core::config::*;
 use batlab_core::model::training::{LossWeighting, MIN_RENOISE_DEPTH, PerpetualRegime};
-use batlab_core::model::{OptimizerKind, WeightInit};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -3319,11 +3318,14 @@ impl App {
 mod tests {
     use super::{
         App, DUPLICATE_CONTENT_CHOICES, InferenceConfig, LayerKind, LossMethod, LossWeighting,
-        MIN_RENOISE_DEPTH, ModelAction, ModelConfig, OptimizerKind, PERPETUAL_SEED_DATASET_FIELD,
+        MIN_RENOISE_DEPTH, ModelAction, ModelConfig, PERPETUAL_SEED_DATASET_FIELD,
         PerpetualRegime, RunConfig,
         RunMode, Screen, TRAINING_DATASET_FIELD, TRAINING_EMA_FIELD, TrainingConfig,
-        TrainingControlCommand, WeightInit, parse_ema_decay_field, storage,
+        TrainingControlCommand, parse_ema_decay_field, storage,
     };
+    // Straight from the engine, as the production code above refers to them —
+    // they are no longer re-exported into `app`'s own scope.
+    use batlab_core::{OptimizerKind, WeightInit};
     use crate::storage::TempRoot;
     use crate::tui::events::handle_key;
     use crossterm::event::KeyCode;
