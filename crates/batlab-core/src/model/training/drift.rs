@@ -1,34 +1,15 @@
-//! File purpose: Carries the latent along a [`PerpetualDrift`]'s itinerary —
-//! the tensors, where `perpetual.rs` holds only the plan.
+//! Carries the latent along a [`PerpetualDrift`]'s itinerary — the tensors, where
+//! `perpetual.rs` holds only the plan. The split is what makes the walk testable:
+//! it needs the model only through one question ("what noise in this latent, at
+//! this level?"), which a closed-form oracle answers without a GPU.
 //!
-//! [`PerpetualDrift`] answers *where on the schedule the run is*; this answers
-//! *what the two panes hold*. Splitting them is what lets the second be tested
-//! at all: the walk needs a model, but only through one question — "what noise
-//! do you see in this latent, at this level?" — so a test can answer that
-//! question with a closed-form oracle and check the whole regime on a machine
-//! with no GPU.
-//!
-//! # The pause, and why it was not a stall
-//!
-//! Watched for any length of time, a wander or a breathe run *froze*: the
-//! right-hand pane held one image, unchanged, for the entire climb, then jumped.
-//! Nothing was stuck. The climb is closed-form arithmetic —
-//! [`LinearNoiseSchedule::forward_from`] — and **the model was never called
-//! during it**, so the x̂₀ estimate beside the dissolving latent was the one the
-//! descent had left behind, `t_r + 1` frames earlier. The instrument panel kept
-//! counting, the left pane kept dissolving, and the pane a viewer actually
-//! looks at was a still.
-//!
-//! The fix is not to change the trajectory: the latent still climbs in closed
-//! form from a single departure under a single field, because that is what
-//! keeps the grain coherent (`CLIMB_COHERENCE.md`). What changes is that the
-//! climb **also asks the model what it now sees**, on every frame. The latent
-//! follows the forward process; the estimate beside it dreams continuously. It
-//! costs one model call per climb frame where it used to cost none — see
-//! `IMG2IMG_DRIFT.md` for what that measures at.
-//!
-//! So the rule this module exists to enforce is one line long: **every frame,
-//! in every regime, calls the model exactly once and publishes a fresh x̂₀.**
+//! The rule this module enforces, in one line: **every frame, in every regime,
+//! calls the model exactly once and publishes a fresh x̂₀.** It exists because the
+//! climb is closed-form ([`LinearNoiseSchedule::forward_from`]) and used to call
+//! no model, so the x̂₀ pane froze on the descent's last estimate for a whole
+//! climb. The fix does not change the trajectory (one departure, one field, for
+//! grain coherence — `CLIMB_COHERENCE.md`); it only ALSO asks the model each
+//! frame. Cost: one model call per climb frame where there was none — `IMG2IMG_DRIFT.md`.
 
 use super::perpetual::DriftAction;
 use super::schedule::{LinearNoiseSchedule, PosteriorVariance};
@@ -38,19 +19,15 @@ use super::schedule::{LinearNoiseSchedule, PosteriorVariance};
 pub struct DriftFrame {
     /// x_t after the frame: the left pane, the noisy latent.
     pub latent: Vec<f32>,
-    /// x̂₀ for that latent: the right pane, what the model believes it is
-    /// looking at. **Never stale** — see the module header.
+    /// x̂₀ for that latent: the right pane. NEVER stale (see module header).
     pub x0_hat: Vec<f32>,
-    /// Model calls this frame cost. One, always, in every regime; carried out
-    /// so a caller can report it rather than assume it.
+    /// Model calls this frame cost — always one, carried out so a caller reports it.
     pub model_calls: usize,
 }
 
-/// The model, as the walk needs it: ε̂ from a latent at a timestep.
-///
-/// One method, because that is the entire coupling between the drift and the
-/// network. The production implementation wraps
-/// [`crate::training::predict_epsilon`]; the tests wrap a closed-form oracle.
+/// The model as the walk needs it: ε̂ from a latent at a timestep. One method —
+/// the entire coupling between drift and network. Production wraps
+/// [`crate::training::predict_epsilon`]; tests wrap a closed-form oracle.
 pub trait NoisePredictor {
     fn predict_noise(&mut self, latent: &[f32], diffusion_step: usize) -> Vec<f32>;
 }
@@ -64,13 +41,10 @@ where
     }
 }
 
-/// The same coupling as [`NoisePredictor`], but the model call is a future.
-///
-/// A browser cannot answer "what noise do you see?" synchronously: the GPU
-/// reports back only when the event loop turns, so the answer has to be awaited
-/// (see [`crate::Model::predict_async`]). This is that one method, made async —
-/// nothing else about the drift changes, and [`DriftWalk::advance_async`] walks
-/// the exact same itinerary [`DriftWalk::advance`] does, one `.await` apart.
+/// [`NoisePredictor`], but the model call is a future — a browser answers only
+/// when the event loop turns ([`crate::Model::predict_async`]).
+/// [`DriftWalk::advance_async`] walks the exact same itinerary as
+/// [`DriftWalk::advance`], one `.await` apart.
 #[allow(async_fn_in_trait)]
 pub trait AsyncNoisePredictor {
     async fn predict_noise(&mut self, latent: &[f32], diffusion_step: usize) -> Vec<f32>;
@@ -108,20 +82,16 @@ impl DriftWalk {
         &self.latent
     }
 
-    /// Restarts on a new latent — what `[r]` does.
-    ///
-    /// The departure is dropped with it: a climb reading a snapshot from before
-    /// the re-seed would carry the *old* image up the schedule.
+    /// Restarts on a new latent (`[r]`). The departure is dropped with it — a
+    /// climb reading a pre-reseed snapshot would carry the old image up the schedule.
     pub fn restart_from(&mut self, latent: Vec<f32>) {
         self.latent = latent;
         self.departure = None;
     }
 
-    /// Performs one action of the itinerary and returns the frame to show.
-    ///
-    /// Every arm ends the same way — predict, estimate x̂₀, publish — which is
-    /// the module's whole claim. A branch that returned a previously held
-    /// estimate would be the pause coming back.
+    /// Performs one itinerary action and returns the frame. Every arm ends the
+    /// same way — predict, estimate x̂₀, publish — the module's whole claim; a
+    /// branch returning a held estimate would be the pause coming back.
     pub fn advance<P: NoisePredictor + ?Sized>(
         &mut self,
         action: DriftAction,
@@ -141,8 +111,7 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
-                    // The drift keeps DDPM's beta variance: bit-identical to
-                    // before the posterior option, which is an inference choice.
+                    // Beta variance: the drift keeps the pre-posterior draw.
                     PosteriorVariance::Beta,
                     true,
                 );
@@ -155,9 +124,8 @@ impl DriftWalk {
                 cycle_seed,
                 opens_cycle,
             } => {
-                // The cycle just closed: the latent is the image it settled on,
-                // and it is the departure every level of this climb is formed
-                // from.
+                // The cycle just closed: the latent is the settled image, and the
+                // departure every level of this climb is formed from.
                 if opens_cycle {
                     self.departure = Some(self.latent.clone());
                 }
@@ -169,11 +137,9 @@ impl DriftWalk {
                     forward_step,
                     cycle_seed,
                 );
-                // **The fix.** The latent above is pure arithmetic, but the
-                // estimate beside it is not allowed to be: the model is asked
-                // what it now sees in the freshly re-noised latent, at the level
-                // the latent is actually on. The image goes on dreaming while it
-                // dissolves.
+                // THE FIX: the latent above is arithmetic, but the estimate beside
+                // it is not allowed to be — ask the model what it now sees in the
+                // re-noised latent, so the image dreams on while it dissolves.
                 let epsilon = predictor.predict_noise(&self.latent, forward_step);
                 let x0_hat = schedule.x0_estimate(&self.latent, &epsilon, forward_step);
                 self.frame(x0_hat)
@@ -191,29 +157,22 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
-                    // The drift keeps DDPM's beta variance: bit-identical to
-                    // before the posterior option, which is an inference choice.
+                    // Beta variance: the drift keeps the pre-posterior draw.
                     PosteriorVariance::Beta,
                     true,
                 );
-                // One level down, exactly that one level back on: the noise
-                // budget is stationary by construction rather than by
-                // accounting.
+                // One level down, exactly that one back on: the noise budget is
+                // stationary by construction.
                 self.latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
                 self.frame(stepped.x0_hat.expect("x0_hat was asked for"))
             }
         }
     }
 
-    /// The async twin of [`Self::advance`], for a browser.
-    ///
-    /// Every line that is not the model call is identical to [`Self::advance`] —
-    /// the same schedule functions, in the same order, mutating the latent the
-    /// same way — because it *is* the same walk: only `predict_noise` becomes an
-    /// `.await`. A web run therefore produces the same frames a native one does,
-    /// which is the property `advance_async_matches_advance_bit_for_bit` pins.
-    /// Keeping the two arms side by side (rather than making `advance` call this
-    /// and block) is what keeps the native path free of any executor.
+    /// The async twin of [`Self::advance`], for a browser. Identical line for line
+    /// except `predict_noise` becomes an `.await` — it IS the same walk, so a web
+    /// run produces the same frames (`advance_async_matches_advance_bit_for_bit`).
+    /// Kept side by side, not one calling the other, so the native path needs no executor.
     pub async fn advance_async<P: AsyncNoisePredictor + ?Sized>(
         &mut self,
         action: DriftAction,
@@ -233,8 +192,7 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
-                    // The drift keeps DDPM's beta variance: bit-identical to
-                    // before the posterior option, which is an inference choice.
+                    // Beta variance: the drift keeps the pre-posterior draw.
                     PosteriorVariance::Beta,
                     true,
                 );
@@ -275,8 +233,7 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
-                    // The drift keeps DDPM's beta variance: bit-identical to
-                    // before the posterior option, which is an inference choice.
+                    // Beta variance: the drift keeps the pre-posterior draw.
                     PosteriorVariance::Beta,
                     true,
                 );
@@ -316,16 +273,11 @@ mod tests {
     /// [`oracle`] — a *perfect* one is useless here.
     const UNDER_CONFIDENCE: f32 = 0.9;
 
-    /// A deliberately imperfect ε̂ predictor, standing in for the network.
-    ///
-    /// The exact posterior-optimal predictor for a point mass at `x0` is
-    /// `eps = (x_t - sqrt(ᾱ)·x0) / sqrt(1 - ᾱ)`, and it is **degenerate for
-    /// these tests**: fed back through `x0_estimate` it inverts x_t exactly, so
-    /// x̂₀ comes out as the constant `x0` whatever the latent — a walk that
-    /// never called the model at all would look identical, and the frozen-pane
-    /// test could not fail. Scaling it by `UNDER_CONFIDENCE` gives what a real
-    /// model gives: `x̂₀ = 0,1·x_t/sqrt(ᾱ) + 0,9·x₀`, an estimate that genuinely
-    /// tracks the latent it was read from.
+    /// A deliberately IMPERFECT ε̂ predictor. The exact posterior-optimal one for a
+    /// point mass at `x0` is degenerate here: through `x0_estimate` it returns the
+    /// constant `x0` whatever the latent, so a walk that never called the model
+    /// would look identical and the frozen-pane test could not fail. Scaling by
+    /// `UNDER_CONFIDENCE` gives an estimate that tracks the latent it was read from.
     fn oracle(
         schedule: &LinearNoiseSchedule,
         x0: Vec<f32>,
@@ -354,16 +306,10 @@ mod tests {
             / a.len() as f64
     }
 
-    /// **The regression this module exists for.**
-    ///
-    /// Reported as "il y a toujours un moment où, pendant qu'on réinjecte le
-    /// bruit, ça se met en pause". It was never a stall: the climb is closed
-    /// form and used to call no model at all, so x̂₀ was frozen for the whole
-    /// ascent — `t_r + 1` identical frames, then a jump.
-    ///
-    /// The assertion is deliberately on the *frames the viewer sees*, not on a
-    /// call counter: a walk that called the model and then published a held
-    /// estimate would pass a counter and fail this.
+    /// The regression this module exists for: the climb was closed-form and called
+    /// no model, so x̂₀ froze for the whole ascent (`t_r+1` identical frames, then a
+    /// jump). Asserted on the FRAMES the viewer sees, not a call counter — a walk
+    /// that called the model then published a held estimate would fool a counter.
     #[test]
     fn x0_never_repeats_itself_between_two_frames_of_a_climb() {
         let schedule = schedule();
@@ -374,11 +320,8 @@ mod tests {
         let mut drift = PerpetualDrift::new(STEPS, PerpetualRegime::Wander, depth, 0x5eed);
         let mut walk = DriftWalk::new(schedule.sample_noise(N, drift.initial_noise_seed()), 1.0);
 
-        // Burn the opening descent from pure noise, then watch three whole
-        // cycles: a climb, its descent, the next climb.
-        // Collected until a *fourth* climb opens: a climb is only complete once
-        // the next has begun, and a truncated one would be compared on length
-        // rather than on content.
+        // Collected until a FOURTH climb opens: a climb is complete only once the
+        // next begins, else a truncated one is compared on length not content.
         let mut climbs: Vec<Vec<Vec<f32>>> = Vec::new();
         let mut actions = 0;
         while climbs.len() < 4 {
@@ -415,23 +358,12 @@ mod tests {
         }
     }
 
-    /// The same claim over a whole cycle — descent *and* climb — and the one
-    /// place where it does not hold, stated exactly rather than tolerated.
-    ///
-    /// Before the fix, half of every wander cycle was repeats: `t_r + 1` frames
-    /// of frozen x̂₀ per turn, which is the "x̂₀ reste figé la moitié du temps
-    /// avant de sauter" `PERPETUAL_FLUX.md` measured and put down to the
-    /// regimes rather than to the climb.
-    ///
-    /// What is left is **one** repeated frame per cycle, and it is not a stale
-    /// estimate: the climb's last increment lands on `t_r` and the descent that
-    /// follows re-reads *that same latent* at *that same level*, because a
-    /// reverse step derives x̂₀ from `x_t` before stepping. Two consecutive
-    /// frames therefore sit on the same instant and agree about it. At 30
-    /// frames a second that is 33 ms, against the 570 ms of a `t_r = 16` freeze.
-    ///
-    /// Flux has no turn and so has no exception at all — asserted separately
-    /// below, because "at most one per cycle" would pass vacuously there.
+    /// The same claim over a whole cycle (descent AND climb), and the one place it
+    /// does not hold, stated exactly. What is left is ONE repeated frame per cycle,
+    /// not a stale estimate: the climb's last increment lands on `t_r` and the next
+    /// descent re-reads that same latent at that same level (a reverse step derives
+    /// x̂₀ from `x_t` before stepping), so two frames sit on the same instant — 33 ms
+    /// against a `t_r=16` freeze's 570 ms. Flux has no turn, asserted separately.
     #[test]
     fn the_only_estimate_a_cycle_repeats_is_the_one_at_its_turn() {
         let schedule = schedule();
@@ -509,13 +441,10 @@ mod tests {
         assert!(checked >= 390, "only {checked} frames compared");
     }
 
-    /// The fix must not have moved the trajectory. The latent still climbs in
-    /// closed form from one departure under one field — asking the model for a
-    /// picture is a *read*, and a read that perturbed the state would trade the
-    /// pause for a drift that no longer holds its noise level.
-    ///
-    /// Checked against the schedule directly: every climb frame's latent must
-    /// be exactly `forward_from(departure, …)`, to the bit.
+    /// The fix must not have moved the trajectory: asking the model is a READ, and
+    /// a read that perturbed the state would trade the pause for a drift that no
+    /// longer holds its noise level. Checked to the bit: every climb frame's latent
+    /// must equal `forward_from(departure, …)`.
     #[test]
     fn asking_the_model_during_the_climb_does_not_move_the_latent() {
         let schedule = schedule();
@@ -587,12 +516,10 @@ mod tests {
         }
     }
 
-    /// The web path's whole safety net: [`DriftWalk::advance_async`] must produce
-    /// the identical frame [`DriftWalk::advance`] does, for the identical action
-    /// — otherwise a browser drift would silently diverge from the native one it
-    /// is supposed to be. Run over every regime, for long enough to cover
-    /// descents, climbs (both panes), the cycle turn, and stationary flux, with
-    /// bit-for-bit equality on both the latent and x̂₀ every single frame.
+    /// The web path's safety net: `advance_async` must produce the IDENTICAL frame
+    /// `advance` does for the identical action, else a browser drift silently
+    /// diverges. Run over every regime (descents, climbs, the turn, flux), bit-for-bit
+    /// on latent and x̂₀ every frame.
     #[test]
     fn advance_async_matches_advance_bit_for_bit() {
         let schedule = schedule();
