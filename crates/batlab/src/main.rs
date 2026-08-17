@@ -67,7 +67,7 @@ are not reachable from the TUI and never write back a model's config_file.
   --headless-perpetual <model> [--checkpoint <path>] [--regime wander|breathe|flux]
       [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
       [--frames N] [--actions N] [--window] [--climb-frames N] [--out <dir>]
-      [--raw-weights]
+      [--raw-weights] [--seed-dataset <path>] [--seed-noise] [--single-view]
 
   --eval <model> --ckpt <path> [--ckpt <path> ...] --dataset <path>
       [--samples N] [--buckets N] [--t-per-bucket N] [--seed N] [--raw-weights]
@@ -268,6 +268,15 @@ Perpetual notes:
   --actions N       stops after N drift actions (frames). The only bound flux
                     accepts, and how two regimes are compared over equal frames.
                     Overrides --frames when both are given.
+  --seed-dataset    the dataset the drift's seed image is drawn from. Overrides
+      <path>        the config's seed_dataset and the channel default; its
+                    channel count must match the model's. Default: the model's
+                    configured seed dataset, else the by-channel default.
+  --seed-noise      open on pure noise instead of a real dataset image — the
+                    old img2img-less opening. Default: drift from a seed image.
+  --single-view     render x0_hat alone rather than the x_t | x0_hat pair.
+                    Default HERE: the pair (unlike the interactive window, which
+                    opens on x0_hat alone).
 
 --dump <path> writes every frame of the run, little-endian throughout:
 
