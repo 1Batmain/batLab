@@ -1,35 +1,20 @@
-//! File purpose: The WebAssembly front end — the engine running in a visitor's
-//! browser on their own GPU (WebGPU), for the portfolio.
+//! The WebAssembly front end — the engine running in a visitor's browser on their
+//! own GPU (WebGPU). The crate the engine/interface boundary was drawn for: it
+//! holds NO diffusion maths of its own (every reverse step, drift frame, input
+//! composition and schedule is the engine's), because a web run diverging from a
+//! native one would be a silent failure — reuse, never re-derive. All it adds is
+//! the DRIVING: turning the engine's async step into `requestAnimationFrame` ticks
+//! and painting x̂₀ onto a canvas.
 //!
-//! This is the crate the whole engine/interface boundary in `batlab_core` was
-//! drawn for. It holds **no diffusion maths of its own**: every reverse step is
-//! [`batlab_core::reverse_step_from_epsilon`], every drift frame is
-//! [`batlab_core::DriftWalk::advance_async`], the input is composed by
-//! [`batlab_core::compose_diffusion_input`], and the schedule is the engine's.
-//! A web run that diverged from a native one would be a silent failure, so the
-//! rule here is: reuse, never re-derive. The one thing this crate adds is the
-//! *driving* — turning the engine's async step into `requestAnimationFrame`
-//! ticks and painting x̂₀ onto a canvas.
+//! Async because [`batlab_core::Model::predict`] blocks on its ε̂ readback, which
+//! in a browser deadlocks the thread that must turn the event loop; the engine's
+//! `*_async` variants await it instead. (GPU-residency across all 256 steps would
+//! drop the per-step readback but means re-expressing the schedule in WGSL — the
+//! divergence forbidden without a bit-agreement test; a measured optimisation left
+//! on the table, see README.)
 //!
-//! # Why async, and why the latent still round-trips
-//!
-//! [`batlab_core::Model::predict`] blocks on its ε̂ readback. In a browser the
-//! thread it would block is the one that has to turn the event loop for the GPU
-//! to answer — a deadlock. So the engine grew [`batlab_core::Model::predict_async`]
-//! and [`batlab_core::DriftWalk::advance_async`], which *await* the readback,
-//! and this crate drives them from JavaScript, one frame at a time.
-//!
-//! Keeping the latent GPU-resident across all 256 steps (project task #19) would
-//! remove the per-step ε̂ readback entirely, but it means re-expressing the
-//! schedule maths in WGSL — precisely the divergence the paragraph above forbids
-//! without a bit-agreement test to hold it. Measured against the target here (a
-//! contemplative piece throttled to display rate), the round-trip is not the
-//! wall — see the crate README. The async path is the correct, verifiable first
-//! port; GPU-residency is a measured optimisation left on the table, not a
-//! prerequisite.
-//!
-//! On a native target this crate is **empty** (the `cfg` below), so the
-//! workspace builds and tests without ever pulling a web dependency.
+//! On a native target this crate is EMPTY (the `cfg` below), so the workspace
+//! builds without pulling a web dependency.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -50,22 +35,13 @@ const STEPS: usize = batlab_core::DIFFUSION_SCHEDULE_STEPS;
 const BETA_START: f32 = batlab_core::DIFFUSION_BETA_START;
 const BETA_END: f32 = batlab_core::DIFFUSION_BETA_END;
 
-// The denoise magnitude and reverse-step variance for both modes are NOT
-// constants here — they are read from the model's own `config_file`
-// (`config.inference.denoise_magnitude` / `.posterior_variance`), the same file
-// the page already fetches, so the page's sampling choice has a single home and
-// the page cannot state a value the model's config contradicts.
-//
-// For `Elephants_XL`, that config carries `1.2` / `beta` — the `SAMPLING_SWEEP.md`
-// result (the page generated *under* the dataset on every statistic; `1.2` lands
-// `grad_energy` on target where `1.0` fell short and `1.5` overshot; `Beta`,
-// DDPM's larger variance, over `Posterior` which only smooths a model already too
-// smooth). The values are the campaign's; their source is now the config, not a
-// literal the config could silently disagree with.
+// Denoise magnitude and reverse-step variance are NOT constants here: they are
+// read from the model's own `config_file` (the file the page already fetches), so
+// the page cannot state a value the config contradicts. Rationale: SAMPLING_SWEEP.md.
 
 /// A private multiplier the page spreads its per-run seed counter with — its own
-/// RNG, not a cross-crate invariant. Once a run *has* a seed, the fold that ties
-/// its opening noise to the native sampler is [`batlab_core::base_noise_seed`],
+/// RNG, not a cross-crate invariant. Once a run has a seed, the fold tying its
+/// opening noise to the native sampler is [`batlab_core::base_noise_seed`],
 /// imported (not restated) so the page cannot drift from path 0.
 const SEED_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -178,12 +154,10 @@ impl AsyncNoisePredictor for ModelPredictor<'_> {
 
 struct Engine {
     model: Model,
-    /// A handle on the device, kept so a frame can run its GPU work inside a
-    /// validation error scope (see [`GpuContext::guarded`]) without borrowing the
-    /// model. This is the browser's only defence against a silently-invalid
-    /// pipeline: without it, a frame whose shaders the browser rejected would
-    /// paint zeroed ε̂ — a model that drifts into saturated noise — and say
-    /// nothing. See `docs/reports/WEB_PORT.md`, "le bug de l'inférence".
+    /// The device handle, kept so a frame runs its GPU work inside a validation
+    /// error scope ([`GpuContext::guarded`]) — the browser's only defence against a
+    /// silently-invalid pipeline that would paint zeroed ε̂ (saturated noise) and
+    /// say nothing. See `docs/reports/WEB_PORT.md`.
     gpu: Arc<GpuContext>,
     schedule: LinearNoiseSchedule,
     input_channels: usize,
@@ -194,10 +168,9 @@ struct Engine {
     seeds: SeedImages,
     seed_counter: u64,
 
-    /// The last frame's tensor statistics, for the on-page diagnostics line and
-    /// the console. An ε̂ whose std collapses to ~0 is the whole tell of the
-    /// inference bug: with ε̂ ≈ 0, x̂₀ = x_t/√ᾱ is the raw latent, saturated at
-    /// every t. A healthy ε̂ has std ≈ 1.
+    /// The last frame's tensor stats for the on-page diagnostics. An ε̂ std
+    /// collapsing to ~0 is the tell of the inference bug (x̂₀ = x_t/√ᾱ, saturated);
+    /// a healthy ε̂ has std ≈ 1.
     last_diag: String,
     /// A GPU validation error caught this session, surfaced on the page so it can
     /// never again be swallowed.
@@ -207,8 +180,8 @@ struct Engine {
 
     mode: Mode,
 
-    /// The sampling choice, read once from `config.inference` — the same value
-    /// the native sampler uses for this model, not a literal baked into wasm.
+    /// The sampling choice, read once from `config.inference` — the native
+    /// sampler's value for this model, not a wasm literal.
     magnitude: f32,
     variance: PosteriorVariance,
 
@@ -688,11 +661,9 @@ async fn build_engine(
         }
     }
 
-    // Weight integrity, logged so a truncated or altered download is caught by
-    // eye rather than by a wrong image. The checkpoint parser is already strict
-    // (it refuses a length mismatch or trailing bytes), so a clean load means the
-    // scalar count matches the model; these numbers let a visitor confirm the
-    // bytes that reached wasm are the bytes on disk.
+    // Weight integrity, logged so a truncated download is caught by eye. The
+    // parser is already strict; these numbers let a visitor confirm the bytes that
+    // reached wasm are the bytes on disk.
     let expected_params: u64 = config.layers.iter().map(|l| l.parameter_count()).sum();
     log::info!(
         "[batlab] weights: {} bytes received, fnv1a={:016x}; model expects {} trainable scalars",
@@ -736,11 +707,9 @@ async fn build_engine(
     // The portfolio opens on the piece: the endless drift from a real image.
     let regime = PerpetualRegime::Wander;
     let depth = 24;
-    // Seeded from the browser, not from a constant. A fixed counter made the
-    // page *deterministic across loads*: every visitor met the same elephant in
-    // the same order, and a reload could never surprise its author. The engine
-    // stays reproducible — a run is still a pure function of its seed — it is
-    // only the opening seed that now comes from outside.
+    // Seeded from the browser, not a constant: a fixed counter made the page
+    // deterministic across loads (every visitor met the same elephant). The engine
+    // stays a pure function of its seed — only the opening seed comes from outside.
     let seed_counter = {
         let hi = (js_sys::Math::random() * (u32::MAX as f64)) as u64;
         let lo = (js_sys::Math::random() * (u32::MAX as f64)) as u64;
@@ -808,12 +777,8 @@ pub fn start() {
     let _ = console_log::init_with_level(log::Level::Info);
 }
 
-/// FNV-1a over the bits of a tensor — a cheap, stable fingerprint.
-///
-/// Not a hash for security: a number a human can read off a page and compare
-/// between two runs. It exists because « the image looks the same » is not a
-/// measurement, and two identical-looking 32x32 pictures cannot be told from
-/// two genuinely identical ones by eye.
+/// FNV-1a over a tensor's bits — a cheap, stable fingerprint a human reads off the
+/// page to compare two runs, because "the image looks the same" is not a measurement.
 fn fingerprint(values: &[f32]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for value in values {
