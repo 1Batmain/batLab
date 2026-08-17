@@ -2078,7 +2078,7 @@ mod tests {
         use crate::PaddingMode;
         use crate::model::layer_types::ConvolutionType;
         use crate::model::training::{
-            LinearNoiseSchedule, reverse_step_async, sample_diffusion,
+            LinearNoiseSchedule, PosteriorVariance, reverse_step_async, sample_diffusion,
         };
         use crate::{DIFFUSION_BETA_END, DIFFUSION_BETA_START};
 
@@ -2117,6 +2117,7 @@ mod tests {
                 seed,
                 1,
                 1.0,
+                PosteriorVariance::Beta,
                 None,
                 None,
                 |_, _| {},
@@ -2137,6 +2138,7 @@ mod tests {
                     diffusion_step,
                     seed,
                     1.0,
+                    PosteriorVariance::Beta,
                     false,
                 )
                 .await;

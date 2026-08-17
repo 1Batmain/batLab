@@ -31,7 +31,7 @@
 //! in every regime, calls the model exactly once and publishes a fresh x̂₀.**
 
 use super::perpetual::DriftAction;
-use super::schedule::LinearNoiseSchedule;
+use super::schedule::{LinearNoiseSchedule, PosteriorVariance};
 
 /// What one frame of a perpetual run produced — both panes, and what it cost.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +141,9 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
+                    // The drift keeps DDPM's beta variance: bit-identical to
+                    // before the posterior option, which is an inference choice.
+                    PosteriorVariance::Beta,
                     true,
                 );
                 self.latent = stepped.latent;
@@ -188,6 +191,9 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
+                    // The drift keeps DDPM's beta variance: bit-identical to
+                    // before the posterior option, which is an inference choice.
+                    PosteriorVariance::Beta,
                     true,
                 );
                 // One level down, exactly that one level back on: the noise
@@ -227,6 +233,9 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
+                    // The drift keeps DDPM's beta variance: bit-identical to
+                    // before the posterior option, which is an inference choice.
+                    PosteriorVariance::Beta,
                     true,
                 );
                 self.latent = stepped.latent;
@@ -266,6 +275,9 @@ impl DriftWalk {
                     diffusion_step,
                     path_seed,
                     self.denoise_magnitude,
+                    // The drift keeps DDPM's beta variance: bit-identical to
+                    // before the posterior option, which is an inference choice.
+                    PosteriorVariance::Beta,
                     true,
                 );
                 self.latent = schedule.forward_step(&stepped.latent, diffusion_step, renoise_seed);
