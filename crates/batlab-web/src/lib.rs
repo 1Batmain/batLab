@@ -39,8 +39,8 @@ use std::sync::Arc;
 
 use batlab_core::{
     AsyncNoisePredictor, CheckpointWeights, DriftWalk, GpuContext, GpuLimitsProfile,
-    LinearNoiseSchedule, Model, ModelConfig, PerpetualDrift, PerpetualRegime, Stats,
-    compose_diffusion_input, compute_inferred_input, decode_u8, reverse_step_async,
+    LinearNoiseSchedule, Model, ModelConfig, PerpetualDrift, PerpetualRegime, PosteriorVariance,
+    Stats, compose_diffusion_input, compute_inferred_input, decode_u8, reverse_step_async,
 };
 use wasm_bindgen::prelude::*;
 
@@ -52,6 +52,12 @@ const BETA_END: f32 = batlab_core::DIFFUSION_BETA_END;
 
 /// The denoise magnitude for both modes — the config's inference default.
 const DENOISE_MAGNITUDE: f32 = 1.0;
+
+/// The reverse-step variance the browser sampler injects. Kept in step with the
+/// model's `config_file` inference block; the single formula behind both spellings
+/// lives in [`batlab_core::PosteriorVariance`], so the page cannot drift from the
+/// native sampler. `Beta` is DDPM's larger variance and the historical default.
+const POSTERIOR_VARIANCE: PosteriorVariance = PosteriorVariance::Beta;
 
 /// Same fold as [`batlab_core`]'s reverse-chain seed: distinct runs get distinct
 /// noise fields, avalanched downstream by the engine's `gaussian_at`.
@@ -274,6 +280,7 @@ impl Engine {
             diffusion_step,
             self.inf_path_seed,
             DENOISE_MAGNITUDE,
+            POSTERIOR_VARIANCE,
             true,
         )
         .await;

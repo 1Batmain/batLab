@@ -65,7 +65,7 @@ pub use model::training::{
     EvalReport, GpuDataset, GpuDatasetError,
     LinearNoiseSchedule, LossWeighting, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, MetricsLogger, MseBucket,
     evaluate,
-    NoisePredictor, PerpetualDrift, PerpetualOrigin, PerpetualRegime, ProbeConfig,
+    NoisePredictor, PerpetualDrift, PerpetualOrigin, PerpetualRegime, PosteriorVariance, ProbeConfig,
     RENOISE_DEPTH_STEP, Stats,
     TaskPassSpec, Trainer, TrainingTask, TrainingTaskError, Workgroups, compose_diffusion_input,
     decode_u8, log_probe, log_train_loss, log_trajectory, predict_epsilon, probe_diffusion, reverse_step,

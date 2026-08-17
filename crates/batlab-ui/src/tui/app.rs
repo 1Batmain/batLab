@@ -2707,6 +2707,14 @@ impl App {
             seed,
             denoising_paths,
             denoise_magnitude,
+            // No form dial for the variance: the model's config_file is
+            // authoritative, so a model set to `posterior` keeps it here.
+            posterior_variance: self
+                .monitor
+                .model_config
+                .as_ref()
+                .map(|config| config.inference.posterior_variance)
+                .unwrap_or_default(),
             checkpoint: self.selected_checkpoint_path.clone(),
         };
 
@@ -2837,6 +2845,15 @@ impl App {
             },
             denoising_paths,
             denoise_magnitude,
+            // Preserve the model's stored variance across a rewrite: the form has
+            // no dial for it, so wiping it to the default would silently downgrade
+            // a `posterior` model back to `beta`.
+            posterior_variance: self
+                .monitor
+                .model_config
+                .as_ref()
+                .map(|config| config.inference.posterior_variance)
+                .unwrap_or_default(),
             checkpoint: self.selected_checkpoint_path.clone(),
         };
         ModelConfig {
@@ -3395,6 +3412,7 @@ mod tests {
                 seed: Some(4242),
                 denoising_paths: 7,
                 denoise_magnitude: 0.35,
+                posterior_variance: Default::default(),
                 checkpoint: None,
             },
             seed_dataset: None,

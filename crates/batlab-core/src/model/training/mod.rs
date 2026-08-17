@@ -27,7 +27,7 @@ pub use perpetual::{
     CLIMB_TEMPO_RATIO, DriftAction, DriftPhase, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, PerpetualDrift,
     PerpetualOrigin, PerpetualRegime, RENOISE_DEPTH_STEP,
 };
-pub use schedule::LinearNoiseSchedule;
+pub use schedule::{LinearNoiseSchedule, PosteriorVariance};
 pub use weighting::{DEFAULT_SNR_GAMMA, LossWeighting};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

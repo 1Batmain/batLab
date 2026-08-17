@@ -1,10 +1,61 @@
 //! File purpose: Implements schedule logic used by the training pipeline.
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone)]
 pub struct LinearNoiseSchedule {
     betas: Vec<f32>,
     alphas: Vec<f32>,
     alpha_bars: Vec<f32>,
+}
+
+/// Which of DDPM's two admissible reverse-step variances the posterior draw uses.
+///
+/// A reverse step adds `sigma_t * N(0, 1)` to the posterior mean, and DDPM
+/// (Ho et al. 2020, §3.2) admits two closed forms for `sigma_t^2` that coincide
+/// only in the `T → ∞` limit:
+///
+/// - [`Beta`](PosteriorVariance::Beta) — `sigma_t^2 = beta_t`. The larger of the
+///   two, and what this sampler has injected since it was written. It is the
+///   default here, and it is **bit-for-bit** the historical draw: [`denoise_step`]
+///   and every config that predates this option resolve to it.
+/// - [`Posterior`](PosteriorVariance::Posterior) — the variance of the true
+///   posterior `q(x_{t-1} | x_t, x_0)`,
+///   `sigma_t^2 = beta_t · (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)`. Strictly
+///   smaller than `beta_t` (the ratio is `< 1`), and smallest at the very bottom
+///   of the chain — `~0.60·beta` at `t = 1` on this schedule — which is exactly
+///   where the last, sharpness-deciding pixels are drawn.
+///
+/// The formula lives in **one place**, [`LinearNoiseSchedule::posterior_sigma`],
+/// so the native sampler, the web crate and every walker read the same number:
+/// a second copy is precisely the divergence this repo has paid for before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PosteriorVariance {
+    /// `sigma_t^2 = beta_t`. The legacy draw and the default.
+    #[default]
+    Beta,
+    /// `sigma_t^2 = beta_t · (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)`.
+    Posterior,
+}
+
+impl PosteriorVariance {
+    /// Parses the CLI spelling; unknown values are rejected by the caller.
+    pub fn from_cli(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "beta" => Some(Self::Beta),
+            "posterior" => Some(Self::Posterior),
+            _ => None,
+        }
+    }
+
+    /// The name the run banner and the config file use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Beta => "beta",
+            Self::Posterior => "posterior",
+        }
+    }
 }
 
 /// Step count the reference DDPM betas (1e-4 .. 0.02) are calibrated for.
@@ -102,6 +153,31 @@ impl LinearNoiseSchedule {
             1.0
         } else {
             self.alpha_bar(step - 1)
+        }
+    }
+
+    /// The reverse-step noise scale `sigma_t` for the chosen [`PosteriorVariance`],
+    /// **before** the `denoise_magnitude` multiplier and **before** the `step == 0`
+    /// override that zeroes the final draw.
+    ///
+    /// This is the *sole* definition of the two variances (see
+    /// [`PosteriorVariance`]); [`denoise_step_with_magnitude`] is its only caller.
+    /// [`PosteriorVariance::Beta`] returns `sqrt(beta_t)` — the exact literal the
+    /// step used before this method existed, so the default stays bit-identical.
+    ///
+    /// [`denoise_step_with_magnitude`]: Self::denoise_step_with_magnitude
+    pub fn posterior_sigma(&self, step: usize, variance: PosteriorVariance) -> f32 {
+        let beta = self.beta(step);
+        match variance {
+            PosteriorVariance::Beta => beta.sqrt(),
+            PosteriorVariance::Posterior => {
+                let alpha_bar = self.alpha_bar(step);
+                let alpha_bar_prev = self.alpha_bar_below(step);
+                // beta_tilde_t = beta_t * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t).
+                // 1 - alpha_bar_t is bounded away from zero for t >= 1 (the only
+                // steps that draw noise), so no guard is needed here.
+                (beta * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)).sqrt()
+            }
         }
     }
 
@@ -265,7 +341,14 @@ impl LinearNoiseSchedule {
         step: usize,
         seed: u64,
     ) -> Vec<f32> {
-        self.denoise_step_with_magnitude(latent, predicted_noise, step, seed, 1.0)
+        self.denoise_step_with_magnitude(
+            latent,
+            predicted_noise,
+            step,
+            seed,
+            1.0,
+            PosteriorVariance::Beta,
+        )
     }
 
     /// The clipped x0 estimate the posterior mean is built from, for the whole
@@ -301,6 +384,7 @@ impl LinearNoiseSchedule {
         step: usize,
         seed: u64,
         denoise_magnitude: f32,
+        variance: PosteriorVariance,
     ) -> Vec<f32> {
         assert_eq!(
             latent.len(),
@@ -325,7 +409,7 @@ impl LinearNoiseSchedule {
         let sigma = if step == 0 {
             0.0
         } else {
-            beta.sqrt() * magnitude
+            self.posterior_sigma(step, variance) * magnitude
         };
 
         latent
@@ -420,7 +504,7 @@ fn gaussian_from_seed(seed: u64) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::LinearNoiseSchedule;
+    use super::{LinearNoiseSchedule, PosteriorVariance};
 
     #[test]
     fn linear_schedule_monotonically_decreases_alpha_bar() {
@@ -444,6 +528,52 @@ mod tests {
             "alpha_bar(T-1) = {terminal:.3e}, residual signal {:.2}%",
             terminal.sqrt() * 100.0
         );
+    }
+
+    /// The default variance must inject *exactly* what the step injected before
+    /// the option existed — `sqrt(beta_t)`, to the bit, at every step. This is the
+    /// "the default changes nothing" guarantee at the level of the sole formula.
+    #[test]
+    fn the_beta_variance_is_the_historical_sigma_to_the_bit() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        for step in 0..schedule.len() {
+            assert_eq!(
+                schedule.posterior_sigma(step, PosteriorVariance::Beta),
+                schedule.beta(step).sqrt(),
+                "beta sigma diverged from sqrt(beta) at step {step}"
+            );
+        }
+    }
+
+    /// The posterior variance is the strictly smaller of DDPM's two, and it is
+    /// smallest at the very bottom of the chain. The ratio `sigma_post / sigma_beta`
+    /// equals `sqrt((1 - alpha_bar_{t-1}) / (1 - alpha_bar_t))`, which is `~0.60`
+    /// at `t = 1` on this schedule — where the last, sharpness-deciding pixels are
+    /// drawn — and rises toward `1` at the top.
+    #[test]
+    fn the_posterior_variance_is_smaller_and_shrinks_most_at_the_bottom() {
+        let schedule = LinearNoiseSchedule::new_linear(256, 1e-4, 0.02);
+        let ratio = |step: usize| {
+            schedule.posterior_sigma(step, PosteriorVariance::Posterior)
+                / schedule.posterior_sigma(step, PosteriorVariance::Beta)
+        };
+        // Never larger than beta's, at any noise-drawing step.
+        for step in 1..schedule.len() {
+            assert!(
+                ratio(step) <= 1.0 + 1e-6,
+                "posterior/beta = {} > 1 at step {step}",
+                ratio(step)
+            );
+        }
+        // Smallest at the bottom, matching the mission's measured 0.600 at t = 1.
+        assert!(
+            (ratio(1) - 0.600).abs() < 0.01,
+            "posterior/beta at t=1 = {}, expected ~0.600",
+            ratio(1)
+        );
+        // Monotone-ish rise: the top of the chain is close to beta's.
+        assert!(ratio(1) < ratio(schedule.len() - 1));
+        assert!(ratio(schedule.len() - 1) > 0.99);
     }
 
     /// Rescaling must preserve the total injected noise across step counts:
@@ -804,7 +934,14 @@ mod tests {
         for step in (0..schedule.len()).rev() {
             let step_seed =
                 base_seed.wrapping_add((step as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            latent = schedule.denoise_step_with_magnitude(&latent, &zero_eps, step, step_seed, 1.0);
+            latent = schedule.denoise_step_with_magnitude(
+                &latent,
+                &zero_eps,
+                step,
+                step_seed,
+                1.0,
+                PosteriorVariance::Beta,
+            );
         }
 
         let rms =

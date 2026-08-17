@@ -7,7 +7,7 @@
 //! internals and behave identically for a healthy and a degenerate model.
 
 use crate::model::Model;
-use crate::model::training::LinearNoiseSchedule;
+use crate::model::training::{LinearNoiseSchedule, PosteriorVariance};
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -389,6 +389,7 @@ pub fn predict_epsilon<State>(
 /// and the perpetual drift, which descends arbitrary spans and re-noises
 /// between them. The step-seed derivation and the posterior draw therefore
 /// cannot diverge between a finite sample and an endless one.
+#[allow(clippy::too_many_arguments)]
 pub fn reverse_step_from_epsilon(
     schedule: &LinearNoiseSchedule,
     latent: &[f32],
@@ -396,6 +397,7 @@ pub fn reverse_step_from_epsilon(
     diffusion_step: usize,
     path_seed: u64,
     denoise_magnitude: f32,
+    variance: PosteriorVariance,
     want_x0_hat: bool,
 ) -> ReverseStep {
     // Derived from x_t, so it must be read before the reverse step produces
@@ -408,6 +410,7 @@ pub fn reverse_step_from_epsilon(
         diffusion_step,
         reverse_step_seed(path_seed, diffusion_step),
         denoise_magnitude,
+        variance,
     );
     ReverseStep {
         latent: next,
@@ -438,6 +441,7 @@ pub async fn reverse_step_async<State>(
     diffusion_step: usize,
     path_seed: u64,
     denoise_magnitude: f32,
+    variance: PosteriorVariance,
     want_x0_hat: bool,
 ) -> ReverseStep {
     let timestep_channels = input_channels.saturating_sub(signal_channels);
@@ -451,6 +455,7 @@ pub async fn reverse_step_async<State>(
         diffusion_step,
         path_seed,
         denoise_magnitude,
+        variance,
         want_x0_hat,
     )
 }
@@ -468,6 +473,7 @@ pub fn reverse_step<State>(
     diffusion_step: usize,
     path_seed: u64,
     denoise_magnitude: f32,
+    variance: PosteriorVariance,
     want_x0_hat: bool,
 ) -> ReverseStep {
     let predicted_noise = predict_epsilon(
@@ -485,6 +491,7 @@ pub fn reverse_step<State>(
         diffusion_step,
         path_seed,
         denoise_magnitude,
+        variance,
         want_x0_hat,
     )
 }
@@ -511,6 +518,7 @@ pub fn sample_diffusion<State, F>(
     seed: u64,
     denoising_paths: usize,
     denoise_magnitude: f32,
+    variance: PosteriorVariance,
     mut trajectory: Option<&mut Vec<DenoiseStepStat>>,
     mut observer: Option<&mut dyn FnMut(&DenoiseFrame)>,
     mut progress: F,
@@ -540,6 +548,7 @@ where
                 diffusion_step,
                 path_seed,
                 denoise_magnitude,
+                variance,
                 observer.is_some(),
             );
             latent = stepped.latent;

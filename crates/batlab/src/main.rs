@@ -17,7 +17,8 @@ use batlab_core::{
     DriftWalk, EmaConfig, EvalConfig, EvalReport, GpuContext, GpuDataset, GpuLimitsProfile,
     LinearNoiseSchedule, LiveFrame,
     LossMethod as PLoss, LossWeighting, MetricsLogger, Model, OptimizerKind, PerpetualDrift,
-    ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, evaluate, log_probe,
+    PosteriorVariance, ProbeConfig, Stats, Trainer, WeightInit, compose_live_frame_view, evaluate,
+    log_probe,
     log_train_loss, log_trajectory, model::Training, probe_diffusion, sample_diffusion,
 };
 use image::imageops::FilterType;
@@ -61,7 +62,7 @@ are not reachable from the TUI and never write back a model's config_file.
       [--ema F] [--resume <ckpt>] [--checkpoint-every N]
 
   --headless-sample <model> [--checkpoint <path>] [--seed N] [--paths N]
-      [--magnitude F] [--out <img>] [--log <jsonl>] [--raw-weights]
+      [--magnitude F] [--variance beta|posterior] [--out <img>] [--log <jsonl>] [--raw-weights]
 
   --headless-perpetual <model> [--checkpoint <path>] [--regime wander|breathe|flux]
       [--t-r K | --t-star K | --depth K] [--seed N] [--magnitude F] [--dump <path>]
@@ -890,6 +891,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             "--seed",
             "--paths",
             "--magnitude",
+            "--variance",
             "--out",
             "--log",
             "--gpu-limits",
@@ -924,6 +926,14 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         .map_err(|err| format!("failed to resolve config path: {err}"))?;
     let config = storage::load_model_config(&config_path)
         .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    // The reverse-step variance. Defaults to the config's choice (Beta unless the
+    // config_file overrode it), and `--variance beta|posterior` forces one.
+    let variance = match flag("--variance") {
+        Some(spec) => PosteriorVariance::from_cli(&spec)
+            .ok_or_else(|| format!("--variance must be 'beta' or 'posterior', got '{spec}'"))?,
+        None => config.inference.posterior_variance,
+    };
 
     let out_path = flag("--out").unwrap_or_else(|| {
         std::env::temp_dir()
@@ -977,6 +987,7 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
             seed,
             paths,
             magnitude,
+            variance,
             Some(&mut trajectory),
             None,
             |_, _| {},
@@ -999,10 +1010,11 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
 
         let img_stats = Stats::of(&image);
         println!(
-            "headless sample '{model_name}': seed={seed} paths={paths} magnitude={magnitude}\n\
+            "headless sample '{model_name}': seed={seed} paths={paths} magnitude={magnitude} \
+             variance={}\n\
              image → {out_path}\nmetrics → {log_path}\n\
              final image stats: min={:.4} max={:.4} mean={:.4} std={:.4}",
-            img_stats.min, img_stats.max, img_stats.mean, img_stats.std
+            variance.as_str(), img_stats.min, img_stats.max, img_stats.mean, img_stats.std
         );
         Ok::<(), String>(())
     })
@@ -1772,6 +1784,7 @@ async fn measure_transfers(
         schedule.len() - 1,
         11,
         1.0,
+        PosteriorVariance::Beta,
         false,
     )
     .latent;
@@ -1786,6 +1799,7 @@ async fn measure_transfers(
             schedule.len().saturating_sub(2 + index),
             11,
             1.0,
+            PosteriorVariance::Beta,
             false,
         )
         .latent;
@@ -3064,6 +3078,7 @@ async fn run_training(
                 step as u64,
                 1,
                 1.0,
+                PosteriorVariance::Beta,
                 Some(&mut trajectory),
                 None,
                 |_, _| {},
@@ -3125,6 +3140,7 @@ async fn run_training(
         final_step as u64,
         1,
         1.0,
+        PosteriorVariance::Beta,
         Some(&mut final_trajectory),
         None,
         |_, _| {},
@@ -3462,6 +3478,7 @@ async fn run_inference(
         seed,
         inference.denoising_paths,
         inference.denoise_magnitude,
+        inference.posterior_variance,
         Some(&mut |frame: &DenoiseFrame| live.publish(frame.latent, frame.x0_hat)),
         |current, total| {
             let _ = tx.send(tui::TrainingEvent::InferenceProgress {
@@ -4498,6 +4515,7 @@ fn sample_diffusion_image_with_controls<State, F>(
     seed: u64,
     denoising_paths: usize,
     denoise_magnitude: f32,
+    variance: PosteriorVariance,
     observer: Option<&mut dyn FnMut(&DenoiseFrame)>,
     progress: F,
 ) -> Vec<f32>
@@ -4514,6 +4532,7 @@ where
         seed,
         denoising_paths,
         denoise_magnitude,
+        variance,
         None,
         observer,
         progress,

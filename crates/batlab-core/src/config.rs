@@ -6,7 +6,7 @@
 //! bytes-in/bytes-out entry points below are what a wasm build will use, where
 //! the config arrives over the network rather than from `Models/`.
 
-use crate::model::training::{LossWeighting, PerpetualRegime};
+use crate::model::training::{LossWeighting, PerpetualRegime, PosteriorVariance};
 use crate::model::{OptimizerKind, WeightInit};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1038,6 +1038,12 @@ pub struct InferenceConfig {
     pub denoising_paths: usize,
     #[serde(default = "InferenceConfig::default_denoise_magnitude")]
     pub denoise_magnitude: f32,
+    /// Which reverse-step variance the posterior draw injects. Absent — as in
+    /// every config written before this option — means [`PosteriorVariance::Beta`],
+    /// DDPM's larger variance and the historical draw, so older files sample
+    /// bit-for-bit as before.
+    #[serde(default)]
+    pub posterior_variance: PosteriorVariance,
     /// Weights to sample from. `None` falls back to the model's `latest.ckpt`,
     /// which is what every config written before the weight choice was honoured
     /// implicitly meant — so older files keep their behaviour.
@@ -1066,6 +1072,7 @@ impl Default for InferenceConfig {
             seed: None,
             denoising_paths: Self::default_denoising_paths(),
             denoise_magnitude: Self::default_denoise_magnitude(),
+            posterior_variance: PosteriorVariance::default(),
             checkpoint: None,
         }
     }
@@ -1249,6 +1256,32 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config written before the variance option existed carries no
+    /// `posterior_variance` field, and it must deserialise to `Beta` — the
+    /// historical draw — so opening and sampling an old model changes nothing.
+    /// Same guarantee the optimizer/weighting fields already hold for their
+    /// pre-existing files.
+    #[test]
+    fn a_config_without_a_variance_field_deserialises_to_beta() {
+        let json = r#"{
+            "random_seed": false,
+            "seed": 7,
+            "denoising_paths": 10,
+            "denoise_magnitude": 1.0
+        }"#;
+        let inference: InferenceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(inference.posterior_variance, PosteriorVariance::Beta);
+        // And the value round-trips through JSON under its snake_case spelling.
+        let posterior = InferenceConfig {
+            posterior_variance: PosteriorVariance::Posterior,
+            ..InferenceConfig::default()
+        };
+        let round = serde_json::to_string(&posterior).unwrap();
+        assert!(round.contains("\"posterior\""), "spelling changed: {round}");
+        let back: InferenceConfig = serde_json::from_str(&round).unwrap();
+        assert_eq!(back.posterior_variance, PosteriorVariance::Posterior);
+    }
 
     /// A diffusion model must be conditionable on the timestep: it has to carry
     /// more input channels than it emits, the excess receiving the time
