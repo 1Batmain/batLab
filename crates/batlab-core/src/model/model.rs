@@ -1,4 +1,4 @@
-//! File purpose: Implements model functionality for model execution, state, or diagnostics.
+//! The `Model`: build, execution, checkpoint I/O and diagnostics.
 
 use crate::gpu_context::GpuContext;
 use crate::model::debug::{
@@ -26,26 +26,19 @@ const CHECKPOINT_MAGIC_V1: &[u8; 7] = b"BBCKPT1";
 /// V1 body followed by an optimiser-state trailer (see `save_checkpoint`).
 /// Still WRITTEN, by every run that keeps no weight average.
 const CHECKPOINT_MAGIC_V2: &[u8; 7] = b"BBCKPT2";
-/// V2 followed by an EMA trailer: the averaged copy of every weight and bias.
-/// Written only by a run that has an EMA, so a run without one produces a file
-/// byte-identical to the one it produced before averaging existed.
+/// V2 plus an EMA trailer (the averaged weights). Written only by a run with an
+/// EMA, so a run without one is byte-identical to the pre-averaging file.
 const CHECKPOINT_MAGIC_V3: &[u8; 7] = b"BBCKPT3";
-/// Weights-only, coded to 8 bits per weight (per-tensor affine, see
-/// [`crate::model::quant`]). An inference artefact: no optimiser trailer, no EMA
-/// trailer — the weight set was already chosen when the file was written. Read
-/// like any other checkpoint; never written by a training run, only by the
-/// export path, because it cannot be resumed from without losing precision.
+/// Weights-only, 8-bit per-tensor affine ([`crate::model::quant`]). An inference
+/// artefact (no trailers); written only by the export path, since it cannot be
+/// resumed without losing precision.
 const CHECKPOINT_MAGIC_Q8: &[u8; 7] = b"BBCKPTQ";
 const CHECKPOINT_MAGIC_LEN: usize = 7;
 
-/// Which checkpoint layout a file declares, read off its magic.
-///
-/// This replaces a `(has_optimizer_trailer, has_ema_trailer, quantized)` triple
-/// whose eight combinations only ever described **four** real formats — a
-/// quantised file that also carried an EMA trailer, for one, was a state no
-/// writer could produce. The four variants are the four magics; what each
-/// carries is a *method*, so an impossible mix is unrepresentable rather than
-/// merely unproduced.
+/// Which checkpoint layout a file declares, read off its magic. Replaces a
+/// `(has_optimizer_trailer, has_ema_trailer, quantized)` triple whose eight
+/// combinations described only four real formats — the four magics — so an
+/// impossible mix is now unrepresentable, not merely unproduced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CheckpointVersion {
     /// `BBCKPT1`: weights only, no trailer.
@@ -95,15 +88,10 @@ const OPT_STATE_ADAM: u32 = 1;
 const EMA_STATE_NONE: u32 = 0;
 const EMA_STATE_PRESENT: u32 = 1;
 
-/// Which of the two weight sets a checkpoint carries lands in the model's
-/// weight buffers.
-///
-/// A V3 checkpoint holds both the last iterate and its moving average. Training
-/// must resume from the iterate — the average is not a point the optimiser ever
-/// visited, and Adam's moments describe the iterate. Sampling wants the
-/// average, which is the whole reason it is kept. So the choice is made by the
-/// caller, at the call site, rather than guessed from a model state that reads
-/// the same in both cases.
+/// Which of a V3 checkpoint's two weight sets lands in the model buffers.
+/// Training must resume from the iterate (Adam's moments describe it, the average
+/// is not a point it visited); sampling wants the average. The caller chooses at
+/// the call site, since the model state reads the same either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CheckpointWeights {
     /// The weights as the last optimiser step left them. The historical
@@ -136,12 +124,10 @@ pub struct ModelState {
     pub(crate) is_build: bool,
 }
 
-/// What a checkpoint turned out to hold, reported back to whoever loaded it.
-///
-/// `carries_ema` and `used_ema` differ exactly when a caller asked for the
-/// average and the file has none — the case that would otherwise turn an
-/// EMA-vs-raw comparison into a comparison of a thing with itself. The CLI
-/// prints both.
+/// What a checkpoint turned out to hold, reported to whoever loaded it.
+/// `carries_ema` and `used_ema` differ exactly when the average was asked for and
+/// the file has none — otherwise an EMA-vs-raw comparison compares a thing with
+/// itself. The CLI prints both.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CheckpointLoad {
     /// The file has an EMA trailer.
@@ -187,31 +173,21 @@ pub struct Model<State = Infer> {
     pub(crate) training: Option<State>,
     pub(crate) state: ModelState,
     pub(crate) saved_outputs: HashMap<String, usize>,
-    /// Global optimiser step counter `t`, 1-based at the first update.
-    ///
-    /// Lives on the model rather than on `Training` so that checkpoint I/O —
-    /// which is shared with `Model<Infer>` — can persist and restore it.
-    /// Adam's bias correction is a function of `t` alone, so resuming with the
-    /// wrong `t` is what makes a naive resume take a huge first step.
+    /// Global optimiser step counter `t`, 1-based. On the model (not `Training`)
+    /// so shared checkpoint I/O can persist/restore it. Adam's bias correction is
+    /// a function of `t` alone, so resuming with the wrong `t` takes a huge first step.
     optimizer_step: u64,
-    /// Initialisation scheme for trainable weight buffers. On the model rather
-    /// than on `Training` because `build_forwards` is shared with inference.
+    /// Weight-init scheme. On the model because `build_forwards` is shared with inference.
     weight_init: WeightInit,
-    /// The weight average this run keeps, if any. `None` — the default — means
-    /// no shadow buffers, no extra dispatch, and a V2 checkpoint.
-    ///
-    /// On the model rather than on `Training` for the same reason the step
-    /// counter is: checkpoint I/O is shared with `Model<Infer>`, and it has to
-    /// know whether there is a shadow to fill.
+    /// The weight average this run keeps, if any. `None` (default) = no shadow
+    /// buffers, no extra dispatch, a V2 checkpoint. On the model so shared
+    /// checkpoint I/O knows whether there is a shadow to fill.
     ema: Option<EmaConfig>,
     pending_loss_readback: Option<PendingLossReadback>,
     last_reported_loss: Option<f32>,
     loss_readback_disabled: bool,
-    /// Samples the built graph carries at once.
-    ///
-    /// Fixed at `build()` time, because it sizes every activation buffer.
-    /// Inference and every non-batched entry point leave it at 1, which
-    /// reproduces the pre-batching graph exactly.
+    /// Samples the built graph carries at once. Fixed at `build()` (it sizes every
+    /// activation buffer); inference and non-batched paths leave it at 1.
     batch: u32,
 }
 
@@ -364,17 +340,11 @@ impl Model<Training> {
         // Positioned after the network so its passes sort last in a profile.
         loss_layer.index = self.layers.len();
 
-        // create_buffers shares last_fwd_output as binding 0 (model_result) and
-        // allocates [1] target, [2] loss_terms, [3] grad_output, [4] specs.
-        //
-        // The loss layer is the one place where "the layer's output" is NOT its
-        // last buffer: what feeds the backward chain is `grad_output`, at the
-        // fixed index 3. Taking `create_buffers`' return value here would have
-        // chained whatever binding happens to sit last — which, since the specs
-        // uniform was appended, is a UNIFORM buffer. It fails loudly at bind
-        // group creation ("does not contain required usage flags STORAGE"), but
-        // only because the usages differ; a storage buffer added last would
-        // have been wired in silently.
+        // Bindings: [0] model_result (shared last_fwd_output), [1] target,
+        // [2] loss_terms, [3] grad_output, [4] specs. The loss layer is the one
+        // place where "the layer's output" is NOT its last buffer: the backward
+        // chain feeds from `grad_output` at fixed index 3, not from
+        // `create_buffers`' return (which is the trailing specs UNIFORM).
         const LOSS_GRAD_OUTPUT_INDEX: usize = 3;
         let empty_saved_outputs = HashMap::new();
         loss_layer.create_buffers(
@@ -426,9 +396,8 @@ impl Model<Training> {
 
         self.loss_layer = Some(loss_layer);
         self.state.is_build = true;
-        // Freshly allocated optimiser state (Adam's m and v are zero) — the
-        // step counter must restart with it. load_checkpoint() restores both
-        // together afterwards.
+        // Fresh optimiser state (m, v = 0), so the step counter restarts with it;
+        // load_checkpoint() restores both together afterwards.
         self.optimizer_step = 0;
         Ok(())
     }
@@ -455,18 +424,10 @@ impl Model<Training> {
             .batch_size = batch_size;
     }
 
-    /// Change the batch size of a *built* model, preserving its training state.
-    ///
-    /// The batch axis lives in the size of every activation buffer, so a new
-    /// batch size means new buffers, new bind groups and new dispatch counts —
-    /// i.e. a rebuild. What must survive the rebuild is everything that *is*
-    /// the run: weights, biases, Adam's first and second moments, and the
-    /// global step counter `t` (Adam's bias correction is a function of `t`
-    /// alone, so losing it would make the first step after a resize a full
-    /// +/-lr on every weight). A checkpoint round-trip carries exactly that
-    /// set, which is why it is used rather than a hand-rolled copy.
-    ///
-    /// Called from a user keystroke in the TUI, i.e. rarely.
+    /// Change the batch size of a BUILT model, preserving its training state. The
+    /// batch axis sizes every activation buffer, so this is a rebuild; a checkpoint
+    /// round-trip carries exactly what must survive it (weights, biases, Adam's
+    /// moments, the step counter `t`), which is why it is used, not a hand copy.
     pub fn resize_batch(&mut self, batch_size: u32) -> Result<(), ModelError> {
         let batch_size = batch_size.max(1);
         if self.state.is_build && self.batch == batch_size {
@@ -499,10 +460,8 @@ impl Model<Training> {
         F: FnOnce(&mut wgpu::CommandEncoder),
     {
         debug_assert!(self.state.is_build, "call build() before train_step()");
-        // Single-sample entry point: it writes slot 0 and reads slot 0, but the
-        // graph it encodes covers `self.batch` samples. On a batched graph the
-        // other slots would be computed from stale memory and their gradients
-        // accumulated as if they were data.
+        // Batch-1 entry point: it writes/reads slot 0, so on a batched graph the
+        // other slots would compute from stale memory.
         debug_assert_eq!(
             self.batch, 1,
             "train_step_report_with_prepass is a batch-1 entry point"
@@ -517,12 +476,10 @@ impl Model<Training> {
         self.read_last_loss()
     }
 
-    /// Sequential reference path — one submit per sample, no optimiser.
-    ///
-    /// This is what the training loop did before the batch axis moved into the
-    /// dispatches, kept verbatim and reachable from the tests so that the
-    /// equivalence checks compare against *executable code* rather than a
-    /// frozen fixture. See `batch_equivalence_tests.rs`.
+    /// Sequential reference path — one submit per sample, no optimiser. What the
+    /// loop did before the batch axis moved into the dispatches, kept verbatim so
+    /// the equivalence checks compare against executable code, not a fixture. See
+    /// `batch_equivalence_tests.rs`.
     #[cfg(test)]
     pub(crate) fn train_step_report_with_prepass_no_opt<F>(&mut self, prepass: F) -> Option<f32>
     where
@@ -549,27 +506,12 @@ impl Model<Training> {
         self.gpu.submit([encoder.finish()]);
     }
 
-    /// One training step over the whole batch: **one encoder, one submit**.
-    ///
-    /// This replaces the `begin_batch_accumulation` / N x
-    /// `train_step_*_with_prepass_no_opt` / `finish_batch_accumulation`
-    /// sequence, which cost `2 + batch` submissions per step (18 at batch 16)
-    /// and left every kernel working on a single small tensor.
-    ///
-    /// The order inside the encoder is the same as before, and so is the
-    /// arithmetic that depends on it:
-    ///
-    /// 1. zero `grad_weights` / `grad_bias` — still needed, the gradient
-    ///    kernels still accumulate with `+=`, they just do it once per step
-    ///    now instead of once per sample;
-    /// 2. the caller's prepass (composing `x_t` and the target noise);
-    /// 3. forward, loss, backward for the whole batch;
-    /// 4. the optimiser, with `grad_scale = 1 / batch` — unchanged, because
-    ///    the gradient buffer holds the same SUM over the batch it held before.
-    ///
-    /// wgpu inserts an implicit barrier between compute passes in one encoder,
-    /// so the sequencing that used to be enforced by separate submissions is
-    /// preserved without them.
+    /// One training step over the whole batch: ONE encoder, ONE submit (replacing
+    /// the old `2 + batch`-submission accumulation loop). Encoder order: zero the
+    /// grad buffers (the kernels still `+=`, once per step now), the caller's
+    /// prepass, forward/loss/backward, then the optimiser with `grad_scale = 1/batch`
+    /// (unchanged — the grad buffer holds the same SUM). wgpu's implicit
+    /// per-pass barrier preserves the sequencing the separate submits used to enforce.
     pub(crate) fn train_step_report_batched<F>(
         &mut self,
         batch_size: usize,
@@ -587,8 +529,8 @@ impl Model<Training> {
         self.encode_zero_optimizer_gradients(&mut encoder);
         prepass(&mut encoder);
         self.encode_train_graph(&mut encoder);
-        // Must be the last thing in this encoder: it copies out the timestamps
-        // the passes above wrote. A no-op unless the profiler is armed.
+        // Last thing in the encoder: copies out the timestamps the passes wrote.
+        // No-op unless the profiler is armed.
         self.gpu.resolve_profiler(&mut encoder);
         self.gpu.submit([encoder.finish()]);
 
@@ -739,16 +681,11 @@ impl<State> Model<State> {
         }
     }
 
-    /// Throw away everything `build()` produced — buffers, pipelines, bind
-    /// groups, optimiser and EMA passes — while **keeping the layer list**.
-    ///
-    /// This is what a rebuild needs, and what it did not have: `build()` used to
-    /// call [`Model::clear`], which drops the layers too, so the second `build()`
-    /// of a model's life panicked with "at least one layer required for
-    /// training". That is the only path [`Model::resize_batch`] has — changing
-    /// the batch size of a live run from the monitor killed the run, and the
-    /// help panel promised the opposite ("la reconstruction préserve poids,
-    /// biais, moments Adam et compteur de pas").
+    /// Throw away everything `build()` produced (buffers, pipelines, passes) while
+    /// KEEPING the layer list — what a rebuild needs. `build()` used to call
+    /// [`Model::clear`], which drops the layers too, so a second `build()`
+    /// panicked with "at least one layer required" — killing every
+    /// [`Model::resize_batch`] from the monitor.
     fn discard_built_state(&mut self) {
         self.layers.iter_mut().for_each(|l| l.clear());
         self.loss_layer = None;
@@ -773,10 +710,8 @@ impl<State> Model<State> {
         self.pending_loss_readback = None;
         self.last_reported_loss = None;
         self.loss_readback_disabled = false;
-        // Back to the inference default. `build()` re-reads the training batch
-        // size right after clearing, so this only ever affects a model that is
-        // cleared and never rebuilt for training — including
-        // `Model<Infer>::build_model`, which must always be 1.
+        // Back to the inference default (1). `build()` re-reads the training batch
+        // size right after, so this only affects a model cleared and never rebuilt.
         self.batch = 1;
     }
 
@@ -798,9 +733,8 @@ impl<State> Model<State> {
         self.layers.last().map(|layer| layer.ty.get_dim_output())
     }
 
-    /// Encode the checkpoint the model would write, without touching a
-    /// filesystem. This is the portable half: a wasm build has weights and no
-    /// `fs`, and gets its bytes from the network.
+    /// Encode the checkpoint the model would write, without touching a filesystem —
+    /// the portable half (a wasm build has weights and no `fs`).
     pub fn checkpoint_bytes(&self) -> Result<Vec<u8>, ModelError> {
         if !self.state.is_build {
             return Err(ModelError::InvalidCheckpointFormat {
@@ -856,9 +790,8 @@ impl<State> Model<State> {
             });
         }
 
-        // The version is decided by what there is to write, not by what the
-        // code can write: a run without an EMA still produces the exact V2 file
-        // it produced before this trailer existed.
+        // The version is decided by what there is to write: a run without an EMA
+        // still produces the exact V2 file it did before this trailer existed.
         let has_ema = self
             .layers
             .iter()
@@ -879,23 +812,16 @@ impl<State> Model<State> {
             bytes.extend_from_slice(bytemuck::cast_slice(&entry.bias));
         }
 
-        // Optimiser-state trailer.
-        //
-        // Adam's m and v are as much part of the training state as the weights:
-        // dropping them on resume restarts the bias correction at t=1, where
-        // m̂ = g and the very first update is a full ±lr on every weight, i.e. a
-        // visible loss spike. They are therefore persisted, and the run's step
-        // counter with them. SGD is stateless and writes the `none` tag, which
-        // keeps its checkpoints byte-identical to V1 apart from the magic and
-        // the 4-byte tag.
+        // Optimiser-state trailer. Adam's m/v are training state: dropping them on
+        // resume restarts the bias correction at t=1 (m̂ = g, a full ±lr first
+        // step, a visible loss spike), so they and the step counter are persisted.
+        // SGD is stateless and writes the `none` tag (byte-identical to V1 but for
+        // the magic and tag).
         self.append_optimizer_state(&mut bytes)?;
 
-        // EMA trailer (V3 only).
-        //
-        // The averaged weights are the ones a V3 checkpoint is generated from,
-        // so they are not an optional diagnostic: a file that dropped them
-        // would silently sample from the raw iterate, which is precisely the
-        // comparison `--raw-weights` exists to make deliberate.
+        // EMA trailer (V3 only): the weights a V3 file is generated from, not an
+        // optional diagnostic — dropping them would silently sample from the raw
+        // iterate, the comparison `--raw-weights` exists to make deliberate.
         if has_ema {
             self.append_ema_state(&mut bytes)?;
         }
@@ -904,15 +830,10 @@ impl<State> Model<State> {
     }
 
     /// Serialise the forward weights coded to 8 bits — the file a browser
-    /// downloads once the export has chosen a weight set.
-    ///
-    /// Same per-layer order as [`Model::checkpoint_bytes`], but each tensor is a
-    /// `(min, scale)` pair and one byte per weight instead of four (see
-    /// [`crate::model::quant`]). No trailers: a quantised checkpoint is an
-    /// inference artefact, so it carries neither optimiser moments nor an EMA —
-    /// whatever is in the forward buffers now is what it will hand back, minus
-    /// the quantisation error. Build the model with SGD and no EMA, load the set
-    /// you want with [`Model::load_checkpoint_bytes_with`], then call this.
+    /// downloads. Same per-layer order as [`Model::checkpoint_bytes`], each tensor
+    /// a `(min, scale)` pair and one byte per weight ([`crate::model::quant`]). No
+    /// trailers (an inference artefact): build with SGD and no EMA, load the set
+    /// you want, then call this.
     pub fn checkpoint_bytes_quantized(&self) -> Result<Vec<u8>, ModelError> {
         if !self.state.is_build {
             return Err(ModelError::InvalidCheckpointFormat {
@@ -1360,13 +1281,9 @@ impl<State> Model<State> {
             self.gpu
                 .write_buffer(bias_buf.as_ref(), 0, bytemuck::cast_slice(bias));
 
-            // Fill this run's shadow, if it keeps one.
-            //
-            // The file's average when it has one — that is the resume case, and
-            // it is the whole point of persisting it. Otherwise whatever landed
-            // in the weight buffers, which re-seeds a V1/V2 file's shadow on the
-            // weights it just brought rather than leaving it on the random draw
-            // the rebuild produced.
+            // Fill this run's shadow: the file's average when it has one (the
+            // resume case), else the weights just loaded — re-seeding a V1/V2
+            // file's shadow rather than leaving it on the rebuild's random draw.
             let shadow = layer.ema_state_buffers();
             if shadow.len() == 2 {
                 let (shadow_w, shadow_b) = averaged.unwrap_or((weights, bias));
@@ -1418,11 +1335,9 @@ impl<State> Model<State> {
 
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         for layer in &self.layers {
-            // One sample: `predict` writes the first slice and reads the first
-            // slice back. On a training model whose buffers are sized for a
-            // full batch (this is what `probe_diffusion` does), dispatching the
-            // whole grid would compute 15 more samples out of stale memory and
-            // throw them away.
+            // One sample: `predict` writes/reads slot 0. On a batch-sized training
+            // model (as `probe_diffusion` uses), the whole grid would compute the
+            // other slots from stale memory.
             layer.encode_pass_with_batch(&self.gpu, &mut encoder, 1);
         }
         self.gpu.submit([encoder.finish()]);
@@ -1430,20 +1345,11 @@ impl<State> Model<State> {
         self.read_last_output()
     }
 
-    /// The async sibling of [`Model::predict`] — same submit, same tensor, but
-    /// it *awaits* the ε̂ readback instead of blocking on it.
-    ///
-    /// [`Model::predict`] cannot run in a browser: its readback blocks the
-    /// thread until the GPU is done, and on the web that thread is the one that
-    /// has to turn the event loop for the GPU to report back — a deadlock. This
-    /// path yields there instead, so a wasm caller drives the reverse chain from
-    /// a `requestAnimationFrame` tick without ever blocking. On native it reads
-    /// the very same bytes (`predict_async_matches_predict_bit_for_bit`), so the
-    /// web sampler and the native one cannot diverge.
-    ///
-    /// The forward pass is encoded identically to [`Model::predict`] — one
-    /// sample, `encode_pass_with_batch(.., 1)` — so a model built for a batch
-    /// still predicts a single tensor here.
+    /// The async sibling of [`Model::predict`] — same submit and tensor, but it
+    /// AWAITS the ε̂ readback. [`Model::predict`] cannot run in a browser: its
+    /// blocking readback deadlocks the thread that must turn the event loop. This
+    /// path yields instead, and reads the same bytes on native
+    /// (`predict_async_matches_predict_bit_for_bit`), so web and native cannot diverge.
     pub async fn predict_async(&mut self, input: &[f32]) -> Vec<f32> {
         debug_assert!(
             self.state.is_build,
@@ -1507,18 +1413,11 @@ impl<State> Model<State> {
         Ok(())
     }
 
-    /// Append the layer a `config_file` entry describes.
-    ///
-    /// The translation from [`LayerDraft`] to [`LayerTypes`] used to live in the
-    /// binary, which meant anything else that wanted the same graph from the
-    /// same file — the resource inventory does, without a GPU — had to write it
-    /// a second time and could disagree. It is one function now
-    /// ([`crate::resources::layer_type_of`]), called from here and from the
-    /// planner, so "what the inventory counts" and "what the model builds"
-    /// cannot be two different stacks.
-    ///
-    /// `Concat` keeps going through [`Model::add_concat`]: its skip dimension is
-    /// resolved from the model's own saved outputs, not from the draft.
+    /// Append the layer a `config_file` entry describes. The `LayerDraft` →
+    /// `LayerTypes` translation is one function ([`crate::resources::layer_type_of`]),
+    /// called from here and the GPU-less inventory planner, so what the inventory
+    /// counts and what the model builds cannot be two stacks. `Concat`/`Add`/`TimeBias`
+    /// still go through their own methods (they resolve a skip from saved outputs).
     pub fn add_draft(&mut self, draft: &crate::config::LayerDraft) -> Result<(), ModelError> {
         match draft {
             crate::config::LayerDraft::Concat { skip_key, .. } => {
@@ -1748,14 +1647,9 @@ impl<State> Model<State> {
             .loss_layer
             .as_ref()
             .expect("loss layer is only available in training mode");
-        // The LAST sample of the batch, not the first.
-        //
-        // Before batching, the reported loss was the one left in the buffer by
-        // the last sample submitted (`is_last && report_last_loss` in
-        // diffusion.rs). Keeping that exact definition is what makes the paired
-        // old-vs-new loss trajectories comparable at all — and since the
-        // forward pass contains no reduction over the batch axis, the number
-        // must come out bit-identical.
+        // The LAST sample of the batch, not the first — the pre-batching
+        // definition (`is_last && report_last_loss`), kept so paired old-vs-new
+        // loss trajectories stay comparable (no batch-axis reduction, bit-identical).
         let per_sample = loss_layer.ty.get_dim_output().bytes_size() as u64;
         let offset = per_sample * (self.batch.saturating_sub(1)) as u64;
         let Some(loss_terms) = read_back_f32_at(
@@ -1874,14 +1768,10 @@ impl<State> Model<State> {
     }
 }
 
-/// Walk past the optimiser trailer without applying it, leaving `offset` on the
-/// byte after it.
-///
-/// The loader has to reach the EMA trailer, which sits behind this one, before
-/// it can decide what to write — so the optimiser section is walked first and
-/// applied afterwards from the offset it started at. Two readers of one layout
-/// would drift; this one shares `restore_optimizer_state`'s field order and
-/// nothing else, and the round-trip tests fail the moment they disagree.
+/// Walk past the optimiser trailer without applying it, leaving `offset` after
+/// it — the loader must reach the EMA trailer behind it before deciding what to
+/// write. Shares `restore_optimizer_state`'s field order; the round-trip tests
+/// fail the moment they disagree.
 fn skip_optimizer_state(bytes: &[u8], offset: &mut usize) -> Result<(), ModelError> {
     let tag = read_u32_le(bytes, offset)?;
     if tag == OPT_STATE_NONE {
@@ -2103,17 +1993,12 @@ mod tests {
         });
     }
 
-    /// The inference analogue of `advance_async_matches_advance_bit_for_bit`.
-    ///
-    /// The perpetual drift had that guard — its async frame provably equals the
-    /// synchronous walk — but the finite *inference* descent had none, and that
-    /// is the path that broke in the browser: the web crate re-derived the
-    /// T→0 loop inline, so a re-derivation that composed the input or seeded the
-    /// posterior differently from [`sample_diffusion`] would only ever show as a
-    /// wrong image in a visitor's browser, where no test runs. This pins the
-    /// async descent — driven exactly as `batlab_web` drives it, one
-    /// [`reverse_step_async`] per frame — to the synchronous sampler, bit for
-    /// bit. See `docs/reports/WEB_PORT.md`, "le bug de l'inférence".
+    /// The inference analogue of `advance_async_matches_advance_bit_for_bit`. The
+    /// web crate re-derives the T→0 loop inline, so a re-derivation that composed
+    /// the input or seeded the posterior differently would only show as a wrong
+    /// image in a visitor's browser, where no test runs. Pins the async descent
+    /// (driven as `batlab_web` drives it) to the sync sampler, bit for bit. See
+    /// `docs/reports/WEB_PORT.md`.
     #[test]
     fn the_async_reverse_step_matches_the_sync_one() {
         use crate::PaddingMode;
@@ -2126,11 +2011,9 @@ mod tests {
         pollster::block_on(async {
             let gpu = Arc::new(GpuContext::new_headless().await);
             let mut model = Model::new(gpu).await;
-            // A diffusion-shaped model: 4 input channels (2 signal + 2 timestep)
-            // down to 2 signal channels, so `compose_diffusion_input` has real
-            // timestep channels to append — the conditioning the reverse chain
-            // relies on. Random init makes ε̂ non-trivial, which is what makes a
-            // divergence between the two drivers visible.
+            // Diffusion-shaped: 4 in (2 signal + 2 timestep) → 2 signal, so
+            // `compose_diffusion_input` has real timestep channels to append.
+            // Random init makes ε̂ non-trivial, so a divergence would show.
             let input_channels = 4usize;
             let signal_channels = 2usize;
             model
