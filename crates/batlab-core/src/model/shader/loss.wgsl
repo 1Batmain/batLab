@@ -1,17 +1,8 @@
-// File purpose: WGSL compute shader implementing loss operations for model forward/backward or optimizer passes.
-//
-// The dispatch grid is 2-D when the batch pushes the workgroup count past
-// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
-// linear thread index is recovered from `num_workgroups` rather than read
-// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
+// Loss forward/backward. 2-D dispatch grid past WebGPU's 65 535-per-dim limit,
+// so the thread index comes from `num_workgroups` (`dispatch_grid` in layer.rs).
 
-// Bindings match LossType::get_buffers_specs():
-//   [0] model_result — the model's forward output  (read)
-//   [1] target       — ground-truth labels          (read, CPU writes each step)
-//   [2] loss_terms   — per-element squared error    (read_write, read back on CPU)
-//   [3] grad_output  — dL/d(output) gradient        (read_write, feeds backward pass)
-//   [4] specs        — LossUniform (dims), for the per-sample element count
-
+// Bindings match LossType::get_buffers_specs(). target: CPU writes each step;
+// loss_terms: read back on CPU; grad_output: feeds the backward pass.
 @group(0) @binding(0) var<storage, read>       model_result:        array<f32>;
 @group(0) @binding(1) var<storage, read>       target_result:       array<f32>;
 @group(0) @binding(2) var<storage, read_write> loss_terms:          array<f32>;
@@ -23,17 +14,10 @@ struct LossSpec {
     dim_output: vec3<u32>,
 }
 
-// MSE forward gradient:  grad[i] = 2 * (pred[i] - target_result[i]) / N
-//
-// `N` is the PER-SAMPLE element count, from the uniform — not
-// `arrayLength(&model_result)`, which is `batch * N` once the buffers carry a
-// batch axis. Reading it off the array would divide every gradient by an extra
-// factor of `batch`: no crash, no NaN, just a silently smaller effective
-// learning rate that scales with a knob nobody thinks of as one.
-//
-// The batch is not an axis of the loss at all: each sample's loss is its own
-// mean, and the averaging over the batch happens once, later, in the optimiser
-// pass (`grad_scale = 1 / batch`).
+// MSE:  grad[i] = 2 * (pred[i] - target[i]) / N. `N` is the PER-SAMPLE element
+// count from the uniform, NOT `arrayLength` (= `batch * N`): dividing by the
+// latter silently shrinks the effective LR by a factor of `batch`. Batch
+// averaging happens later, in the optimiser pass (`grad_scale = 1 / batch`).
 @compute @workgroup_size(64)
 fn mean_squared(
     @builtin(global_invocation_id) gid: vec3<u32>,
