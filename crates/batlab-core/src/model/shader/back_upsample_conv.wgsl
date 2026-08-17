@@ -1,18 +1,7 @@
-// File purpose: WGSL compute shader implementing back upsample conv operations for model forward/backward or optimizer passes.
-//
-// The dispatch grid is 2-D when the batch pushes the workgroup count past
-// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
-// linear thread index is recovered from `num_workgroups` rather than read
-// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
-
-// Bindings match UpsampleConvType::get_back_buffers_specs():
-//   [0] fwd_input    — original forward input (HWC)
-//   [1] weights      — forward weights (KHKWKC)
-//   [2] specs        — UpsampleConvSpec
-//   [3] grad_output  — incoming gradient from next layer/loss (HWK)
-//   [4] grad_input   — outgoing gradient to previous layer (HWC)
-//   [5] grad_weights — gradient accumulator for weights (KHKWKC)
-//   [6] grad_bias    — gradient accumulator for bias (K)
+// Upsample-conv backward. 2-D dispatch grid past WebGPU's 65 535-per-dim limit
+// (`dispatch_grid` in layer.rs). Bindings match UpsampleConvType::get_back_buffers_specs():
+// [0] fwd_input (HWC), [1] weights (KHKWKC), [2] specs, [3] grad_output (HWK), and
+// the accumulators [4] grad_input, [5] grad_weights, [6] grad_bias.
 
 @group(0) @binding(0) var<storage, read>       fwd_input:    array<f32>;
 @group(0) @binding(1) var<storage, read>       weights:      array<f32>;
@@ -26,23 +15,17 @@ struct UpsampleConvSpec {
     nb_kernel:    u32,
     scale_factor: u32,
     padding_mode: u32,
-    // Cooperating threads per grad_bias sum. Sits in the word that used to be
-    // padding, so the uniform's size and layout are unchanged and the legacy
-    // fixture still binds the very same buffer.
+    // Cooperating threads per grad_bias sum, in the old padding word (layout pinned).
     bias_lanes:   u32,
     dim_kernel:   vec3<u32>,
     dim_input:    vec3<u32>,
     dim_output:   vec3<u32>,
 }
 
-// ---------------------------------------------------------------------------
-// Cooperative reduction layout — the same one back_convolution.wgsl uses, and
-// for the same reason. A workgroup of 64 threads is split into `slots`
-// independent sums of `lanes` threads each (lanes * slots == 64); each lane
-// walks the position axis in strides of `lanes`, then the lanes of a slot are
-// tree-reduced. `lanes` comes from the uniform, so the dispatch on the Rust
-// side and the split in here cannot drift apart.
-// ---------------------------------------------------------------------------
+// Cooperative reduction, same as back_convolution.wgsl: a 64-thread workgroup
+// splits into `slots` sums of `lanes` threads (lanes*slots == 64), each lane
+// striding by `lanes`, then tree-reduced. `lanes` from the uniform, so the Rust
+// dispatch and this split cannot drift.
 const WG_SIZE: u32 = 64u;
 var<workgroup> partial: array<f32, WG_SIZE>;
 
@@ -115,30 +98,14 @@ fn upsample_conv_back_input(
     let up_x_min = ix * scale;
     let up_x_max = up_x_min + scale;
 
-    // The map is INVERTED here, not scanned.
-    //
-    // The forward writes `output[oy,ox,k] += input[up_y/scale, up_x/scale, kz]
-    // * w[k,ky,kx,kz]` with `up_y = oy + ky - pad_y`. This kernel used to walk
-    // the ENTIRE output map — `k × OH × OW × KH × KW` iterations — and `continue`
-    // on the ones that did not land in this thread's `scale × scale` window.
-    // On `Color_Diffusion_XL`'s second UpsampleConv (16×16×96 → 32×32×48) that
-    // is 48·32·32·9 = 442 368 iterations per thread to accumulate 48·2·2·9 =
-    // 1728 products: **256 useless iterations for every useful one**, and the
-    // ratio is `OH·OW / scale²`, so it grows with the resolution of the layer.
-    // Measured cost of the two such passes: 4 140 ms of a 4 400 ms training
-    // step (`GPU_PROFILE.md`).
-    //
-    // The window is known in closed form. `up_y` ranges over exactly
-    // `[iy·scale, (iy+1)·scale)` — inside `[0, up_h)` by construction, which is
-    // why the two bounds tests on `up_y`/`up_x` are gone rather than merely
-    // moved — and `oy = up_y + pad_y - ky` is the inverse of the forward map,
-    // the same inversion `conv_back_input` performs (and the same one the f64
-    // oracle validates instead of repeating).
-    //
-    // `k` innermost, as in `conv_back_input` and for the same two reasons: the
-    // tap geometry depends only on `(up_y, ky, up_x, kx)` and would otherwise be
-    // recomputed `K` times, and `grad_output` is then walked contiguously along
-    // `k`, the fastest axis of the HWK layout.
+    // The map is INVERTED here, not scanned. This kernel used to walk the ENTIRE
+    // output map and `continue` on positions outside this thread's `scale × scale`
+    // window — a ratio of `OH·OW / scale²` useless iterations that GREW with the
+    // layer's resolution (256:1 on an XL UpsampleConv, 4 140 of a 4 400 ms step,
+    // `GPU_PROFILE.md`). Instead `up_y ∈ [iy·scale, (iy+1)·scale)` is known in
+    // closed form (so the bounds tests are gone), and `oy = up_y + pad_y - ky`
+    // inverts the forward map — the same inversion `conv_back_input` does, `k`
+    // innermost (tap geometry reused, `grad_output` walked contiguously).
     let py = pad_y();
     let px = pad_x();
     let stride_w = KH * KW * IC;
@@ -168,32 +135,13 @@ fn upsample_conv_back_input(
     grad_input[idx] = g;
 }
 
-// One thread per weight, whatever the batch: `grad_weights` is a parameter, so
-// the batch is the outer loop of its reduction, not an axis of its grid.
-//
-// # What the inner loop stopped doing
-//
-// It used to recompute, for every one of the `batch · OH · OW` positions:
-// two `pad_*()` calls (a uniform load and a branch each), the two-sided bounds
-// test on `up_y`/`up_x`, and **two integer divisions by `scale`** — all to
-// produce one multiply-add. Three of those four are loop-invariant in `ox`, and
-// the fourth is a counter.
-//
-//   - `up_y = oy + ky - pad_y` is monotonic in `oy` and `up_x = ox + kx - pad_x`
-//     in `ox`, so "the tap lands in the upsampled map" is a **contiguous
-//     interval** at both levels. Computing the four ends once replaces a
-//     four-way bounds test taken `OH · OW` times.
-//   - `iy = up_y / scale` advances by one every `scale` rows, and
-//     `ix = up_x / scale` every `scale` columns. Two divisions at the top of
-//     the kernel and a counter each replace `2 · batch · OH · OW` of them.
-//   - Both addresses are incremented: `grad_output` by `K` per `ox` (HWK),
-//     `fwd_input` by `IC` when the column counter wraps.
-//
-// Unlike `conv_back_weights`, this one visits **exactly the same taps in
-// exactly the same order** as the loop it replaces — `(b, oy, ox)` ascending,
-// with the same positions skipped. The sum is therefore **bit-identical**, and
-// the test asserts bit-identity rather than a tolerance: anything else would
-// mean the order moved.
+// One thread per weight whatever the batch: `grad_weights` is a parameter, so the
+// batch is the reduction's outer loop, not a grid axis. The inner loop no longer
+// recomputes per position the `pad_*()` calls, the bounds tests, and two integer
+// divisions by `scale`: `up_y`/`up_x` are monotonic so the in-map taps are a
+// contiguous interval (ends computed once), `iy`/`ix` advance by counters, and both
+// addresses are incremented. Unlike `conv_back_weights`, this visits the SAME taps
+// in the SAME order, so the sum is BIT-IDENTICAL — the test asserts that, not a tolerance.
 @compute @workgroup_size(64)
 fn upsample_conv_back_weights(
     @builtin(global_invocation_id) gid: vec3<u32>,
@@ -278,20 +226,10 @@ fn upsample_conv_back_weights(
     grad_weights[idx] += g;
 }
 
-// grad_bias[k] += Σ_{b,oy,ox} grad_output[b][oy][ox][k]
-//
-// One slot per kernel. Consecutive slots are consecutive `k`, which is the
-// fastest-varying axis of `grad_output`.
-//
-// This pass used to give each bias a single thread. With 48 kernels that is
-// `48.div_ceil(64)` = ONE workgroup — 48 threads walking 32 768 positions each,
-// 9,8 ms to read 6,3 Mio. Nothing about the arithmetic was wrong: 48 threads
-// simply cannot cover the memory latency of any GPU. The sum is unchanged; only
-// how many threads carry it is.
-//
-// The position axis is walked flat — `p / positions` is the sample and
-// `p % positions` the position within it — which is what turns `batch`
-// sequential accumulations into one tree reduction.
+// grad_bias[k] += Σ_{b,oy,ox} grad_output[b][oy][ox][k]. One slot per kernel
+// (consecutive `k`, the fastest axis). Giving each bias one thread left 48 kernels
+// on ONE workgroup (48 threads, 9.8 ms), latency-bound; the sum is unchanged, only
+// the thread count. Position axis walked flat, which folds `batch` into one reduction.
 @compute @workgroup_size(64)
 fn upsample_conv_back_bias(
     @builtin(workgroup_id) wid: vec3<u32>,
