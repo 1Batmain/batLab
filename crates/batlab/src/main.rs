@@ -71,6 +71,8 @@ are not reachable from the TUI and never write back a model's config_file.
   --eval <model> --ckpt <path> [--ckpt <path> ...] --dataset <path>
       [--samples N] [--buckets N] [--t-per-bucket N] [--seed N] [--raw-weights]
 
+  --export-weights <model> --ckpt <path> --out <path> [--raw-weights] [--quantize]
+
   --resources <model> [--batch N] [--dataset <path>] [--measure] [--steps N]
       [--inference] [--vram GiB] [--device <name>] [--no-gpu] [--width N]
 
@@ -197,6 +199,30 @@ Weight averaging (EMA):
                     Sampling and perpetual use the average whenever the
                     checkpoint carries one; this is the other arm of the
                     comparison. Both paths print which set they loaded.
+
+Shipping a checkpoint (a lighter file to download):
+  --export-weights  read a checkpoint and write one that holds ONLY the weights
+                    inference generates from — no Adam moments, no EMA trailer.
+                    A training checkpoint is four times heavier: the two optimiser
+                    moments and (for a V3 file) the averaged copy each weigh as
+                    much as the weights again. This drops them, keeping by default
+                    the AVERAGED set the EMA exists to be sampled from, exactly as
+                    sampling would select it. The result is an ordinary checkpoint:
+                    inference, the TUI weight selector and --resume all read it.
+                    It samples bit-for-bit like the file it came from on the same
+                    seed — that is the point, and it is a test, not a claim.
+  --ckpt <path>     the checkpoint to strip.
+  --out <path>      where to write the stripped checkpoint. Required: this mode
+                    only exists to produce a file, so it never guesses the name.
+  --raw-weights     carry the last iterate instead of the average, the same
+                    choice sampling's --raw-weights makes.
+  --quantize        code each weight to 8 bits (per-tensor affine: one
+                    (min, scale) pair and one byte per weight, dequantised on
+                    load through a 256-entry table). A quarter of the file again,
+                    at the cost of the quantisation error — measure it with
+                    --eval before shipping it, exactly as the dataset's own 8-bit
+                    move was measured. The file (magic BBCKPTQ) is read by
+                    inference and the web engine; it is NOT resumable.
 
 Where a run's weights land:
   Every run writes its OWN file, `run-<YYYY-MM-DD_HHMM>.ckpt`, and then points
@@ -480,6 +506,15 @@ fn main() {
             return;
         }
 
+        // DEV/CI ONLY — strip a checkpoint down to the weights inference uses.
+        if args.iter().any(|arg| arg == "--export-weights") {
+            if let Err(err) = run_export_weights(&args) {
+                eprintln!("export-weights failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+
         let config = match tui::run() {
             Ok(c) => c,
             Err(_) => return,
@@ -686,6 +721,125 @@ fn load_sampling_checkpoint(
         (false, _) => "raw weights (the file carries no EMA)".to_string(),
     };
     println!("[weights] {} → {which}", path.display());
+    Ok(())
+}
+
+/// The bytes an export carries.
+///
+/// Load `source` with the inference selection rule — the average when the file
+/// carries one, the raw iterate under `--raw-weights` — into a fresh inference
+/// model, then re-serialise only the weights that model would sample from. No
+/// optimiser moments, no EMA trailer: four fifths of a training checkpoint that
+/// inference never reads.
+///
+/// The selection is *not* re-implemented here — it is the one `CheckpointWeights`
+/// enum every sampling path already funnels through. The stripping is not a new
+/// serialiser either: the model is built with SGD (stateless, no optimiser
+/// trailer) and no EMA shadow, so [`Model::checkpoint_bytes`] emits exactly the
+/// weights-only V2 file it has always written for such a model — the layout
+/// `the_parameter_count_matches_the_scalars_a_checkpoint_holds` pins down.
+async fn stripped_checkpoint(
+    config: &ModelConfig,
+    source: &[u8],
+    weights: CheckpointWeights,
+    quantize: bool,
+) -> Result<Vec<u8>, String> {
+    let (_gpu, mut model) = build_execution_model(
+        config,
+        INFERENCE_RUNTIME_LR,
+        INFERENCE_RUNTIME_BATCH_SIZE,
+        OptimizerKind::default(),
+        WeightInit::default(),
+        None,
+    )
+    .await?;
+    let report = model
+        .load_checkpoint_bytes_with(source, weights)
+        .map_err(|err| format!("failed to load source checkpoint: {err}"))?;
+    let which = match (report.carries_ema, report.used_ema) {
+        (true, true) => format!(
+            "EMA weights (decay {:.5})",
+            report.ema_decay.unwrap_or_default()
+        ),
+        (true, false) => "raw weights (the file also carries an EMA)".to_string(),
+        (false, _) => "raw weights (the file carries no EMA)".to_string(),
+    };
+    println!("[weights] source → {which}");
+    if quantize {
+        model.checkpoint_bytes_quantized().map_err(|err| err.to_string())
+    } else {
+        model.checkpoint_bytes().map_err(|err| err.to_string())
+    }
+}
+
+/// See the DEV/CI note in `main`. Not reachable from the TUI.
+///
+/// Writes a checkpoint carrying only the weights inference would generate from —
+/// the file a browser downloads. A training checkpoint is four times heavier: it
+/// also holds Adam's two moments and, for a V3 file, the EMA trailer. This drops
+/// both, keeping (by default) the averaged set the EMA exists to be sampled from.
+fn run_export_weights(args: &[String]) -> Result<(), String> {
+    let flag = |name: &str| -> Option<String> {
+        args.iter()
+            .position(|arg| arg == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+
+    reject_unknown_flags(
+        args,
+        &["--export-weights", "--ckpt", "--out", "--gpu-limits"],
+        &["--raw-weights", "--quantize"],
+    )?;
+
+    let model_name = flag("--export-weights")
+        .ok_or_else(|| "--export-weights requires a model name".to_string())?;
+    let ckpt = flag("--ckpt").ok_or_else(|| "--ckpt <path to .ckpt> is required".to_string())?;
+    let ckpt_path = PathBuf::from(&ckpt);
+    if !ckpt_path.exists() {
+        return Err(format!("checkpoint does not exist: {ckpt}"));
+    }
+    let out = flag("--out").ok_or_else(|| "--out <path to .ckpt> is required".to_string())?;
+    // The average when the file has one, the raw iterate under `--raw-weights` —
+    // the same rule sampling applies, so the export carries what the page shows.
+    let weights = weights_source(args);
+    // 8-bit codes instead of f32: a quarter of the weights-only file again, at
+    // the cost of the quantisation error — a trade the run measures, not assumes.
+    let quantize = args.iter().any(|arg| arg == "--quantize");
+
+    let config_path = storage::model_config_path(&model_name)
+        .map_err(|err| format!("failed to resolve config path: {err}"))?;
+    let config = storage::load_model_config(&config_path)
+        .map_err(|err| format!("failed to load {}: {err}", config_path.display()))?;
+
+    let source = fs::read(&ckpt_path).map_err(|err| format!("failed to read {ckpt}: {err}"))?;
+
+    let rt = tokio::runtime::Runtime::new().map_err(|err| format!("tokio runtime: {err}"))?;
+    let bytes = rt.block_on(stripped_checkpoint(&config, &source, weights, quantize))?;
+
+    let out_path = PathBuf::from(&out);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create output dir: {err}"))?;
+        }
+    }
+    fs::write(&out_path, &bytes).map_err(|err| format!("failed to write {out}: {err}"))?;
+
+    // The banner re-emits the parsed configuration so a scripted run can prove
+    // the flag was understood — the same contract every headless mode keeps.
+    let which = if matches!(weights, CheckpointWeights::Raw) {
+        "raw"
+    } else {
+        "ema"
+    };
+    let encoding = if quantize { "u8" } else { "f32" };
+    println!(
+        "export-weights '{model_name}': ckpt={ckpt}, weights={which}, encoding={encoding}, \
+         out={out}, bytes={} (source {} bytes)",
+        bytes.len(),
+        source.len()
+    );
     Ok(())
 }
 
@@ -4984,6 +5138,185 @@ mod tests {
                 template.key
             );
         }
+    }
+
+    // -- Exporting the weights inference uses --------------------------------
+
+    /// A tiny t-conditioned diffusion model: 8×8, one signal channel and one
+    /// time channel in, one channel out. Small enough that a full 256-step
+    /// reverse chain is cheap, real enough that `sample_diffusion` runs it end
+    /// to end (input depth 2 > output depth 1, the conditioning invariant).
+    fn tiny_diffusion_config() -> ModelConfig {
+        use batlab_core::config::{ActivationMethod, PaddingMode};
+        let layers = vec![
+            LayerDraft::Convolution {
+                dim_input: (8, 8, 2),
+                nb_kernel: 4,
+                dim_kernel: (3, 3, 2),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+            LayerDraft::Activation {
+                dim_input: (8, 8, 4),
+                method: ActivationMethod::Silu,
+                save_key: None,
+            },
+            LayerDraft::Convolution {
+                dim_input: (8, 8, 4),
+                nb_kernel: 1,
+                dim_kernel: (3, 3, 4),
+                stride: 1,
+                padding: PaddingMode::Same,
+                save_key: None,
+            },
+        ];
+        ModelConfig {
+            model_name: Some("export-test".to_string()),
+            input_size: (8, 8, 2),
+            layers,
+            inference: batlab_core::InferenceConfig::default(),
+            seed_dataset: None,
+            run: batlab_core::RunConfig {
+                mode: RunMode::Infer,
+            },
+        }
+    }
+
+    /// Train `config` a few steps with Adam and an EMA so the averaged set and
+    /// the last iterate genuinely differ, and return its V3 checkpoint bytes.
+    async fn trained_v3_checkpoint(config: &ModelConfig) -> Vec<u8> {
+        let ema = EmaConfig::new(0.9).expect("decay in range");
+        let (_gpu, mut model) = build_execution_model(
+            config,
+            1e-2,
+            1,
+            OptimizerKind::Adam,
+            WeightInit::default(),
+            Some(ema),
+        )
+        .await
+        .expect("tiny model must build");
+
+        let input_len = 8 * 8 * 2;
+        let output_len = 8 * 8 * 1;
+        for step in 0..8 {
+            let input: Vec<f32> = (0..input_len)
+                .map(|i| ((i as f32 * 0.37 + step as f32 * 0.11).sin()) * 0.8)
+                .collect();
+            let target: Vec<f32> = (0..output_len)
+                .map(|i| ((i as f32 * 0.21 - step as f32 * 0.17).cos()) * 0.5)
+                .collect();
+            model.train_step(&input, &target);
+        }
+        model.checkpoint_bytes().expect("checkpoint")
+    }
+
+    /// Generate one image from `bytes`, loaded with `weights`, on a fresh
+    /// inference model — the same path `--headless-sample` walks.
+    async fn sample_from_checkpoint(
+        config: &ModelConfig,
+        bytes: &[u8],
+        weights: CheckpointWeights,
+        seed: u64,
+    ) -> Vec<f32> {
+        let (_gpu, mut model) = build_execution_model(
+            config,
+            INFERENCE_RUNTIME_LR,
+            INFERENCE_RUNTIME_BATCH_SIZE,
+            OptimizerKind::default(),
+            WeightInit::default(),
+            None,
+        )
+        .await
+        .expect("inference model must build");
+        model
+            .load_checkpoint_bytes_with(bytes, weights)
+            .expect("load checkpoint");
+
+        let input_dims = model.input_dim().expect("input dims");
+        let output_dims = model.output_dim().expect("output dims");
+        let output_len = (output_dims.x * output_dims.y * output_dims.z) as usize;
+        let schedule = LinearNoiseSchedule::new_linear(
+            DIFFUSION_SCHEDULE_STEPS,
+            DIFFUSION_BETA_START,
+            DIFFUSION_BETA_END,
+        );
+        sample_diffusion(
+            &mut model,
+            input_dims.z as usize,
+            output_dims.z as usize,
+            output_len,
+            &schedule,
+            seed,
+            1,
+            1.0,
+            None,
+            None,
+            |_, _| {},
+        )
+    }
+
+    /// The property the whole feature rests on: an export samples **bit for
+    /// bit** the same image, on the same seed, as the checkpoint it came from —
+    /// selecting the same weight set the page selects (the average by default,
+    /// the raw iterate under `--raw-weights`). Proven, not inspected: two full
+    /// reverse chains compared value by value.
+    ///
+    /// The export is also checked to be a smaller, ordinary V2 checkpoint — the
+    /// optimiser moments and the EMA trailer are gone, the weights remain — and
+    /// the EMA and raw references are checked to differ, so "same image" is not
+    /// the vacuous truth of a model whose two weight sets coincide.
+    #[test]
+    fn an_export_samples_the_same_image_as_the_checkpoint_it_came_from() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            let config = tiny_diffusion_config();
+            let source = trained_v3_checkpoint(&config).await;
+            assert_eq!(
+                &source[..7],
+                b"BBCKPT3",
+                "a run with an EMA writes a V3 checkpoint"
+            );
+
+            let ema_ref = sample_from_checkpoint(&config, &source, CheckpointWeights::Ema, 101).await;
+            let raw_ref = sample_from_checkpoint(&config, &source, CheckpointWeights::Raw, 101).await;
+            assert_ne!(
+                ema_ref, raw_ref,
+                "the averaged and raw weight sets sample the same image — the \
+                 equivalence below would then be vacuous"
+            );
+
+            for (weights, reference) in [
+                (CheckpointWeights::Ema, &ema_ref),
+                (CheckpointWeights::Raw, &raw_ref),
+            ] {
+                let exported = stripped_checkpoint(&config, &source, weights, false)
+                    .await
+                    .expect("export");
+                assert_eq!(
+                    &exported[..7],
+                    b"BBCKPT2",
+                    "a weights-only export carries no EMA trailer, so it is a V2 file"
+                );
+                assert!(
+                    exported.len() < source.len(),
+                    "the export ({} bytes) is not lighter than the source ({} bytes)",
+                    exported.len(),
+                    source.len()
+                );
+
+                // The export has no EMA trailer, so `Ema` falls back to its raw
+                // entries — which are exactly the set that was baked in.
+                let sampled =
+                    sample_from_checkpoint(&config, &exported, CheckpointWeights::Ema, 101).await;
+                assert_eq!(
+                    &sampled, reference,
+                    "the export sampled a different image from the checkpoint it \
+                     came from"
+                );
+            }
+        });
     }
 
     // -- The img2img seed ----------------------------------------------------

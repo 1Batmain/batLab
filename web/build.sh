@@ -20,9 +20,26 @@ DIST="$WEB_DIR/dist"
 # checkout rather than in this worktree; hence absolute defaults.
 MODEL_DIR="${MODEL_DIR:-/Users/bat/development/lab/batLab/Models/Elephants_XL}"
 CONFIG="${CONFIG:-$MODEL_DIR/config_file}"
-WEIGHTS="${WEIGHTS:-$MODEL_DIR/pretrained_weights/latest.ckpt}"
+# The deployed page uses the AVERAGED (EMA) night model, so that is the default
+# source. It is a full training checkpoint (weights + Adam + EMA); the export
+# step below strips it to the weights inference actually generates from.
+WEIGHTS="${WEIGHTS:-/Users/bat/development/lab/batLab/eleph_night/night.ckpt}"
 SEED_DATASET="${SEED_DATASET:-/Users/bat/development/lab/batLab/datasets/elephants256.batraw}"
 SEED_COUNT="${SEED_COUNT:-32}"
+
+# The export resolves the model's geometry by NAME through the storage layer, so
+# it needs both the name and the root that holds Models/. Defaults derive from
+# MODEL_DIR (…/<root>/Models/<name>); override either if your layout differs.
+MODEL="${MODEL:-$(basename "$MODEL_DIR")}"
+BATLAB_ROOT="${BATLAB_ROOT:-$(cd "$MODEL_DIR/../.." 2>/dev/null && pwd || echo "$REPO_DIR")}"
+
+# What the export carries. RAW_WEIGHTS=1 ships the last iterate instead of the
+# average. QUANTIZE=1 codes the weights to 8 bits — a quarter of the file again,
+# but MEASURED NO-GO on this model (x₀-RMSE +14 %, visibly muddier; see the
+# report in docs/reports/WEB_PORT.md and docs/gallery/web_slim_q8_nogo.png), so
+# it is off by default: the page ships the f32 stripped file.
+QUANTIZE="${QUANTIZE:-0}"
+RAW_WEIGHTS="${RAW_WEIGHTS:-0}"
 
 WASM_CRATE="batlab_web"
 TARGET="wasm32-unknown-unknown"
@@ -76,7 +93,22 @@ fi
 # --- 4. Assets --------------------------------------------------------------
 say "assets → dist"
 cp "$CONFIG"  "$DIST/model.json"
-cp "$WEIGHTS" "$DIST/weights.ckpt"
+
+# The weights the page downloads are the STRIPPED file, not the training
+# checkpoint: the two Adam moments and the EMA trailer inflate the source four
+# times over and inference reads none of them. `--export-weights` bakes in the
+# set inference would select (the average by default) and re-serialises the
+# weights alone — the same file, sampling bit-for-bit identically (proven by
+# `an_export_samples_the_same_image_as_the_checkpoint_it_came_from`).
+EXPORT_FLAGS=()
+[ "$QUANTIZE" = "1" ]    && EXPORT_FLAGS+=(--quantize)
+[ "$RAW_WEIGHTS" = "1" ] && EXPORT_FLAGS+=(--raw-weights)
+say "export-weights $MODEL → dist/weights.ckpt ${EXPORT_FLAGS[*]:-(f32, EMA)}"
+( cd "$REPO_DIR" && BATLAB_ROOT="$BATLAB_ROOT" cargo run --release -p batlab -- \
+    --export-weights "$MODEL" --ckpt "$WEIGHTS" --out "$DIST/weights.ckpt" \
+    ${EXPORT_FLAGS[@]+"${EXPORT_FLAGS[@]}"} )
+[ -f "$DIST/weights.ckpt" ] || die "export produced no weights.ckpt"
+
 python3 "$WEB_DIR/tools/make_seeds.py" "$SEED_DATASET" "$DIST/seeds.bin" --count "$SEED_COUNT"
 cp "$WEB_DIR/index.html" "$DIST/index.html"
 
@@ -87,10 +119,13 @@ total=0
 for f in "$BG" "$DIST/weights.ckpt" "$DIST/seeds.bin" "$DIST/model.json" "$DIST/${WASM_CRATE}.js" "$DIST/index.html"; do
   [ -f "$f" ] && total=$(( total + $(bytes "$f") ))
 done
+src_bytes=$(bytes "$WEIGHTS")
+ckpt_bytes=$(bytes "$DIST/weights.ckpt")
 echo
 say "web/dist/ built — download weight of the deposited page:"
 printf '  %-22s %8s\n' "wasm (WebGPU engine)" "$(size "$BG")"
-printf '  %-22s %8s\n' "weights.ckpt" "$(size "$DIST/weights.ckpt")"
+printf '  %-22s %8s  (stripped from %s, ×%s)\n' "weights.ckpt" "$(size "$DIST/weights.ckpt")" \
+  "$(size "$WEIGHTS")" "$(awk -v s="$src_bytes" -v c="$ckpt_bytes" 'BEGIN{printf "%.1f", s/c}')"
 printf '  %-22s %8s\n' "seeds.bin" "$(size "$DIST/seeds.bin")"
 printf '  %-22s %8s\n' "model.json + js + html" "$(( $(bytes "$DIST/model.json") + $(bytes "$DIST/${WASM_CRATE}.js") + $(bytes "$DIST/index.html") )) B"
 printf '  %-22s %8s\n' "TOTAL" "$(awk -v b="$total" 'BEGIN{printf "%.1f Mo", b/1048576}')"

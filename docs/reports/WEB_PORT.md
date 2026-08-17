@@ -97,20 +97,71 @@ propriété d'inférence de `--headless-sample`). Le port n'y touche pas.
 
 ## 2. Le poids téléchargé (chiffré)
 
+Le checkpoint d'un entraînement transporte **quatre fois** ce que l'inférence
+lit. Sur `eleph_night/night.ckpt` (le modèle **EMA** que la page utilise,
+`BBCKPT3`, 19 082 087 o) :
+
+| Contenu du checkpoint | Poids | Utile en inférence |
+|---|---:|:--:|
+| les poids | 4,77 Mo (1 192 563 params × 4 o) | **oui** |
+| les deux moments d'Adam | 9,54 Mo | non (entraînement seul) |
+| la remorque EMA | 4,77 Mo | **c'est ELLE qu'on garde**, à la place des poids bruts |
+
+D'où l'export **nu** (`--export-weights`, item 1) : relire le checkpoint et n'en
+réécrire que les poids que l'inférence génèrerait — la **moyenne EMA** par
+défaut, exactement la règle de sélection du sampler (`CheckpointWeights::Ema`,
+non ré-implémentée) — dans un `BBCKPT2` ordinaire, sans moments ni remorque. Le
+fichier échantillonne **au bit près** la même image que le checkpoint d'origine,
+sur la même graine : prouvé, pas inspecté
+(`an_export_samples_the_same_image_as_the_checkpoint_it_came_from`, et reconfirmé
+par `--eval`, cf. plus bas).
+
+`web/build.sh` lance cet export à la place de l'ancien `cp` (knobs `WEIGHTS`,
+`MODEL`, `RAW_WEIGHTS`, `QUANTIZE`). Le bilan mesuré de la page déposée :
+
 | Asset | Taille | Note |
 |---|---:|---|
-| `weights.ckpt` | **13,65 Mio** (14 311 503 o) | poids f32 — **domine** |
-| `batlab_web_bg.wasm` | 1,6 Mo brut (release, avant `wasm-bindgen`/`wasm-opt`) ; **~1,0–1,3 Mo** attendu après `wasm-opt -Oz` | moteur WebGPU compilé (compute seul, pas de Vulkan/GL/DX) |
-| `seeds.bin` | 96 Kio | 32 images de départ 32×32×3 |
-| `batlab_web.js` + `model.json` + `index.html` | ~24 Kio | glue + config + page |
-| **Total** | **≈ 15,5 Mo** non compressé | |
+| `weights.ckpt` | **4,55 Mio** (4 770 507 o) | poids EMA f32, nus — dépouillés de 18,20 Mio (×4,0) |
+| `batlab_web_bg.wasm` | 395 Kio (404 197 o) | moteur WebGPU, après `wasm-opt -Oz` |
+| `seeds.bin` | 96 Kio (98 320 o) | 32 images de départ 32×32×3 |
+| `batlab_web.js` + `model.json` + `index.html` | 63,6 Kio (65 089 o) | glue + config + page |
+| **Total** | **5,09 Mio** (5 338 113 o) non compressé | contre ~18,7 Mo déposés — **×3,7** |
 
-**Le mot honnête** : 13,65 Mo de poids f32 sur une page portfolio, c'est
-beaucoup, et c'est ~88 % du poids. La quantification int8 (÷4 → ~3,5 Mo, total
-≈ 5 Mo) est la piste évidente ; non implémentée ici par discipline (« ne
-l'implémente que si le reste marche », et le reste n'a pas encore été observé en
-navigateur — §4). Servi avec gzip/brotli, le wasm tombe à ~450 Kio ; les poids
-f32 se compriment peu.
+Le fichier reste un checkpoint ordinaire : l'inférence, le sélecteur de poids du
+TUI et `--resume` le relisent tous. Le moteur web le charge par la **même**
+fonction que le natif — `load_checkpoint_bytes_with(&weights,
+CheckpointWeights::Ema)` (`crates/batlab-web/src/lib.rs`) : un `BBCKPT2` n'ayant
+pas de remorque, `Ema` retombe sur ses entrées brutes, qui **sont** le jeu EMA
+qu'on y a cuit — d'où l'égalité au bit près.
+
+### La quantification 8 bits : MESURÉE NO-GO à ce jalon
+
+Descendre encore ces 4,77 Mo à ~1,2 Mo en stockant les poids en **u8** (échelle
++ zéro par tenseur, déquantifiés au chargement par une table de 256 valeurs —
+jamais une formule, même piège que `dataset_decode.wgsl`, ici sans morsure car
+la déquant est côté hôte) est implémenté (`--export-weights --quantize`, module
+`model::quant`, format `BBCKPTQ`) et **le fichier tient la cible** : 1 193 134 o.
+Mais c'est un compromis, donc ça se mesure — `--eval` sur `elephants_all` (256
+held-out, seed 7) et une planche seeds 101..606 (`docs/gallery/web_slim_q8_nogo.png`) :
+
+| | f32 nu (= source, au bit près) | u8 quantifié | Δ |
+|---|---:|---:|---:|
+| taille des poids | 4 770 507 o | 1 193 134 o | ÷4,0 |
+| ε-MSE (tout le schedule) | 0,0567 | 0,0571 | +0,7 % |
+| **x₀-RMSE (tout)** | **0,3568** | **0,4079** | **+14,3 %** |
+| x₀-RMSE tranche haute t[192,256) | 0,5756 | 0,6904 | +20 % |
+
++14,3 % de x₀-RMSE (et +20 % sur la tranche haute), **plus** une dégradation
+**visible** sur la planche (images plus boueuses, détails perdus, teintes
+décalées). Les deux critères de NO-GO sont franchis. **La page embarque donc
+l'export nu f32**, pas l'u8 ; `--quantize` reste un opt-in documenté et
+reproductible (`QUANTIZE=1` dans `build.sh`), jamais câblé au build par défaut.
+Le dépôt a déjà deux NO-GO chiffrés (EMA court, pondération de loss) ; en voici
+un troisième. Ce qui rachèterait peut-être la quantification — une échelle par
+canal plutôt que par tenseur, ou un modèle moins sensible sur le haut-t — n'est
+pas de ce jalon.
+
+Servi avec gzip/brotli, le wasm tombe encore ; les poids f32 se compriment peu.
 
 ---
 
@@ -193,14 +244,17 @@ Passent aujourd'hui, en principe (non re-testés en navigateur ici) :
 
 ## 6. Ce qui reste
 
-1. **Installer `wasm-bindgen-cli` + `binaryen`** dans `/etc/nix-darwin/flake.nix`
-   (`environment.systemPackages`), rebuild, puis `web/build.sh`. La version de
-   `wasm-bindgen-cli` **doit** correspondre au crate verrouillé (`0.2.114`) —
-   sinon épingler le crate à la version de la CLI ; `build.sh` avertit.
-2. **Constater en navigateur** les deux modes, relever les img/s réelles.
-3. **Quantification int8** des poids (13,65 → ~3,5 Mo), *après* validation, en
-   mesurant la dégradation avec `--eval` — un gain de taille qui casse les
-   images est un NO-GO.
+1. ~~**Installer `wasm-bindgen-cli` + `binaryen`**~~ — **fait** : la chaîne est en
+   place (`wasm-bindgen 0.2.121`, `wasm-opt`, cible `wasm32-unknown-unknown`) et
+   `web/build.sh` tourne de bout en bout ici. `build.sh` avertit toujours si la
+   version de la CLI diverge du crate verrouillé.
+2. **Constater en navigateur** les deux modes, relever les img/s réelles — non
+   pilotable depuis cet agent (§4). La page se sert déjà (fenêtre tmux, port
+   8080/8000) : ouvrir, vérifier que les éléphants s'affichent, que « Nouveau
+   bruit » en ouvre un autre.
+3. ~~**Quantification int8**~~ — **fait et MESURÉ NO-GO** (§2) : implémentée
+   (`--quantize`, `BBCKPTQ`), le fichier tient 1,2 Mo, mais x₀-RMSE +14 % et
+   images visiblement dégradées. La page reste sur l'export nu f32.
 4. **Latent résident sur GPU** (tâche #19) : réécrire le pas inverse en WGSL avec
    un test d'égalité bit-à-bit contre `denoise_step_with_magnitude`/`x0_estimate`/
    `gaussian_at`, dans l'idiome du dépôt. Optimisation, pas correctif.
@@ -317,6 +371,13 @@ Dans tous les cas la page ne peut **plus** animer un modèle mort en silence.
   workspace.
 - **Livrable** : `web/index.html`, `web/build.sh`, `web/tools/make_seeds.py`,
   `web/README.md` ; `web/dist/` gitignoré (wasm + poids + seeds).
+- **Allègement des poids (§2)** : `crates/batlab-core/src/model/quant.rs`
+  (quantification affine u8 + table de déquant), `…/model/model.rs`
+  (`checkpoint_bytes_quantized`, magic `BBCKPTQ`, branche de chargement),
+  `…/model/mod.rs` (module), `…/model/ema_tests.rs` (fidélité u8 au bit près),
+  `crates/batlab/src/main.rs` (`--export-weights [--raw-weights] [--quantize]`,
+  `stripped_checkpoint`, `an_export_samples_the_same_image_…`), `web/build.sh`
+  (export à la place du `cp`), `docs/gallery/web_slim_q8_nogo.png` (planche NO-GO).
 - **Le bug de l'inférence (§7)** : `crates/batlab-core/src/gpu_context.rs`
   (`GpuContext::guarded`, l'error scope de validation),
   `…/model/training/metrics.rs` (`reverse_step_async`, sibling async de

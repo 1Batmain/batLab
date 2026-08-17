@@ -30,6 +30,12 @@ const CHECKPOINT_MAGIC_V2: &[u8; 7] = b"BBCKPT2";
 /// Written only by a run that has an EMA, so a run without one produces a file
 /// byte-identical to the one it produced before averaging existed.
 const CHECKPOINT_MAGIC_V3: &[u8; 7] = b"BBCKPT3";
+/// Weights-only, coded to 8 bits per weight (per-tensor affine, see
+/// [`crate::model::quant`]). An inference artefact: no optimiser trailer, no EMA
+/// trailer — the weight set was already chosen when the file was written. Read
+/// like any other checkpoint; never written by a training run, only by the
+/// export path, because it cannot be resumed from without losing precision.
+const CHECKPOINT_MAGIC_Q8: &[u8; 7] = b"BBCKPTQ";
 const CHECKPOINT_MAGIC_LEN: usize = 7;
 
 /// Trailer tags for the optimiser-state section of a V2 checkpoint.
@@ -848,6 +854,70 @@ impl<State> Model<State> {
         Ok(bytes)
     }
 
+    /// Serialise the forward weights coded to 8 bits — the file a browser
+    /// downloads once the export has chosen a weight set.
+    ///
+    /// Same per-layer order as [`Model::checkpoint_bytes`], but each tensor is a
+    /// `(min, scale)` pair and one byte per weight instead of four (see
+    /// [`crate::model::quant`]). No trailers: a quantised checkpoint is an
+    /// inference artefact, so it carries neither optimiser moments nor an EMA —
+    /// whatever is in the forward buffers now is what it will hand back, minus
+    /// the quantisation error. Build the model with SGD and no EMA, load the set
+    /// you want with [`Model::load_checkpoint_bytes_with`], then call this.
+    pub fn checkpoint_bytes_quantized(&self) -> Result<Vec<u8>, ModelError> {
+        if !self.state.is_build {
+            return Err(ModelError::InvalidCheckpointFormat {
+                message: "model must be built before saving checkpoint".to_string(),
+            });
+        }
+
+        let mut entries: Vec<(u32, Vec<f32>, Vec<f32>)> = Vec::new();
+        for (layer_index, layer) in self.layers.iter().enumerate() {
+            let Some(bindings) = layer.ty.get_optimizer_bindings() else {
+                continue;
+            };
+            let weights_buf = layer
+                .buffers
+                .forward
+                .get(bindings.weights_forward_index)
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "missing weights buffer".to_string(),
+                })?;
+            let bias_buf = layer
+                .buffers
+                .forward
+                .get(bindings.bias_forward_index)
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "missing bias buffer".to_string(),
+                })?;
+            let weights = read_back_f32(self.gpu.as_ref(), weights_buf, weights_buf.size())
+                .ok_or_else(|| ModelError::CheckpointLayerMismatch {
+                    layer_index,
+                    message: "weights buffer is not readable from GPU".to_string(),
+                })?;
+            let bias =
+                read_back_f32(self.gpu.as_ref(), bias_buf, bias_buf.size()).ok_or_else(|| {
+                    ModelError::CheckpointLayerMismatch {
+                        layer_index,
+                        message: "bias buffer is not readable from GPU".to_string(),
+                    }
+                })?;
+            entries.push((layer_index as u32, weights, bias));
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(CHECKPOINT_MAGIC_Q8);
+        bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (layer_index, weights, bias) in entries {
+            bytes.extend_from_slice(&layer_index.to_le_bytes());
+            append_quantized_tensor(&mut bytes, &weights);
+            append_quantized_tensor(&mut bytes, &bias);
+        }
+        Ok(bytes)
+    }
+
     /// Write [`Model::checkpoint_bytes`] to disk, creating the parent directory.
     /// The filesystem lives in this wrapper and nowhere deeper.
     pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> Result<(), ModelError> {
@@ -1100,17 +1170,20 @@ impl<State> Model<State> {
         }
 
         // Version, read off the magic. V1 has no trailer at all, V2 an
-        // optimiser trailer, V3 that plus the weight average.
-        let (has_optimizer_trailer, has_ema_trailer) = match bytes.get(..CHECKPOINT_MAGIC_LEN) {
-            Some(magic) if magic == CHECKPOINT_MAGIC_V3 => (true, true),
-            Some(magic) if magic == CHECKPOINT_MAGIC_V2 => (true, false),
-            Some(magic) if magic == CHECKPOINT_MAGIC_V1 => (false, false),
-            _ => {
-                return Err(ModelError::InvalidCheckpointFormat {
-                    message: "missing or invalid checkpoint magic".to_string(),
-                });
-            }
-        };
+        // optimiser trailer, V3 that plus the weight average; the quantised
+        // artefact has no trailer and reads its entries as 8-bit codes.
+        let (has_optimizer_trailer, has_ema_trailer, quantized) =
+            match bytes.get(..CHECKPOINT_MAGIC_LEN) {
+                Some(magic) if magic == CHECKPOINT_MAGIC_V3 => (true, true, false),
+                Some(magic) if magic == CHECKPOINT_MAGIC_V2 => (true, false, false),
+                Some(magic) if magic == CHECKPOINT_MAGIC_V1 => (false, false, false),
+                Some(magic) if magic == CHECKPOINT_MAGIC_Q8 => (false, false, true),
+                _ => {
+                    return Err(ModelError::InvalidCheckpointFormat {
+                        message: "missing or invalid checkpoint magic".to_string(),
+                    });
+                }
+            };
 
         struct LoadedEntry {
             layer_index: usize,
@@ -1123,10 +1196,20 @@ impl<State> Model<State> {
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             let layer_index = read_u32_le(bytes, &mut offset)? as usize;
-            let weight_len = read_u32_le(bytes, &mut offset)? as usize;
-            let weights = read_f32_vec_le(bytes, &mut offset, weight_len)?;
-            let bias_len = read_u32_le(bytes, &mut offset)? as usize;
-            let bias = read_f32_vec_le(bytes, &mut offset, bias_len)?;
+            // A quantised entry dequantises to the very same f32 vector a float
+            // entry reads directly, so everything below is oblivious to which
+            // encoding produced it.
+            let (weights, bias) = if quantized {
+                let weights = read_quantized_tensor(bytes, &mut offset)?;
+                let bias = read_quantized_tensor(bytes, &mut offset)?;
+                (weights, bias)
+            } else {
+                let weight_len = read_u32_le(bytes, &mut offset)? as usize;
+                let weights = read_f32_vec_le(bytes, &mut offset, weight_len)?;
+                let bias_len = read_u32_le(bytes, &mut offset)? as usize;
+                let bias = read_f32_vec_le(bytes, &mut offset, bias_len)?;
+                (weights, bias)
+            };
             entries.push(LoadedEntry {
                 layer_index,
                 weights,
@@ -1823,6 +1906,45 @@ fn read_f32_vec_le(bytes: &[u8], offset: &mut usize, len: usize) -> Result<Vec<f
     }
     *offset = end;
     Ok(values)
+}
+
+fn read_f32_le(bytes: &[u8], offset: &mut usize) -> Result<f32, ModelError> {
+    let end = offset.saturating_add(4);
+    if end > bytes.len() {
+        return Err(ModelError::InvalidCheckpointFormat {
+            message: "unexpected end of checkpoint while reading f32".to_string(),
+        });
+    }
+    let value = f32::from_le_bytes(bytes[*offset..end].try_into().unwrap());
+    *offset = end;
+    Ok(value)
+}
+
+/// Serialise one tensor as `u32 len | f32 min | f32 scale | u8[len]` — the
+/// quantised counterpart of a float entry's `u32 len | f32[len]`.
+fn append_quantized_tensor(bytes: &mut Vec<u8>, values: &[f32]) {
+    let q = crate::model::quant::quantize(values);
+    bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&q.min.to_le_bytes());
+    bytes.extend_from_slice(&q.scale.to_le_bytes());
+    bytes.extend_from_slice(&q.bytes);
+}
+
+/// Read a tensor written by [`append_quantized_tensor`] and reconstruct its f32
+/// values through the module's lookup table.
+fn read_quantized_tensor(bytes: &[u8], offset: &mut usize) -> Result<Vec<f32>, ModelError> {
+    let len = read_u32_le(bytes, offset)? as usize;
+    let min = read_f32_le(bytes, offset)?;
+    let scale = read_f32_le(bytes, offset)?;
+    let end = offset.saturating_add(len);
+    if end > bytes.len() {
+        return Err(ModelError::InvalidCheckpointFormat {
+            message: "unexpected end of checkpoint while reading quantised tensor".to_string(),
+        });
+    }
+    let raw = &bytes[*offset..end];
+    *offset = end;
+    Ok(crate::model::quant::dequantize(min, scale, raw))
 }
 
 // ---------------------------------------------------------------------------
