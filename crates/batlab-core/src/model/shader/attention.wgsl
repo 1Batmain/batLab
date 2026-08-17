@@ -1,55 +1,28 @@
-// File purpose: WGSL compute shader implementing spatial self-attention forward passes.
+// Spatial self-attention, forward. 2-D dispatch grid past WebGPU's 65 535-per-dim
+// limit (`dispatch_grid` in layer.rs).
 //
-// The dispatch grid is 2-D when the batch pushes the workgroup count past
-// WebGPU's 65 535-per-dimension limit (see `dispatch_grid` in layer.rs), so the
-// linear thread index is recovered from `num_workgroups` rather than read
-// straight out of `gid.x`. `nwg.x * 64` is the width of one row of threads.
-//
-// THE LAYER IS RESIDUAL: `output = input + W_o · softmax(qᵀk/√d) · V`. The
-// residual lives inside the layer on purpose — the graph stays a chain, and
-// with `W_o` initialised to zero the layer starts life as the exact identity.
-//
-// Four sequential passes, because attention needs GLOBAL barriers a single
-// kernel cannot provide: row `n`'s scores read `k[m]` and `v[m]` for every `m`,
-// which other workgroups produce. wgpu inserts the barrier between compute
-// passes of one encoder, so the split *is* the synchronisation:
-//
+// RESIDUAL: `output = input + W_o · softmax(qᵀk/√d) · V`. The residual is inside
+// the layer so the graph stays a chain, and with `W_o` init to zero it starts as
+// the exact identity. FOUR passes, because attention needs GLOBAL barriers (row
+// `n` reads every `k[m]`/`v[m]`) that only wgpu's inter-pass barrier provides:
 //   1. attn_qkv     — q, k, v = W·x + b            (one thread per q/k/v scalar)
 //   2. attn_scores  — softmax(qᵀk · scale) rows    (ONE WORKGROUP PER (sample, row))
 //   3. attn_context — ctx = probs · v              (one thread per ctx scalar)
 //   4. attn_out     — out = x + W_o·ctx + b_o      (one thread per output scalar)
 //
-// ---------------------------------------------------------------------------
-// WHY ONE SCRATCH BUFFER AND NOT FIVE
-// ---------------------------------------------------------------------------
-//
-// WebGPU guarantees only EIGHT storage buffers per shader stage
-// (`max_storage_buffers_per_shader_stage`), and this engine targets the
-// visitor's own GPU through a browser — raising the limit at `request_device`
-// would trade portability for convenience. The backward pass needs the layer
-// input, the weights, the incoming gradient, grad_input, grad_weights,
-// grad_bias, everything the forward saved, and its own scratch. Bound
-// separately that is twelve, and the failure is SILENT AND TOTAL: the bind
-// group layout is rejected, so the whole command buffer — forward included —
-// is dropped, the loss reads 0.000000, and nothing else says a word.
-//
-// So q, k, v, ctx and probs share ONE buffer, and their gradients share
-// another with THE SAME LAYOUT. Block `X`'s gradient sits at block `X`'s
-// offset in the twin buffer, which is what keeps the arithmetic legible:
+// ONE scratch buffer, not five: WebGPU guarantees only EIGHT storage buffers per
+// stage, and the backward already needs most of them — bind q/k/v/ctx/probs
+// separately and it overflows, a SILENT TOTAL failure (bind group rejected, whole
+// command buffer dropped, loss 0.000000). So they share one buffer, gradients a
+// twin with the same layout (block `X`'s gradient at block `X`'s offset):
 //
 //   [ q | k | v | ctx | probs ]   per sample, stride 4·N·C + N²
 //     0  NC  2NC  3NC   4NC
 //
-// Bindings match AttentionType::get_buffers_specs():
-//   [0] input   — HWC layout, N=H*W positions of C channels: index = n*C + c
-//   [1] weights — the FOUR projections concatenated, C*C each, in order
-//                 Wq, Wk, Wv at [i*C + c] (row i = output feature), then
-//                 Wo at [c*C + i] (row c = output channel). One buffer so the
-//                 optimiser sees one weight tensor, exactly like a convolution.
-//   [2] bias    — 4*C: bq, bk, bv, bo back to back
-//   [3] specs   — AttentionSpec
-//   [4] scratch — the five blocks above, saved for the backward pass
-//   [5] output  — HWC, same shape as input (LAST: the model chains .last())
+// Bindings (AttentionType::get_buffers_specs()): [0] input (HWC, n*C+c), [1]
+// weights (Wq,Wk,Wv at [i*C+c] then Wo at [c*C+i], one tensor for the optimiser),
+// [2] bias (4*C), [3] specs, [4] scratch (the five blocks, saved for backward),
+// [5] output (HWC, LAST — the model chains .last()).
 
 @group(0) @binding(0) var<storage, read>       input:      array<f32>;
 @group(0) @binding(1) var<storage, read>       weights:    array<f32>;
@@ -178,27 +151,14 @@ fn attn_qkv(
 // 2. scores + softmax
 // ---------------------------------------------------------------------------
 //
-// ONE WORKGROUP PER (SAMPLE, ROW): the softmax denominator is a reduction over
-// the whole row, so the row is the unit of work, not the element.
-//
-// THE ROW NEVER LEAVES ITS SAMPLE. `b` is fixed for the workgroup and every
-// read of q/k/v is offset into that sample's slice, so position `n` of image 3
-// cannot attend to position `m` of image 4. Batching two images together must
-// not change either one's output — that is the whole contract of the batch
-// axis, and it is the specific failure mode this layer is exposed to.
-//
-// Trailing workgroups from the 2-D grid split RETURN. They must not be folded
-// onto the last real row instead: this pass is a read-modify-write on that row
-// (write the score, read it back to exponentiate, read that back to normalise),
-// so two workgroups sharing a row would interleave — one reading a value the
-// other has already transformed. The result is not "the same work done twice",
-// it is corruption, and only above 65 535 row-workgroups, which is where nobody
-// is looking.
-//
-// The early return is legal precisely because the condition is WORKGROUP-
-// UNIFORM: `unit` comes from `wid` and `nwg`, identical for every invocation of
-// the workgroup, so all of them take the same branch and the barriers below
-// stay in uniform control flow. A per-thread condition could not do this.
+// ONE WORKGROUP PER (SAMPLE, ROW): the softmax denominator reduces over the row.
+// The row NEVER leaves its sample (`b` fixed, all reads offset into that sample),
+// so batching two images cannot change either's output — the batch contract, and
+// this layer's specific failure mode. Trailing workgroups RETURN, not folded onto
+// the last row: this is a read-modify-write, so two workgroups sharing a row would
+// corrupt it (only above 65 535 row-workgroups, where nobody looks). The return is
+// legal because the condition is WORKGROUP-UNIFORM, keeping the barriers below in
+// uniform control flow.
 
 @compute @workgroup_size(64)
 fn attn_scores(
@@ -219,16 +179,10 @@ fn attn_scores(
     let k_base = block_base(b, 1u);
     let p_row = block_base(b, 4u) + n * seq;
 
-    // Pass 1 — raw scores, and the row max for the stable softmax.
-    //
-    // The sentinel is deliberately NOT the canonical `-3.4028235e38` that Rust
-    // prints for `f32::MIN`: read as an exact decimal that value sits *above*
-    // f32::MAX (3.40282346...e38), so a strict WGSL front-end refuses it —
-    // « value -3.4028235e+38 cannot be represented as 'f32' ». naga→Metal
-    // accepted it, the browser's compiler did not, and a rejected pipeline
-    // fails SILENTLY: its dispatches become no-ops, ε̂ comes back all zeros and
-    // the sampler renders pure noise. Any literal safely under f32::MAX does
-    // the job of « lower than every score ».
+    // Pass 1 — raw scores and the row max for the stable softmax. The sentinel is
+    // NOT `f32::MIN`'s `-3.4028235e38`: read as an exact decimal it sits ABOVE
+    // f32::MAX, so a strict WGSL front-end (the browser's, unlike naga→Metal)
+    // rejects it and the pipeline fails silently. Any literal under f32::MAX works.
     var local_max: f32 = -3.4028234e38;
     for (var m: u32 = tid; m < seq; m += WORKGROUP_SIZE) {
         var s: f32 = 0.0;
