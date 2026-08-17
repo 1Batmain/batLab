@@ -1,4 +1,4 @@
-//! File purpose: Implements ui behavior for the terminal user interface flow.
+//! ratatui rendering for every TUI screen and the breadcrumb.
 
 use super::app::{
     App, DUPLICATE_CONTENT_CHOICES, INFERENCE_PARAM_FIELD_NAMES, INPUT_SIZE_FIELD_NAMES,
@@ -14,19 +14,13 @@ use ratatui::{prelude::*, widgets::*};
 pub fn draw(f: &mut Frame, app: &App) {
     let full = f.area();
 
-    // Most screens are a popup over nothing, so the cells they do not touch
-    // keep whatever the *previous* screen left there. That is invisible while a
-    // screen redraws itself — consecutive frames are identical — and glaring
-    // the moment the flow moves from a full-screen one to a popup one: coming
-    // back from the monitor, half the architecture panel and the analytics
-    // table stayed behind the weight selector, interleaved with it. Clearing
-    // the frame first is one line, and ratatui still diffs before writing, so
-    // it costs nothing on a still screen.
+    // A popup screen leaves untouched cells showing the PREVIOUS screen — glaring
+    // when a full-screen screen gives way to a popup (the monitor's panels stayed
+    // behind the weight selector). Clearing first is one line; ratatui still diffs.
     f.render_widget(Clear, full);
 
-    // The breadcrumb takes the last row of the terminal, and the screen gets
-    // what is left — reserved rather than drawn over, because the monitor uses
-    // its full area right down to the bottom border.
+    // The breadcrumb reserves the last row (not drawn over — the monitor uses its
+    // full area to the bottom border); the screen gets the rest.
     let (body, trail) = match app.screen.path_step() {
         Some(_) if full.height > 1 => {
             let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(full);
@@ -73,13 +67,9 @@ pub fn draw(f: &mut Frame, app: &App) {
 const BREADCRUMB_FULL_WIDTH: u16 = 72;
 const BREADCRUMB_MIN_WIDTH: u16 = 30;
 
-/// The flow drawn as the path it is: `Model › Action › Weights › Parameters ›
-/// Run`, current step lit, steps already walked kept legible, steps ahead
-/// dimmed.
-///
-/// It answers the question the screens themselves never did — *where am I, and
-/// how did I get here* — which is why it is drawn on every step and on none of
-/// the detours.
+/// The flow as a path: `Model › Action › Weights › Parameters › Run`, current step
+/// lit, steps ahead dimmed. Answers "where am I, how did I get here" — drawn on
+/// every step, none of the detours.
 fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
     let Some(current) = app.screen.path_step() else {
         return;
@@ -163,12 +153,9 @@ fn split_for_help(area: Rect, has_help: bool) -> (Rect, Option<Rect>) {
     (columns[0], Some(columns[1]))
 }
 
-/// The panel's frame, and where its text goes. Shared by the two things that
-/// claim that column — a parameter's explanation, and the selected model's
-/// architecture — so they cannot drift apart into two panels that merely look
-/// alike.
-///
-/// Returns the rectangle the caller may write into, already inset.
+/// The panel's frame and inset text rectangle. Shared by the two things that claim
+/// that column (a parameter's help, the model's architecture) so they cannot drift
+/// into two panels that only look alike.
 fn open_side_panel(f: &mut Frame, title: &str, area: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -246,13 +233,9 @@ fn clip(text: &str, width: usize) -> String {
     text.chars().take(keep).chain(['…']).collect()
 }
 
-/// The selected model's architecture, laid out for a column `width` wide and
-/// `height` rows tall.
-///
-/// The stack is the part that does not fit: a 28-layer model against a 20-row
-/// panel. Rather than scroll something the user cannot scroll, the middle is
-/// elided and *says* how many rows it swallowed — a silently truncated stack
-/// reads as a shorter network.
+/// The selected model's architecture for a `width`×`height` column. A stack too
+/// tall for the panel is elided in the MIDDLE and says how many rows it swallowed —
+/// a silently truncated stack reads as a shorter network.
 fn architecture_lines(
     entry: &crate::storage::SavedModelEntry,
     width: usize,
@@ -487,10 +470,8 @@ fn selected_style(selected: bool) -> Style {
     }
 }
 
-/// How a model's checkpoints are summarised in the list. The count first,
-/// because "does this model have trained weights at all" is the question; the
-/// date of the newest right after it, because "is this thing fresh, or did I
-/// last train it in June?" is the next one — and the names last.
+/// A model's checkpoints summarised for the list: count first ("has it trained
+/// weights?"), then the newest's date ("is it fresh?"), then the names.
 ///
 /// The list is newest-first, so the date is `checkpoints[0]`'s.
 fn checkpoint_summary(checkpoints: &[storage::CheckpointEntry]) -> String {
@@ -603,16 +584,10 @@ fn draw_model_list(f: &mut Frame, app: &App, area: Rect) {
 // Screen: Model Actions — what to do with the model that was just picked
 // ---------------------------------------------------------------------------
 
-/// What this model costs on the GPU.
-///
-/// Full width rather than a popup: the page is a table of figures, and the
-/// figures are the point — squeezing them into a 56-column dialog would elide
-/// exactly the numbers someone opened it for.
-///
-/// The body is the *same* text the CLI prints (`batlab_core::report_lines`, fed
-/// the terminal's own width), so a screenshot of this page and the output of
-/// `--resources` cannot disagree. Only the header and the key line are drawn
-/// here, because only they are about being a TUI.
+/// What this model costs on the GPU. Full width, not a popup: the figures are the
+/// point. The body is the SAME text the CLI prints (`batlab_core::report_lines`),
+/// so a screenshot and `--resources` cannot disagree; only the header and key line
+/// are drawn here.
 fn draw_resources(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1038,12 +1013,8 @@ fn draw_template_selector(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// One row of the weight selector: the file name, then when it was written and
-/// how big it is.
-///
-/// The names are padded to a common width so the dates line up as a column —
-/// scanning down for "yesterday evening" is the whole reason the date is here,
-/// and a ragged right edge makes that scan a reading exercise.
+/// One row of the weight selector: file name, then when it was written and its
+/// size. Names padded to a common width so the dates align into a scannable column.
 fn checkpoint_row(
     checkpoint: &storage::CheckpointEntry,
     selected: bool,
@@ -1058,8 +1029,7 @@ fn checkpoint_row(
 }
 
 fn draw_weight_selector(f: &mut Frame, app: &App, area: Rect) {
-    // The weight choice is a parameter like any other now that it has a
-    // default, so it gets the same panel as the forms.
+    // The weight choice has a default now, so it gets the forms' help panel.
     let entry = help::help_for(Screen::WeightSelector, app.weight_selector.selected);
     let (area, help_area) = split_for_help(area, entry.is_some());
     if let (Some(entry), Some(help_area)) = (entry, help_area) {
@@ -1384,12 +1354,9 @@ fn draw_lb_form(f: &mut Frame, app: &App, area: Rect) {
 // Screen: Training Params
 // ---------------------------------------------------------------------------
 
-/// How the random-weights toggle reads.
-///
-/// Three states, not two: "No" (continuing from a checkpoint), "Yes" (the
-/// deliberate opt-out), and "Yes — no checkpoint found", which is the *forced*
-/// case. Collapsing the third into the second would show a checkbox the user
-/// cannot uncheck, with nothing on screen to say why.
+/// How the random-weights toggle reads. Three states, not two: "No" (continuing),
+/// "Yes" (deliberate opt-out), and "Yes — no checkpoint found" (forced) — collapsing
+/// the third would show a checkbox the user cannot uncheck with no reason why.
 fn random_weights_value(app: &App) -> String {
     if !app.has_pretrained_weights() {
         return "Yes — no checkpoint found".to_string();
@@ -1569,12 +1536,9 @@ fn draw_dataset_selector(f: &mut Frame, app: &App, area: Rect) {
 // Screen: Seed Dataset Selector
 // ---------------------------------------------------------------------------
 
-/// The dataset a perpetual drift sets out from.
-///
-/// Every row carries its geometry, and a row whose channels do not match the
-/// model's output is marked as refused *before* it is chosen — the point of a
-/// chooser over a typed path. The first row hands the decision back to the
-/// channel convention, and says which file that convention will pick.
+/// The dataset a perpetual drift sets out from. Every row shows its geometry, and
+/// a channel mismatch is marked refused BEFORE it is chosen (the point of a chooser
+/// over a typed path); the first row hands back to the convention and names its file.
 fn draw_seed_dataset_selector(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(72, 70, area);
     f.render_widget(Clear, popup);
@@ -1763,8 +1727,7 @@ fn perpetual_hint(app: &App) -> String {
     const KEYS: &str = "[↑↓] niveau  [←→] tempo  [espace] pause  [r] re-seed  \
                         [m] regime  [x] vue  [s] PNG  [v] visualise  [q] quit";
 
-    // The last PNG write (or failure) is worth a word, but must not cost the
-    // user the key list — it rides as a prefix instead of replacing the line.
+    // The last PNG write/failure rides as a prefix, not replacing the key list.
     let notice = app
         .monitor
         .error
@@ -2354,12 +2317,9 @@ mod tests {
         entry_with(template.layers, template.input_size)
     }
 
-    /// The panel lives in a fixed 46-column gutter, and the layer descriptions
-    /// it prints are not bounded by anything: a `Concat(enc1) 32x32x64 +
-    /// 32x32x32 -> 32x32x96 [save:d2]` is 55 characters. Ratatui does not wrap
-    /// a plain `Paragraph`, so an over-long line is silently cut at the border —
-    /// but a line cut by the *renderer* loses its right edge without a mark,
-    /// where one cut here ends in `…` and says so.
+    /// The panel is a fixed gutter and layer descriptions can exceed it (a `Concat`
+    /// line runs 55 chars). Ratatui does not wrap a `Paragraph`, so an over-long
+    /// line is cut at the border WITHOUT a mark — a line cut here ends in `…`.
     #[test]
     fn no_line_of_the_panel_is_wider_than_the_column_it_lives_in() {
         let entry = template_entry();
