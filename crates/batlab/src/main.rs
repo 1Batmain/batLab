@@ -2787,11 +2787,24 @@ async fn build_execution_model(
     ema: Option<EmaConfig>,
 ) -> Result<(Arc<GpuContext>, Model<Training>), String> {
     let gpu = Arc::new(GpuContext::new_headless().await);
+    // The loss the run is configured with — cabled through, not hardcoded. A
+    // training run always reaches here with run.mode = Train(the very
+    // TrainingConfig being executed): the headless path sets it just before
+    // run_training, and the TUI path destructures train_cfg out of it. So this
+    // reads exactly train_cfg.loss, alongside the lr/batch/optimizer that
+    // already flow in — and the day LossMethod grows a second variant, a
+    // config_file that names it will no longer be silently ignored. An inference
+    // build (run.mode Infer/Perpetual) computes no loss; MeanSquared is the
+    // dormant default it was always built with.
+    let loss = match &config.run.mode {
+        RunMode::Train(train) => train.loss.clone().into(),
+        RunMode::Infer | RunMode::Perpetual(_) => PLoss::MeanSquared,
+    };
     let mut model = Model::new_training_with_optimizer(
         gpu.clone(),
         lr,
         batch_size,
-        PLoss::MeanSquared,
+        loss,
         optimizer,
     )
     .await;
