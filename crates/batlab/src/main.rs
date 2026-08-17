@@ -1068,9 +1068,13 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1)
         .max(1);
-    let magnitude = flag("--magnitude")
-        .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(1.0);
+    let magnitude_flag = flag("--magnitude").and_then(|v| v.parse::<f32>().ok());
+    // Kept at 1.0 by default on purpose: this is the DEV/CI path, and benches
+    // under `bench/` pin that default. Unlike the interactive infer and the web
+    // (which read `config.inference.denoise_magnitude`), this path does not — so
+    // the banner below *names its source*, and flags when the config would have
+    // said something else, rather than being a silent third way of resolving it.
+    let magnitude = magnitude_flag.unwrap_or(1.0);
     // Generating uses the average when the checkpoint carries one, because
     // that is the set the average exists to be sampled from. `--raw-weights`
     // asks for the last iterate instead — the other arm of the comparison.
@@ -1087,6 +1091,20 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
         Some(spec) => PosteriorVariance::from_cli(&spec)
             .ok_or_else(|| format!("--variance must be 'beta' or 'posterior', got '{spec}'"))?,
         None => config.inference.posterior_variance,
+    };
+
+    // Where the magnitude in force actually came from — named on the banner so
+    // this path is not a silent third resolver (cf. the GPU-profile and seed
+    // lines, which already announce their source).
+    let magnitude_source = if magnitude_flag.is_some() {
+        "--magnitude".to_string()
+    } else if (config.inference.denoise_magnitude - magnitude).abs() > f32::EPSILON {
+        format!(
+            "défaut DEV/CI (config.inference.denoise_magnitude={} n'est PAS lu sur ce chemin)",
+            config.inference.denoise_magnitude
+        )
+    } else {
+        "défaut DEV/CI".to_string()
     };
 
     let out_path = flag("--out").unwrap_or_else(|| {
@@ -1164,8 +1182,8 @@ fn run_headless_sample(args: &[String]) -> Result<(), String> {
 
         let img_stats = Stats::of(&image);
         println!(
-            "headless sample '{model_name}': seed={seed} paths={paths} magnitude={magnitude} \
-             variance={}\n\
+            "headless sample '{model_name}': seed={seed} paths={paths} \
+             magnitude={magnitude} (source: {magnitude_source}) variance={}\n\
              image → {out_path}\nmetrics → {log_path}\n\
              final image stats: min={:.4} max={:.4} mean={:.4} std={:.4}",
             variance.as_str(), img_stats.min, img_stats.max, img_stats.mean, img_stats.std
