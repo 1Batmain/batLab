@@ -1,10 +1,8 @@
-//! File purpose: Serialisable description of a model and of the run to perform with it — the schema behind every `Models/<name>/config_file`.
-//!
-//! This is the contract between whoever *describes* a model (the TUI builder, a
-//! generator script, tomorrow a web page) and the engine that *builds* it. It is
-//! therefore pure data: serde in, serde out, no filesystem, no terminal. The
-//! bytes-in/bytes-out entry points below are what a wasm build will use, where
-//! the config arrives over the network rather than from `Models/`.
+//! Serialisable model + run description — the schema behind every
+//! `Models/<name>/config_file`, and the contract between whoever describes a model
+//! (the TUI, a script, tomorrow a web page) and the engine that builds it. Pure
+//! data: serde in/out, no filesystem, no terminal. The bytes-in/bytes-out entry
+//! points are what a wasm build uses, where the config arrives over the network.
 
 use crate::model::training::{LossWeighting, PerpetualRegime, PosteriorVariance};
 use crate::model::{OptimizerKind, WeightInit};
@@ -40,13 +38,9 @@ impl PaddingMode {
     }
 }
 
-/// The engine's own padding enum, from the config's mirror of it.
-///
-/// The two enums exist because the config is serialisable and the engine's is
-/// not, but the translation between them was written out by hand in the CLI and
-/// nowhere else — so anything else that wanted to turn a `config_file` into a
-/// graph (the resource inventory does) had to write it a second time. One
-/// conversion, in the crate that owns both types.
+/// The engine's padding enum from the config's serialisable mirror — one
+/// conversion in the crate that owns both types, so anything turning a
+/// `config_file` into a graph (the inventory does) does not rewrite it.
 impl From<&PaddingMode> for crate::model::types::PaddingMode {
     fn from(mode: &PaddingMode) -> Self {
         match mode {
@@ -107,13 +101,10 @@ pub enum LossMethod {
     MeanSquared,
 }
 
-/// The engine's loss type is a separate enum — the config layer must not depend
-/// on `model` internals — so this is the one conversion between them, in the
-/// crate that owns both, the missing twin of the `PaddingMode`/`ActivationMethod`
-/// conversions above. Its exhaustiveness is the guard: add a variant to both and
-/// the compiler forces the mapping here, so a configured loss can never again be
-/// silently dropped on the way to the trainer (it used to be — the field was
-/// serialised, round-tripped, and never read).
+/// The one conversion to the engine's loss enum (twin of `PaddingMode`/
+/// `ActivationMethod` above). Its exhaustiveness is the guard: a configured loss
+/// can no longer be silently dropped on the way to the trainer (it used to be —
+/// serialised, round-tripped, never read).
 impl From<LossMethod> for crate::model::layer_types::LossMethod {
     fn from(method: LossMethod) -> Self {
         match method {
@@ -541,15 +532,10 @@ pub struct ArchitectureRow {
 
 /// A model's architecture, computed from its `config_file` alone.
 ///
-/// No GPU, no checkpoint, no filesystem: everything here comes out of the
-/// layer list the config already carries, which is what makes it affordable to
-/// compute for every model in the list on every keystroke.
-///
-/// The receptive field follows the same recurrence as
-/// `tools/receptive_field.py`, and for the same reason: a diffusion model whose
-/// output pixel cannot see the whole image cannot choose a *global* content,
-/// and drifts towards the dataset mean. `Concat` is skipped by both — it
-/// re-injects a skip whose field is smaller, so the main path stays the bound.
+/// Everything here comes from the layer list alone (no GPU, checkpoint or fs), so
+/// it is affordable per keystroke for every model. The receptive field follows
+/// `tools/receptive_field.py`'s recurrence (a model whose output pixel cannot see
+/// the whole image drifts to the dataset mean); `Concat` is skipped by both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArchitectureSummary {
     pub rows: Vec<ArchitectureRow>,
@@ -567,9 +553,7 @@ pub struct ArchitectureSummary {
 }
 
 impl ArchitectureSummary {
-    /// Whether one output pixel can see the whole input image.
-    ///
-    /// `None` when there is no receptive field to speak of.
+    /// Whether one output pixel can see the whole input image (`None` if no field).
     pub fn covers_the_image(&self) -> Option<bool> {
         self.receptive_field
             .map(|field| field >= self.input_edge as f32)
@@ -577,12 +561,9 @@ impl ArchitectureSummary {
 }
 
 impl LayerDraft {
-    /// Trainable scalars this layer owns, weights and biases together.
-    ///
-    /// Mirrors the buffer sizes the layer types allocate: a convolution's
-    /// `kernel_bytes` plus one bias per kernel, GroupNorm's `gamma`/`beta`,
-    /// attention's four packed `C×C` projections plus their four bias vectors.
-    /// `Activation` and `Concat` own nothing.
+    /// Trainable scalars this layer owns, mirroring the buffer sizes the layer
+    /// types allocate (conv kernels + a bias each, GroupNorm's gamma/beta,
+    /// attention's four C×C projections + biases). `Activation`/`Concat` own nothing.
     pub fn parameter_count(&self) -> u64 {
         let product = |(x, y, z): (u32, u32, u32)| x as u64 * y as u64 * z as u64;
         match self {
@@ -939,15 +920,12 @@ impl UNetDraft {
     }
 }
 
-/// The 12-layer diffusion U-Net both templates share, given its channel budget.
-///
-/// `time_channels` is the whole point of the split: a diffusion model **must**
-/// be conditioned on the timestep, which it is by carrying more input channels
-/// than it emits — the excess receives the time embedding. With
-/// `time_channels = 0` the input and output depths match, ε̂ degenerates and
-/// sampling saturates to white. That is not hypothetical: it is the geometry
-/// the repository keeps as `Models/Greyscale_Diffusion_broken`, and it is what
-/// both templates shipped until a blind test read their config off disk.
+/// The 12-layer diffusion U-Net both templates share. `time_channels` is the
+/// point of the split: a diffusion model MUST be conditioned on t, by carrying
+/// more input channels than it emits (the excess takes the time embedding). With
+/// `time_channels = 0` the depths match, ε̂ degenerates and sampling saturates to
+/// white — the geometry kept as `Models/Greyscale_Diffusion_broken`, which both
+/// templates shipped until a blind test read their config off disk.
 fn diffusion_unet(signal_channels: u32, time_channels: u32) -> ((u32, u32, u32), Vec<LayerDraft>) {
     let input = (32, 32, signal_channels + time_channels);
     let mut net = UNetDraft::new(input);
@@ -1053,9 +1031,8 @@ pub struct InferenceConfig {
     pub denoising_paths: usize,
     #[serde(default = "InferenceConfig::default_denoise_magnitude")]
     pub denoise_magnitude: f32,
-    /// Which reverse-step variance the posterior draw injects. Absent — as in
-    /// every config written before this option — means [`PosteriorVariance::Beta`],
-    /// DDPM's larger variance and the historical draw, so older files sample
+    /// Which reverse-step variance the posterior draw injects. Absent (old configs)
+    /// = [`PosteriorVariance::Beta`], the historical draw, so older files sample
     /// bit-for-bit as before.
     #[serde(default)]
     pub posterior_variance: PosteriorVariance,
@@ -1217,22 +1194,13 @@ pub struct ModelConfig {
     pub layers: Vec<LayerDraft>,
     #[serde(default)]
     pub inference: InferenceConfig,
-    /// The dataset this model's images come from — what a perpetual drift sets
-    /// out from, and the one thing a specialised model must not have to be told
-    /// twice. A path, absolute or relative to the project root.
-    ///
-    /// **Top-level, not inside [`PerpetualConfig`].** It belongs to the *model*
-    /// — "what do this model's pictures look like" — not to one run of it, and
-    /// `run.mode` only ever holds the last run: parked under
-    /// `RunMode::Perpetual`, a single training run would erase it, and the next
-    /// drift would set out from CIFAR again. Same reason [`InferenceConfig`] is
-    /// a section of its own rather than a payload of `RunMode::Infer`.
-    ///
-    /// `None` falls back on the model's **output channels** (grey →
-    /// `cifar10_grey.batraw`, colour → `cifar10_rgb.batraw`); a run whose
-    /// dataset cannot be found falls back on pure noise at the top of the
-    /// schedule and says so. Read on every path that starts a drift — the
-    /// ranking flag > this > convention is resolved in exactly one function.
+    /// The dataset this model's images come from — what a drift sets out from. A
+    /// path, absolute or relative to project root. TOP-LEVEL, not inside
+    /// [`PerpetualConfig`]: it belongs to the MODEL, and `run.mode` holds only the
+    /// last run, so parked under `RunMode::Perpetual` a training run would erase it
+    /// (same reason [`InferenceConfig`] is its own section). `None` falls back on
+    /// output channels (grey/colour → the matching CIFAR); the ranking
+    /// flag > this > convention is resolved in exactly one function.
     #[serde(default)]
     pub seed_dataset: Option<String>,
     pub run: RunConfig,
@@ -1252,17 +1220,14 @@ impl ModelConfig {
 
 
 impl ModelConfig {
-    /// Parse a `config_file` from its bytes.
-    ///
-    /// The engine never opens the file itself: the CLI hands it `fs::read(...)`,
-    /// a browser would hand it a `fetch` response body. Keeping the filesystem
-    /// out of this path is what makes the inference chain portable to wasm.
+    /// Parse a `config_file` from its bytes. The engine never opens the file (the
+    /// CLI hands it `fs::read`, a browser a `fetch` body) — keeping fs out of this
+    /// path is what makes the inference chain wasm-portable.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
     }
 
-    /// Serialise back to the on-disk `config_file` form (pretty-printed, as the
-    /// TUI has always written it).
+    /// Serialise back to the on-disk `config_file` form (pretty-printed).
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec_pretty(self)
     }
@@ -1272,11 +1237,8 @@ impl ModelConfig {
 mod tests {
     use super::*;
 
-    /// A config written before the variance option existed carries no
-    /// `posterior_variance` field, and it must deserialise to `Beta` — the
-    /// historical draw — so opening and sampling an old model changes nothing.
-    /// Same guarantee the optimizer/weighting fields already hold for their
-    /// pre-existing files.
+    /// A config predating the variance option must deserialise to `Beta` (the
+    /// historical draw), so opening an old model changes nothing.
     #[test]
     fn a_config_without_a_variance_field_deserialises_to_beta() {
         let json = r#"{
@@ -1298,15 +1260,10 @@ mod tests {
         assert_eq!(back.posterior_variance, PosteriorVariance::Posterior);
     }
 
-    /// A diffusion model must be conditionable on the timestep: it has to carry
-    /// more input channels than it emits, the excess receiving the time
-    /// embedding. Without it ε̂ degenerates and sampling saturates to white.
-    ///
-    /// Both built-in templates violated this — 1→1 and 3→3 — which is exactly
-    /// the geometry the repository preserves as
-    /// `Models/Greyscale_Diffusion_broken`. Found by a blind test reading the
-    /// config the "New model (from template)" flow writes to disk, not by
-    /// reading this file.
+    /// A diffusion model must be conditionable on t (more input channels than it
+    /// emits; else ε̂ degenerates to white). Both templates violated this (1→1 and
+    /// 3→3, the `Models/Greyscale_Diffusion_broken` geometry) until a blind test
+    /// read the config the template flow writes to disk.
     #[test]
     fn every_template_is_conditionable_on_the_timestep() {
         for template in built_in_templates() {
@@ -1328,10 +1285,9 @@ mod tests {
         }
     }
 
-    /// The kernel depth of every convolution must equal the channel count
-    /// reaching it. `Convolution` rejects a mismatch at build time, but
-    /// `UpsampleConv` does not — it indexes its weights with `dim_input.z` and
-    /// corrupts silently. This is why the templates derive their dims.
+    /// Every kernel depth must equal the channels reaching it. `Convolution`
+    /// rejects a mismatch at build; `UpsampleConv` corrupts silently — why the
+    /// templates derive their dims.
     #[test]
     fn every_template_kernel_is_as_deep_as_its_input() {
         for template in built_in_templates() {
