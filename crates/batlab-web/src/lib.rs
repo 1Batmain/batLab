@@ -50,22 +50,18 @@ const STEPS: usize = batlab_core::DIFFUSION_SCHEDULE_STEPS;
 const BETA_START: f32 = batlab_core::DIFFUSION_BETA_START;
 const BETA_END: f32 = batlab_core::DIFFUSION_BETA_END;
 
-/// The denoise magnitude for both modes.
-///
-/// `1.2`, not `1.0`: the `docs/reports/SAMPLING_SWEEP.md` campaign measured the
-/// page's generation as *under* the dataset on every statistic (a deficit of
-/// detail, not an excess of noise), and raising the magnitude fills it. `1.2`
-/// lands `grad_energy` on the dataset target without tipping into noise (`1.5`
-/// overshoots); it is the closest config to the real elephants (distance 0.098
-/// vs 0.253 for the old `1.0`, on the full stats vector).
-const DENOISE_MAGNITUDE: f32 = 1.2;
-
-/// The reverse-step variance the browser sampler injects. The single formula
-/// behind both spellings lives in [`batlab_core::PosteriorVariance`], so the page
-/// cannot drift from the native sampler. `Beta` — DDPM's larger variance — wins:
-/// `Posterior` is smaller and only smooths further, the wrong way for a model that
-/// is already too smooth (SAMPLING_SWEEP.md §2).
-const POSTERIOR_VARIANCE: PosteriorVariance = PosteriorVariance::Beta;
+// The denoise magnitude and reverse-step variance for both modes are NOT
+// constants here — they are read from the model's own `config_file`
+// (`config.inference.denoise_magnitude` / `.posterior_variance`), the same file
+// the page already fetches, so the page's sampling choice has a single home and
+// the page cannot state a value the model's config contradicts.
+//
+// For `Elephants_XL`, that config carries `1.2` / `beta` — the `SAMPLING_SWEEP.md`
+// result (the page generated *under* the dataset on every statistic; `1.2` lands
+// `grad_energy` on target where `1.0` fell short and `1.5` overshot; `Beta`,
+// DDPM's larger variance, over `Posterior` which only smooths a model already too
+// smooth). The values are the campaign's; their source is now the config, not a
+// literal the config could silently disagree with.
 
 /// A private multiplier the page spreads its per-run seed counter with — its own
 /// RNG, not a cross-crate invariant. Once a run *has* a seed, the fold that ties
@@ -211,6 +207,11 @@ struct Engine {
 
     mode: Mode,
 
+    /// The sampling choice, read once from `config.inference` — the same value
+    /// the native sampler uses for this model, not a literal baked into wasm.
+    magnitude: f32,
+    variance: PosteriorVariance,
+
     // Inference run state.
     inf_latent: Vec<f32>,
     inf_step: usize,
@@ -260,7 +261,7 @@ impl Engine {
         let seed = self.next_seed();
         let image = self.seeds.image(self.image_index);
         self.drift = PerpetualDrift::from_image(STEPS, self.regime, self.depth, seed);
-        self.walk = DriftWalk::new(image, DENOISE_MAGNITUDE);
+        self.walk = DriftWalk::new(image, self.magnitude);
     }
 
     /// One inference frame: predict ε̂, take one reverse step, display x̂₀. When
@@ -287,8 +288,8 @@ impl Engine {
             &self.inf_latent,
             diffusion_step,
             self.inf_path_seed,
-            DENOISE_MAGNITUDE,
-            POSTERIOR_VARIANCE,
+            self.magnitude,
+            self.variance,
             true,
         )
         .await;
@@ -720,6 +721,14 @@ async fn build_engine(
     let schedule = LinearNoiseSchedule::new_linear(STEPS, BETA_START, BETA_END);
     let seeds = SeedImages::parse(&seeds)?;
 
+    // The sampling choice comes from the model's config, not a wasm literal.
+    let magnitude = config.inference.denoise_magnitude;
+    let variance = config.inference.posterior_variance;
+    log::info!(
+        "[batlab] sampling from config: magnitude={magnitude}, variance={:?}",
+        variance,
+    );
+
     let input_channels = config.input_size.2 as usize;
     let signal_channels = out_channels as usize;
     let output_len = (width * height * out_channels) as usize;
@@ -753,13 +762,15 @@ async fn build_engine(
         seeds,
         seed_counter,
         mode: Mode::Errance,
+        magnitude,
+        variance,
         inf_latent: Vec::new(),
         inf_step: 0,
         inf_path_seed: 0,
         inf_resolved: None,
         inf_noise_print: 0,
         drift: PerpetualDrift::from_image(STEPS, regime, depth, 1),
-        walk: DriftWalk::new(vec![0.0; output_len], DENOISE_MAGNITUDE),
+        walk: DriftWalk::new(vec![0.0; output_len], magnitude),
         depth,
         regime,
         image_index: 0,
