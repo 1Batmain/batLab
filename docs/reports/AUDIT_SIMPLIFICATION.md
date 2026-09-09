@@ -250,6 +250,67 @@ les deux chemins couverts) ; crate web toujours compilé en `wasm32-unknown-unkn
 `the_base_noise_fold_is_written_in_exactly_one_place` toujours vert (le `const BASE_NOISE_FOLD` et son
 détecteur ont voyagé ensemble).
 
+### T1 — pourquoi le sampler RESTE dans `training/` (et pas dans `model/inference.rs`)
+
+La consigne initiale demandait `model/inference.rs`, **hors** de `training/`. Le sampler a été
+laissé dans `model/training/sampler.rs` à dessein, et c'est le bon choix : `training/` **contient
+déjà tout le chemin d'inférence** — `drift.rs` (le pas-à-pas des tenseurs d'une dérive),
+`perpetual.rs` (l'itinéraire de la dérive sans fin), et `schedule.rs` (le pas inverse partagé).
+Sortir le seul `sampler.rs` l'aurait éparpillé sur deux dossiers : on chercherait la **boucle
+inverse** (`sample_diffusion`, `reverse_step`) dans `model/inference.rs` et la **dérive qui
+l'appelle** (`PerpetualDrift`, `DriftWalk`) dans `model/training/` — deux moitiés d'un même
+mécanisme séparées par un répertoire. Le regroupement local prime : le voisin qui lit
+`sample_diffusion` doit trouver `reverse_step_from_epsilon`, `drift.rs` et `schedule.rs` sous la
+main, ce qui est le cas ici. **Que celui qui lit « le chemin d'inférence vit dans `training/` » n'y
+voie pas un oubli : c'est délibéré, argumenté ici, et à ne pas « corriger » en déplaçant `sampler.rs`.**
+
+### T1 (bis) — le vrai défaut mis à nu : c'est le DOSSIER qui est mal nommé, pas le fichier
+
+Ce déménagement révèle un défaut d'un cran au-dessus. Le nom `metrics.rs` mentait sur le fichier ;
+mais `training/` ment sur le **dossier** : il porte la machinerie de diffusion **complète**,
+entraînement ET inférence, à parts quasi égales. Chiffré (lignes de code, hors tests) :
+
+| Rôle | Fichiers | Lignes |
+|---|---|---|
+| **Entraînement** | `dataset.rs`, `diffusion.rs`, `weighting.rs`, `mod.rs` (Trainer/TrainingTask), `shader/{dataset_decode,diffusion_prepare}.wgsl` | ~2630 |
+| **Inférence** | `sampler.rs`, `drift.rs`, `perpetual.rs` | ~2590 |
+| **Partagé (les deux)** | `schedule.rs` (bruitage avant ET pas inverse) | ~970 |
+| **Diagnostic / éval** | `metrics.rs`, `eval.rs` | ~820 |
+
+Presque 50/50 entraînement/inférence. Le CLAUDE.md doit d'ailleurs déjà se justifier
+(« l'entraînement y reste aussi, mais c'est l'inférence qui doit être découplée ») — signe que le
+nom du dossier force une note de bas de page. Un nom honnête serait **`model/diffusion/`** (la
+machinerie DDPM, dans les deux sens), `Trainer`/`TrainingTask` restant le sous-ensemble entraînement.
+
+**Ce n'est pas une décision qui nous appartient** — c'est un renommage d'architecture, à l'auteur.
+Posé chiffré, sans l'appliquer, voici son coût réel :
+
+- **Déclaration** : 1 ligne (`pub mod training;` → `pub mod diffusion;`, `model/mod.rs:12`) + le
+  `git mv` du dossier.
+- **API publique** : `lib.rs:60` fait `pub use model::training;` — le chemin public
+  `batlab_core::training` (et `batlab_core::model::training`) **change**. Un seul appelant externe
+  l'emprunte aujourd'hui (`batlab-ui/src/tui/app.rs:8`,
+  `use batlab_core::model::training::{…}`) ; les réexports **à plat** de `lib.rs:61`
+  (`batlab_core::LinearNoiseSchedule`, etc.) sont, eux, **insensibles** au nom du dossier — c'est ce
+  qui limite le rayon de souffle. Option de transition sans casse : garder `pub use model::diffusion
+  as training;` un temps.
+- **Chemins internes** : ~25 lignes de code citent le module par son chemin, réparties sur ~10
+  fichiers, et sous **deux orthographes** qu'un renommage doit toutes deux attraper —
+  `crate::model::training::…` (config.rs, model.rs, audit_tests.rs, resources/mod.rs, et les frères
+  `sampler.rs`/`metrics.rs`/`eval.rs`) et la forme courte `crate::training::…` héritée du réexport
+  crate-root (diffusion.rs, drift.rs, weighting.rs, resources/{mod,tests}.rs, audit_tests.rs).
+  Qu'il y ait **deux** orthographes en usage est déjà un petit indice que le nom est porteur.
+- **Rapports** : 21 lignes dans ~10 rapports de `docs/reports/` citent `training/<fichier>.rs`. Par
+  la politique du dépôt, les rapports sont des **archives** (leur texte cite les anciens chemins et
+  n'est pas réécrit — cf. `INDEX.md`) : ne pas les toucher, ajouter une seule ligne de
+  correspondance `training/ → diffusion/` à la table de `INDEX.md`.
+- **Doc-comments** : une poignée de citations de chemin en commentaire (`drift.rs:30`,
+  `config.rs:1074`, `resources/mod.rs:69`) rouilleraient sans mise à jour — cosmétique.
+
+Coût total honnête : mécanique, ~une trentaine d'éditions de code sur ~11 fichiers, un seul point de
+contact d'API externe, zéro changement de comportement — mais c'est un **choix de nom**, donc à
+arbitrer par l'auteur, pas un nettoyage à faire en passant.
+
 ## T2. La version de checkpoint est un tuple `(bool, bool, bool)` aux combinaisons impossibles
 
 `model.rs:1175-1186` décode le magic en

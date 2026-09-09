@@ -1,4 +1,11 @@
-//! File purpose: Module entry point for training; wires submodules and shared exports.
+//! File purpose: entry point for the whole diffusion machinery — training
+//! (`dataset`, `diffusion`, `weighting`, `Trainer`/`TrainingTask`) AND inference
+//! (`sampler`, `drift`, `perpetual`), over a shared `schedule` and the `metrics`
+//! instrumentation. The folder is named `training/` for history only; the
+//! inference path lives here too, and by design — see
+//! `docs/reports/AUDIT_SIMPLIFICATION.md` §T1 for why the sampler stays here and
+//! why the *directory* (not this or that file) is the misnomer. Wires submodules
+//! and shared exports.
 
 pub mod dataset;
 pub mod diffusion;
