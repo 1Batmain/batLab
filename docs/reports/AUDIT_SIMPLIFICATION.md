@@ -185,6 +185,132 @@ reverse/sample, et laisser `metrics.rs` aux métriques. Déplacement + réexport
 `lib.rs`/`mod.rs` : aucun changement de comportement. Cosmétique mais à haute valeur de
 lisibilité.
 
+### T1 — fait
+
+Scindé en `model/training/sampler.rs`, en **deux commits**.
+
+**Ce qui a déménagé dans `sampler.rs`** (le chemin d'inférence) : `compose_diffusion_input`,
+`DenoiseFrame`, la dérivation des graines (`STEP_SEED_GAMMA` privé, `reverse_step_seed`,
+`BASE_NOISE_FOLD`/`base_noise_seed`, `path_seed`), `ReverseStep`, `predict_epsilon`,
+`reverse_step_from_epsilon`, `reverse_step_async`, `reverse_step`, `sample_diffusion`, et les
+cinq tests qui les tiennent (dont `the_base_noise_fold_is_written_in_exactly_one_place` et
+`the_canonical_seed_folds_match_the_old_literals`).
+
+**Ce qui reste dans `metrics.rs`** (ce qui mesure) : `Stats`, `MetricsLogger`, `ProbeConfig`,
+`BucketStat`, `probe_diffusion`, `log_probe`, `log_train_loss`, `log_trajectory`,
+`DenoiseStepStat`, et les tests `stats_*`.
+
+**Les deux cas limites, tranchés.**
+
+- `DenoiseFrame` → **sampler**. C'est le paramètre du callback observateur dans la signature
+  de `sample_diffusion` (`observer: Option<&mut dyn FnMut(&DenoiseFrame)>`) et la couture
+  sampler↔visualiseur (`live_frame`). Il porte des tenseurs *empruntés* (`latent`, `x0_hat`),
+  pas des statistiques : c'est un contrat du sampler, pas une métrique. Le laisser dans
+  `metrics` ferait dépendre la signature du sampler d'un type d'instrumentation.
+- `DenoiseStepStat` → **metrics**. C'est un *résumé statistique* par pas (trois champs `Stats`),
+  produit dans l'unique but d'être remis à `log_trajectory` qui l'écrit en JSONL. Un enregistrement
+  de métrique dans chacun de ses champs. `sample_diffusion` le *remplit* comme un out-param
+  optionnel (`trajectory`) — exactement comme il ne remplit rien quand on ne le lui demande pas ;
+  il reste donc avec la métrique qu'il alimente, et `sampler.rs` l'importe.
+- `compose_diffusion_input` → **sampler**, comme le veut la mission : elle compose l'entrée
+  `[signal | timestep]` du modèle, cœur de l'appel réseau. Appelants vérifiés avant de trancher :
+  `predict_epsilon`/`reverse_step_async` (sampler), `probe_diffusion` (metrics), `eval.rs`
+  (eval d'entraînement), `batlab_web`. Utilisée des deux côtés, mais elle est de nature
+  *inférence* — c'est la primitive de composition du chemin d'appel du modèle.
+
+**Couplage résiduel assumé** : `sample_diffusion` calcule `Stats::of(...)` en ligne et bâtit un
+`DenoiseStepStat` quand une trajectoire est demandée, donc `sampler.rs` importe `Stats` et
+`DenoiseStepStat` de `metrics.rs` ; réciproquement `metrics.rs` (via `probe_diffusion`) importe
+`compose_diffusion_input` de `sampler.rs`. Les deux sont des modules frères d'un même crate, l'usage
+mutuel est légal et sans cycle de crate. `Stats` est une structure pure (aucun `fs`, aucun GPU),
+donc ce couplage ne blesse pas la portabilité wasm. Le supprimer (sortir le calcul de `Stats` de
+`sample_diffusion`) serait un **changement de logique**, hors du périmètre de ce déplacement pur.
+
+**Discipline des deux commits.**
+
+1. *Déplacement pur.* Le code quitte `metrics.rs` pour `sampler.rs` verbatim ; `metrics.rs`
+   re-exporte le tout (`pub use super::sampler::*`) et `mod sampler;` reste privé, si bien
+   qu'**aucun appelant ne change d'import** — `metrics::…`, les réexports `mod.rs`/`lib.rs` et
+   les paths internes (`drift.rs`, `eval.rs`) résolvent inchangés. Seule concession forcée par le
+   déplacement : l'import `PosteriorVariance` de `metrics.rs`, devenu mort (son seul usager est
+   parti), est retiré pour tenir le zéro-warning ; ce n'est pas de la logique.
+2. *Imports et documentation.* `mod.rs` passe à `pub mod sampler;` et scinde ses `pub use` entre
+   `metrics::{…}` et `sampler::{…}` selon le vrai foyer ; le pont `pub use super::sampler::*` est
+   retiré et remplacé par l'unique `use …sampler::compose_diffusion_input` dont `probe_diffusion` a
+   besoin ; `drift.rs` (`super::metrics::reverse_step_from_epsilon` → `super::sampler::…`, ×4) et
+   `eval.rs` (`…metrics::compose_diffusion_input` → `…sampler::…`) sont repointés. `lib.rs` est
+   **inchangé** : il source depuis `model::training::{…}`, niveau où les noms restent exposés à plat.
+   Ce présent rapport et le CLAUDE.md (section frontière) sont mis à jour.
+
+**Preuve d'innocuité** (aux deux commits) : `cargo build --workspace` sans warning (le seul warning
+`mut` du build de test préexiste dans `attention_tests.rs:811`, fichier non touché) ; `cargo test
+--workspace` vert (392) ; `git status` propre ; image `--headless-sample` identique au **SHA-256**
+avant/après sur `Greyscale_Diffusion_L` et `Stable_Diffusion` (PNG **et** JSONL de métriques, donc
+les deux chemins couverts) ; crate web toujours compilé en `wasm32-unknown-unknown` ;
+`the_base_noise_fold_is_written_in_exactly_one_place` toujours vert (le `const BASE_NOISE_FOLD` et son
+détecteur ont voyagé ensemble).
+
+### T1 — pourquoi le sampler RESTE dans `training/` (et pas dans `model/inference.rs`)
+
+La consigne initiale demandait `model/inference.rs`, **hors** de `training/`. Le sampler a été
+laissé dans `model/training/sampler.rs` à dessein, et c'est le bon choix : `training/` **contient
+déjà tout le chemin d'inférence** — `drift.rs` (le pas-à-pas des tenseurs d'une dérive),
+`perpetual.rs` (l'itinéraire de la dérive sans fin), et `schedule.rs` (le pas inverse partagé).
+Sortir le seul `sampler.rs` l'aurait éparpillé sur deux dossiers : on chercherait la **boucle
+inverse** (`sample_diffusion`, `reverse_step`) dans `model/inference.rs` et la **dérive qui
+l'appelle** (`PerpetualDrift`, `DriftWalk`) dans `model/training/` — deux moitiés d'un même
+mécanisme séparées par un répertoire. Le regroupement local prime : le voisin qui lit
+`sample_diffusion` doit trouver `reverse_step_from_epsilon`, `drift.rs` et `schedule.rs` sous la
+main, ce qui est le cas ici. **Que celui qui lit « le chemin d'inférence vit dans `training/` » n'y
+voie pas un oubli : c'est délibéré, argumenté ici, et à ne pas « corriger » en déplaçant `sampler.rs`.**
+
+### T1 (bis) — le vrai défaut mis à nu : c'est le DOSSIER qui est mal nommé, pas le fichier
+
+Ce déménagement révèle un défaut d'un cran au-dessus. Le nom `metrics.rs` mentait sur le fichier ;
+mais `training/` ment sur le **dossier** : il porte la machinerie de diffusion **complète**,
+entraînement ET inférence, à parts quasi égales. Chiffré (lignes de code, hors tests) :
+
+| Rôle | Fichiers | Lignes |
+|---|---|---|
+| **Entraînement** | `dataset.rs`, `diffusion.rs`, `weighting.rs`, `mod.rs` (Trainer/TrainingTask), `shader/{dataset_decode,diffusion_prepare}.wgsl` | ~2630 |
+| **Inférence** | `sampler.rs`, `drift.rs`, `perpetual.rs` | ~2590 |
+| **Partagé (les deux)** | `schedule.rs` (bruitage avant ET pas inverse) | ~970 |
+| **Diagnostic / éval** | `metrics.rs`, `eval.rs` | ~820 |
+
+Presque 50/50 entraînement/inférence. Le CLAUDE.md doit d'ailleurs déjà se justifier
+(« l'entraînement y reste aussi, mais c'est l'inférence qui doit être découplée ») — signe que le
+nom du dossier force une note de bas de page. Un nom honnête serait **`model/diffusion/`** (la
+machinerie DDPM, dans les deux sens), `Trainer`/`TrainingTask` restant le sous-ensemble entraînement.
+
+**Ce n'est pas une décision qui nous appartient** — c'est un renommage d'architecture, à l'auteur.
+Posé chiffré, sans l'appliquer, voici son coût réel :
+
+- **Déclaration** : 1 ligne (`pub mod training;` → `pub mod diffusion;`, `model/mod.rs:12`) + le
+  `git mv` du dossier.
+- **API publique** : `lib.rs:60` fait `pub use model::training;` — le chemin public
+  `batlab_core::training` (et `batlab_core::model::training`) **change**. Un seul appelant externe
+  l'emprunte aujourd'hui (`batlab-ui/src/tui/app.rs:8`,
+  `use batlab_core::model::training::{…}`) ; les réexports **à plat** de `lib.rs:61`
+  (`batlab_core::LinearNoiseSchedule`, etc.) sont, eux, **insensibles** au nom du dossier — c'est ce
+  qui limite le rayon de souffle. Option de transition sans casse : garder `pub use model::diffusion
+  as training;` un temps.
+- **Chemins internes** : ~25 lignes de code citent le module par son chemin, réparties sur ~10
+  fichiers, et sous **deux orthographes** qu'un renommage doit toutes deux attraper —
+  `crate::model::training::…` (config.rs, model.rs, audit_tests.rs, resources/mod.rs, et les frères
+  `sampler.rs`/`metrics.rs`/`eval.rs`) et la forme courte `crate::training::…` héritée du réexport
+  crate-root (diffusion.rs, drift.rs, weighting.rs, resources/{mod,tests}.rs, audit_tests.rs).
+  Qu'il y ait **deux** orthographes en usage est déjà un petit indice que le nom est porteur.
+- **Rapports** : 21 lignes dans ~10 rapports de `docs/reports/` citent `training/<fichier>.rs`. Par
+  la politique du dépôt, les rapports sont des **archives** (leur texte cite les anciens chemins et
+  n'est pas réécrit — cf. `INDEX.md`) : ne pas les toucher, ajouter une seule ligne de
+  correspondance `training/ → diffusion/` à la table de `INDEX.md`.
+- **Doc-comments** : une poignée de citations de chemin en commentaire (`drift.rs:30`,
+  `config.rs:1074`, `resources/mod.rs:69`) rouilleraient sans mise à jour — cosmétique.
+
+Coût total honnête : mécanique, ~une trentaine d'éditions de code sur ~11 fichiers, un seul point de
+contact d'API externe, zéro changement de comportement — mais c'est un **choix de nom**, donc à
+arbitrer par l'auteur, pas un nettoyage à faire en passant.
+
 ## T2. La version de checkpoint est un tuple `(bool, bool, bool)` aux combinaisons impossibles
 
 `model.rs:1175-1186` décode le magic en
@@ -360,8 +486,8 @@ Un commit par point, en commençant par les doublons de logique :
    *(preuve : rendu bit-à-bit, la config déployée porte déjà 1.2/beta.)*
 5. **T2, T3** — `enum CheckpointVersion`, `describe_weights`. *(preuve : formats et
    messages inchangés.)*
-6. **T1** — scinder `metrics.rs` (inférence ⇄ métriques). *(preuve : réexports, tests
-   verts.)*
+6. **T1** — ✅ fait — sampler sorti dans `model/training/sampler.rs`, `metrics.rs` aux
+   métriques (voir §T1 — fait). *(preuve : SHA-256 image identique, tests verts, wasm32 OK.)*
 7. **T4, T6** — flags dans `--help`, import inutilisé. *(trivial.)*
 8. **T5, C1, C2, C3, T7** — rangements et découpes, sur arbitrage, en dernier.
 

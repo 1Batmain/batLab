@@ -1,4 +1,11 @@
-//! File purpose: Module entry point for training; wires submodules and shared exports.
+//! File purpose: entry point for the whole diffusion machinery — training
+//! (`dataset`, `diffusion`, `weighting`, `Trainer`/`TrainingTask`) AND inference
+//! (`sampler`, `drift`, `perpetual`), over a shared `schedule` and the `metrics`
+//! instrumentation. The folder is named `training/` for history only; the
+//! inference path lives here too, and by design — see
+//! `docs/reports/AUDIT_SIMPLIFICATION.md` §T1 for why the sampler stays here and
+//! why the *directory* (not this or that file) is the misnomer. Wires submodules
+//! and shared exports.
 
 pub mod dataset;
 pub mod diffusion;
@@ -6,6 +13,7 @@ pub mod drift;
 pub mod eval;
 pub mod metrics;
 pub mod perpetual;
+pub mod sampler;
 pub mod schedule;
 pub mod weighting;
 
@@ -18,10 +26,13 @@ pub use diffusion::DiffusionTask;
 pub use eval::{BaselineBucket, EvalConfig, EvalReport, MseBucket, evaluate};
 pub use drift::{AsyncNoisePredictor, DriftFrame, DriftWalk, NoisePredictor};
 pub use metrics::{
-    BASE_NOISE_FOLD, BucketStat, DenoiseFrame, DenoiseStepStat, MetricsLogger, ProbeConfig,
-    ReverseStep, Stats, base_noise_seed, compose_diffusion_input, log_probe, log_train_loss,
-    log_trajectory, path_seed, probe_diffusion, predict_epsilon, reverse_step, reverse_step_async,
-    reverse_step_from_epsilon, reverse_step_seed, sample_diffusion,
+    BucketStat, DenoiseStepStat, MetricsLogger, ProbeConfig, Stats, log_probe, log_train_loss,
+    log_trajectory, probe_diffusion,
+};
+pub use sampler::{
+    BASE_NOISE_FOLD, DenoiseFrame, ReverseStep, base_noise_seed, compose_diffusion_input,
+    path_seed, predict_epsilon, reverse_step, reverse_step_async, reverse_step_from_epsilon,
+    reverse_step_seed, sample_diffusion,
 };
 pub use perpetual::{
     CLIMB_TEMPO_RATIO, DriftAction, DriftPhase, MIN_FLUX_LEVEL, MIN_RENOISE_DEPTH, PerpetualDrift,
