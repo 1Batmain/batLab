@@ -6,6 +6,9 @@ pub mod drift;
 pub mod eval;
 pub mod metrics;
 pub mod perpetual;
+// Commit-1 move: the inference path lives here now; `metrics` re-exports it so
+// no caller path changes. Commit 2 makes this `pub` and repoints the re-exports.
+mod sampler;
 pub mod schedule;
 pub mod weighting;
 
