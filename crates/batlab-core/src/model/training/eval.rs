@@ -34,7 +34,7 @@
 //! schedule maths and the determinism are exercised in tests against oracle
 //! predictors on a machine with no GPU, and the CLI hands in `model.predict`.
 
-use crate::model::training::metrics::compose_diffusion_input;
+use crate::model::training::sampler::compose_diffusion_input;
 use crate::model::training::schedule::LinearNoiseSchedule;
 
 /// Odd multiplier folding the timestep into a draw's seed — the same constant

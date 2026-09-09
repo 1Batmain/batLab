@@ -104,7 +104,7 @@ impl DriftWalk {
                 path_seed,
             } => {
                 let epsilon = predictor.predict_noise(&self.latent, diffusion_step);
-                let stepped = super::metrics::reverse_step_from_epsilon(
+                let stepped = super::sampler::reverse_step_from_epsilon(
                     schedule,
                     &self.latent,
                     epsilon,
@@ -150,7 +150,7 @@ impl DriftWalk {
                 renoise_seed,
             } => {
                 let epsilon = predictor.predict_noise(&self.latent, diffusion_step);
-                let stepped = super::metrics::reverse_step_from_epsilon(
+                let stepped = super::sampler::reverse_step_from_epsilon(
                     schedule,
                     &self.latent,
                     epsilon,
@@ -185,7 +185,7 @@ impl DriftWalk {
                 path_seed,
             } => {
                 let epsilon = predictor.predict_noise(&self.latent, diffusion_step).await;
-                let stepped = super::metrics::reverse_step_from_epsilon(
+                let stepped = super::sampler::reverse_step_from_epsilon(
                     schedule,
                     &self.latent,
                     epsilon,
@@ -226,7 +226,7 @@ impl DriftWalk {
                 renoise_seed,
             } => {
                 let epsilon = predictor.predict_noise(&self.latent, diffusion_step).await;
-                let stepped = super::metrics::reverse_step_from_epsilon(
+                let stepped = super::sampler::reverse_step_from_epsilon(
                     schedule,
                     &self.latent,
                     epsilon,

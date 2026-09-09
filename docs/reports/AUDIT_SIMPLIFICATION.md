@@ -185,6 +185,71 @@ reverse/sample, et laisser `metrics.rs` aux métriques. Déplacement + réexport
 `lib.rs`/`mod.rs` : aucun changement de comportement. Cosmétique mais à haute valeur de
 lisibilité.
 
+### T1 — fait
+
+Scindé en `model/training/sampler.rs`, en **deux commits**.
+
+**Ce qui a déménagé dans `sampler.rs`** (le chemin d'inférence) : `compose_diffusion_input`,
+`DenoiseFrame`, la dérivation des graines (`STEP_SEED_GAMMA` privé, `reverse_step_seed`,
+`BASE_NOISE_FOLD`/`base_noise_seed`, `path_seed`), `ReverseStep`, `predict_epsilon`,
+`reverse_step_from_epsilon`, `reverse_step_async`, `reverse_step`, `sample_diffusion`, et les
+cinq tests qui les tiennent (dont `the_base_noise_fold_is_written_in_exactly_one_place` et
+`the_canonical_seed_folds_match_the_old_literals`).
+
+**Ce qui reste dans `metrics.rs`** (ce qui mesure) : `Stats`, `MetricsLogger`, `ProbeConfig`,
+`BucketStat`, `probe_diffusion`, `log_probe`, `log_train_loss`, `log_trajectory`,
+`DenoiseStepStat`, et les tests `stats_*`.
+
+**Les deux cas limites, tranchés.**
+
+- `DenoiseFrame` → **sampler**. C'est le paramètre du callback observateur dans la signature
+  de `sample_diffusion` (`observer: Option<&mut dyn FnMut(&DenoiseFrame)>`) et la couture
+  sampler↔visualiseur (`live_frame`). Il porte des tenseurs *empruntés* (`latent`, `x0_hat`),
+  pas des statistiques : c'est un contrat du sampler, pas une métrique. Le laisser dans
+  `metrics` ferait dépendre la signature du sampler d'un type d'instrumentation.
+- `DenoiseStepStat` → **metrics**. C'est un *résumé statistique* par pas (trois champs `Stats`),
+  produit dans l'unique but d'être remis à `log_trajectory` qui l'écrit en JSONL. Un enregistrement
+  de métrique dans chacun de ses champs. `sample_diffusion` le *remplit* comme un out-param
+  optionnel (`trajectory`) — exactement comme il ne remplit rien quand on ne le lui demande pas ;
+  il reste donc avec la métrique qu'il alimente, et `sampler.rs` l'importe.
+- `compose_diffusion_input` → **sampler**, comme le veut la mission : elle compose l'entrée
+  `[signal | timestep]` du modèle, cœur de l'appel réseau. Appelants vérifiés avant de trancher :
+  `predict_epsilon`/`reverse_step_async` (sampler), `probe_diffusion` (metrics), `eval.rs`
+  (eval d'entraînement), `batlab_web`. Utilisée des deux côtés, mais elle est de nature
+  *inférence* — c'est la primitive de composition du chemin d'appel du modèle.
+
+**Couplage résiduel assumé** : `sample_diffusion` calcule `Stats::of(...)` en ligne et bâtit un
+`DenoiseStepStat` quand une trajectoire est demandée, donc `sampler.rs` importe `Stats` et
+`DenoiseStepStat` de `metrics.rs` ; réciproquement `metrics.rs` (via `probe_diffusion`) importe
+`compose_diffusion_input` de `sampler.rs`. Les deux sont des modules frères d'un même crate, l'usage
+mutuel est légal et sans cycle de crate. `Stats` est une structure pure (aucun `fs`, aucun GPU),
+donc ce couplage ne blesse pas la portabilité wasm. Le supprimer (sortir le calcul de `Stats` de
+`sample_diffusion`) serait un **changement de logique**, hors du périmètre de ce déplacement pur.
+
+**Discipline des deux commits.**
+
+1. *Déplacement pur.* Le code quitte `metrics.rs` pour `sampler.rs` verbatim ; `metrics.rs`
+   re-exporte le tout (`pub use super::sampler::*`) et `mod sampler;` reste privé, si bien
+   qu'**aucun appelant ne change d'import** — `metrics::…`, les réexports `mod.rs`/`lib.rs` et
+   les paths internes (`drift.rs`, `eval.rs`) résolvent inchangés. Seule concession forcée par le
+   déplacement : l'import `PosteriorVariance` de `metrics.rs`, devenu mort (son seul usager est
+   parti), est retiré pour tenir le zéro-warning ; ce n'est pas de la logique.
+2. *Imports et documentation.* `mod.rs` passe à `pub mod sampler;` et scinde ses `pub use` entre
+   `metrics::{…}` et `sampler::{…}` selon le vrai foyer ; le pont `pub use super::sampler::*` est
+   retiré et remplacé par l'unique `use …sampler::compose_diffusion_input` dont `probe_diffusion` a
+   besoin ; `drift.rs` (`super::metrics::reverse_step_from_epsilon` → `super::sampler::…`, ×4) et
+   `eval.rs` (`…metrics::compose_diffusion_input` → `…sampler::…`) sont repointés. `lib.rs` est
+   **inchangé** : il source depuis `model::training::{…}`, niveau où les noms restent exposés à plat.
+   Ce présent rapport et le CLAUDE.md (section frontière) sont mis à jour.
+
+**Preuve d'innocuité** (aux deux commits) : `cargo build --workspace` sans warning (le seul warning
+`mut` du build de test préexiste dans `attention_tests.rs:811`, fichier non touché) ; `cargo test
+--workspace` vert (392) ; `git status` propre ; image `--headless-sample` identique au **SHA-256**
+avant/après sur `Greyscale_Diffusion_L` et `Stable_Diffusion` (PNG **et** JSONL de métriques, donc
+les deux chemins couverts) ; crate web toujours compilé en `wasm32-unknown-unknown` ;
+`the_base_noise_fold_is_written_in_exactly_one_place` toujours vert (le `const BASE_NOISE_FOLD` et son
+détecteur ont voyagé ensemble).
+
 ## T2. La version de checkpoint est un tuple `(bool, bool, bool)` aux combinaisons impossibles
 
 `model.rs:1175-1186` décode le magic en
@@ -360,8 +425,8 @@ Un commit par point, en commençant par les doublons de logique :
    *(preuve : rendu bit-à-bit, la config déployée porte déjà 1.2/beta.)*
 5. **T2, T3** — `enum CheckpointVersion`, `describe_weights`. *(preuve : formats et
    messages inchangés.)*
-6. **T1** — scinder `metrics.rs` (inférence ⇄ métriques). *(preuve : réexports, tests
-   verts.)*
+6. **T1** — ✅ fait — sampler sorti dans `model/training/sampler.rs`, `metrics.rs` aux
+   métriques (voir §T1 — fait). *(preuve : SHA-256 image identique, tests verts, wasm32 OK.)*
 7. **T4, T6** — flags dans `--help`, import inutilisé. *(trivial.)*
 8. **T5, C1, C2, C3, T7** — rangements et découpes, sur arbitrage, en dernier.
 

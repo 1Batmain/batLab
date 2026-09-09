@@ -5,15 +5,10 @@
 
 use crate::model::Model;
 use crate::model::training::LinearNoiseSchedule;
+use crate::model::training::sampler::compose_diffusion_input;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::Path;
-
-// Commit-1 bridge: the inference path moved to `sampler.rs`; re-exporting it here
-// keeps every existing `metrics::…` path (and the `mod.rs`/`lib.rs` re-exports
-// that lean on it) resolving unchanged, so this move touches no caller. Commit 2
-// repoints the callers and removes this line.
-pub use super::sampler::*;
 
 /// Summary statistics of a tensor slice (NaN/Inf tolerant).
 #[derive(Debug, Clone, Copy)]
