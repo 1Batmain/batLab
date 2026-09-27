@@ -210,7 +210,7 @@ par exactement l'expression qui la produisait avant — même `batch_offset`, m�
 Sans cette identité, comparer un run ancien à un run nouveau ne mesurerait
 rien : les deux ne résoudraient pas le même problème.
 
-**Sur la règle anti-`seed ^ index` du CLAUDE.md** : le motif interdit est la
+**Sur la règle anti-`seed ^ index` d'AGENTS.md** : le motif interdit est la
 *composition* de deux XOR (le pas de diffusion dans la graine de chemin **et**
 l'indice pixel dans le champ de bruit), dont la somme s'effondrait sur les
 anti-diagonales (`ANISOTROPY_HUNT.md`). Il n'y a ici qu'un seul XOR, celui qui

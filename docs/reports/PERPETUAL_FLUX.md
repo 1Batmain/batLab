@@ -436,7 +436,7 @@ sans aucun flag.
 Ce qui l'a rendu invisible pendant toute la campagne est un défaut de plus :
 **un flag inconnu était ignoré en silence, code de retour 0**. « Ignoré » et
 « pas implémenté » étaient indistinguables, et une faute de frappe passait pour
-un réglage. C'est exactement le piège du flag muet que le `CLAUDE.md` du projet
+un réglage. C'est exactement le piège du flag muet que le `AGENTS.md` du projet
 demande de contrer par la bannière — et la bannière affichait `t_r=64` quoi qu'on
 passe.
 
@@ -526,7 +526,7 @@ Pourquoi 129 tests verts ne l'ont pas vu : **toute la batterie lisait déjà la
 phase depuis l'action** (`walk_tagged`), c'est-à-dire la bonne notion, pendant
 que le dump en enregistrait une autre. Rien qui s'accorde avec soi-même ne peut
 voir cet écart — c'est très exactement le désaccord que le dispositif d'aveugle
-existe pour produire (`CLAUDE.md`). `walk_tagged` route maintenant par
+existe pour produire (`AGENTS.md`). `walk_tagged` route maintenant par
 `DriftAction::phase()`, donc une mutation de cet accesseur fait tomber les tests
 de flux existants **en plus** des deux nouveaux.
 

@@ -58,7 +58,7 @@ def main():
     std_a = a.std(axis=(1, 2, 3))
     std_b = b.std(axis=(1, 2, 3))
     # « Plus proche du dataset » et non « plus grand » : l'écart-type intra-image
-    # doit APPROCHER 0,206 par le bas, pas le dépasser (CLAUDE.md).
+    # doit APPROCHER 0,206 par le bas, pas le dépasser (AGENTS.md).
     closer = np.abs(std_a - DATASET_INTRA_STD) < np.abs(std_b - DATASET_INTRA_STD)
 
     # Meilleur `a·B + b` par seed, en fermé : a = cov(A,B)/var(B), b = Ā − a·B̄.

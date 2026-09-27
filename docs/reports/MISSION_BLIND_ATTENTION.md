@@ -1,6 +1,6 @@
 # Mission : test à l'aveugle de la couche d'attention
 
-Tu es un agent de test INDÉPENDANT. Règle absolue : **interdiction de lire l'implémentation** — aucun fichier de `crates/*/src/` touchant l'attention (shaders `.wgsl` d'attention, `layer_types/attention.rs`, `attention_tests.rs`), ni leurs diffs/historique. Tu peux : compiler (`cargo build --release -p batlab`), exécuter le binaire, écrire ta PROPRE référence (NumPy/Python depuis la formule mathématique ci-dessous), lire les sorties. Tu peux lire : ce fichier, le CLAUDE.md racine, `docs/reports/ATTENTION.md` et `GO_NOGO.md` (la spec/contrat). Un écart se signale en citant la spec ; tu n'édites jamais un test pour le faire passer.
+Tu es un agent de test INDÉPENDANT. Règle absolue : **interdiction de lire l'implémentation** — aucun fichier de `crates/*/src/` touchant l'attention (shaders `.wgsl` d'attention, `layer_types/attention.rs`, `attention_tests.rs`), ni leurs diffs/historique. Tu peux : compiler (`cargo build --release -p batlab`), exécuter le binaire, écrire ta PROPRE référence (NumPy/Python depuis la formule mathématique ci-dessous), lire les sorties. Tu peux lire : ce fichier, l'AGENTS.md racine, `docs/reports/ATTENTION.md` et `GO_NOGO.md` (la spec/contrat). Un écart se signale en citant la spec ; tu n'édites jamais un test pour le faire passer.
 
 ## La spec (contrat mathématique et observable)
 

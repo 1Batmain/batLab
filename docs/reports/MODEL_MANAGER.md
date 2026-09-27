@@ -27,7 +27,7 @@ Huit commits :
 | `569110f` | La navigation modèle-centrée, les deux écrans du manager, `nav_tests.rs` |
 | `044a0b2` | Relire les checkpoints en revenant au menu d'actions (trouvé au TUI réel) |
 | `8044904` | Les barres d'aide disent ce que les touches font vraiment |
-| `cc79bf4` | CLAUDE.md : le flow, `BATLAB_ROOT`, la limite levée |
+| `cc79bf4` | AGENTS.md : le flow, `BATLAB_ROOT`, la limite levée |
 | `7310e94` | Un checkpoint est un `.ckpt` (trouvé au TUI réel) |
 | `5435440` | `[Esc] back` annoncé sur le formulaire d'inférence |
 | `6b91485` | **Les templates créaient des modèles non conditionnables sur t** (trouvé par l'agent aveugle) |
@@ -145,7 +145,7 @@ fait descendre dans tout le TUI.
 
 ### Preuve que `cargo test` ne pollue plus
 
-Critère de recette permanent, inscrit au CLAUDE.md — `cargo test --workspace`
+Critère de recette permanent, inscrit dans AGENTS.md — `cargo test --workspace`
 suivi d'un `git status` **propre** :
 
 ```
@@ -205,7 +205,7 @@ Le flux « New model (from template) » écrivait `input_size.z == canaux de sor
 | Greyscale Diffusion | `[32,32,1]` → 1 ❌ | `[32,32,3]` → 1 (1 signal + 2 temporels) |
 | Stable Diffusion | `[32,32,3]` → 3 ❌ | `[32,32,7]` → 3 (3 signal + 4 temporels) |
 
-CLAUDE.md exige l'inverse : « un modèle de diffusion DOIT être conditionné sur le
+AGENTS.md exige l'inverse : « un modèle de diffusion DOIT être conditionné sur le
 timestep : `input_size.z > output.z` ». Sans canal excédentaire pour porter
 l'embedding temporel, ε̂ dégénère et l'échantillonnage explose en blanc saturé.
 La géométrie du template Greyscale était **exactement celle que le dépôt conserve
@@ -229,7 +229,7 @@ pas** — son shader indexe les poids avec `IC = dim_input.z` et corrompt en sil
 **Pourquoi mon parcours e2e ne l'a pas vu.** Au pas 9 j'ai entraîné un modèle issu
 du template et j'ai regardé la loss descendre — elle descendait. Une loss qui décroît
 ne dit rien du conditionnement temporel : c'est précisément l'avertissement de
-CLAUDE.md (« une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche
+AGENTS.md (« une loss batch qui décroît ne suffit PAS — vérifier la loss par tranche
 de t »). Je vérifiais que le manager *manipulait* correctement les modèles, sans
 jamais demander si le modèle produit était *valide*. L'aveugle, lui, partait de la
 spec — l'invariant y est écrit noir sur blanc — et il est allé lire le fichier.

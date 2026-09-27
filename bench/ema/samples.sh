@@ -8,7 +8,7 @@
 # séparés diffèrent aussi par leur tirage de données.
 #
 # `--magnitude 1.0` : `inter_seed_std` est proportionnel à la magnitude
-# (CLAUDE.md), il ne se lit qu'à magnitude fixée, et 1.0 est le réglage nominal.
+# (AGENTS.md), il ne se lit qu'à magnitude fixée, et 1.0 est le réglage nominal.
 # `--paths 1` : `paths=3` moyenne trois trajectoires et masque une partie de
 # l'effondrement (SCALE_UNET §1.3).
 set -u

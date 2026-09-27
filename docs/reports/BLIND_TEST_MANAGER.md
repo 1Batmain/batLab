@@ -5,7 +5,7 @@ Branche : `blind-test-manager` · Plateforme : macOS (Darwin 25.4.0) · binaire
 
 Agent de test **indépendant** : aucun fichier de `crates/*/src/` n'a été lu, ni
 leurs diffs, ni leur historique. Sources autorisées et effectivement utilisées :
-`MISSION_BLIND_TEST_MANAGER.md`, `CLAUDE.md` (flow, `BATLAB_ROOT`, points
+`MISSION_BLIND_TEST_MANAGER.md`, `AGENTS.md` (flow, `BATLAB_ROOT`, points
 d'attention), `docs/reports/MODEL_MANAGER.md` (la spec), et
 `docs/reports/INFER_VIZ.md` §5 pour le protocole de pilotage tmux. Tout le reste
 vient de l'écran et du disque.
@@ -58,7 +58,7 @@ Le flux « New model (from template) », dernière ligne de l'écran d'accueil,
 | Greyscale Diffusion | 1 | 1 |
 | Stable Diffusion | 3 | 3 |
 
-CLAUDE.md, section « Points d'attention » :
+AGENTS.md, section « Points d'attention » :
 
 > Un modèle de diffusion **DOIT** être conditionné sur le timestep :
 > `input_size.z > output.z` (les canaux excédentaires reçoivent l'embedding
@@ -98,7 +98,7 @@ d'entraînement qui l'a établi.
 
 ### 1. `[i]` n'ouvre pas la géométrie d'entrée depuis l'écran que `[e]` ouvre
 
-CLAUDE.md et `MODEL_MANAGER.md` §1 disent :
+AGENTS.md et `MODEL_MANAGER.md` §1 disent :
 
 > `[e]` depuis le menu d'actions ouvre le constructeur de couches, `[i]` dedans
 > ouvre la géométrie d'entrée.
@@ -296,7 +296,7 @@ l'empreinte SHA-256 de tout `Models/` du dépôt est **inchangée**. La limite
 
 | Fichier | Rôle |
 | --- | --- |
-| `lib.sh` | racines jetables, lancement tmux détaché, envoi de touches (texte et `Enter` séparés, cf. CLAUDE.md), capture d'écran, `bt_select` qui vise le curseur `>` **par lecture d'écran** et jamais par comptage de flèches, empreinte SHA-256 récursive, `bt_redraw` (le journal de métriques écrit sur stdout par-dessus le TUI : un redimensionnement force ratatui à repeindre) |
+| `lib.sh` | racines jetables, lancement tmux détaché, envoi de touches (texte et `Enter` séparés, cf. AGENTS.md), capture d'écran, `bt_select` qui vise le curseur `>` **par lecture d'écran** et jamais par comptage de flèches, empreinte SHA-256 récursive, `bt_redraw` (le journal de métriques écrit sur stdout par-dessus le TUI : un redimensionnement force ratatui à repeindre) |
 | `t01`…`t09` | une propriété par fichier, chaque échec citant la phrase de spec |
 | `run.sh` | runner, verdict PASS/FAIL par propriété, journaux conservés |
 

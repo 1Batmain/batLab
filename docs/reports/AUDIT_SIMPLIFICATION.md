@@ -176,7 +176,7 @@ un `.batraw` (en-tête 16 o, sans magic) — le laisser tel quel ; c'est en reva
 `crates/batlab-core/src/model/training/metrics.rs` (678 l.) porte, sous un nom
 « metrics », **tout le sampler public** : `compose_diffusion_input`, `predict_epsilon`,
 `reverse_step`, `reverse_step_from_epsilon`, `reverse_step_async`, `sample_diffusion`,
-`reverse_step_seed`, `log_trajectory`. Le CLAUDE.md affirme « tout le chemin d'inférence
+`reverse_step_seed`, `log_trajectory`. Le AGENTS.md affirme « tout le chemin d'inférence
 vit dans `batlab_core` » — vrai, mais qui le chercherait dans `metrics.rs` ? Les vraies
 métriques (`MetricsLogger`, `ProbeConfig`, `probe_diffusion`, `log_*`) y cohabitent.
 
@@ -240,7 +240,7 @@ donc ce couplage ne blesse pas la portabilité wasm. Le supprimer (sortir le cal
    besoin ; `drift.rs` (`super::metrics::reverse_step_from_epsilon` → `super::sampler::…`, ×4) et
    `eval.rs` (`…metrics::compose_diffusion_input` → `…sampler::…`) sont repointés. `lib.rs` est
    **inchangé** : il source depuis `model::training::{…}`, niveau où les noms restent exposés à plat.
-   Ce présent rapport et le CLAUDE.md (section frontière) sont mis à jour.
+   Ce présent rapport et l'AGENTS.md (section frontière) sont mis à jour.
 
 **Preuve d'innocuité** (aux deux commits) : `cargo build --workspace` sans warning (le seul warning
 `mut` du build de test préexiste dans `attention_tests.rs:811`, fichier non touché) ; `cargo test
@@ -277,7 +277,7 @@ entraînement ET inférence, à parts quasi égales. Chiffré (lignes de code, h
 | **Partagé (les deux)** | `schedule.rs` (bruitage avant ET pas inverse) | ~970 |
 | **Diagnostic / éval** | `metrics.rs`, `eval.rs` | ~820 |
 
-Presque 50/50 entraînement/inférence. Le CLAUDE.md doit d'ailleurs déjà se justifier
+Presque 50/50 entraînement/inférence. Le AGENTS.md doit d'ailleurs déjà se justifier
 (« l'entraînement y reste aussi, mais c'est l'inférence qui doit être découplée ») — signe que le
 nom du dossier force une note de bas de page. Un nom honnête serait **`model/diffusion/`** (la
 machinerie DDPM, dans les deux sens), `Trainer`/`TrainingTask` restant le sous-ensemble entraînement.
@@ -393,9 +393,9 @@ Cinq fichiers `.md` de mission/rapport traînent à la racine — `BLIND_TEST_AT
 `BLIND_TEST_MANAGER.md`, `MISSION_BLIND_ATTENTION.md`, `MISSION_BLIND_TEST_MANAGER.md`,
 `GO_NOGO.md` — au lieu de `docs/reports/` (qui a son `INDEX.md`). Et le dépôt porte
 **trois** répertoires de tests à l'aveugle — `blind_tests/`, `blind_tests_attention/`,
-`blind_tests_manager/` — quand le CLAUDE.md n'en documente qu'un (« la suite »).
+`blind_tests_manager/` — quand l'AGENTS.md n'en documente qu'un (« la suite »).
 Proposition : déplacer les `.md` sous `docs/reports/`, et soit documenter les deux suites
-supplémentaires dans le CLAUDE.md, soit les ranger sous `blind_tests/`. Ce n'est pas
+supplémentaires dans l'AGENTS.md, soit les ranger sous `blind_tests/`. Ce n'est pas
 l'écran d'accueil du TUI, mais celui du dépôt : c'est ce que l'auteur voit en `ls`.
 
 ## C2. Checkpoints commités — politique incohérente

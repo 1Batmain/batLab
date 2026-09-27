@@ -29,7 +29,7 @@ batlab_web → batlab_core        (comme batlab → batlab_ui → batlab_core)
 ne vit ici. Chaque pas inverse est `reverse_step_from_epsilon`, chaque frame de
 dérive est `DriftWalk::advance_async`, l'entrée est composée par
 `compose_diffusion_input`, le schedule est celui du moteur. Vérifié en une
-commande, la même que le CLAUDE.md :
+commande, la même que l'AGENTS.md :
 
 ```
 $ awk '/^\[dependencies\]/{f=1;next}/^\[/{f=0}f' crates/batlab-core/Cargo.toml \

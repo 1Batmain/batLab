@@ -5,7 +5,7 @@
 //! # Why these are not constants
 //!
 //! batLab is developed on exactly one GPU and is meant to run on the visitor's
-//! (`lib.rs`, and the engine/interface boundary in `CLAUDE.md`). A constant
+//! (`lib.rs`, and the engine/interface boundary in `AGENTS.md`). A constant
 //! tuned here is a constant tuned *there* too, and nobody would ever find out:
 //! a badly chosen tile size does not fail, it just costs time silently.
 //!

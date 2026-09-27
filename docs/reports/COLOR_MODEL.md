@@ -9,7 +9,7 @@ Branche `color-model` · Plateforme macOS (Darwin 25.4.0, Apple M5 Pro) · 5 ao�
   PNG : tout est piloté par `Dim3.z`, aucune constante « 1 canal » nulle part. Ce
   qui manquait, c'était un **config** correct (le seul modèle « couleur »
   préexistant, `Stable_Diffusion`, a **0 canal temporel** — le cas dégénéré que
-  `CLAUDE.md` interdit).
+  `AGENTS.md` interdit).
 - **Architecture retenue : `Color_Diffusion_L` (32/64/128)**, entrée `[32,32,7]`
   (3 image + 4 temps), sortie `[32,32,3]`, champ réceptif **35 px ≥ 32**.
   Mesuré contre une variante XL (48/96/192) : XL coûte **2,18× par pas** pour
@@ -144,7 +144,7 @@ retouchée. Elle n'est de toute façon pas greyscale-only — `live_frame.rs` pr
 
 **Piège préexistant signalé** : `Models/Stable_Diffusion/config_file` a
 `input_size [32,32,3]` pour une sortie à 3 canaux — soit **zéro canal temporel**.
-C'est le cas dégénéré documenté dans `CLAUDE.md` (ε̂ dégénère, échantillonnage
+C'est le cas dégénéré documenté dans `AGENTS.md` (ε̂ dégénère, échantillonnage
 saturé en blanc). **Il n'est pas utilisable comme modèle couleur.** Même défaut
 dans `tui/app.rs::diffusion_template()`. Non corrigé ici : hors mission, et le
 toucher la veille d'un run long n'apporte rien.
@@ -326,7 +326,7 @@ python3 tools/compare_plate.py --out color_samples/night_plate.png \
    dataset). **Aucune raison d'attendre mieux en couleur** : la cause mesurée dans
    `SCALE_UNET.md` §5 (pondération de l'objectif) est intacte, et ce run ne la
    traite pas. Le lire à `--magnitude` fixée, avec `intra_image_std` et
-   `banding_ratio`, comme le rappelle `CLAUDE.md`.
+   `banding_ratio`, comme le rappelle `AGENTS.md`.
 4. **Les tranches de `t`**, converties en unités x₀ via
    `tools/eps_metric_analysis.py` avant toute conclusion.
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # t09 — Le flux « New model (from template) » : la géométrie qu'il écrit sur
 # disque respecte-t-elle l'invariant de conditionnement temporel ?
-# Spec : CLAUDE.md « Points d'attention » — « Un modèle de diffusion DOIT être
+# Spec : AGENTS.md « Points d'attention » — « Un modèle de diffusion DOIT être
 # conditionné sur le timestep : input_size.z > output.z ».
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 BT_PROP="Géométrie des templates"
 bt_init_report
 echo "== $BT_PROP =="
 
-SPEC_T='CLAUDE.md, Points d’attention : « Un modèle de diffusion DOIT être conditionné sur le timestep : input_size.z > output.z (les canaux excédentaires reçoivent l’embedding temporel). Sans ça, ε̂ dégénère et l’échantillonnage explose en blanc saturé (voir docs/reports/INSIGHTS_TRAINING.md). »'
+SPEC_T='AGENTS.md, Points d’attention : « Un modèle de diffusion DOIT être conditionné sur le timestep : input_size.z > output.z (les canaux excédentaires reçoivent l’embedding temporel). Sans ça, ε̂ dégénère et l’échantillonnage explose en blanc saturé (voir docs/reports/INSIGHTS_TRAINING.md). »'
 SPEC_FLOW='MODEL_MANAGER.md §1 : « dernière ligne : « New model (from template) » → sélecteur de templates » ; §5 pas 2 : « Enter → template Greyscale → Enter → modèle créé sur disque, menu d’actions → OK ».'
 
 geom() { # <config_file> -> "in_z out_z"

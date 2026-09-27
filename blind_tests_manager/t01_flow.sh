@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # P1 — Flow : l'ouverture est la liste des modèles ; un modèle ouvre son menu d'actions.
-# Spec : CLAUDE.md « Ouverture → LISTE DES MODÈLES (l'écran d'accueil) » et
+# Spec : AGENTS.md « Ouverture → LISTE DES MODÈLES (l'écran d'accueil) » et
 #        MODEL_MANAGER.md §1 / §2.1.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 BT_PROP="P1 Flow"

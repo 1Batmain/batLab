@@ -234,7 +234,7 @@ coûtent sans rendre. Deux options défendables :
   actuelle n'est pas le goulot mesurable ici ; le budget de calcul est mieux
   dépensé en pas qu'en paramètres. Coût : 163 ms/pas × 15 000 ≈ **41 min**.
   Au-delà de ~10 000 pas, l'EMA (`--ema 0.999`) reprend un sens (la rampe cesse
-  de dominer la valeur nominale, cf. CLAUDE.md) et la mémorisation apparaît —
+  de dominer la valeur nominale, cf. AGENTS.md) et la mémorisation apparaît —
   surveiller alors l'écart vu/inconnu et le `--checkpoint-every` pour garder le
   meilleur avant sur-mémorisation.
 - **C (largeur ×1.5), ~15 000 pas** — si l'on veut le petit gain de

@@ -273,7 +273,7 @@ n'en sort pas. La fondation apporte cette part-là, et le fine-tune n'a plus qu'
 déplacer la distribution.
 
 **`--magnitude 1.0` à la génération.** `inter_seed_std` est proportionnel à la
-magnitude et ne se lit pas seul (voir `CLAUDE.md`) ; à magnitude réduite on croit
+magnitude et ne se lit pas seul (voir `AGENTS.md`) ; à magnitude réduite on croit
 gagner en netteté ce qu'on perd en diversité.
 
 **Le nombre de pas est le levier.** Pas le taux, pas l'EMA (mesurée NO-GO à 1500

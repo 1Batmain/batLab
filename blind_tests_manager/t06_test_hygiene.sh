@@ -6,7 +6,7 @@ BT_PROP="P6 Hygiène des tests"
 bt_init_report
 echo "== $BT_PROP =="
 
-SPEC='MODEL_MANAGER.md §3 : « Critère de recette permanent, inscrit au CLAUDE.md — cargo test --workspace suivi d’un git status propre. […] Avant cette mission, la même commande laissait Models/Stable_Diffusion/config_file modifié dans le dépôt. La limite est levée. »'
+SPEC='MODEL_MANAGER.md §3 : « Critère de recette permanent, inscrit dans AGENTS.md — cargo test --workspace suivi d’un git status propre. […] Avant cette mission, la même commande laissait Models/Stable_Diffusion/config_file modifié dans le dépôt. La limite est levée. »'
 SPEC_GREEN='MODEL_MANAGER.md §7 : « cargo test --workspace # 167 tests, 0 échec » — « Aucun test n’a été affaibli. »'
 
 cd "$BT_REPO" || exit 1

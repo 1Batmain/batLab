@@ -10,7 +10,7 @@ use crate::profile::{PassProfiler, ProfileRun};
 /// baseline (256 MiB/buffer, 128 MiB/binding) — right for inference (the visitor's
 /// browser), wrong for training here, where the adapter allows 28 GiB and the
 /// baseline capped the batch by a BINDING limit. So the limits are a choice: two
-/// questions, both must keep working. Rationale: CLAUDE.md.
+/// questions, both must keep working. Rationale: AGENTS.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpuLimitsProfile {
     /// Everything the adapter reports. The default, what training wants.

@@ -2,7 +2,7 @@
 # end that runs the engine in a visitor's browser on their own GPU (WebGPU).
 #
 # This is the crate the whole engine/interface boundary was drawn for
-# (see the root CLAUDE.md): it depends on `batlab_core` and on the web platform,
+# (see the root AGENTS.md): it depends on `batlab_core` and on the web platform,
 # never the other way round. The dependency arrow is batlab_web -> batlab_core,
 # exactly as batlab -> batlab_ui -> batlab_core, and nothing here reaches back
 # into the engine.

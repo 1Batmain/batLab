@@ -1,6 +1,6 @@
 // Widens an 8-bit BATRAW3 chunk into the f32 `[-1, 1]` batch slot the diffusion
 // prepass reads. The f32 path skips this shader (plain `copy_buffer_to_buffer`,
-// see `GpuDataset::copy_samples_to`). Rationale and traffic numbers: CLAUDE.md.
+// see `GpuDataset::copy_samples_to`). Rationale and traffic numbers: AGENTS.md.
 //
 // 2-D dispatch grid when the batch pushes the workgroup count past WebGPU's
 // 65 535-per-dimension limit (`dispatch_grid` in layer.rs), so the linear thread

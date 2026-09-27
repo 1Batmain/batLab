@@ -30,7 +30,7 @@ const RAW_DATASET_MAGIC_UNIT: &[u8; 8] = b"BATRAW1\0";
 /// Legacy magic — f32 payload already in `[-1, 1]`.
 const RAW_DATASET_MAGIC_SIGNED: &[u8; 8] = b"BATRAW2\0";
 /// Current magic — u8 payload widened to `[-1, 1]` on the GPU (a quarter of the
-/// bytes for the same values). See CLAUDE.md and `dataset_decode.wgsl`.
+/// bytes for the same values). See AGENTS.md and `dataset_decode.wgsl`.
 const RAW_DATASET_MAGIC_BYTES: &[u8; 8] = b"BATRAW3\0";
 
 // Schedule constants live in the engine (one definition, shared with the web
@@ -3913,7 +3913,7 @@ fn load_dataset(dataset_path: &str, output_size: (u32, u32, u32)) -> Result<Data
 /// default), `BATRAW2` (f32 in `[-1,1]`), `BATRAW1` (f32 in `[0,1]`, rescaled).
 /// A BATRAW3 file whose geometry matches the model stays 8-bit to the GPU;
 /// anything needing a resample falls back to the f32 path (the resample is on the
-/// host anyway). Rationale: CLAUDE.md.
+/// host anyway). Rationale: AGENTS.md.
 fn try_load_raw_dataset(
     dataset_path: &Path,
     output_size: (u32, u32, u32),

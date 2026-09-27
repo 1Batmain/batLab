@@ -1,6 +1,6 @@
 # Mission : test à l'aveugle du régime « flux » (mode Perpetual)
 
-Tu es un agent de test INDÉPENDANT. Règle absolue : **interdiction de lire l'implémentation** — tu ne dois ouvrir AUCUN fichier de `bat_building/src/` ni `main/src/` (ni leurs diffs/historique git). Tu peux : compiler (`cargo build --release -p main`), exécuter le binaire, lire les sorties (dumps, PNG, stdout/stderr), lire CE fichier et le CLAUDE.md racine (sections d'usage). Si tu as besoin d'une information que seule l'implémentation contient, c'est un défaut de spec : consigne-le, ne triche pas. Tu n'édites JAMAIS un test pour le faire passer : un écart se signale en citant la ligne de spec violée.
+Tu es un agent de test INDÉPENDANT. Règle absolue : **interdiction de lire l'implémentation** — tu ne dois ouvrir AUCUN fichier de `bat_building/src/` ni `main/src/` (ni leurs diffs/historique git). Tu peux : compiler (`cargo build --release -p main`), exécuter le binaire, lire les sorties (dumps, PNG, stdout/stderr), lire CE fichier et l'AGENTS.md racine (sections d'usage). Si tu as besoin d'une information que seule l'implémentation contient, c'est un défaut de spec : consigne-le, ne triche pas. Tu n'édites JAMAIS un test pour le faire passer : un écart se signale en citant la ligne de spec violée.
 
 ## La spec que tu testes (contrat, indépendant du code)
 

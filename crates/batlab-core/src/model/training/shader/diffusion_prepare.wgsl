@@ -19,7 +19,7 @@
 // of a batch draws bit-for-bit the noise and timestep it drew before. That is
 // what makes an old-path/new-path training run comparable at all.
 //
-// On the CLAUDE.md rule against `seed ^ index`: the forbidden pattern is the
+// On the AGENTS.md rule against `seed ^ index`: the forbidden pattern is the
 // COMPOSITION of two XORs — one folding the diffusion step into the path seed,
 // one folding the pixel index into the noise field — whose sum collapsed onto
 // the anti-diagonals (ANISOTROPY_HUNT.md). There is a single XOR here, the one

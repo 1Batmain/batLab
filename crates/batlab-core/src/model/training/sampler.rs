@@ -1,5 +1,5 @@
 //! The diffusion inference path: input composition, the reverse recursion and
-//! the sampler. This is the chain CLAUDE.md requires to stay decoupled — it runs
+//! the sampler. This is the chain AGENTS.md requires to stay decoupled — it runs
 //! in the visitor's browser on their own GPU (WebGPU) — so it drives the model
 //! through its PUBLIC API (`predict`/`predict_async`) and the shared schedule,
 //! never GPU internals. The statistics it captures along the way live next door

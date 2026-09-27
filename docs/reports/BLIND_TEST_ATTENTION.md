@@ -9,7 +9,7 @@ et la partie manquante est *rendue inobservable par la spec elle-même*, pas
 esquivée. Quatre défauts d'observabilité et un défaut de contrat CLI sont
 consignés en §7.
 
-Ce que j'ai lu : `MISSION_BLIND_ATTENTION.md`, `CLAUDE.md`, `GO_NOGO.md`,
+Ce que j'ai lu : `MISSION_BLIND_ATTENTION.md`, `AGENTS.md`, `GO_NOGO.md`,
 `docs/reports/ATTENTION.md`, la sortie de `batlab --help`, les `config_file` des
 modèles, `tools/sample_diversity.py`. Ce que je n'ai pas lu : aucun fichier de
 `crates/*/src/`, aucun `.wgsl`, aucun `attention_tests.rs`, aucun diff.
@@ -142,7 +142,7 @@ Deux compléments :
 - Diversité par l'outil du dépôt (`tools/sample_diversity.py`) :
   `inter_seed_std = 0,2217` — **au-dessus du seuil de 0,2 de la spec**.
 
-> **Réserve honnête sur le critère.** 0,2217 passe de 11 %. Et `CLAUDE.md`
+> **Réserve honnête sur le critère.** 0,2217 passe de 11 %. Et `AGENTS.md`
 > avertit que `inter_seed_std` « n'est pas un critère de diversité lisible
 > seul » : il est proportionnel à `--magnitude`. Les deux repères qu'il demande
 > de lire avec sont bons — `intra_image_std = 0,152`, sous le plafond 0,206
@@ -305,7 +305,7 @@ couche tourne donc toujours à `W_o = 0`, c'est-à-dire avec la couche en identi
 et les gradients de q/k/v exactement nuls. Voir §6.
 
 **Non-défaut, à noter tout de même** : le seuil `inter_seed_std > 0,2` de
-l'ordre de mission est franchi de 11 % seulement, et `CLAUDE.md` déconseille de
+l'ordre de mission est franchi de 11 % seulement, et `AGENTS.md` déconseille de
 lire cet indicateur seul (§4).
 
 ---

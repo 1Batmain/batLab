@@ -2,7 +2,7 @@
 # P4 — Navigation : Esc remonte d'exactement un cran depuis chaque écran
 # atteignable ; l'application ne quitte que depuis la liste et le moniteur ;
 # aucun écran annoncé n'est inatteignable au clavier.
-# Spec : MODEL_MANAGER.md §2.1 + §1, CLAUDE.md « Esc remonte d'exactement un cran ».
+# Spec : MODEL_MANAGER.md §2.1 + §1, AGENTS.md « Esc remonte d'exactement un cran ».
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 BT_PROP="P4 Navigation"
 bt_init_report
@@ -111,7 +111,7 @@ esc_to 'sélecteur de poids'  "menu d'actions"     "$M_ACT" "$M_LIST"
 # --- Constructeur de couches et géométrie d'entrée ------------------------
 bt_key e
 on_screen 'constructeur de couches (liste des couches)' "$M_LAY"
-# la spec CLAUDE.md dit « [i] dedans ouvre la géométrie d'entrée » : ici [i] est inerte
+# la spec AGENTS.md dit « [i] dedans ouvre la géométrie d'entrée » : ici [i] est inerte
 bt_key i
 if at "$M_INS"; then ok "[i] depuis l'écran ouvert par [e] mène à la géométrie d'entrée"
 else

@@ -151,7 +151,7 @@ lit `specs[sample]` au lieu de `specs`, et rien d'autre ne bouge :
 let noise = gaussian_from_seed(specs[sample].seed ^ clean_idx);
 ```
 
-Sur la règle anti-`seed ^ index` du CLAUDE.md : le motif interdit est la
+Sur la règle anti-`seed ^ index` d'AGENTS.md : le motif interdit est la
 **composition** de deux XOR (`path_seed ^ diffusion_step` côté sampler *et*
 `index ^ …` côté champ de bruit), qui faisait s'effondrer la somme sur les
 anti-diagonales (`ANISOTROPY_HUNT.md`). Ici il n'y a qu'un seul XOR, celui qui

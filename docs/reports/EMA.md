@@ -164,7 +164,7 @@ paniquait sur « at least one layer required for training ». Cause : `build()` 
 Sans rapport avec l'EMA — reproduit sans elle. Exhumé en écrivant le test qui
 vérifie que le shadow survit à un resize. Le panneau d'aide promettait
 l'inverse (« la reconstruction préserve poids, biais, moments Adam et compteur
-de pas ») et CLAUDE.md le documente comme un contrat.
+de pas ») et AGENTS.md le documente comme un contrat.
 
 Corrigé : `discard_built_state()` jette tout ce que `build()` a produit en
 **gardant la liste des couches** ; `clear()` garde sa sémantique destructrice
@@ -301,14 +301,14 @@ génération   : 16 seeds × 2 bras, DEPUIS LE MÊME FICHIER
   résumé par bras laisserait ouvert « cet écart vient-il des poids ou du tirage
   de seeds ? » ; l'appariement (`bench/ema/paired.py`) le ferme.
 - **`--magnitude 1.0`, `--paths 1`.** `inter_seed_std` est proportionnel à la
-  magnitude (CLAUDE.md) et ne se lit qu'à magnitude fixée ; `paths=3` moyenne
+  magnitude (AGENTS.md) et ne se lit qu'à magnitude fixée ; `paths=3` moyenne
   trois trajectoires et masque une partie de l'effondrement (`SCALE_UNET` §1.3).
 
 **Une seule valeur de decay, et c'est délibéré.** À 1500 pas la rampe donne
 `d(1500) = 1501/1510 = 0,99404 < 0,999` : c'est elle qui lie tout du long
 (§1.2), la valeur nominale n'a jamais la main, et `--ema 0.9999` aurait rendu le
 **même fichier**. Comparer deux decays ici aurait été comparer une chose avec
-elle-même — le piège que CLAUDE.md retient. La fenêtre effectivement moyennée
+elle-même — le piège que AGENTS.md retient. La fenêtre effectivement moyennée
 en fin de course fait `1/(1−d) ≈ 168` pas.
 
 **16 seeds et non 8.** L'échantillonnage est bon marché à côté de

@@ -68,7 +68,7 @@ Là où **aucun** test ne gardait l'invariant, je **n'ai pas supprimé** le comm
 Chacun est un « pourquoi » ou un piège que **rien ne teste**, resserré à l'os mais conservé :
 
 **Pièges de plateforme (faits externes, aucun test local ne les rend évidents)**
-- `visualiser/mod.rs` — **le vol de focus macOS** : winit termine `applicationDidFinishLaunching` par `activateIgnoringOtherApps(true)` par défaut ; `ActivationPolicy::Accessory` ne le couvre pas ; `with_activate_ignoring_other_apps(false)` est la ligne à NE PAS retirer. (CLAUDE.md l'exige aussi.)
+- `visualiser/mod.rs` — **le vol de focus macOS** : winit termine `applicationDidFinishLaunching` par `activateIgnoringOtherApps(true)` par défaut ; `ActivationPolicy::Accessory` ne le couvre pas ; `with_activate_ignoring_other_apps(false)` est la ligne à NE PAS retirer. (AGENTS.md l'exige aussi.)
 - `visualiser/mod.rs` — l'event loop winit doit vivre sur le **main thread** (AppKit).
 - `visualiser/mod.rs` — la couleur de letterbox est **linéaire** alors que la surface est **sRGB** : un `0,08` sort à `sRGB 80/255`.
 - `batlab-web/lib.rs` — `predict` **bloque** sur son readback ε̂ et **deadlock** le thread qui doit tourner l'event loop du navigateur (d'où les variantes `*_async`).

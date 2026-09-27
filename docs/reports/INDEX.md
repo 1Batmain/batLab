@@ -4,7 +4,7 @@ Chaque mission de la campagne a laissé un rapport. **Ces fichiers sont des arch
 leur contenu n'a pas été réécrit lors de la restructuration du dépôt.** Ils citent donc
 les chemins qui existaient au moment où ils ont été rédigés (`bat_building/src/…`,
 `main/src/main.rs`, `cargo run -p main`, `perpetual_samples/…`). La table de
-correspondance ci-dessous suffit à les relire ; le CLAUDE.md racine, lui, est à jour.
+correspondance ci-dessous suffit à les relire ; l'AGENTS.md racine, lui, est à jour.
 
 Pour une lecture en une passe, commencer par [SYNTHESE_CAMPAGNE.md](SYNTHESE_CAMPAGNE.md).
 

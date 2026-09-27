@@ -483,7 +483,7 @@ mesurés ici.
 La *conclusion* de ce rapport-là est intacte, et même renforcée : le trafic
 dataset est de l'ordre du dataset entier par pas, et c'est ce qui explique ses
 630 s de temps système. Seuls les nombres intermédiaires sont à relire.
-Ni `CLAUDE.md` ni `INDEX.md` ne reprennent le chiffre — seul
+Ni `AGENTS.md` ni `INDEX.md` ne reprennent le chiffre — seul
 `BATCH_DISPATCH.md` le porte, en §2.4, §5.2 et §8, et il n'a pas été réécrit :
 les rapports de ce dépôt sont des archives (`INDEX.md`), et c'est ce
 paragraphe-ci qui fait foi.

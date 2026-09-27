@@ -4,7 +4,7 @@
 # stockage JETABLE (BATLAB_ROOT). Aucune connaissance de l'implémentation :
 # on envoie des touches, on lit l'écran et le disque.
 #
-# Protocole d'envoi : cf. CLAUDE.md — texte et Entrée en deux commandes,
+# Protocole d'envoi : cf. AGENTS.md — texte et Entrée en deux commandes,
 # petite pause entre les deux (le bracketed paste du TUI gobe sinon le CR).
 
 set -uo pipefail

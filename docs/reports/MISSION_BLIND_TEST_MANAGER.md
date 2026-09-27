@@ -1,12 +1,12 @@
 # Mission : test à l'aveugle du gestionnaire de modèles et de la navigation
 
-Tu es un agent de test INDÉPENDANT. Règle absolue : **interdiction de lire l'implémentation** — aucun fichier de `crates/*/src/`, ni leurs diffs, ni leur historique. Tu peux : compiler (`cargo build --release -p batlab`), exécuter le binaire (TUI piloté par `tmux send-keys` dans un pane dédié — méthode éprouvée, cf. `docs/reports/INFER_VIZ.md` §5 pour le protocole d'envoi et de capture), observer l'écran (`tmux capture-pane`) et le DISQUE. Tu peux lire : ce fichier, le CLAUDE.md racine (sections flow/BATLAB_ROOT), et `docs/reports/MODEL_MANAGER.md` (le contrat observable — c'est ta spec). Un écart se signale en citant la spec ; tu n'édites jamais un test pour le faire passer.
+Tu es un agent de test INDÉPENDANT. Règle absolue : **interdiction de lire l'implémentation** — aucun fichier de `crates/*/src/`, ni leurs diffs, ni leur historique. Tu peux : compiler (`cargo build --release -p batlab`), exécuter le binaire (TUI piloté par `tmux send-keys` dans un pane dédié — méthode éprouvée, cf. `docs/reports/INFER_VIZ.md` §5 pour le protocole d'envoi et de capture), observer l'écran (`tmux capture-pane`) et le DISQUE. Tu peux lire : ce fichier, l'AGENTS.md racine (sections flow/BATLAB_ROOT), et `docs/reports/MODEL_MANAGER.md` (le contrat observable — c'est ta spec). Un écart se signale en citant la spec ; tu n'édites jamais un test pour le faire passer.
 
 ## Dispositif
 
-Travaille sur une racine de stockage JETABLE : `BATLAB_ROOT=<tmpdir>` (documenté au CLAUDE.md). Peuple-la en copiant 1-2 modèles depuis le vrai `Models/` (config_file + un petit .ckpt) — en shell, sans lire leur contenu. JAMAIS le TUI sur le vrai `Models/`.
+Travaille sur une racine de stockage JETABLE : `BATLAB_ROOT=<tmpdir>` (documenté dans AGENTS.md). Peuple-la en copiant 1-2 modèles depuis le vrai `Models/` (config_file + un petit .ckpt) — en shell, sans lire leur contenu. JAMAIS le TUI sur le vrai `Models/`.
 
-## Propriétés à tester (spec : MODEL_MANAGER.md + CLAUDE.md « le modèle d'abord, l'action ensuite »)
+## Propriétés à tester (spec : MODEL_MANAGER.md + AGENTS.md « le modèle d'abord, l'action ensuite »)
 
 - **P1 Flow** : l'ouverture est la liste des modèles (nom, géométrie, checkpoints) + « New model (from template) » ; sélectionner un modèle ouvre le menu d'actions (Train/Infer/Perpetual/Rename/Delete).
 - **P2 Rename** : renomme le dossier ET le model_name du config_file, de façon cohérente ; la liste reflète le nouveau nom ; validation des noms (vide/collision/caractères dangereux refusés — essaie `../evil`, un nom existant, un nom vide).

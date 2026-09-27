@@ -1,7 +1,7 @@
 //! On-disk layout: where `Models/`, `datasets/` and checkpoints live, how a
 //! `config_file` is read/written, and the manager ops (rename, duplicate,
 //! delete). Deliberately not in `batlab_core` — the engine takes bytes and knows
-//! no paths, so inference can run in a browser (engine/host frontier: CLAUDE.md).
+//! no paths, so inference can run in a browser (engine/host frontier: AGENTS.md).
 //!
 //! The root is injected off a [`Storage`], never a workspace-deduced global:
 //! tests build a `Storage` on a temp dir so `cargo test` cannot rewrite the
