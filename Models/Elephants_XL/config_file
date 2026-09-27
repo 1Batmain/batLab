@@ -419,13 +419,23 @@
   "inference": {
     "random_seed": true,
     "seed": null,
-    "denoising_paths": 1,
-    "denoise_magnitude": 1.2,
+    "denoising_paths": 2,
+    "denoise_magnitude": 0.75,
     "posterior_variance": "beta",
     "checkpoint": "/Users/bat/development/lab/batLab/Models/Elephants_XL/pretrained_weights/latest.ckpt"
   },
-  "seed_dataset": "datasets/elephants256.batraw",
+  "seed_dataset": "/Users/bat/development/lab/batLab/datasets/elephants_all.batraw",
   "run": {
-    "mode": "Infer"
+    "mode": {
+      "Perpetual": {
+        "random_seed": true,
+        "seed": null,
+        "denoise_magnitude": 0.9,
+        "renoise_depth": 64,
+        "regime": "Flux",
+        "tempo": 30.0,
+        "checkpoint": "/Users/bat/development/lab/batLab/Models/Elephants_XL/pretrained_weights/latest.ckpt"
+      }
+    }
   }
 }
